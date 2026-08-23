@@ -175,3 +175,24 @@ export function useHistory() {
     refetchInterval: 10_000,
   });
 }
+
+export function useEvents(limit = 200) {
+  return useQuery({
+    queryKey: ["events", limit],
+    queryFn: () =>
+      api.get<import("./types").EventsResponse>(`/api/v1/events?limit=${limit}`),
+    refetchInterval: 3000,
+  });
+}
+
+export function useStateNames(jobId: string, opId: string) {
+  return useQuery({
+    queryKey: ["state-names", jobId, opId],
+    queryFn: () =>
+      api.get<import("./types").ListStateNamesResponse>(
+        `/api/v1/jobs/${encodeURIComponent(jobId)}/state/${encodeURIComponent(opId)}`,
+      ),
+    enabled: jobId.length > 0 && opId.length > 0,
+    retry: 0,
+  });
+}

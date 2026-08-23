@@ -37,6 +37,17 @@ const ICONS: Record<string, ReactNode> = {
       <path d="M4.5 4.5h.01M4.5 11.5h.01" />
     </svg>
   ),
+  events: (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-[15px] w-[15px] shrink-0 opacity-75">
+      <path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7" />
+    </svg>
+  ),
+  state: (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-[15px] w-[15px] shrink-0 opacity-75">
+      <circle cx="7" cy="7" r="4.5" />
+      <path d="M10.5 10.5L14 14" />
+    </svg>
+  ),
   history: (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-[15px] w-[15px] shrink-0 opacity-75">
       <circle cx="8" cy="8" r="6" />
@@ -55,6 +66,8 @@ const NAV: { to: string; label: string; icon: string; exact?: boolean }[] = [
   { to: "/jobs", label: "Jobs", icon: "jobs" },
   { to: "/streaming", label: "Streaming", icon: "streaming" },
   { to: "/executors", label: "Executors", icon: "executors" },
+  { to: "/events", label: "Events", icon: "events" },
+  { to: "/state", label: "State", icon: "state" },
   { to: "/history", label: "History", icon: "history" },
   { to: "/sql", label: "SQL", icon: "sql" },
 ];

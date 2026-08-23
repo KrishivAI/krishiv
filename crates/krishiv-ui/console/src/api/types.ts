@@ -147,3 +147,41 @@ export interface JobHistoryListResponse {
   limit: number;
   offset: number;
 }
+
+export interface MetricsSnapshot {
+  at_ms: number;
+  current_tick: number;
+  executor_count: number;
+  max_heartbeat_lag: number | null;
+  running_jobs: number;
+  failed_jobs: number;
+  running_task_count: number;
+  retry_count: number;
+  failed_assignments: number;
+  shuffle_bytes_written: number;
+  shuffle_partitions_available: number;
+}
+
+export interface EventView {
+  seq: number;
+  kind: string;
+  job_id?: string;
+  stage_id?: string;
+  task_id?: string;
+  executor_id?: string;
+  attempt?: number;
+  detail?: string;
+}
+export interface EventsResponse {
+  events: EventView[];
+  total: number;
+}
+
+export interface ListStateNamesResponse {
+  job_id: string;
+  op_id: string;
+  state_names: string[];
+}
+export type QueryStateResponse =
+  | { found: "true"; job_id: string; op_id: string; state_name: string; key_hex: string; value_base64: string }
+  | { found: "false"; job_id: string; op_id: string; state_name: string; key_hex: string };

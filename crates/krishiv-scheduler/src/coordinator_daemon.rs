@@ -573,6 +573,8 @@ pub fn coordinator_http_router(
         .route("/api/v1/jobs/{job_id}/cancel", post(api_job_cancel))
         .route("/api/v1/jobs/{job_id}/stages", get(api_job_stages))
         .route("/api/v1/executors", get(api_executors))
+        .route("/api/v1/metrics-snapshot", get(api_metrics_snapshot))
+        .route("/api/v1/events", get(api_events))
         .route(
             "/api/v1/executors/{executor_id}/reset",
             post(api_executor_reset),
@@ -973,6 +975,214 @@ async fn api_job_cancel(
             )
         }
     }
+}
+
+/// One point-in-time JSON metrics sample for the console's client-side time
+/// series. Every field is read from live coordinator state — the same sources
+/// the Prometheus text endpoint uses — never derived or estimated. `at_ms` is
+/// the coordinator's wall clock at sampling time so client-side series align
+/// across pollers.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MetricsSnapshotResponse {
+    at_ms: u64,
+    current_tick: u64,
+    executor_count: usize,
+    /// Worst heartbeat lag across executors, in ticks; null with no executors.
+    max_heartbeat_lag: Option<u64>,
+    running_jobs: usize,
+    failed_jobs: usize,
+    running_task_count: usize,
+    retry_count: usize,
+    failed_assignments: usize,
+    shuffle_bytes_written: u64,
+    shuffle_partitions_available: usize,
+}
+
+async fn api_metrics_snapshot(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
+    let coord = coordinator.read().await;
+    let stability = coord.stability_metrics();
+    let current_tick = coord.executors().current_tick();
+    let executors = coord.executor_snapshots();
+    let max_heartbeat_lag = executors
+        .iter()
+        .map(|e| current_tick.saturating_sub(e.last_heartbeat_tick()))
+        .max();
+    let (mut running_jobs, mut failed_jobs) = (0usize, 0usize);
+    for job in coord.job_snapshots() {
+        match format!("{:?}", job.state()).as_str() {
+            "Running" => running_jobs += 1,
+            "Failed" => failed_jobs += 1,
+            _ => {}
+        }
+    }
+    let at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    Json(MetricsSnapshotResponse {
+        at_ms,
+        current_tick,
+        executor_count: executors.len(),
+        max_heartbeat_lag,
+        running_jobs,
+        failed_jobs,
+        running_task_count: stability.running_task_count(),
+        retry_count: stability.retry_count(),
+        failed_assignments: stability.failed_assignments(),
+        shuffle_bytes_written: stability.shuffle_bytes_written,
+        shuffle_partitions_available: stability.shuffle_partitions_available,
+    })
+}
+
+/// One event-log entry, flattened for the console feed.
+///
+/// `seq` is the entry's ordinal in the CURRENT log buffer — the store evicts
+/// old events under memory pressure and records no wall-clock time, so the
+/// feed is honestly "ordered, untimed" rather than carrying fabricated
+/// timestamps.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EventView {
+    seq: usize,
+    kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    job_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+}
+
+fn event_view(seq: usize, event: &crate::EventLogEvent) -> EventView {
+    use crate::EventLogEvent as E;
+    let mut v = EventView {
+        seq,
+        kind: "unknown",
+        job_id: None,
+        stage_id: None,
+        task_id: None,
+        executor_id: None,
+        attempt: None,
+        detail: None,
+    };
+    match event {
+        E::JobSubmitted { job_id } => {
+            v.kind = "job_submitted";
+            v.job_id = Some(job_id.to_string());
+        }
+        E::StagePlanned { job_id, stage_id } => {
+            v.kind = "stage_planned";
+            v.job_id = Some(job_id.to_string());
+            v.stage_id = Some(stage_id.to_string());
+        }
+        E::TaskAssigned {
+            job_id,
+            stage_id,
+            task_id,
+            executor_id,
+        } => {
+            v.kind = "task_assigned";
+            v.job_id = Some(job_id.to_string());
+            v.stage_id = Some(stage_id.to_string());
+            v.task_id = Some(task_id.to_string());
+            v.executor_id = Some(executor_id.to_string());
+        }
+        E::TaskStarted {
+            job_id,
+            stage_id,
+            task_id,
+            attempt,
+        } => {
+            v.kind = "task_started";
+            v.job_id = Some(job_id.to_string());
+            v.stage_id = Some(stage_id.to_string());
+            v.task_id = Some(task_id.to_string());
+            v.attempt = Some(attempt.as_u32());
+        }
+        E::TaskSucceeded {
+            job_id,
+            stage_id,
+            task_id,
+            attempt,
+        } => {
+            v.kind = "task_succeeded";
+            v.job_id = Some(job_id.to_string());
+            v.stage_id = Some(stage_id.to_string());
+            v.task_id = Some(task_id.to_string());
+            v.attempt = Some(attempt.as_u32());
+        }
+        E::TaskFailed {
+            job_id,
+            stage_id,
+            task_id,
+            attempt,
+            reason,
+        } => {
+            v.kind = "task_failed";
+            v.job_id = Some(job_id.to_string());
+            v.stage_id = Some(stage_id.to_string());
+            v.task_id = Some(task_id.to_string());
+            v.attempt = Some(attempt.as_u32());
+            v.detail = Some(reason.clone());
+        }
+        E::ExecutorLost { executor_id } => {
+            v.kind = "executor_lost";
+            v.executor_id = Some(executor_id.to_string());
+        }
+        E::JobCancelled { job_id } => {
+            v.kind = "job_cancelled";
+            v.job_id = Some(job_id.to_string());
+        }
+        E::JobCompleted {
+            job_id,
+            final_state,
+        } => {
+            v.kind = "job_completed";
+            v.job_id = Some(job_id.to_string());
+            v.detail = Some(final_state.clone());
+        }
+    }
+    v
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `GET /api/v1/events?limit=N` — the coordinator's decision feed, newest
+/// first, straight from the metadata store's event log.
+async fn api_events(
+    State(coordinator): State<SharedCoordinator>,
+    axum::extract::Query(query): axum::extract::Query<EventsQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(200).min(1000);
+    let coord = coordinator.read().await;
+    let (events, total) = match coord.store.as_ref() {
+        Some(store) => {
+            let guard = store.inner();
+            let all = guard.events();
+            let total = all.len();
+            let start = total.saturating_sub(limit);
+            let mut views: Vec<EventView> = all
+                .get(start..)
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+                .map(|(i, e)| event_view(start + i, e))
+                .collect();
+            views.reverse();
+            (views, total)
+        }
+        None => (Vec::new(), 0),
+    };
+    Json(serde_json::json!({ "events": events, "total": total }))
 }
 
 async fn api_executors(State(coordinator): State<SharedCoordinator>) -> impl IntoResponse {
@@ -2950,6 +3160,80 @@ mod parse_tests {
         assert!(
             json["current_tick"].is_u64(),
             "executors response must expose the coordinator tick: {json}"
+        );
+    }
+
+    /// The console's time-series charts poll this; every field must be a
+    /// real coordinator value. Revert-proof: drop either route and its
+    /// request 404s.
+    #[tokio::test]
+    async fn metrics_snapshot_and_events_feed_serve_real_state() {
+        use crate::CoordinatorDaemonConfig;
+        use crate::coordinator_http_router;
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+        use tower::ServiceExt;
+
+        let _ = crate::auth::set_allow_anonymous();
+        let coordinator = SharedCoordinator::new(Coordinator::active(
+            CoordinatorId::try_new("coord-snapshot").unwrap(),
+        ));
+        coordinator
+            .write()
+            .await
+            .attach_store(crate::InMemoryMetadataStore::default());
+        let job_id = JobId::try_new("job-snapshot-feed").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "snap", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-snap").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new("task-snap").unwrap(), "window:s"),
+            ),
+        );
+        coordinator.write().await.submit_job(spec).unwrap();
+
+        let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        let router = coordinator_http_router(coordinator, &config);
+
+        let snap = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/metrics-snapshot")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(snap.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(snap.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(json["at_ms"].as_u64().unwrap() > 0);
+        assert!(json["current_tick"].is_u64());
+        assert!(json["running_task_count"].is_u64());
+        assert!(json["shuffle_bytes_written"].is_u64());
+
+        let events = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/events?limit=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(events.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let list = json["events"].as_array().unwrap();
+        // submit_job appended JobSubmitted to the attached store; newest first.
+        assert!(
+            list.iter()
+                .any(|e| e["kind"] == "job_submitted" && e["job_id"] == "job-snapshot-feed"),
+            "event feed must carry the submitted job: {json}"
         );
     }
 

@@ -14,11 +14,13 @@ import { session } from "./auth/session";
 import { Shell } from "./components/Shell";
 import { DashboardPage } from "./pages/Dashboard";
 import { HistoryPage } from "./pages/History";
+import { EventsPage } from "./pages/Events";
 import { ExecutorsPage } from "./pages/Executors";
 import { JobDetailPage } from "./pages/JobDetail";
 import { JobsPage } from "./pages/Jobs";
 import { LoginPage } from "./pages/Login";
 import { SqlPage } from "./pages/Sql";
+import { StateBrowserPage } from "./pages/StateBrowser";
 import { StreamingDetailPage } from "./pages/StreamingDetail";
 import { StreamingPage } from "./pages/Streaming";
 
@@ -72,6 +74,16 @@ const executorsRoute = createRoute({
   path: "/executors",
   component: ExecutorsPage,
 });
+const eventsRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/events",
+  component: EventsPage,
+});
+const stateRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/state",
+  component: StateBrowserPage,
+});
 const historyRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/history",
@@ -92,6 +104,8 @@ const routeTree = rootRoute.addChildren([
     streamingRoute,
     streamingDetailRoute,
     executorsRoute,
+    eventsRoute,
+    stateRoute,
     historyRoute,
     sqlRoute,
   ]),
