@@ -1583,6 +1583,7 @@ impl StageRecord {
             tasks: self.tasks.iter().map(TaskRecord::snapshot).collect(),
             shuffle_bytes_written,
             shuffle_partitions_available,
+            upstream_stage_ids: self.spec.upstream_stage_ids().to_vec(),
         }
     }
 }

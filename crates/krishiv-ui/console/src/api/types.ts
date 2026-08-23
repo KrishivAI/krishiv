@@ -41,6 +41,8 @@ export interface StageTimingView {
   max_task_ms: number | null;
   shuffle_bytes_written: number;
   tasks: TaskTimingView[];
+  /** Real DAG in-edges (upstream shuffle producers) from the stage spec. */
+  upstream_stage_ids: string[];
 }
 export interface StageTimingResponse {
   job_id: string;

@@ -834,6 +834,11 @@ pub struct StageTimingView {
     shuffle_bytes_written: u64,
     /// Per-task placement and outcome rows (additive; older clients ignore).
     tasks: Vec<TaskTimingView>,
+    /// The job DAG's in-edges for this stage (upstream shuffle producers),
+    /// from the stage spec — real dependency data, so the console can draw
+    /// an actual DAG instead of fabricating structure.
+    #[serde(default)]
+    upstream_stage_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -894,6 +899,11 @@ async fn api_job_stages(
                         completed_duration_ms: task.completed_duration_ms(),
                         last_watermark_ms: task.last_watermark_ms,
                     })
+                    .collect(),
+                upstream_stage_ids: stage
+                    .upstream_stage_ids()
+                    .iter()
+                    .map(|id| id.to_string())
                     .collect(),
             }
         })
@@ -3094,11 +3104,20 @@ mod parse_tests {
             CoordinatorId::try_new("coord-task-rows").unwrap(),
         ));
         let job_id = JobId::try_new("job-task-rows").unwrap();
-        let spec = JobSpec::new(job_id.clone(), "task-rows", JobKind::Batch).with_stage(
-            StageSpec::new(StageId::try_new("stage-task-rows").unwrap(), "stage").with_task(
-                TaskSpec::new(TaskId::try_new("task-task-rows").unwrap(), "window:rows"),
-            ),
-        );
+        let spec = JobSpec::new(job_id.clone(), "task-rows", JobKind::Batch)
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-task-rows").unwrap(), "stage").with_task(
+                    TaskSpec::new(TaskId::try_new("task-task-rows").unwrap(), "window:rows"),
+                ),
+            )
+            .with_stage(
+                StageSpec::new(StageId::try_new("stage-task-rows-b").unwrap(), "reduce")
+                    .with_task(TaskSpec::new(
+                        TaskId::try_new("task-task-rows-b").unwrap(),
+                        "window:rows-b",
+                    ))
+                    .with_upstream_stage(StageId::try_new("stage-task-rows").unwrap()),
+            );
         coordinator.write().await.submit_job(spec).unwrap();
 
         let config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
@@ -3124,6 +3143,16 @@ mod parse_tests {
         // Not yet dispatched: placement is honestly null, never a fake value.
         assert!(tasks[0]["executor_id"].is_null());
         assert_eq!(tasks[0]["attempt"], 0);
+        // The DAG edge must ride along: stage B declares stage A upstream.
+        // Revert-proof: drop the upstream_stage_ids mapping and this fails.
+        assert_eq!(
+            json["stages"][0]["upstream_stage_ids"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            json["stages"][1]["upstream_stage_ids"],
+            serde_json::json!(["stage-task-rows"])
+        );
     }
 
     /// `current_tick` gives clients the reference point for heartbeat

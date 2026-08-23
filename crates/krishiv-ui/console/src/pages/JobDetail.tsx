@@ -1,6 +1,7 @@
 import { useNavigate, useParams } from "@tanstack/react-router";
 
 import { useCancelJob, useJob, useJobDiagnose, useJobStages } from "../api/queries";
+import { StageDag } from "../components/StageDag";
 import { StateBadge } from "../components/StateBadge";
 import { Button, Card, ErrorText } from "../components/ui";
 import { fmtBytes, fmtMs, watermark } from "../lib/format";
@@ -48,6 +49,13 @@ export function JobDetailPage() {
               {job.running_task_count} / {job.succeeded_task_count} / {job.failed_task_count}
             </div>
           </Card>
+        </div>
+      )}
+
+      {stages.data && stages.data.stages.length > 1 && (
+        <div className="mt-6">
+          <h2 className="mb-2 text-sm font-semibold text-muted">Stage graph</h2>
+          <StageDag stages={stages.data.stages} />
         </div>
       )}
 

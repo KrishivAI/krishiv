@@ -134,12 +134,20 @@ pub struct StageSnapshot {
     pub(crate) shuffle_bytes_written: u64,
     /// Shuffle partitions currently available for this stage.
     pub(crate) shuffle_partitions_available: usize,
+    /// Stages whose shuffle output this stage consumes (the job DAG's
+    /// in-edges), straight from the `StageSpec` — empty for source stages.
+    pub(crate) upstream_stage_ids: Vec<StageId>,
 }
 
 impl StageSnapshot {
     /// Stage id.
     pub fn stage_id(&self) -> &StageId {
         &self.stage_id
+    }
+
+    /// Stages whose shuffle output this stage consumes.
+    pub fn upstream_stage_ids(&self) -> &[StageId] {
+        &self.upstream_stage_ids
     }
 
     /// Stage state.
