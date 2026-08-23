@@ -54,6 +54,12 @@ const ICONS: Record<string, ReactNode> = {
       <path d="M8 4.5V8l2.4 1.6" />
     </svg>
   ),
+  ivm: (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-[15px] w-[15px] shrink-0 opacity-75">
+      <path d="M2 8a6 6 0 0110.5-4M14 8A6 6 0 013.5 12" />
+      <path d="M12.5 1.5v3h-3M3.5 14.5v-3h3" />
+    </svg>
+  ),
   sql: (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-[15px] w-[15px] shrink-0 opacity-75">
       <path d="M2 4l4 4-4 4M8 12h6" />
@@ -68,6 +74,7 @@ const NAV: { to: string; label: string; icon: string; exact?: boolean }[] = [
   { to: "/executors", label: "Executors", icon: "executors" },
   { to: "/events", label: "Events", icon: "events" },
   { to: "/state", label: "State", icon: "state" },
+  { to: "/ivm", label: "IVM", icon: "ivm" },
   { to: "/history", label: "History", icon: "history" },
   { to: "/sql", label: "SQL", icon: "sql" },
 ];
@@ -117,24 +124,69 @@ function useTheme(): [string, () => void] {
   return [theme, () => setTheme((t) => (t === "dark" ? "light" : "dark"))];
 }
 
+function SidebarNav({ onNavigate }: { onNavigate?: () => void }) {
+  return (
+    <nav
+      className="flex-1 space-y-0.5 overflow-y-auto p-2"
+      aria-label="Primary"
+      onClick={onNavigate}
+    >
+      {NAV.map((item) => (
+        <NavItem key={item.to} {...item} />
+      ))}
+    </nav>
+  );
+}
+
 export function Shell({ children }: { children?: ReactNode }) {
   const navigate = useNavigate();
   const [theme, toggleTheme] = useTheme();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  // Escape closes the mobile nav drawer.
+  useEffect(() => {
+    if (!drawerOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setDrawerOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [drawerOpen]);
   return (
     <div className="flex h-screen">
       <aside className="hidden w-56 shrink-0 flex-col border-r border-border bg-bg md:flex">
         <BrandRow />
-        <nav className="flex-1 space-y-0.5 overflow-y-auto p-2" aria-label="Primary">
-          {NAV.map((item) => (
-            <NavItem key={item.to} {...item} />
-          ))}
-        </nav>
+        <SidebarNav />
       </aside>
+      {drawerOpen ? (
+        <div
+          className="fixed inset-0 z-40 bg-black/60 md:hidden"
+          onMouseDown={() => setDrawerOpen(false)}
+          role="presentation"
+        >
+          <div
+            className="flex h-full w-64 max-w-[85vw] flex-col border-r border-border bg-bg"
+            onMouseDown={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+            aria-label="Navigation"
+          >
+            <BrandRow />
+            <SidebarNav onNavigate={() => setDrawerOpen(false)} />
+          </div>
+        </div>
+      ) : null}
       <div className="flex min-w-0 flex-1 flex-col">
         <header className="flex h-14 shrink-0 items-center gap-3 border-b border-border px-3 sm:px-4">
-          <span className="md:hidden">
-            <BrandRow />
-          </span>
+          <button
+            type="button"
+            onClick={() => setDrawerOpen(true)}
+            aria-label="Open navigation"
+            className="flex items-center rounded-md p-1.5 text-muted hover:bg-surface-2 hover:text-text md:hidden"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" className="h-4 w-4">
+              <path d="M2 4h12M2 8h12M2 12h12" />
+            </svg>
+          </button>
           <div className="flex-1" />
           <button
             type="button"

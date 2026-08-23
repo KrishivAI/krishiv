@@ -7,6 +7,7 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  lazyRouteComponent,
   redirect,
 } from "@tanstack/react-router";
 
@@ -14,12 +15,12 @@ import { session } from "./auth/session";
 import { Shell } from "./components/Shell";
 import { DashboardPage } from "./pages/Dashboard";
 import { HistoryPage } from "./pages/History";
+import { IvmPage } from "./pages/Ivm";
 import { EventsPage } from "./pages/Events";
 import { ExecutorsPage } from "./pages/Executors";
 import { JobDetailPage } from "./pages/JobDetail";
 import { JobsPage } from "./pages/Jobs";
 import { LoginPage } from "./pages/Login";
-import { SqlPage } from "./pages/Sql";
 import { StateBrowserPage } from "./pages/StateBrowser";
 import { StreamingDetailPage } from "./pages/StreamingDetail";
 import { StreamingPage } from "./pages/Streaming";
@@ -84,6 +85,11 @@ const stateRoute = createRoute({
   path: "/state",
   component: StateBrowserPage,
 });
+const ivmRoute = createRoute({
+  getParentRoute: () => appRoute,
+  path: "/ivm",
+  component: IvmPage,
+});
 const historyRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/history",
@@ -92,7 +98,9 @@ const historyRoute = createRoute({
 const sqlRoute = createRoute({
   getParentRoute: () => appRoute,
   path: "/sql",
-  component: SqlPage,
+  // CodeMirror + sql-formatter (and apache-arrow on first result) are the
+  // heavy chunks — code-split so every other route stays light.
+  component: lazyRouteComponent(() => import("./pages/Sql"), "SqlPage"),
 });
 
 const routeTree = rootRoute.addChildren([
@@ -106,6 +114,7 @@ const routeTree = rootRoute.addChildren([
     executorsRoute,
     eventsRoute,
     stateRoute,
+    ivmRoute,
     historyRoute,
     sqlRoute,
   ]),

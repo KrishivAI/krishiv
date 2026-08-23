@@ -1,13 +1,14 @@
 // SQL runner over the batch-sql submit/poll endpoints. Results come back
-// as base64 Arrow IPC stream payloads (serde_ipc_b64); apache-arrow
-// decodes them client-side. CodeMirror editor is a follow-up — parity
-// with the platform's editor is tracked, a textarea ships first.
+// as base64 Arrow IPC stream payloads (serde_ipc_b64); apache-arrow is
+// imported lazily so the editor route's chunk stays small until the first
+// result actually needs decoding.
 
-import { tableFromIPC } from "apache-arrow";
 import { useRef, useState } from "react";
+import { format as formatSql } from "sql-formatter";
 
 import { api } from "../api/client";
 import type { BatchSqlPollResponse, BatchSqlSubmitResponse } from "../api/types";
+import { CodeMirrorSql } from "../components/editor/CodeMirrorSql";
 import { Button, ErrorText, StatusText } from "../components/ui";
 
 interface ResultGrid {
@@ -17,7 +18,8 @@ interface ResultGrid {
   taskCount: number;
 }
 
-function decodeResults(poll: BatchSqlPollResponse): ResultGrid {
+async function decodeResults(poll: BatchSqlPollResponse): Promise<ResultGrid> {
+  const { tableFromIPC } = await import("apache-arrow");
   const columns: string[] = [];
   const rows: unknown[][] = [];
   for (const b64 of poll.inline_record_batch_ipc ?? []) {
@@ -32,11 +34,13 @@ function decodeResults(poll: BatchSqlPollResponse): ResultGrid {
 }
 
 export function SqlPage() {
-  const [sql, setSql] = useState("SELECT 1 AS one");
+  const [sqlText, setSqlText] = useState("SELECT 1 AS one");
   const [state, setState] = useState<"idle" | "running">("idle");
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ResultGrid | null>(null);
   const cancelled = useRef(false);
+  const sqlRef = useRef(sqlText);
+  sqlRef.current = sqlText;
 
   async function run() {
     setState("running");
@@ -44,14 +48,16 @@ export function SqlPage() {
     setResult(null);
     cancelled.current = false;
     try {
-      const submit = await api.post<BatchSqlSubmitResponse>("/api/v1/batch-sql/submit", { query: sql });
+      const submit = await api.post<BatchSqlSubmitResponse>("/api/v1/batch-sql/submit", {
+        query: sqlRef.current,
+      });
       for (;;) {
         if (cancelled.current) return;
         const poll = await api.get<BatchSqlPollResponse>(
           `/api/v1/batch-sql/${encodeURIComponent(submit.job_id)}`,
         );
         if (poll.state === "Succeeded") {
-          setResult(decodeResults(poll));
+          setResult(await decodeResults(poll));
           break;
         }
         if (poll.state === "Failed" || poll.state === "Cancelled") {
@@ -67,23 +73,39 @@ export function SqlPage() {
     }
   }
 
+  function format(): boolean {
+    try {
+      setSqlText(formatSql(sqlRef.current, { language: "postgresql" }));
+    } catch {
+      // Unparseable input: leave the text as typed.
+    }
+    return true;
+  }
+
   return (
     <div>
       <h1 className="mb-4 text-lg font-semibold">SQL</h1>
-      <textarea
-        value={sql}
-        onChange={(e) => setSql(e.target.value)}
-        rows={6}
-        spellCheck={false}
-        className="w-full rounded border border-border bg-surface p-3 font-mono text-sm focus:border-accent focus:outline-none"
+      <CodeMirrorSql
+        value={sqlText}
+        onChange={setSqlText}
+        onRun={() => {
+          if (state === "idle" && sqlRef.current.trim()) void run();
+          return true;
+        }}
+        onFormat={format}
       />
       <div className="mt-2 flex items-center gap-3">
-        <Button disabled={state === "running" || !sql.trim()} onClick={() => void run()}>
-          {state === "running" ? "Running…" : "Run"}
+        <Button disabled={state === "running" || !sqlText.trim()} onClick={() => void run()}>
+          {state === "running" ? "Running…" : "Run  ⌘⏎"}
+        </Button>
+        <Button variant="ghost" onClick={format}>
+          Format
         </Button>
         {result && (
           <StatusText>
-            {result.rows.length} rows · {result.stageCount} stages · {result.taskCount} tasks
+            {result.rows.length} rows · {result.stageCount} stage{result.stageCount === 1 ? "" : "s"} ·{" "}
+            {result.taskCount} task{result.taskCount === 1 ? "" : "s"}
+            {result.stageCount === 1 && result.taskCount === 1 && " (single-task)"}
           </StatusText>
         )}
       </div>
