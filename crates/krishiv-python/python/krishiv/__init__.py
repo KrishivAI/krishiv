@@ -122,37 +122,59 @@ async def _session_sql_async(self, query: str):
     return await loop.run_in_executor(None, _native_session_sql, self, query)
 
 
+_native_dataframe_collect = DataFrame.collect
 _native_dataframe_collect_async = DataFrame.collect_async
 
 
 async def _dataframe_collect_async(self):
-    """Collect a DataFrame from async code (runs on a thread pool).
+    """Collect a DataFrame from async code.
 
-    The native ``collect_async`` blocks the calling thread until the query
-    completes (it releases the GIL internally but returns only once the
-    result is ready), so it must run on a worker thread rather than be
-    called directly on the event loop thread.
+    The native ``collect_async`` is a real coroutine (``future_into_py``): it
+    schedules the query on the Tokio runtime and suspends this coroutine
+    without blocking the event loop, so it is awaited directly.
+
+    This wrapper used to hand the native method to ``run_in_executor``,
+    on the belief that it blocked. Once it became a coroutine that stopped
+    working entirely — a coroutine function needs a running event loop on the
+    thread that calls it, and a thread-pool worker has none, so every await
+    raised ``RuntimeError: no running event loop`` from inside the worker.
+    The fallback below is for a build whose native method is still blocking.
     """
+    result = _native_dataframe_collect_async(self)
+    if _inspect.isawaitable(result):
+        return await result
     loop = _asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _native_dataframe_collect_async, self)
+    return await loop.run_in_executor(None, _native_dataframe_collect, self)
 
 
 _native_dataframe_execute_stream_async = DataFrame.execute_stream_async
 
 
 async def _dataframe_execute_stream_async(self):
-    """Execute a DataFrame as a stream from async code (runs on a thread pool)."""
-    loop = _asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _native_dataframe_execute_stream_async, self)
+    """Execute a DataFrame as a stream from async code.
+
+    Awaited directly for the same reason as `_dataframe_collect_async`. There
+    is no synchronous `DataFrame.execute_stream`, so a non-awaitable native
+    result is simply returned.
+    """
+    result = _native_dataframe_execute_stream_async(self)
+    if _inspect.isawaitable(result):
+        return await result
+    return result
 
 
 _native_streaming_dataframe_execute_stream_async = StreamingDataFrame.execute_stream_async
 
 
 async def _streaming_dataframe_execute_stream_async(self):
-    """Execute a streaming DataFrame from async code (runs on a thread pool)."""
-    loop = _asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _native_streaming_dataframe_execute_stream_async, self)
+    """Execute a streaming DataFrame from async code.
+
+    Awaited directly for the same reason as `_dataframe_collect_async`.
+    """
+    result = _native_streaming_dataframe_execute_stream_async(self)
+    if _inspect.isawaitable(result):
+        return await result
+    return result
 
 
 _native_query_handle_collect = QueryHandle.collect

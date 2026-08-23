@@ -208,6 +208,12 @@ honesty of the surfaces around it.
 | DDL-F3/F4 | LOW | `session.rs:2821`, `incremental_view.rs:121` | Dead binding `let _ = &view_entry`; `IncrementalViewRegistry::view_names()` has zero consumers. | OPEN |
 | DIST-A1-doc | MED | `cert_matrix.rs:142` | The distributed-IVM `Preview` label is honest, but nothing discloses that the canonical `GROUP BY` workload never uses executors at all (DIST-A1). | OPEN |
 
+## Found while fixing (not in the original 147)
+
+| ID | Sev | Where | Claim | Status |
+|---|---|---|---|---|
+| PY-ASYNC-1 | HIGH | `krishiv-python/python/krishiv/__init__.py:137` | `DataFrame.collect_async`, `DataFrame.execute_stream_async` and `StreamingDataFrame.execute_stream_async` were unusable: the Python wrappers handed the native method to `run_in_executor` on the belief that it blocks. It had since become a real coroutine (`future_into_py`), and a coroutine function needs a running event loop on the calling thread — a thread-pool worker has none — so every call raised `RuntimeError: no running event loop` from inside the worker. Four tests in the CI-run Python suite had been failing. | FIXED `async-await-native` (await the native coroutine directly, with the executor path kept as a fallback for a blocking build — the shape `_session_sql_async` already used). Revert-proven red. |
+
 ## Verified correct (do not "fix")
 
 Retraction atomicity (`from_update`/`from_cdc` emit `-1`/`+1` in one
