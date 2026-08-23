@@ -23,6 +23,11 @@ export function HealthHeader() {
       ? null
       : Math.max(...execs.map((e) => tick - e.last_heartbeat_tick));
   const failing = execs.filter((e) => e.consecutive_task_failures > 0);
+  const lost = execs.filter((e) => e.state === "Lost");
+  const healthy = execs.filter((e) => e.state !== "Lost");
+  // Zero healthy executors means nothing can be placed: every task queues
+  // as Pending. This is the loudest cluster condition, not just a number.
+  const noCapacity = !executors.isLoading && !executors.error && healthy.length === 0;
 
   return (
     <div className="mb-5">
@@ -42,6 +47,16 @@ export function HealthHeader() {
           </span>
         )}
       </div>
+      {noCapacity && (
+        <div className="mt-3 rounded border border-failed/40 bg-surface px-3 py-2 text-sm text-failed">
+          No healthy executors — tasks cannot be placed and will sit Pending.
+          {lost.map((e) => (
+            <div key={e.executor_id} className="text-xs">
+              {e.executor_id} is Lost (last heartbeat tick {e.last_heartbeat_tick})
+            </div>
+          ))}
+        </div>
+      )}
       {failing.length > 0 && (
         <div className="mt-3 rounded border border-failed/40 bg-surface px-3 py-2 text-sm text-failed">
           {failing.map((e) => (

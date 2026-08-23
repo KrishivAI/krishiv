@@ -91,6 +91,17 @@ impl IvmJob {
         matches!(self, IvmJob::Partitioned(_))
     }
 
+    /// Names of the views registered on this job (either variant).
+    pub fn view_names(&self) -> Vec<String> {
+        match self {
+            IvmJob::Single(flow) => flow.view_names().unwrap_or_default(),
+            IvmJob::Partitioned(part) => part
+                .view_specs()
+                .map(|specs| specs.into_iter().map(|s| s.name).collect())
+                .unwrap_or_default(),
+        }
+    }
+
     /// Register a view on the job. (Partitioning is decided by the registry
     /// *before* the job reaches this variant; here we just register.)
     pub fn register_view(&self, spec: IncrementalViewSpec) -> IvmResult<()> {

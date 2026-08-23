@@ -246,6 +246,20 @@ pub async fn api_ivm_create_job(
 #[derive(Debug, Serialize)]
 pub struct ListJobsResponse {
     pub job_ids: Vec<String>,
+    /// Per-job detail (additive, #console): view names let a client fetch
+    /// per-view stats without guessing names, which the id list alone
+    /// forced. Snapshot-only jobs (present durably but not live in the
+    /// registry) report no views and live=false.
+    pub jobs: Vec<IvmJobSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IvmJobSummary {
+    pub job_id: String,
+    pub view_names: Vec<String>,
+    pub partitioned: bool,
+    /// Whether the job is live in the registry (vs. snapshot-only).
+    pub live: bool,
 }
 
 pub async fn api_ivm_list_jobs(
@@ -262,7 +276,24 @@ pub async fn api_ivm_list_jobs(
     );
     job_ids.sort();
     job_ids.dedup();
-    Json(ListJobsResponse { job_ids })
+    let jobs = job_ids
+        .iter()
+        .map(|id| match registry.get(id) {
+            Some(job) => IvmJobSummary {
+                job_id: id.clone(),
+                view_names: job.view_names(),
+                partitioned: job.is_partitioned(),
+                live: true,
+            },
+            None => IvmJobSummary {
+                job_id: id.clone(),
+                view_names: Vec::new(),
+                partitioned: false,
+                live: false,
+            },
+        })
+        .collect();
+    Json(ListJobsResponse { job_ids, jobs })
 }
 
 // ── DELETE /api/v1/ivm/jobs/{job_id} ─────────────────────────────────────────
@@ -1270,6 +1301,47 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The console fetches per-view stats by name; the list must carry the
+    /// names. Revert-proof: drop the `jobs` field mapping and this fails.
+    #[tokio::test]
+    async fn list_jobs_carries_view_names() {
+        let registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::new());
+        let coordinator = crate::SharedCoordinator::new(crate::Coordinator::active(
+            krishiv_proto::CoordinatorId::try_new("coord-ivm-list").unwrap(),
+        ));
+        create_or_rehydrate_ivm_job(&registry, &coordinator, "job-list-views", Some(false))
+            .await
+            .unwrap();
+        let job = registry.get("job-list-views").unwrap();
+        job.register_view(krishiv_ivm::IncrementalViewSpec {
+            name: "v_total".to_string(),
+            body_sql: "SELECT k, SUM(v) AS total FROM t GROUP BY k".to_string(),
+            output_schema: std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new("k", arrow::datatypes::DataType::Utf8, false),
+                arrow::datatypes::Field::new("total", arrow::datatypes::DataType::Int64, true),
+            ])),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: Vec::new(),
+        })
+        .unwrap();
+
+        let resp = api_ivm_list_jobs(
+            axum::extract::State(registry),
+            axum::extract::State(coordinator),
+        )
+        .await;
+        let json = serde_json::to_value(&resp.0).unwrap();
+        let entry = json["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["job_id"] == "job-list-views")
+            .expect("job present");
+        assert_eq!(entry["view_names"], serde_json::json!(["v_total"]));
+        assert_eq!(entry["live"], serde_json::json!(true));
+    }
+
     use super::*;
     use crate::Coordinator;
     use arrow::array::{Float64Array, Int64Array, StringArray};
