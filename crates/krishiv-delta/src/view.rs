@@ -88,11 +88,18 @@ impl IncrementalView {
         // just the delta's positive rows (that would lose prior state).
         if self.spec.is_materialized {
             let updated = {
-                let mut snap = self
+                let snap = self
                     .snapshot
                     .lock()
                     .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-                let current = snap.take();
+                // IVM-AUD-CORE-14: clone, do NOT `take()`, before the
+                // fallible apply. Taking left the guard holding `None` on the
+                // error path, so the log line "snapshot not updated" was
+                // false — the entire materialized snapshot was destroyed and
+                // the next tick rebuilt the view from one delta, silently
+                // losing all history. `RecordBatch` clones share Arc'd
+                // buffers, so this costs a refcount bump.
+                let current = snap.clone();
                 match crate::operators::stream::apply_delta(current, &output) {
                     Ok(rb) => rb,
                     Err(e) => {
@@ -100,7 +107,7 @@ impl IncrementalView {
                             view = %self.spec.name,
                             error = %e,
                             output_rows = output.num_rows(),
-                            "apply_delta failed in publish_output — snapshot not updated"
+                            "apply_delta failed in publish_output — snapshot left intact"
                         );
                         return Err(e);
                     }
@@ -268,20 +275,40 @@ impl IncrementalView {
     /// with the executor's flow without ever shipping the full output. The
     /// delta is also published to subscribers and stored as `last_output`.
     pub fn apply_output_delta(&self, delta: &DeltaBatch) -> DeltaResult<()> {
+        // IVM-AUD-CORE-15: same take-then-`?` hazard as publish_output, twice.
+        // A failed mirror of a resident-executor tick used to leave both the
+        // diff baseline and the snapshot permanently `None` — after the tick
+        // counter had already advanced. Compute both updates from clones
+        // first, and only commit them once BOTH have succeeded, so a partial
+        // failure cannot leave the two halves inconsistent either.
+        let updated_full = {
+            let fo = self
+                .full_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+            crate::operators::stream::apply_delta(fo.clone(), delta)?
+        };
+        let updated_snapshot = if self.spec.is_materialized {
+            let snap = self
+                .snapshot
+                .lock()
+                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+            Some(crate::operators::stream::apply_delta(snap.clone(), delta)?)
+        } else {
+            None
+        };
         {
             let mut fo = self
                 .full_output
                 .lock()
                 .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            let updated = crate::operators::stream::apply_delta(fo.take(), delta)?;
-            *fo = Some(updated);
+            *fo = Some(updated_full);
         }
-        if self.spec.is_materialized {
+        if let Some(updated) = updated_snapshot {
             let mut snap = self
                 .snapshot
                 .lock()
                 .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            let updated = crate::operators::stream::apply_delta(snap.take(), delta)?;
             *snap = Some(updated);
         }
         {
@@ -423,6 +450,97 @@ mod tests {
             is_recursive: false,
             lateness: vec![],
         }
+    }
+
+    fn materialized_spec(name: &str) -> IncrementalViewSpec {
+        IncrementalViewSpec {
+            is_materialized: true,
+            ..test_spec(name)
+        }
+    }
+
+    /// A batch whose column type differs from `int_batch`, so applying it as
+    /// a delta onto an Int64 snapshot is a genuine Arrow concat failure.
+    /// (A same-typed, differently-named column is NOT a failure: Arrow's
+    /// `concat_batches` concatenates positionally.)
+    fn str_batch(col: &str, vals: &[&str]) -> arrow::record_batch::RecordBatch {
+        use arrow::array::StringArray;
+        let schema = Arc::new(Schema::new(vec![Field::new(col, DataType::Utf8, false)]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(vals.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    fn int_batch(col: &str, vals: &[i64]) -> arrow::record_batch::RecordBatch {
+        use arrow::array::Int64Array;
+        let schema = Arc::new(Schema::new(vec![Field::new(col, DataType::Int64, false)]));
+        arrow::record_batch::RecordBatch::try_new(
+            schema,
+            vec![Arc::new(Int64Array::from(vals.to_vec()))],
+        )
+        .unwrap()
+    }
+
+    /// IVM-AUD-CORE-14. Revert-proof: change the `snap.clone()` back to
+    /// `snap.take()` and the second assertion fails — the snapshot is `None`
+    /// after the failed publish, so the view has silently lost all history
+    /// while the log claims it was merely "not updated".
+    #[test]
+    fn failed_publish_leaves_the_materialized_snapshot_intact() {
+        let (view, _rx) = IncrementalView::new(materialized_spec("v_publish"));
+        view.publish_output(DeltaBatch::from_inserts(int_batch("x", &[1, 2])).unwrap())
+            .unwrap();
+        let before = view
+            .snapshot()
+            .unwrap()
+            .expect("snapshot after first publish");
+        assert_eq!(before.num_rows(), 2);
+
+        // A delta whose column TYPE cannot be concatenated onto the snapshot.
+        let mismatched = DeltaBatch::from_inserts(str_batch("x", &["nine"])).unwrap();
+        assert!(
+            view.publish_output(mismatched).is_err(),
+            "a schema-mismatched delta must fail the publish"
+        );
+
+        let after = view
+            .snapshot()
+            .unwrap()
+            .expect("snapshot must survive a failed publish");
+        assert_eq!(
+            after.num_rows(),
+            2,
+            "the failed publish must not destroy prior state"
+        );
+    }
+
+    /// IVM-AUD-CORE-15. Revert-proof: restore the `fo.take()` / `snap.take()`
+    /// form and both baselines are `None` after the failed mirror.
+    #[test]
+    fn failed_output_delta_mirror_leaves_both_baselines_intact() {
+        let (view, _rx) = IncrementalView::new(materialized_spec("v_mirror"));
+        view.apply_output_delta(&DeltaBatch::from_inserts(int_batch("x", &[1, 2, 3])).unwrap())
+            .unwrap();
+        assert_eq!(view.snapshot().unwrap().unwrap().num_rows(), 3);
+
+        let mismatched = DeltaBatch::from_inserts(str_batch("x", &["nine"])).unwrap();
+        assert!(view.apply_output_delta(&mismatched).is_err());
+
+        assert_eq!(
+            view.snapshot()
+                .unwrap()
+                .expect("snapshot must survive a failed mirror")
+                .num_rows(),
+            3
+        );
+        assert!(
+            view.full_output_baseline()
+                .unwrap()
+                .is_some_and(|b| b.num_rows() == 3),
+            "the diff baseline must survive a failed mirror too"
+        );
     }
 
     #[test]

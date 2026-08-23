@@ -576,15 +576,22 @@ impl IncrementalFlow {
     ) -> IvmResult<()> {
         let source_name = source_name.into();
         {
-            let mut inner = self.inner.lock().map_err(lock_err)?;
+            let inner = self.inner.lock().map_err(lock_err)?;
             if let Some(last) = inner.source_ordinals.get(&source_name)
                 && *last == ordinal
             {
                 return Ok(()); // Same offset — nothing new.
             }
-            inner.source_ordinals.insert(source_name.clone(), ordinal);
         } // Release lock before calling feed.
-        self.feed(source_name, batch)
+        // IVM-AUD-CORE-21: commit the ordinal only AFTER the feed succeeds.
+        // Committing first meant a failing `feed` (a dedup filter error, or
+        // now an unknown-source rejection) advanced the offset anyway: the
+        // batch was dropped permanently and a retry at the same offset was a
+        // silent no-op.
+        self.feed(source_name.clone(), batch)?;
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        inner.source_ordinals.insert(source_name, ordinal);
+        Ok(())
     }
 
     /// Push a `DeltaBatch` as input for a named source on the next step.
@@ -600,6 +607,7 @@ impl IncrementalFlow {
     pub fn feed(&self, source_name: impl Into<String>, batch: DeltaBatch) -> IvmResult<()> {
         let source_name = source_name.into();
         let mut inner = self.inner.lock().map_err(lock_err)?;
+        validate_feed_target(&inner, &source_name)?;
 
         // Content-addressed dedup: filter out re-delivered insertion rows.
         let batch = if inner.input_dedup_enabled {
@@ -680,11 +688,23 @@ impl IncrementalFlow {
     ) -> IvmResult<()> {
         let source_name = source_name.into();
         let mut inner = self.inner.lock().map_err(lock_err)?;
+        validate_feed_target(&inner, &source_name)?;
         if batch.is_empty() {
             return Ok(());
         }
         // AUD-8 (retention): advance this source's LATENESS watermark.
         observe_source_watermark(&mut inner, &source_name, &batch);
+        // IVM-AUD-CORE-20: keep the delta-checkpoint accumulator consistent
+        // with `pending`. This path REPLACES the pending delta (that is the
+        // point — snapshot sources coalesce), so the accumulator must replace
+        // too. It previously skipped accumulation entirely, so a job using
+        // coalesced feeds produced delta checkpoints that silently omitted
+        // every coalesced input and restored to a wrong state.
+        if inner.delta_checkpoint_enabled {
+            inner
+                .checkpoint_deltas
+                .insert(source_name.clone(), vec![batch.clone()]);
+        }
         inner.pending.insert(source_name, vec![batch]);
         Ok(())
     }
@@ -2043,6 +2063,46 @@ pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> IvmResult<u64> {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Reject a feed aimed at a source no registered view reads (IVM-AUD-API-F1).
+///
+/// `feed` used to accept ANY name into `pending`, and the tick drains
+/// `pending` wholesale — so a key no view references was drained and dropped.
+/// `iv.insert(batch, source="order")` (a typo for `"orders"`) returned
+/// success, advanced the tick, and lost the data forever. The check lives
+/// here, at the single choke point, so it covers every surface: the Rust and
+/// Python handles, the HTTP `/feed` and `/stream-delta` routes, the CLI and
+/// MCP.
+///
+/// Deliberately permissive in one direction: with no views registered yet
+/// there is nothing to validate against, so pre-registration feeds are still
+/// allowed. Matching is case-insensitive because DataFusion lowercases
+/// unquoted identifiers while callers name sources however they like
+/// (IVM-AUD-CORE-24).
+fn validate_feed_target(inner: &IncrementalFlowInner, source_name: &str) -> IvmResult<()> {
+    if inner.view_deps.is_empty() {
+        return Ok(());
+    }
+    let wanted = source_name.to_lowercase();
+    // A view name is itself a legal feed target on the view-DAG path (a
+    // derived view reads its parent's output).
+    let known: Vec<String> = inner
+        .view_deps
+        .iter()
+        .flat_map(|(view, deps)| {
+            std::iter::once(view.to_lowercase()).chain(deps.iter().map(|d| d.to_lowercase()))
+        })
+        .collect();
+    if known.contains(&wanted) {
+        return Ok(());
+    }
+    let mut sorted = known;
+    sorted.sort();
+    sorted.dedup();
+    Err(IvmError::execution(format!(
+        "no registered view reads source '{source_name}'; feeding it would silently          discard the delta at the next tick. Known sources: {sorted:?}"
+    )))
+}
+
 pub fn coalesce_pending(
     raw: HashMap<String, Vec<DeltaBatch>>,
 ) -> IvmResult<HashMap<String, DeltaBatch>> {
@@ -2757,6 +2817,76 @@ mod integration_tests {
 
         let snap = flow.source_snapshot("src").unwrap().unwrap();
         assert_eq!(snap.num_rows(), 1, "update replaces row 1 with row 2");
+    }
+
+    // ── feed target validation (IVM-AUD-API-F1) ───────────────────────────────
+
+    /// A typo'd source name used to be accepted, tick the clock, and lose the
+    /// data forever: `feed` put it in `pending` under an unreferenced key and
+    /// the tick drained `pending` wholesale.
+    ///
+    /// Revert-proof: delete the `validate_feed_target(&inner, &source_name)?`
+    /// line from `feed` and the first assertion fails (the typo is accepted),
+    /// which is exactly the silent-loss behaviour.
+    #[tokio::test]
+    async fn feeding_a_source_no_view_reads_is_rejected_not_silently_dropped() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let flow = IncrementalFlow::new();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Int64,
+            true,
+        )]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "totals".into(),
+            body_sql: "SELECT SUM(value) AS total FROM orders".into(),
+            output_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        let delta = DeltaBatch::from_inserts(make_batch(&[1, 2])).unwrap();
+        let err = flow
+            .feed("order", delta)
+            .expect_err("a source no view reads must be rejected, not dropped");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no registered view reads source 'order'"),
+            "the error must name the offending source: {msg}"
+        );
+        assert!(
+            msg.contains("orders"),
+            "the error must list the real sources so the typo is obvious: {msg}"
+        );
+
+        // The real name is accepted, and case does not matter (DataFusion
+        // lowercases unquoted identifiers — IVM-AUD-CORE-24).
+        flow.feed(
+            "orders",
+            DeltaBatch::from_inserts(make_batch(&[3])).unwrap(),
+        )
+        .unwrap();
+        flow.feed(
+            "ORDERS",
+            DeltaBatch::from_inserts(make_batch(&[4])).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Pre-registration feeds stay legal: with no views there is nothing to
+    /// validate against, so the guard must not break the feed-then-register
+    /// ordering.
+    #[tokio::test]
+    async fn feeding_before_any_view_is_registered_is_still_allowed() {
+        let flow = IncrementalFlow::new();
+        flow.feed(
+            "anything",
+            DeltaBatch::from_inserts(make_batch(&[7])).unwrap(),
+        )
+        .unwrap();
     }
 
     // ── materialized view snapshot ────────────────────────────────────────────
