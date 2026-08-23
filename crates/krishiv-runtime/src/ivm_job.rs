@@ -155,6 +155,25 @@ impl RemoteIvmJob {
         execute_coordinator_ivm_step(&self.coordinator_http, &self.job_id).await
     }
 
+    /// Delete this job on the coordinator, freeing its flow, its in-memory
+    /// state and its durable snapshot. Returns `false` when the coordinator had
+    /// no such job (already gone), which is not an error.
+    ///
+    /// IVM-AUD-API-A7: **must be called explicitly.** Rust has no async `Drop`,
+    /// so dropping this handle cannot issue the request; before this method
+    /// existed there was no way at all to remove a job created through it, and
+    /// every remote handle leaked a coordinator job for the coordinator's
+    /// lifetime. Other handles to the same job id keep working against a job
+    /// that is now absent — the coordinator answers 404 until something
+    /// recreates it.
+    pub async fn delete(&self) -> RuntimeResult<bool> {
+        crate::coordinator_http_client::execute_coordinator_ivm_delete_job(
+            &self.coordinator_http,
+            &self.job_id,
+        )
+        .await
+    }
+
     /// Retrieve a serialized checkpoint from the coordinator.
     pub async fn checkpoint(&self) -> RuntimeResult<Vec<u8>> {
         execute_coordinator_ivm_checkpoint(&self.coordinator_http, &self.job_id).await
@@ -212,6 +231,43 @@ impl EmbeddedIvmJob {
         })
     }
 
+    /// Create (or get existing) an in-process IVM job **pinned to a single
+    /// flow**, so it can host a view-DAG (a derived view reading a base view's
+    /// full output; a partitioned flow never cascades one).
+    ///
+    /// IVM-AUD-API-A4: the embedded twin of
+    /// [`RemoteIvmJob::create_unpartitioned`]. Callers that need the pin used to
+    /// express it by constructing a whole registry with `with_default_shards(1)`
+    /// instead, which pins every job in that registry rather than this one, and
+    /// only works if the registry is theirs alone.
+    pub fn create_unpartitioned(
+        registry: &SharedIvmJobRegistry,
+        job_id: impl Into<String>,
+    ) -> RuntimeResult<Self> {
+        let job_id = job_id.into();
+        registry
+            .create_unpartitioned(job_id.clone())
+            .map_err(|e| RuntimeError::plan_rejected(e.to_string()))?;
+        let job = registry.get(&job_id).ok_or_else(|| {
+            RuntimeError::plan_rejected(format!("ivm job '{job_id}' not found after create"))
+        })?;
+        // IVM-AUD-INT-F16, the embedded half: `create_unpartitioned` records the
+        // pin and then no-ops on a job that already exists, so a name already
+        // held by an auto-partitioned job (from `Session::ivm`) would come back
+        // partitioned with the pin merely *claimed*. Refuse instead: the caller
+        // asked for single because a partitioned flow cannot cascade to derived
+        // views, and handing one back would fail later and silently.
+        if job.is_partitioned() {
+            return Err(RuntimeError::plan_rejected(format!(
+                "ivm job '{job_id}' already exists and is key-partitioned, so it cannot be                  pinned to a single flow. A partitioned flow does not cascade a base view's                  output to derived views. Use a different name, or drop the existing job                  (Session::reset_ivm_job)."
+            )));
+        }
+        Ok(Self {
+            registry: registry.clone(),
+            job_id,
+        })
+    }
+
     /// The job ID.
     pub fn job_id(&self) -> &str {
         &self.job_id
@@ -220,6 +276,18 @@ impl EmbeddedIvmJob {
     /// `true` if this job auto-partitioned (its first view was shardable).
     pub fn is_partitioned(&self) -> RuntimeResult<bool> {
         Ok(self.job()?.is_partitioned())
+    }
+
+    /// Remove this job from its registry, dropping the flow and everything it
+    /// holds. Returns `false` when it was not there. The symmetric counterpart
+    /// of [`RemoteIvmJob::delete`] (IVM-AUD-API-A7), so one mode-agnostic
+    /// `close()` can mean the same thing on both sides.
+    ///
+    /// Other handles to the same id keep their `job_id` and start failing with
+    /// "no longer exists"; a later `create` under the same name makes a *new*,
+    /// empty job.
+    pub fn delete(&self) -> bool {
+        self.registry.delete(&self.job_id)
     }
 
     /// Fetch the current backing job from the registry.

@@ -540,9 +540,167 @@ mod sink_echo_tests {
 mod tests {
     use super::{
         BatchSqlResponseBody, ContinuousRegisterAck, ContinuousRegisterOptions,
-        CoordinatorBatchSqlJobResult, batch_sql_job_result_from_payload, normalize_http_base,
+        CoordinatorBatchSqlJobResult, batch_sql_job_result_from_payload,
+        ivm_register_view_body_json, normalize_http_base, remote_step_summary,
     };
     use std::sync::Arc;
+
+    /// IVM-AUD-API-A5. The `/step` response used to carry counters only, so
+    /// `krishiv_api::IvmJob::step` had nothing to fill its health vectors from
+    /// and filled them with `Vec::new()` — a failed view and a healthy one
+    /// produced identical reports. The client must now carry the report, and
+    /// must keep "empty report" distinct from "no report".
+    #[test]
+    fn a_reported_step_health_object_decodes_into_the_summary() {
+        let body = serde_json::json!({
+            "active_views": 1,
+            "total_output_rows": 3,
+            "tick": 9,
+            "view_health": {
+                "reported": true,
+                "unreported_reason": "",
+                "degraded_views": ["slow"],
+                "errored_views": [
+                    { "view": "broken", "kind": "view_sql", "message": "column not found" }
+                ],
+            },
+        });
+        let summary = remote_step_summary("j", serde_json::from_value(body).expect("decodes"));
+        let health = summary
+            .view_health
+            .expect("a reported object must not decode to None");
+        assert_eq!(health.degraded_views, vec!["slow".to_string()]);
+        assert_eq!(health.errored_views.len(), 1);
+        assert_eq!(health.errored_views[0].view, "broken");
+        assert_eq!(health.errored_views[0].kind, "view_sql");
+    }
+
+    /// A report that says "nothing failed" is a real answer and must survive as
+    /// `Some(empty)` — collapsing it to `None` would make a healthy distributed
+    /// tick indistinguishable from an unmonitored one, which is the same defect
+    /// pointing the other way.
+    #[test]
+    fn an_empty_but_present_health_object_still_counts_as_reported() {
+        let body = serde_json::json!({
+            "active_views": 1,
+            "total_output_rows": 0,
+            "tick": 2,
+            "view_health": {
+                "reported": true,
+                "degraded_views": [],
+                "errored_views": [],
+            },
+        });
+        let summary = remote_step_summary("j", serde_json::from_value(body).expect("decodes"));
+        let health = summary
+            .view_health
+            .expect("present-and-empty is still a report");
+        assert!(health.degraded_views.is_empty() && health.errored_views.is_empty());
+    }
+
+    /// Two ways there is no signal: a coordinator that omits the field, and one
+    /// that sends `reported: false` (a tick it dispatched to a resident
+    /// executor, whose result wire carries output deltas only). Both must
+    /// decode to `None`, never to an empty report.
+    #[test]
+    fn an_absent_or_unreported_health_object_decodes_to_none() {
+        let omitted = serde_json::json!({
+            "active_views": 1, "total_output_rows": 0, "tick": 2
+        });
+        let summary = remote_step_summary("j", serde_json::from_value(omitted).expect("decodes"));
+        assert!(
+            summary.view_health.is_none(),
+            "an older coordinator that omits the field reports nothing, not health"
+        );
+        assert_eq!(summary.tick, 2, "the counters still decode");
+
+        let unreported = serde_json::json!({
+            "active_views": 1,
+            "total_output_rows": 0,
+            "tick": 3,
+            "view_health": {
+                "reported": false,
+                "unreported_reason": "this tick ran on a resident executor",
+                "degraded_views": [],
+                "errored_views": [],
+            },
+        });
+        let summary =
+            remote_step_summary("j", serde_json::from_value(unreported).expect("decodes"));
+        assert!(
+            summary.view_health.is_none(),
+            "reported:false must not decode to an empty report"
+        );
+    }
+
+    /// IVM-AUD-API-A1. The register-view body must carry the output schema as
+    /// Arrow IPC, not only as type-name strings: the coordinator parses those
+    /// against a closed whitelist, so a `Decimal128` / timezoned `Timestamp` /
+    /// `List` / `Struct` / `Time64` / `Interval` / `Null` / `FixedSizeBinary`
+    /// column made `DataFrame::to_incremental` a 400 distributed and a success
+    /// embedded.
+    ///
+    /// The assertion is that the field decodes back to the *exact* schema, so
+    /// the test cannot be satisfied by a present-but-lossy value.
+    #[test]
+    fn register_view_body_carries_the_output_schema_as_arrow_ipc() {
+        use arrow::datatypes::{DataType, Field, Fields, IntervalUnit, Schema, TimeUnit};
+
+        let schema: arrow::datatypes::SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(20, 4), false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("t32", DataType::Time32(TimeUnit::Second), true),
+            Field::new("t64", DataType::Time64(TimeUnit::Nanosecond), true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "addr",
+                DataType::Struct(Fields::from(vec![Field::new("zip", DataType::Int32, true)])),
+                true,
+            ),
+            Field::new("gap", DataType::Interval(IntervalUnit::MonthDayNano), true),
+            Field::new("nothing", DataType::Null, true),
+            Field::new("hash", DataType::FixedSizeBinary(16), true),
+        ]));
+        let spec = krishiv_ivm::IncrementalViewSpec {
+            name: "wide".into(),
+            body_sql: "SELECT * FROM t".into(),
+            output_schema: Arc::clone(&schema),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: Vec::new(),
+        };
+
+        let body = ivm_register_view_body_json(&spec).expect("body encodes");
+        let b64 = body["output_schema_ipc_b64"]
+            .as_str()
+            .expect("output_schema_ipc_b64 is a string on the wire");
+        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+            .expect("base64");
+        let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+            .expect("arrow ipc stream");
+        assert_eq!(
+            reader.schema().as_ref(),
+            schema.as_ref(),
+            "the IPC schema must round-trip every field exactly"
+        );
+
+        // The legacy type-name half is still sent for older coordinators, and
+        // it is exactly as lossy as it always was — `Decimal128(20, 4)` is not
+        // a name the coordinator's whitelist knows. That is why the IPC field
+        // has to exist; asserting it here keeps the claim honest.
+        assert_eq!(
+            body["output_schema"]["fields"][0]["data_type"],
+            "Decimal128(20, 4)"
+        );
+    }
 
     /// Serialise the request body exactly as `execute_coordinator_continuous_register`
     /// builds it, so these tests pin the bytes that actually go on the wire.
@@ -1028,6 +1186,38 @@ mod tests {
             request_line.starts_with("DELETE /api/v1/continuous/nexd-q1-0 "),
             "expected DELETE on the job resource, got: {request_line}"
         );
+    }
+
+    /// IVM-AUD-API-A7. The coordinator has owned
+    /// `DELETE /api/v1/ivm/jobs/{job_id}` since the IVM API existed, but
+    /// `krishiv-runtime` had no binding for it, so a `RemoteIvmJob` — and
+    /// therefore every distributed `DataFrame::to_incremental` — could only
+    /// ever create coordinator jobs, never remove one.
+    #[tokio::test]
+    async fn ivm_delete_sends_delete_to_the_job_resource() {
+        let (url, server) = one_shot_http("200 OK", "{\"deleted\":true}").await;
+        let deleted = super::execute_coordinator_ivm_delete_job(&url, "revenue job/1")
+            .await
+            .expect("delete succeeds");
+        assert!(deleted, "the coordinator's answer must be relayed");
+        let request = server.await.expect("server");
+        let request_line = request.lines().next().unwrap_or_default();
+        assert!(
+            request_line.starts_with("DELETE /api/v1/ivm/jobs/revenue%20job%2F1 "),
+            "expected DELETE on the IVM job resource with an encoded id, got: {request_line}"
+        );
+    }
+
+    /// A job the coordinator no longer has is not an error to delete — the
+    /// caller's intent (it must be gone) is already satisfied.
+    #[tokio::test]
+    async fn ivm_delete_treats_a_missing_job_as_already_gone() {
+        let (url, server) = one_shot_http("404 Not Found", "").await;
+        let deleted = super::execute_coordinator_ivm_delete_job(&url, "ghost")
+            .await
+            .expect("a missing job must not be an error");
+        assert!(!deleted);
+        let _ = server.await;
     }
 }
 
@@ -1977,6 +2167,20 @@ pub async fn execute_coordinator_ivm_create_job(
         .send()
         .await
         .map_err(|e| RuntimeError::transport(format!("ivm create job: {e}")))?;
+    if resp.status() == reqwest::StatusCode::CONFLICT && partitioned == Some(false) {
+        // IVM-AUD-INT-F16: the coordinator already has a key-partitioned job
+        // under this name. It used to answer 200 and hand back the partitioned
+        // job anyway, so a view-DAG built on the returned handle sat empty
+        // forever (a partitioned flow never cascades a base view's output).
+        return Err(RuntimeError::plan_rejected(format!(
+            "cannot create an unpartitioned IVM job named '{}': the coordinator already has a \
+             key-partitioned job under that name (Session::ivm auto-partitions; \
+             DataFrame::to_incremental pins single). A partitioned flow never cascades a base \
+             view's output to derived views, so this handle would never work as asked. Use a \
+             different name, or delete the existing job first.",
+            job_id.unwrap_or("<generated>")
+        )));
+    }
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm create job HTTP {}",
@@ -1990,11 +2194,62 @@ pub async fn execute_coordinator_ivm_create_job(
     Ok(parsed.job_id)
 }
 
+#[derive(serde::Deserialize)]
+struct IvmDeleteJobResponse {
+    deleted: bool,
+}
+
+/// Delete a remote IVM job (`DELETE /api/v1/ivm/jobs/{job_id}`), freeing its
+/// flow, its state and its durable snapshot on the coordinator.
+///
+/// IVM-AUD-API-A7: the coordinator has owned this route all along, but no
+/// client binding existed, so nothing built on `RemoteIvmJob` could ever tear a
+/// job down. Every distributed `to_incremental` leaked a coordinator job that
+/// only an operator with `curl` could remove.
+///
+/// Returns whether the coordinator actually removed a live job; `false` means
+/// there was nothing there to remove, which is not an error.
+pub async fn execute_coordinator_ivm_delete_job(
+    coordinator_http: &str,
+    job_id: &str,
+) -> RuntimeResult<bool> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp =
+        apply_coordinator_bearer(client.delete(format!("{base}/api/v1/ivm/jobs/{}", seg(job_id))))
+            .send()
+            .await
+            .map_err(|e| RuntimeError::transport(format!("ivm delete job: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm delete job HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmDeleteJobResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm delete job decode: {e}")))?;
+    Ok(parsed.deleted)
+}
+
 #[derive(serde::Serialize)]
 struct IvmRegisterViewBody<'a> {
     name: &'a str,
     body_sql: &'a str,
+    /// Legacy type-name schema. Still sent so a coordinator that predates
+    /// `output_schema_ipc_b64` keeps working; a current coordinator ignores it.
     output_schema: IvmSchemaJson<'a>,
+    /// IVM-AUD-API-A1: the same schema as Arrow IPC bytes. `arrow_dt_to_str`
+    /// below has a `format!("{other:?}")` fallback that produces strings the
+    /// coordinator's whitelist rejects (`Decimal128(20, 4)`, `Timestamp(…, Some
+    /// ("UTC"))`, `List(Field …)`), so every DataFrame whose output carried one
+    /// of those types registered embedded and 400'd distributed. Arrow's own
+    /// encoding carries all of them.
+    output_schema_ipc_b64: String,
     is_materialized: bool,
     is_recursive: bool,
     /// IVM-AUD-DDL-B1: this field did not exist, and the coordinator
@@ -2048,14 +2303,32 @@ fn arrow_dt_to_str(dt: &arrow::datatypes::DataType) -> String {
     }
 }
 
-/// Register or update an incremental view on a remote IVM job.
-pub async fn execute_coordinator_ivm_register_view(
-    coordinator_http: &str,
-    job_id: &str,
+/// Encode an Arrow schema as base64 of an Arrow IPC stream carrying only its
+/// schema header — the lossless half of the register-view wire (IVM-AUD-API-A1).
+fn schema_to_ipc_b64(schema: &arrow::datatypes::SchemaRef) -> RuntimeResult<String> {
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow::ipc::writer::StreamWriter::try_new(&mut buf, schema)
+            .map_err(|e| RuntimeError::transport(format!("ivm schema ipc: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| RuntimeError::transport(format!("ivm schema ipc finish: {e}")))?;
+    }
+    Ok(base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &buf,
+    ))
+}
+
+/// Build the JSON body of a register-view request.
+///
+/// Split out from the request so the wire itself is unit-testable without a
+/// live coordinator: the field names below are the contract with
+/// `krishiv_scheduler::ivm_http::RegisterViewRequest`, and a schema silently
+/// degraded here is a mode divergence nothing else would catch.
+fn ivm_register_view_body_json(
     spec: &krishiv_ivm::IncrementalViewSpec,
-) -> RuntimeResult<()> {
-    let base = normalize_http_base(coordinator_http)?;
-    let client = coordinator_http_client()?;
+) -> RuntimeResult<serde_json::Value> {
     let fields: Vec<IvmFieldJson> = spec
         .output_schema
         .fields()
@@ -2078,10 +2351,24 @@ pub async fn execute_coordinator_ivm_register_view(
         name: &spec.name,
         body_sql: &spec.body_sql,
         output_schema: IvmSchemaJson { fields: &fields },
+        output_schema_ipc_b64: schema_to_ipc_b64(&spec.output_schema)?,
         is_materialized: spec.is_materialized,
         is_recursive: spec.is_recursive,
         lateness: &lateness,
     };
+    serde_json::to_value(&body)
+        .map_err(|e| RuntimeError::transport(format!("ivm register view encode: {e}")))
+}
+
+/// Register or update an incremental view on a remote IVM job.
+pub async fn execute_coordinator_ivm_register_view(
+    coordinator_http: &str,
+    job_id: &str,
+    spec: &krishiv_ivm::IncrementalViewSpec,
+) -> RuntimeResult<()> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let body = ivm_register_view_body_json(spec)?;
     let resp = apply_coordinator_bearer(
         client.post(format!("{base}/api/v1/ivm/jobs/{}/views", seg(job_id))),
     )
@@ -2139,14 +2426,68 @@ struct IvmStepResponse {
     active_views: usize,
     total_output_rows: usize,
     tick: u64,
+    /// IVM-AUD-API-A5. Absent when the coordinator predates the field, which is
+    /// why it is an `Option` and not a defaulted struct: an empty health report
+    /// and no health report at all must not decode to the same value.
+    #[serde(default)]
+    view_health: Option<IvmViewHealthJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct IvmViewHealthJson {
+    reported: bool,
+    #[serde(default)]
+    unreported_reason: String,
+    #[serde(default)]
+    degraded_views: Vec<String>,
+    #[serde(default)]
+    errored_views: Vec<IvmViewErrorJson>,
+}
+
+#[derive(serde::Deserialize)]
+struct IvmViewErrorJson {
+    view: String,
+    kind: String,
+    message: String,
 }
 
 /// Summary returned by [`execute_coordinator_ivm_step`].
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RemoteStepSummary {
     pub active_views: usize,
     pub total_output_rows: usize,
     pub tick: u64,
+    /// Per-view health for the tick, or `None` when this tick has no health
+    /// signal at all — an older coordinator that does not send the field, or a
+    /// tick the coordinator dispatched to a resident executor whose result wire
+    /// carries output deltas only (IVM-AUD-API-A5).
+    ///
+    /// `Some(h)` with both vectors empty means "nothing failed". `None` means
+    /// "nobody looked". Callers that flatten the two are back to the bug this
+    /// field exists to close.
+    pub view_health: Option<RemoteViewHealth>,
+}
+
+/// A real per-view health report for one remote tick.
+#[derive(Debug, Clone, Default)]
+pub struct RemoteViewHealth {
+    /// Views that ran on the O(state) DiffBased path.
+    pub degraded_views: Vec<String>,
+    /// Views that failed and were skipped; the tick itself still succeeded.
+    pub errored_views: Vec<RemoteViewError>,
+}
+
+/// One view's failure on a remote tick.
+#[derive(Debug, Clone)]
+pub struct RemoteViewError {
+    pub view: String,
+    /// Snake-case failure kind as named by the coordinator
+    /// (`operator_apply` / `view_sql` / `publish` / `fixpoint_not_converged`).
+    /// Kept as a string here: a coordinator newer than this binary may name a
+    /// kind this crate has no variant for, and mapping it onto a known one
+    /// would be a false diagnosis.
+    pub kind: String,
+    pub message: String,
 }
 
 /// Run one IVM tick on a remote job. Returns a [`RemoteStepSummary`].
@@ -2173,11 +2514,42 @@ pub async fn execute_coordinator_ivm_step(
         .json()
         .await
         .map_err(|e| RuntimeError::transport(format!("ivm step decode: {e}")))?;
-    Ok(RemoteStepSummary {
+    Ok(remote_step_summary(job_id, parsed))
+}
+
+/// Decode a `/step` response body into a [`RemoteStepSummary`].
+///
+/// Split out so the "absent means unknown, present-and-empty means healthy"
+/// distinction (IVM-AUD-API-A5) is unit-testable without a coordinator.
+fn remote_step_summary(job_id: &str, parsed: IvmStepResponse) -> RemoteStepSummary {
+    let view_health = parsed.view_health.and_then(|h| {
+        if !h.reported {
+            tracing::debug!(
+                job_id,
+                reason = %h.unreported_reason,
+                "coordinator reported no per-view IVM health for this tick"
+            );
+            return None;
+        }
+        Some(RemoteViewHealth {
+            degraded_views: h.degraded_views,
+            errored_views: h
+                .errored_views
+                .into_iter()
+                .map(|e| RemoteViewError {
+                    view: e.view,
+                    kind: e.kind,
+                    message: e.message,
+                })
+                .collect(),
+        })
+    });
+    RemoteStepSummary {
         active_views: parsed.active_views,
         total_output_rows: parsed.total_output_rows,
         tick: parsed.tick,
-    })
+        view_health,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -2346,10 +2718,19 @@ struct IvmStreamBridgeBody {
     snapshot_ipc_b64: String,
 }
 
-/// Push streaming micro-batch snapshots to an IVM source via the stream-bridge endpoint.
+/// Push a **whole snapshot** of an IVM source to the stream-bridge endpoint.
 ///
-/// The coordinator calls `feed_stream_output` which differentiates consecutive snapshots
-/// and pushes the resulting delta to the IVM source.
+/// `batches` must be the source's complete contents, not an increment of it.
+/// The coordinator decodes them and calls `IncrementalFlow::feed_snapshot`,
+/// which differentiates them against the previous snapshot fed for this source:
+/// every row present before and absent now is **retracted**. Push a micro-batch
+/// here and the bridge dutifully retracts the entire rest of the source. Use
+/// [`execute_coordinator_ivm_feed_source`] (or the `stream-delta` route) for a
+/// producer that already emits increments.
+///
+/// IVM-AUD-INT-F9: this doc used to say "micro-batch snapshots" and to name a
+/// coordinator function `feed_stream_output` that does not exist anywhere in
+/// the repository — the wrong contract, attributed to the wrong callee.
 pub async fn execute_coordinator_ivm_stream_bridge(
     coordinator_http: &str,
     job_id: &str,

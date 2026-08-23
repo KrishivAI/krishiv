@@ -215,6 +215,16 @@ pub struct DataFrame {
     /// into this base job (same registry / coordinator job) so a feed to the base
     /// cascades to it — the live view-DAG. `None` for a normal root DataFrame.
     ivm_parent: Option<crate::IvmJob>,
+    /// The **session's** embedded IVM registry, so `to_incremental` registers
+    /// its view where `Session::ivm` and `Session::reset_ivm_job` can see it.
+    ///
+    /// IVM-AUD-INT-F15 / API-D5: `to_incremental` used to build a fresh private
+    /// registry per call, so two calls with the same name produced two isolated
+    /// views, `Session::ivm(name)` saw neither, and `reset_ivm_job(name)` could
+    /// not drop either. `None` only for DataFrames no session built (`new`,
+    /// `from_batches`) — none of which can reach `to_incremental`, because it
+    /// needs SQL those constructors do not carry.
+    ivm_registry: Option<krishiv_runtime::SharedIvmJobRegistry>,
     runtime: Arc<dyn ExecutionRuntime>,
     registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
     /// When set, this DataFrame was produced by `cache()` / `persist()` and
@@ -326,6 +336,7 @@ impl DataFrame {
             _coordinator_url: None,
             coordinator_http_url: None,
             ivm_parent: None,
+            ivm_registry: None,
             runtime: crate::session::shared_embedded_runtime()?,
             registered_parquet: Arc::new(DashMap::new()),
             force_local: false,
@@ -409,6 +420,7 @@ impl DataFrame {
         runtime: Arc<dyn ExecutionRuntime>,
         registered_parquet: Arc<DashMap<String, RegisteredParquet>>,
         remote_prelude: Option<String>,
+        ivm_registry: Option<krishiv_runtime::SharedIvmJobRegistry>,
     ) -> Self {
         let logical_plan = sql_dataframe.krishiv_logical_plan();
         Self {
@@ -422,6 +434,7 @@ impl DataFrame {
             _coordinator_url: coordinator_url,
             coordinator_http_url,
             ivm_parent: None,
+            ivm_registry,
             runtime,
             registered_parquet,
             force_local: false,
@@ -453,6 +466,10 @@ impl DataFrame {
             _coordinator_url: None,
             coordinator_http_url: None,
             ivm_parent: None,
+            // A pre-collected DataFrame carries no SQL, so it cannot reach
+            // `to_incremental` (which needs a body to register) and has no use
+            // for a registry.
+            ivm_registry: None,
             runtime,
             registered_parquet,
             force_local: false,
@@ -660,7 +677,49 @@ Execution statistics:
     ///
     /// Requires an SQL-backed DataFrame (built from `session.sql`/`table`/`read_*`),
     /// whose scan leaves are the feedable sources. Inherits the session's mode.
+    ///
+    /// # This job is pinned to a single flow; `Session::ivm` auto-partitions
+    ///
+    /// IVM-AUD-API-A3. The job created here never shards, in any mode, because
+    /// the view may gain derived views (`Session::view` + `to_incremental`) and
+    /// a key-partitioned flow does not cascade a base view's output to
+    /// downstream views. [`Session::ivm`](crate::Session::ivm) makes the
+    /// opposite choice for the same session and mode: its first single-column
+    /// `GROUP BY` view shards the job across `KRISHIV_IVM_SHARDS` flows. So the
+    /// same aggregate reaches a fraction of the throughput through this entry
+    /// point, and `Session::ivm` cannot host a view-DAG. Neither is a default
+    /// the other can override — choose the entry point by which property you
+    /// need.
+    ///
+    /// The view is registered in the **session's** IVM registry, so
+    /// `Session::ivm(name)` reaches the same job and `Session::reset_ivm_job`
+    /// drops it (IVM-AUD-INT-F15). One consequence of that shared namespace:
+    /// this call fails if `name` is already held by a partitioned job, rather
+    /// than quietly handing back one that cannot cascade (IVM-AUD-INT-F16).
     pub async fn to_incremental(&self, name: &str) -> Result<crate::IncrementalDataFrame> {
+        // IVM-AUD-API-F2. No body this could choose honours the cache. An
+        // incremental view is populated by the deltas fed to it, never by a
+        // session table, so the rows `cache()` just materialized are absent from
+        // the view either way — and *which* body gets chosen turns on an
+        // invisible detail of how the DataFrame was built. With a SQL-ops
+        // backing, `ops.to_sql()` below re-derives the pre-cache query and the
+        // view reads the original sources, so `cache()` bought nothing; without
+        // one, `sql_query` is `SELECT * FROM "_krishiv_cache_N"` and the view's
+        // only feedable source is a generated name the caller never chose. Both
+        // used to return a handle that looked like a working view over the
+        // cached data.
+        if let Some(cache_name) = &self._cache_name {
+            return Err(KrishivError::unsupported(format!(
+                "cannot build incremental view '{name}' from a cached DataFrame: cache() \
+                 materialized this query into the session table '{cache_name}', and an \
+                 incremental view is populated by the deltas you feed it, not by a session \
+                 table — so none of the cached rows would reach the view. Depending on how \
+                 this DataFrame was built its body would either re-derive the pre-cache query \
+                 (making cache() a no-op here) or read '{cache_name}' itself, whose generated \
+                 name would then be the view's only feedable source. Call to_incremental() on \
+                 the uncached DataFrame and feed it."
+            )));
+        }
         let body_sql = match &self.sql_dataframe {
             Some(ops) => ops.to_sql()?,
             None => self.sql_query.clone().ok_or_else(|| {
@@ -696,6 +755,7 @@ Execution statistics:
             output_schema,
             self.mode,
             ivm_url,
+            self.ivm_registry.clone(),
         )
         .await
     }
@@ -928,6 +988,7 @@ Execution statistics:
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
             ivm_parent: self.ivm_parent.clone(),
+            ivm_registry: self.ivm_registry.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
@@ -990,6 +1051,7 @@ Execution statistics:
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
             ivm_parent: self.ivm_parent.clone(),
+            ivm_registry: self.ivm_registry.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
             force_local: self.force_local,
@@ -1922,7 +1984,13 @@ Execution statistics:
             next_job_id: self.next_job_id.clone(),
             _coordinator_url: self._coordinator_url.clone(),
             coordinator_http_url: self.coordinator_http_url.clone(),
-            ivm_parent: self.ivm_parent.clone(),
+            // IVM-AUD-API-F3: the parent link does NOT survive caching. It means
+            // "this DataFrame reads the parent view's live output", and a cached
+            // DataFrame reads a frozen copy under a generated table name
+            // instead. Carrying it forward made `s.view(iv).cache()` a handle
+            // that still claimed the view-DAG relationship it had just severed.
+            ivm_parent: None,
+            ivm_registry: self.ivm_registry.clone(),
             remote_prelude: self.remote_prelude.clone(),
             runtime: self.runtime.clone(),
             registered_parquet: self.registered_parquet.clone(),
@@ -2096,4 +2164,256 @@ fn build_parquet_writer_props(
     }
     builder = builder.set_max_row_group_row_count(opts.max_row_group_size);
     Ok(Some(builder.build()))
+}
+
+#[cfg(test)]
+mod cache_and_ivm_tests {
+    use std::sync::Arc;
+
+    use crate::{FeedableJob as _, Job as _};
+
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+
+    fn session_with_orders() -> crate::Session {
+        let session = crate::SessionBuilder::new()
+            .build()
+            .expect("session builds");
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["US", "EU"])),
+                Arc::new(Int64Array::from(vec![10_i64, 5])),
+            ],
+        )
+        .expect("batch");
+        session
+            .register_record_batches("orders", vec![batch])
+            .expect("register");
+        session
+    }
+
+    /// IVM-AUD-API-F2. `df.cache().to_incremental()` used to return a handle
+    /// that looked like an incremental view over the cached data and was not:
+    /// an incremental view is populated by feeds, never by a session table, so
+    /// the rows `cache()` had just materialized were nowhere in it. This
+    /// DataFrame keeps a SQL-ops backing, so the view it produced silently read
+    /// `orders` — the pre-cache query, cache() a no-op — which is what the
+    /// panic arm below reports; a DataFrame without that backing instead got a
+    /// view whose only feedable source was the generated `_krishiv_cache_N`.
+    /// Both are the same defect, and the success was the bug.
+    #[tokio::test]
+    async fn to_incremental_on_a_cached_dataframe_is_refused() {
+        let session = session_with_orders();
+        let cached = session
+            .sql("SELECT region, amount FROM orders")
+            .expect("sql")
+            .cache()
+            .expect("cache");
+        let err = match cached.to_incremental("revenue").await {
+            Ok(iv) => panic!(
+                "a cached DataFrame must not become an incremental view; got sources {:?}",
+                iv.source_names()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("_krishiv_cache_"),
+            "the error must name the generated cache table that would have been the only \
+             feedable source: {err}"
+        );
+    }
+
+    /// IVM-AUD-INT-F15 / API-D5. `to_incremental` built a fresh private
+    /// registry per call, so the view it registered was invisible to
+    /// `Session::ivm(name)` (which made a *second*, empty job under the same
+    /// name in the session registry) and `Session::reset_ivm_job(name)` had
+    /// nothing to drop. Two `to_incremental("x")` calls in one session likewise
+    /// produced two isolated views.
+    #[tokio::test]
+    async fn to_incremental_registers_into_the_session_registry() {
+        use krishiv_delta::DeltaBatch;
+
+        let session = session_with_orders();
+        let iv = session
+            .sql("SELECT region, SUM(amount) AS total FROM orders GROUP BY region")
+            .expect("sql")
+            .to_incremental("revenue")
+            .await
+            .expect("to_incremental");
+
+        // The session reaches the SAME job by name — not a second empty one.
+        let via_session = session.ivm("revenue").await.expect("session.ivm");
+        assert_eq!(via_session.job_id(), "revenue");
+
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["US"])),
+                Arc::new(Int64Array::from(vec![7_i64])),
+            ],
+        )
+        .expect("batch");
+        iv.apply(None, &DeltaBatch::from_inserts(batch).expect("delta"))
+            .await
+            .expect("apply");
+        iv.step().await.expect("step");
+
+        let snapshot = via_session
+            .snapshot("revenue")
+            .await
+            .expect("the session handle must know this view");
+        assert_eq!(
+            snapshot.map(|b| b.num_rows()),
+            Some(1),
+            "a feed through the IncrementalDataFrame must be visible through Session::ivm"
+        );
+
+        // …and the session can drop it, which it could not do to a private one.
+        assert!(
+            session.reset_ivm_job("revenue"),
+            "reset_ivm_job must find the job to_incremental created"
+        );
+    }
+
+    /// IVM-AUD-API-D2. There was no Rust view-DAG entry point: `with_ivm_parent`
+    /// is `pub` but tags a DataFrame that has nothing to plan against, so a
+    /// Rust user had to hand-register a table named after the base view, with
+    /// the base view's declared schema, before the derived SQL would resolve —
+    /// undocumented, and easy to get subtly wrong. `Session::view` does both
+    /// halves and drops the registration again.
+    #[tokio::test]
+    async fn session_view_plans_a_derived_view_against_the_base() {
+        use krishiv_delta::DeltaBatch;
+        let session = session_with_orders();
+        let base = session
+            .sql("SELECT region, SUM(amount) AS total FROM orders GROUP BY region")
+            .expect("sql")
+            .to_incremental("revenue")
+            .await
+            .expect("to_incremental");
+
+        let derived = session
+            .view(&base)
+            .expect("the base view must be readable as a DataFrame")
+            .to_incremental("big_regions")
+            .await
+            .expect("the derived view must co-register on the base's job");
+
+        // Co-registered onto the SAME job — that is what makes the cascade work.
+        assert_eq!(derived.shared_job().job_id(), base.shared_job().job_id());
+        assert_eq!(derived.source_names(), ["revenue"]);
+
+        // The registration must not outlive the call.
+        assert!(
+            !session.table_exists("revenue").expect("table_exists"),
+            "the base view's rows were registered only for planning"
+        );
+
+        // One feed, one tick: the derived view carries the base's output.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, false),
+                Field::new("amount", DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["US", "EU"])),
+                Arc::new(Int64Array::from(vec![10_i64, 5])),
+            ],
+        )
+        .expect("batch");
+        base.apply(
+            Some("orders"),
+            &DeltaBatch::from_inserts(batch).expect("delta"),
+        )
+        .await
+        .expect("apply");
+        let report = base.step().await.expect("step");
+        assert!(
+            report.errored_views.is_empty(),
+            "the derived view must plan against its base: {:?}",
+            report.errored_views
+        );
+        assert_eq!(
+            derived
+                .snapshot()
+                .await
+                .expect("snapshot")
+                .map(|b| b.num_rows()),
+            Some(2)
+        );
+    }
+
+    /// A real table under the view's name is refused, not replaced — the
+    /// derived view's SQL could not tell the two apart.
+    #[tokio::test]
+    async fn session_view_refuses_to_shadow_an_existing_table() {
+        let session = session_with_orders();
+        let iv = session
+            .sql("SELECT region FROM orders")
+            .expect("sql")
+            .to_incremental("orders_view")
+            .await
+            .expect("to_incremental");
+        session
+            .register_record_batches(
+                "orders_view",
+                vec![
+                    RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+                        vec![Arc::new(Int64Array::from(vec![1_i64]))],
+                    )
+                    .expect("batch"),
+                ],
+            )
+            .expect("register");
+
+        let err = match session.view(&iv) {
+            Ok(_) => panic!("a real table of the same name must not be shadowed"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains("orders_view"),
+            "must name the collision: {err}"
+        );
+        assert!(
+            session.table_exists("orders_view").expect("table_exists"),
+            "the real table must survive the refusal"
+        );
+    }
+
+    /// IVM-AUD-API-F3. `ivm_parent` means "this DataFrame reads that view's
+    /// live output"; a cached DataFrame reads a frozen copy under a generated
+    /// table name, so the link must not survive `cache()`.
+    #[tokio::test]
+    async fn cache_drops_the_ivm_parent_link() {
+        let session = session_with_orders();
+        let registry: krishiv_runtime::SharedIvmJobRegistry =
+            Arc::new(krishiv_runtime::IvmJobRegistry::with_default_shards(1));
+        let parent = crate::IvmJob::embedded(&registry, "base").expect("embedded job");
+
+        let live = session
+            .sql("SELECT region, amount FROM orders")
+            .expect("sql")
+            .with_ivm_parent(parent);
+        assert!(
+            live.ivm_parent.is_some(),
+            "precondition: the uncached DataFrame carries the parent link"
+        );
+
+        let cached = live.cache().expect("cache");
+        assert!(
+            cached.ivm_parent.is_none(),
+            "cache() froze the rows into '{:?}', so it can no longer claim to read the \
+             parent view's live output",
+            cached._cache_name
+        );
+    }
 }

@@ -455,6 +455,16 @@ impl PartitionedIncrementalFlow {
         Ok(Some(merged))
     }
 
+    /// Total queued input bytes across every shard — see
+    /// [`IncrementalFlow::pending_bytes`] (IVM-AUD-INT-F11).
+    pub fn pending_bytes(&self) -> IvmResult<usize> {
+        let mut total = 0usize;
+        for shard in &self.shards {
+            total = total.saturating_add(shard.pending_bytes()?);
+        }
+        Ok(total)
+    }
+
     /// The tick **every** shard has completed.
     ///
     /// IVM-AUD-PART-10: this reported shard 0's counter. Shards advance

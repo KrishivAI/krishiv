@@ -18,4 +18,6 @@ pub mod job;
 
 pub use incremental_df::IncrementalDataFrame;
 pub use ivm::IvmJob;
-pub use job::{Checkpointable, FeedableJob, Job, JobKind, StepReport, ViewError, ViewErrorKind};
+pub use job::{
+    Checkpointable, FeedableJob, Job, JobKind, StepReport, ViewError, ViewErrorKind, ViewHealth,
+};

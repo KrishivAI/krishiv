@@ -33,6 +33,43 @@ pub struct StepReport {
     /// Step did not panic; subsequent ticks re-evaluate. Each entry is a
     /// `(view_name, kind, message)` triple.
     pub errored_views: Vec<ViewError>,
+    /// Whether the two vectors above are a *report* at all.
+    ///
+    /// They are the only view-level failure channel there is — a failing view
+    /// does not make `step` return `Err` — so "empty" has to mean one thing.
+    /// It did not: distributed ticks filled both with `Vec::new()` because the
+    /// coordinator's step response carried counters only, making a broken view
+    /// indistinguishable from a healthy one (IVM-AUD-API-A5). Check this before
+    /// concluding anything from an empty `errored_views`.
+    pub view_health: ViewHealth,
+}
+
+/// Provenance of [`StepReport::degraded_views`] / [`StepReport::errored_views`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewHealth {
+    /// The engine that ran the tick reported per-view health. Empty vectors
+    /// mean "no view degraded / failed".
+    Reported,
+    /// Nothing reported per-view health for this tick, so the vectors are empty
+    /// for lack of a signal — **not** because every view is healthy. The string
+    /// says which link in the chain has no signal to give.
+    Unreported(String),
+}
+
+impl ViewHealth {
+    /// Whether the report's health vectors can be trusted as a statement about
+    /// the views.
+    pub fn is_reported(&self) -> bool {
+        matches!(self, Self::Reported)
+    }
+}
+
+/// A default-constructed `StepReport` describes no tick, so it can make no
+/// claim about any view's health.
+impl Default for ViewHealth {
+    fn default() -> Self {
+        Self::Unreported("no step was reported".to_owned())
+    }
 }
 
 /// One view's failure during a `step`. Carried in [`StepReport::errored_views`].
@@ -53,6 +90,15 @@ pub enum ViewErrorKind {
     ViewSql,
     /// The view's published output failed (downstream backpressure, etc.).
     Publish,
+    /// A recursive view's body did not reach a fixed point within the engine's
+    /// iteration cap, so the tick has no value for it and its previous value
+    /// stands (IVM-AUD-CORE-12).
+    FixpointNotConverged,
+    /// The engine that ran the tick named a failure kind this binary does not
+    /// know — a coordinator newer than this client. The view really did fail;
+    /// only its category is unknown, and the reported name is preserved at the
+    /// front of [`ViewError::message`]. Never produced by an embedded tick.
+    Unrecognized,
 }
 
 /// Identity common to every long-lived job. Batch is not a `Job` (it is

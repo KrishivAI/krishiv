@@ -137,7 +137,14 @@ pub fn capability_matrix() -> Vec<CapabilityCell> {
             evidence: "benchmarks/results.jsonl ivm_tick_p50_at_10m_rows (64.6ms vs 2000ms budget); \
                        ivm_vs_full_recompute bench; krishiv-ivm flow + partitioned tests; live IVM \
                        job proven on the k3s cert cluster 2026-07-22",
-            notes: "",
+            notes: "Certified for correctness and throughput, NOT for restart-resume. \
+                    IVM-AUD-INT-F13: `IncrementalEngine::run` never touches the runtime's \
+                    checkpoint service, so at single-node placement an incremental job restarts \
+                    from zero and re-emits its whole changelog, exactly as it does embedded — \
+                    the durable-checkpoint property that distinguishes single-node from \
+                    embedded for the streaming engine does not exist for this one, and none of \
+                    the evidence above restarts a job. Whether this row should be downgraded \
+                    is an open decision recorded in docs/implementation/ivm-audit-register.md.",
         },
         CapabilityCell {
             compute: Ivm,
@@ -148,7 +155,15 @@ pub fn capability_matrix() -> Vec<CapabilityCell> {
             notes: "Preview until a distributed-IVM chaos gate lands: an in-flight IVM tick is \
                     non-cancellable by design (#224, already-accepted deltas) and distributed \
                     executor-loss during a resident tick has lighter fault coverage than the \
-                    batch/streaming paths.",
+                    batch/streaming paths. Also read this row narrowly: executor-resident IVM \
+                    requires an UNPARTITIONED job, and a job whose first view is a routable \
+                    single-column GROUP BY is auto-partitioned on any coordinator with more \
+                    than one shard (IvmJobRegistry::register_view), while a partitioned job \
+                    always computes centrally. The canonical GROUP BY workload therefore runs \
+                    on the coordinator's in-process shards and never reaches an executor; only \
+                    jobs pinned single (Session::view / to_incremental view-DAGs) or with a \
+                    non-shardable first view take the distributed path at all \
+                    (IVM-AUD-DIST-A1).",
         },
     ]
 }
@@ -156,8 +171,31 @@ pub fn capability_matrix() -> Vec<CapabilityCell> {
 /// The certified end-to-end data-movement paths.
 pub fn data_path_matrix() -> Vec<DataPathCell> {
     use ConnectorMaturity::{Certified, Preview};
-    use DeliveryGuarantee::{AtLeastOnce, EffectivelyOnce, ExactlyOnce};
+    use DeliveryGuarantee::{AtLeastOnce, BestEffort, EffectivelyOnce, ExactlyOnce};
     vec![
+        DataPathCell {
+            source: "CDC / connector source (krishiv ivm run, submit of an Incremental job)",
+            sink: "connector sink (per-tick consolidated changelog)",
+            delivery: BestEffort,
+            status: Preview,
+            evidence: "IVM-AUD-INT-F4 / INT-F13. Listed to state the guarantee, not to claim \
+                       one: `IncrementalEngine::run` (krishiv-engines/src/lib.rs) takes no \
+                       checkpoints and rewinds no source, so a restart re-runs the job from \
+                       zero and rewrites the whole changelog, and a crash mid-drain leaves \
+                       whatever the sink had already flushed. `CompiledJob::delivery` is never \
+                       read by any engine, so requesting a stronger contract has no effect",
+        },
+        DataPathCell {
+            source: "IVM view output (coordinator /views/{view}/snap and /output)",
+            sink: "pull-only — the caller polls; there is no sink",
+            delivery: BestEffort,
+            status: Preview,
+            evidence: "IVM-AUD-INT-F4 / INT-F5. `/output` peeks a coalescing watch that holds \
+                       one delta per view, so a consumer polling slower than /step loses every \
+                       delta but the newest; since INT-F5 the loss is measurable from \
+                       `published_rows_total` but it is not recoverable. `/snap` is a whole \
+                       snapshot and loses nothing, at O(view) per poll",
+        },
         DataPathCell {
             source: "Kafka",
             sink: "Iceberg",

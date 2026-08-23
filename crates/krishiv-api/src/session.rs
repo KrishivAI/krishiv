@@ -2620,6 +2620,12 @@ impl Session {
             self.runtime.clone(),
             self.registered_parquet.clone(),
             remote_prelude,
+            // IVM-AUD-INT-F15 / API-D5: `to_incremental` used to make a private
+            // registry per call, so its view was invisible to `Session::ivm`
+            // and to `reset_ivm_job`, and two calls with the same name built
+            // two isolated views. Every session-built DataFrame now carries the
+            // session's registry.
+            Some(self.ivm_registry.clone()),
         )
     }
 
@@ -3006,9 +3012,15 @@ impl Session {
                     .map_err(KrishivError::from)
             }
             // Stateful engines (incremental / streaming) at single-node run
-            // in-process over connector-backed sources/sinks, but with durable
-            // (on-disk) checkpoints so operator state and source offsets survive a
-            // restart — the single-node daemon's defining difference from embedded.
+            // in-process over connector-backed sources/sinks with an on-disk
+            // checkpoint service.
+            //
+            // IVM-AUD-INT-F13: only the streaming engine uses it. This comment
+            // used to say operator state and source offsets survive a restart
+            // for both; `IncrementalEngine::run` never reads or writes
+            // `rt.checkpoint`, so an incremental job at single-node restarts
+            // from zero exactly as it does embedded. See
+            // `connector_runtime::durable_engine_runtime`.
             ExecutionMode::SingleNode => {
                 // Incremental output consolidates retractions into the net table;
                 // streaming output is insert-only.
@@ -3340,6 +3352,38 @@ impl Session {
     /// URL) returns a remote job; otherwise an in-process embedded job. The
     /// returned [`IvmJob`](crate::IvmJob) exposes the same `feed`/`step`/
     /// `snapshot`/`checkpoint` surface in both modes.
+    ///
+    /// # This job auto-partitions; `DataFrame::to_incremental` does not
+    ///
+    /// IVM-AUD-API-A3. A job created here shards its flow by key when its
+    /// **first** view is a single-column `GROUP BY` over a routable key type,
+    /// into `KRISHIV_IVM_SHARDS` shards. `DataFrame::to_incremental` pins its
+    /// job to a single flow instead, because a partitioned flow never cascades
+    /// a base view's output to derived views and that surface has to support
+    /// the view-DAG. Same session, same mode, same SQL, different fan-out and
+    /// different composability — pick this one for a single aggregate at scale
+    /// and `to_incremental` when views build on views.
+    ///
+    /// The two also collide by name: an unpartitioned job cannot be created
+    /// under a name a partitioned job already holds, and vice versa. That is
+    /// refused rather than silently reinterpreted (IVM-AUD-INT-F16).
+    ///
+    /// # `SingleNode` gets the embedded job, not the daemon's
+    ///
+    /// IVM-AUD-API-A2 / INT-F14. A `SingleNode` session has a coordinator and
+    /// routes [`submit`](Self::submit) through it with on-disk checkpoints, but
+    /// IVM is not routed there: the arm below treats `SingleNode` exactly like
+    /// `Embedded`, so the job lives in this process's registry, the local
+    /// daemon cannot see or list it, and nothing about it survives the process.
+    /// Same session, same mode: `submit` is daemon-backed and `ivm` is not.
+    ///
+    /// Two further consequences worth knowing before you rely on it: the
+    /// coordinator's `/api/v1/ivm/*` surface (`/stats`, `/snap`, `DELETE`) does
+    /// not reach this job, and neither does `krishiv ivm run --mode single-node`
+    /// as a way to attach to it. Whether SingleNode IVM *should* route to the
+    /// daemon is an open decision, recorded in
+    /// `docs/implementation/ivm-audit-register.md`; until it is taken, this doc
+    /// is the whole of the contract.
     pub async fn ivm(&self, name: &str) -> Result<crate::IvmJob> {
         match self.mode {
             ExecutionMode::Distributed => {
@@ -3354,6 +3398,86 @@ impl Session {
                 crate::IvmJob::embedded(&self.ivm_registry, name)
             }
         }
+    }
+
+    /// Read an incremental view as a [`DataFrame`] — the Rust view-DAG entry
+    /// point.
+    ///
+    /// Two uses, both of which need the view's rows registered under its name
+    /// so the query can be planned against it:
+    ///
+    /// * **compose** — `session.view(&iv)?.filter(..)?.to_incremental("d")`
+    ///   co-registers the derived view into `iv`'s job, so a feed to the base
+    ///   cascades to it in the same tick;
+    /// * **read** — `.collect()` returns the view's rows *as of this call*. The
+    ///   DataFrame carries that snapshot; it is not a live handle.
+    ///
+    /// IVM-AUD-API-D2: only Python had this. `DataFrame::with_ivm_parent` is
+    /// `pub`, but on its own it tags a DataFrame that has nothing to plan
+    /// against — a Rust user had to hand-register a table named after the base
+    /// view, with the base view's schema, before the derived SQL would resolve,
+    /// and nothing said so. Getting it subtly wrong (registering the storage
+    /// schema rather than the declared one) types the derived view differently
+    /// before and after the base's first tick.
+    ///
+    /// # Cost
+    ///
+    /// Every call materializes the base view's **whole** snapshot and casts it
+    /// — O(rows in the view) in time and memory. The compose path does not need
+    /// those rows (only the schema is load-bearing once the derived view is
+    /// registered into the base's job), but this function cannot tell the two
+    /// uses apart, because the caller picks afterwards. Hoist it out of loops.
+    ///
+    /// A session table that already carries the view's name is refused rather
+    /// than replaced: the derived view's SQL could not tell the two apart. The
+    /// registration lasts only as long as planning.
+    pub fn view(&self, iv: &crate::IncrementalDataFrame) -> Result<DataFrame> {
+        let name = iv.name();
+        if self.table_exists(name)? {
+            return Err(KrishivError::unsupported(format!(
+                "cannot read incremental view '{name}' as a DataFrame: this session already has                  a table named '{name}', and the derived view's SQL cannot distinguish them.                  Rename the view (to_incremental(name)) or drop/rename the table."
+            )));
+        }
+        // The table always carries the view's DECLARED output schema, whether
+        // or not it has rows yet, so a derived view is typed identically before
+        // and after the base has ticked. The engine materializes snapshots in
+        // equivalent storage types (`Utf8` where the plan says `Utf8View`), so
+        // the rows are cast onto the declared schema; a cast that fails is a
+        // real divergence and is raised, not papered over with an empty table.
+        let schema = iv.output_schema();
+        let mut batches = vec![RecordBatch::new_empty(schema.clone())];
+        if let Some(snapshot) = block_on(iv.snapshot())? {
+            let columns = schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(i, field)| {
+                    let column = snapshot.column(i);
+                    arrow::compute::cast(column, field.data_type()).map_err(|e| {
+                        KrishivError::unsupported(format!(
+                            "incremental view '{name}' materialized column '{}' as {:?}, which                              does not fit its declared output type {:?}: {e}",
+                            field.name(),
+                            column.data_type(),
+                            field.data_type()
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            batches.push(
+                RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                    KrishivError::unsupported(format!(
+                        "incremental view '{name}' snapshot does not fit its declared output                          schema: {e}"
+                    ))
+                })?,
+            );
+        }
+        self.register_record_batches(name, batches)?;
+        let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+        let planned = self.sql(format!("SELECT * FROM {quoted}"));
+        // Deregister whether or not planning succeeded: the registration must
+        // never outlive the call, or it shadows a later real table of that name.
+        self.deregister_table(name)?;
+        Ok(planned?.with_ivm_parent(iv.shared_job()))
     }
 
     /// Resolve the coordinator **HTTP** base for management endpoints (IVM lives

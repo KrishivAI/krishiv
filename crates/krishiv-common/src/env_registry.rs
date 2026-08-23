@@ -1175,6 +1175,18 @@ pub static FLAGS: &[FlagSpec] = &[
         "Checkpoint storage path the distributed NEXMark harness passes at registration when KRISHIV_BENCH_CHECKPOINT_INTERVAL_MS is non-zero.",
     ),
     rt(
+        "KRISHIV_IVM_MAX_PENDING_BYTES",
+        FlagKind::UInt,
+        "1073741824",
+        "Per-IVM-job cap on queued input bytes across all sources. A /feed that would push the backlog past it is refused with HTTP 429 instead of growing an unbounded in-memory queue (audit INT-F11). 0 restores the old unbounded behaviour; a value that does not parse falls back to the default.",
+    ),
+    rt(
+        "KRISHIV_IVM_DISPATCH_TIMEOUT_SECS",
+        FlagKind::UInt,
+        "300",
+        "How long the coordinator waits for an executor-resident IVM tick before falling back to central compute. Also bounds how long DELETE on a job can block behind an in-flight tick (audit DIST-H7). 0 or an unparseable value falls back to the default.",
+    ),
+    rt(
         "KRISHIV_BENCH_CASE_FILTER",
         FlagKind::Text,
         "",

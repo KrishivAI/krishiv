@@ -34,15 +34,36 @@ pub struct IncrementalDataFrame {
 impl IncrementalDataFrame {
     /// Register `body_sql` as an incremental view on a mode-inherited job.
     ///
-    /// Embedded/single-node sessions get a fresh in-process job (sources are
-    /// established by the fed [`DeltaBatch`]es, so no session catalog is needed);
-    /// distributed sessions attach to the coordinator's IVM endpoint.
+    /// Embedded/single-node sessions register into `registry` — the session's
+    /// own embedded IVM registry — so the view is the same job
+    /// [`Session::ivm`](crate::Session::ivm) reaches by that name and
+    /// `Session::reset_ivm_job` can drop. Distributed sessions attach to the
+    /// coordinator's IVM endpoint instead. Sources are established by the fed
+    /// [`DeltaBatch`]es, so no session catalog is needed either way.
+    ///
+    /// `registry = None` means the DataFrame was not built by a session; a
+    /// private one-job registry is used and nothing else can see the view. In
+    /// practice that combination is unreachable — the constructors that leave
+    /// it `None` produce DataFrames with no SQL, and this call needs a body —
+    /// so it exists for direct callers of this function (its own tests).
+    ///
+    /// # `SingleNode` is handled as `Embedded`
+    ///
+    /// IVM-AUD-API-A2 / INT-F14: the match arm below is
+    /// `Embedded | SingleNode`, so a single-node session's incremental view
+    /// runs in the client process with no daemon visibility, no durable state
+    /// and no restart-resume — while the same session's
+    /// [`Session::submit`](crate::Session::submit) routes a job to the local
+    /// daemon with on-disk checkpoints. That divergence is deliberate only in
+    /// the sense that nobody has decided otherwise; it is recorded as an open
+    /// decision in `docs/implementation/ivm-audit-register.md`.
     pub(crate) async fn from_view_sql(
         name: &str,
         body_sql: String,
         output_schema: SchemaRef,
         mode: ExecutionMode,
         coordinator_http: Option<String>,
+        registry: Option<SharedIvmJobRegistry>,
     ) -> Result<Self> {
         let sources = extract_source_names(&body_sql)?;
         let spec = IncrementalViewSpec {
@@ -66,18 +87,25 @@ impl IncrementalDataFrame {
                 IvmJob::remote_unpartitioned(&url, name).await?
             }
             ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-                // shards=1 disables auto-partitioning: an IncrementalDataFrame job
-                // may gain derived views (Session::view view-DAG), and a partitioned
-                // job does not cascade to downstream views. Composition correctness
-                // outweighs single-view sharding here (in-process anyway).
+                // Pinned to a single (non-partitioned) flow: an
+                // IncrementalDataFrame job may gain derived views (the
+                // `Session::view` view-DAG), and a partitioned job does not
+                // cascade a base view's output to downstream views. Composition
+                // correctness outweighs single-view sharding here (in-process
+                // anyway) — and `Session::ivm` does NOT make the same choice,
+                // which is the divergence documented on `DataFrame::to_incremental`.
                 //
-                // The registry is private to this handle and is kept alive by the
-                // returned job: `EmbeddedIvmJob` holds its own `Arc` clone of it.
-                // (An extra `_registry` field here used to claim that job — it was
-                // inert, and a second owner of an `Arc` proves nothing, API-G7.)
-                let registry: SharedIvmJobRegistry =
-                    Arc::new(IvmJobRegistry::with_default_shards(1));
-                IvmJob::embedded(&registry, name)?
+                // IVM-AUD-API-A4: the pin is now the same mechanism the remote
+                // path uses — `create_unpartitioned`, which sets the registry's
+                // `pinned_single` marker — rather than a registry built with
+                // `with_default_shards(1)`. The old form worked only because
+                // *every* job in that private registry was single by accident of
+                // its shard count, and it could not survive sharing the
+                // session's registry (INT-F15) at all.
+                let registry = registry.unwrap_or_else(|| {
+                    Arc::new(IvmJobRegistry::with_default_shards(1)) as SharedIvmJobRegistry
+                });
+                IvmJob::embedded_unpartitioned(&registry, name)?
             }
         };
         job.register_view(spec).await?;
@@ -205,10 +233,12 @@ impl IncrementalDataFrame {
     /// is skipped, and its name appears in `errored_views` (API-F6). Code that
     /// ignores those two fields cannot tell a healthy tick from a broken view.
     ///
-    /// Distributed jobs are worse off still: the coordinator's step response
-    /// has no health fields, so both vectors arrive empty regardless of what
-    /// happened remotely (API-A5, open — see
-    /// `docs/implementation/ivm-audit-register.md`).
+    /// Because "empty" has to mean one thing, check
+    /// [`StepReport::view_health`] before concluding anything from an empty
+    /// `errored_views`. A distributed tick reports health only when the
+    /// coordinator computed it centrally; a tick dispatched to a resident
+    /// executor comes back `ViewHealth::Unreported`, because that wire carries
+    /// per-view output deltas and no health at all (API-A5).
     pub async fn step(&self) -> Result<StepReport> {
         self.job.step().await
     }
@@ -231,6 +261,21 @@ impl IncrementalDataFrame {
     /// first delta is gone, so this is a "latest value", not a stream.
     pub fn last_output(&self) -> Result<Option<DeltaBatch>> {
         self.job.view_output(&self.view)
+    }
+
+    /// Delete the underlying IVM job — this view and every other view
+    /// co-registered on the same job (a view-DAG shares one job).
+    ///
+    /// **Must be called explicitly.** IVM-AUD-API-A7: Rust has no async `Drop`,
+    /// so dropping this handle cannot tear down a remote job, and there was no
+    /// other way to do it — a distributed `to_incremental` created a
+    /// coordinator job that outlived the process and could only be removed with
+    /// `curl`. Embedded, the private registry this handle owns is freed when
+    /// the handle drops, so `close()` is optional there and harmless.
+    ///
+    /// Returns `false` when the job was already gone.
+    pub async fn close(&self) -> Result<bool> {
+        self.job.close().await
     }
 
     /// The view's identifier.
@@ -397,6 +442,7 @@ mod tests {
             revenue_schema(),
             ExecutionMode::Embedded,
             None,
+            None,
         )
         .await
         .unwrap()
@@ -509,12 +555,69 @@ mod tests {
             ])),
             ExecutionMode::Embedded,
             None,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(iv.source_names(), ["orders".to_string()]);
         let delta = DeltaBatch::from_inserts(orders_batch(&["US"], &[10])).unwrap();
         iv.apply(None, &delta).await.unwrap();
+    }
+
+    /// IVM-AUD-DDL-F5: no end-to-end test asserted **incrementality** — the
+    /// pipeline tests feed once, and their answers are identical under full
+    /// recompute. This one feeds twice and pins both halves of the claim: the
+    /// second tick's answer accumulates, AND the engine did not fall back to
+    /// recomputing the view in full. `degraded_views` is the engine's own
+    /// report of which views took the O(state) path this tick, so an empty
+    /// entry for `revenue` is the only externally visible evidence that the
+    /// second tick was O(Δ).
+    #[tokio::test]
+    async fn a_second_feed_is_maintained_incrementally_not_recomputed() {
+        let iv = embedded_revenue("revenue").await;
+        iv.apply(
+            None,
+            &DeltaBatch::from_inserts(orders_batch(&["US", "EU"], &[100, 50])).unwrap(),
+        )
+        .await
+        .unwrap();
+        iv.step().await.unwrap();
+
+        iv.apply(
+            None,
+            &DeltaBatch::from_inserts(orders_batch(&["US"], &[25])).unwrap(),
+        )
+        .await
+        .unwrap();
+        let report = iv.step().await.unwrap();
+        assert!(
+            report.degraded_views.is_empty(),
+            "the second tick recomputed the view in full instead of maintaining it: {:?}",
+            report.degraded_views
+        );
+
+        let snap = iv.snapshot().await.unwrap().expect("materialized view");
+        let regions = snap
+            .column_by_name("region")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let totals = snap
+            .column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut got: Vec<(String, i64)> = (0..snap.num_rows())
+            .map(|i| (regions.value(i).to_string(), totals.value(i)))
+            .collect();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![("EU".to_string(), 50), ("US".to_string(), 125)],
+            "the second feed must accumulate onto the first"
+        );
     }
 
     // ── API-D1 / API-G5: `apply` buffers, `step` ticks ────────────────────
@@ -697,6 +800,7 @@ mod tests {
                 Field::new("no_such_column", DataType::Int64, true),
             ])),
             ExecutionMode::Embedded,
+            None,
             None,
         )
         .await

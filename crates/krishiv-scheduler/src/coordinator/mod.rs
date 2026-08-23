@@ -510,6 +510,20 @@ impl SharedCoordinator {
             .store(token, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Whether a metadata store is attached, i.e. whether anything this
+    /// coordinator persists actually survives the process.
+    ///
+    /// IVM-AUD-DIST-C5: with no store configured, [`save_ivm_snapshot`] takes
+    /// the `return Ok(())` branch below — every "durable" IVM write is a silent
+    /// success that writes nothing, `/restore` reports a rewind that only ever
+    /// existed in memory, and a restart loses the lot with no warning anywhere.
+    /// The IVM handlers report this back to the caller rather than guessing.
+    ///
+    /// [`save_ivm_snapshot`]: Self::save_ivm_snapshot
+    pub async fn has_metadata_store(&self) -> bool {
+        self.inner.read().await.store.is_some()
+    }
+
     /// Persist a complete IVM job snapshot through the configured metadata store.
     pub async fn save_ivm_snapshot(&self, job_id: &str, snapshot: Vec<u8>) -> SchedulerResult<()> {
         let store = { self.inner.read().await.store.clone() };

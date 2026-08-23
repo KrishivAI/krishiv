@@ -1513,11 +1513,22 @@ impl KrishivMcpServer {
         let job_name = required_string(arguments, "job_name")?;
         let job = self.session.ivm(job_name).await?;
         let report = job.step().await?;
+        // IVM-AUD-API-A5: `degraded_views`/`errored_views` are the only
+        // view-level failure channel, and a distributed tick may have no health
+        // signal at all (an older coordinator, or a tick dispatched to a
+        // resident executor). Emitting the two arrays alone would tell an agent
+        // "nothing failed" when the truth is "nobody looked".
+        let (health_reported, health_note) = match &report.view_health {
+            krishiv_api::ViewHealth::Reported => (true, String::new()),
+            krishiv_api::ViewHealth::Unreported(why) => (false, why.clone()),
+        };
         Ok(json!({
             "job_id": job.job_id(),
             "tick": report.tick,
             "active_views": report.active_views,
             "total_output_rows": report.total_output_rows,
+            "view_health_reported": health_reported,
+            "view_health_note": health_note,
             "degraded_views": report.degraded_views,
             "errored_views": report.errored_views.into_iter().map(|error| {
                 json!({

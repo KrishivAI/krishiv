@@ -95,6 +95,27 @@ pub struct ViewDeltaStats {
     pub last_tick_retracts: u64,
 }
 
+/// Per-map entry counts for one flow (IVM-AUD-CORE-25).
+///
+/// Every field counts *entries*, not bytes, except `dedup_hashes_retained`
+/// which counts individual retained row hashes across all sources — the only
+/// one of these that can reach eight figures on its own.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct RetainedState {
+    pub sources_with_snapshots: usize,
+    pub sources_with_pending: usize,
+    pub sources_with_dedup_hashes: usize,
+    pub dedup_hashes_retained: usize,
+    pub sources_with_checkpoint_deltas: usize,
+    pub sources_with_streaming_snapshots: usize,
+    pub sources_with_ordinals: usize,
+    pub sources_with_watermarks: usize,
+    pub views_registered: usize,
+    pub views_with_plans: usize,
+    pub views_with_stats: usize,
+    pub views_with_pending_plan_state: usize,
+}
+
 /// Count logical inserts/retracts in a delta (sum of positive weights,
 /// sum of negative weight magnitudes).
 fn delta_insert_retract_counts(delta: &DeltaBatch) -> (u64, u64) {
@@ -260,6 +281,10 @@ pub enum ViewErrorKind {
     ViewSql,
     /// The view's published output failed (downstream backpressure, etc.).
     Publish,
+    /// A recursive view's body did not reach a fixed point within
+    /// `MAX_FIXPOINT_ITERS` iterations, so this tick has no value for it
+    /// (IVM-AUD-CORE-12). The view keeps its previous value.
+    FixpointNotConverged,
 }
 
 // ── IncrementalFlowInner ──────────────────────────────────────────────────────
@@ -302,6 +327,10 @@ struct IncrementalFlowInner {
     /// Rows dropped per source by a LATENESS bound, so the enforcement is
     /// observable rather than silent (IVM-AUD-CORE-7).
     late_dropped_rows: AHashMap<String, u64>,
+    /// Duplicate row copies per source discarded by `restore_delta`'s
+    /// set-materialization (IVM-AUD-CORE-29). Non-zero means the restored
+    /// source is not multiset-equal to the one that was checkpointed.
+    delta_restore_collapsed_rows: AHashMap<String, u64>,
     /// Union of every registered view's LATENESS declarations.
     ///
     /// IVM-AUD-CORE-9: association used to happen at register time and only
@@ -332,6 +361,21 @@ struct IncrementalFlowInner {
     /// when a dependency is dirty, and a restore makes nothing dirty
     /// (IVM-AUD-CORE-16).
     rebuild_all_views: bool,
+    /// Bumped by every operation that replaces state a tick in flight has
+    /// already read: `restore`, `restore_full`, `restore_delta`,
+    /// `apply_computed_tick`, `apply_remote_tick`, `invalidate_view_plans`, and
+    /// each committed `step_datafusion`.
+    ///
+    /// IVM-AUD-CORE-19: a tick clones `source_snapshots` under the lock, runs
+    /// view SQL for as long as it takes with the lock RELEASED, then reassigns
+    /// `inner.source_snapshots = new_snapshots` wholesale. Anything that landed
+    /// in that window — a restore, a mirrored remote tick, a second concurrent
+    /// `step_datafusion_with_ctx` (which does not take the `tick_ctx` mutex at
+    /// all) — was overwritten with no error anywhere. A tick now records this
+    /// counter when it reads the state and re-checks it before committing; a
+    /// mismatch aborts the tick, which returns its drained deltas to `pending`
+    /// through the custody guard so the caller can simply step again.
+    state_epoch: u64,
 
     // Per-step output deltas, keyed by view name, captured during the most
     // recent `step_datafusion`. Cleared at the start of each step. Lets a caller
@@ -500,10 +544,12 @@ impl IncrementalFlow {
                 source_ordinals: AHashMap::new(),
                 watermark_trackers: AHashMap::new(),
                 late_dropped_rows: AHashMap::new(),
+                delta_restore_collapsed_rows: AHashMap::new(),
                 declared_lateness: Vec::new(),
                 force_diff_based: false,
                 view_deps: AHashMap::new(),
                 rebuild_all_views: false,
+                state_epoch: 0,
                 last_step_outputs: AHashMap::new(),
                 view_delta_stats: AHashMap::new(),
                 pending_plan_state: HashMap::new(),
@@ -580,6 +626,29 @@ impl IncrementalFlow {
             p.forget(input_hash);
         }
         Ok(())
+    }
+
+    /// Approximate in-memory size of the input deltas queued for the next tick.
+    ///
+    /// IVM-AUD-INT-F11: `pending` is an unbounded `Vec` per source and nothing
+    /// anywhere applied backpressure, so a producer feeding faster than the
+    /// stepper drains simply grew the coordinator's heap until it died, with
+    /// every `/feed` answering `success: true` on the way. This is the number
+    /// an ingress gate needs to refuse the next feed instead
+    /// (`ivm_http::ensure_pending_headroom`).
+    ///
+    /// "Approximate" is Arrow's own `get_array_memory_size`: allocated buffer
+    /// bytes, which over-counts a sliced array sharing a parent buffer and
+    /// ignores per-`DeltaBatch` overhead. It is the right order of magnitude
+    /// for a backlog limit, not an accounting figure.
+    pub fn pending_bytes(&self) -> IvmResult<usize> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .pending
+            .values()
+            .flatten()
+            .map(|delta| delta.inner().get_array_memory_size())
+            .sum())
     }
 
     /// Take all pending input deltas (for external dispatch, e.g. executor fragments).
@@ -699,13 +768,93 @@ impl IncrementalFlow {
         inner.view_registry.register(spec).map_err(delta_err)
     }
 
+    /// Drop a view and every piece of per-view state the flow holds for it.
+    ///
+    /// IVM-AUD-CORE-25: this used to prune four of the seven per-view maps.
+    /// `view_delta_stats`, `pending_plan_state` and `last_step_outputs` kept
+    /// their entries for the life of the process, so a job that registered and
+    /// dropped views (a session re-running a pipeline under generated names, a
+    /// coordinator rehydrating jobs) grew monotonically — and a view later
+    /// re-registered under the same name inherited the dead view's counters and
+    /// its stale checkpointed operator state.
     pub fn drop_view(&self, name: &str) -> IvmResult<bool> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.view_deps.remove(name);
         inner.view_plans.remove(name);
         inner.view_plan_sqls.remove(name);
         inner.view_output_ticks.remove(name);
+        inner.view_delta_stats.remove(name);
+        inner.pending_plan_state.remove(name);
+        inner.last_step_outputs.remove(name);
         inner.view_registry.drop_view(name).map_err(delta_err)
+    }
+
+    /// Drop a source and every piece of per-source state the flow holds for it.
+    ///
+    /// Returns `true` if anything was actually held for `name`.
+    ///
+    /// IVM-AUD-CORE-25: there was no such method at all. Nine maps are keyed by
+    /// source name — the materialized snapshot, the un-stepped `pending`
+    /// deltas, the dedup hash set (up to 10 M hashes), the delta-checkpoint
+    /// accumulator, the streaming-bridge previous snapshot, the ordinal, the
+    /// watermark tracker and two counters — and every one of them was
+    /// write-only for the life of the flow. A long-lived coordinator whose
+    /// sources come and go (per-tenant tables, a connector reconfigured under a
+    /// new name) had no way to give any of it back.
+    ///
+    /// Matching is case-insensitive, because `feed` accepts `"Sales"` and
+    /// `"sales"` as the same target.
+    pub fn drop_source(&self, name: &str) -> IvmResult<bool> {
+        let wanted = name.to_lowercase();
+        let mut inner = self.inner.lock().map_err(lock_err)?;
+        let mut found = false;
+        macro_rules! prune {
+            ($map:expr) => {{
+                let keys: Vec<String> = $map
+                    .keys()
+                    .filter(|k| k.to_lowercase() == wanted)
+                    .cloned()
+                    .collect();
+                for k in keys {
+                    $map.remove(&k);
+                    found = true;
+                }
+            }};
+        }
+        prune!(inner.pending);
+        prune!(inner.source_snapshots);
+        prune!(inner.seen_input_hashes);
+        prune!(inner.checkpoint_deltas);
+        prune!(inner.streaming_prev_snapshots);
+        prune!(inner.source_ordinals);
+        prune!(inner.watermark_trackers);
+        prune!(inner.late_dropped_rows);
+        prune!(inner.delta_restore_collapsed_rows);
+        Ok(found)
+    }
+
+    /// How many per-source / per-view entries the flow is currently holding.
+    ///
+    /// IVM-AUD-CORE-25: the maps below have no size bound of their own — they
+    /// grow with the number of distinct names ever fed or registered — so the
+    /// first question about a flow that will not stop growing is which map is
+    /// growing. Before this there was no way to ask from outside the crate.
+    pub fn retained_state(&self) -> IvmResult<RetainedState> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(RetainedState {
+            sources_with_snapshots: inner.source_snapshots.len(),
+            sources_with_pending: inner.pending.len(),
+            sources_with_dedup_hashes: inner.seen_input_hashes.len(),
+            dedup_hashes_retained: inner.seen_input_hashes.values().map(|(_, s)| s.len()).sum(),
+            sources_with_checkpoint_deltas: inner.checkpoint_deltas.len(),
+            sources_with_streaming_snapshots: inner.streaming_prev_snapshots.len(),
+            sources_with_ordinals: inner.source_ordinals.len(),
+            sources_with_watermarks: inner.watermark_trackers.len(),
+            views_registered: inner.view_registry.view_names().map_err(delta_err)?.len(),
+            views_with_plans: inner.view_plans.len(),
+            views_with_stats: inner.view_delta_stats.len(),
+            views_with_pending_plan_state: inner.pending_plan_state.len(),
+        })
     }
 
     // ── Gap 6: LATENESS registration ──────────────────────────────────────────
@@ -761,6 +910,21 @@ impl IncrementalFlow {
         let inner = self.inner.lock().map_err(lock_err)?;
         if inner.view_registry.get(view).is_err() {
             return Ok(None);
+        }
+        // A recursive view never gets an O(Δ) plan (see the `is_recursive`
+        // guard in the tick), so "not yet planned" would be a permanent lie
+        // about it: it is recomputed to a fixed point every tick it is dirty.
+        if inner
+            .view_registry
+            .get(view)
+            .is_ok_and(|v| v.spec.is_recursive)
+        {
+            return Ok(Some((
+                ViewExecution::DiffBased,
+                "recursive view — re-evaluated to a fixed point from SQL each tick it is \
+                 dirty; recursive bodies have no O(Δ) plan"
+                    .to_string(),
+            )));
         }
         Ok(Some(match inner.view_plans.get(view) {
             None => (
@@ -834,44 +998,17 @@ impl IncrementalFlow {
                 .seen_input_hashes
                 .entry(source_name.clone())
                 .or_default();
-            // Evict oldest entries when capacity is reached. Evicting a small
-            // batch (1% of capacity) means only those rows can be re-delivered
-            // on the next burst, versus the old full-clear which re-admitted
-            // the entire history.
-            if set.len() >= DEDUP_SEEN_CAPACITY {
+            let (filtered, evicted) =
+                dedup_filter(order, set, batch, DEDUP_SEEN_CAPACITY, DEDUP_EVICT_BATCH)?;
+            if evicted > 0 {
                 tracing::warn!(
                     source = %source_name,
                     capacity = DEDUP_SEEN_CAPACITY,
-                    evicting = DEDUP_EVICT_BATCH,
-                    "dedup set capacity reached; evicting oldest entries"
+                    evicted,
+                    "dedup set capacity reached; evicted oldest entries"
                 );
-                for _ in 0..DEDUP_EVICT_BATCH {
-                    if let Some(h) = order.pop_front() {
-                        set.remove(&h);
-                    } else {
-                        break;
-                    }
-                }
             }
-            let data = batch.data_batch();
-            let weights = batch.weights();
-            let mask: arrow::array::BooleanArray = (0..data.num_rows())
-                .map(|row| -> IvmResult<Option<bool>> {
-                    if weights.value(row) > 0 {
-                        let h = hash_row(&data, row)?;
-                        if set.contains(&h) {
-                            Ok(Some(false)) // already seen
-                        } else {
-                            set.insert(h);
-                            order.push_back(h);
-                            Ok(Some(true))
-                        }
-                    } else {
-                        Ok(Some(true)) // retractions always pass
-                    }
-                })
-                .collect::<IvmResult<arrow::array::BooleanArray>>()?;
-            batch.filter_mask(&mask).map_err(delta_err)?
+            filtered
         } else {
             batch
         };
@@ -968,9 +1105,17 @@ impl IncrementalFlow {
     /// On the first call for a source, all rows are treated as insertions (no previous
     /// snapshot). Identical consecutive snapshots produce an empty delta and no tick work.
     ///
-    /// Stateful: owns the per-source `streaming_prev_snapshots` map (which
-    /// participates in checkpoint/restore), so it cannot be a `DeltaBatch`
-    /// constructor. Use `feed` directly if your producer already emits `DeltaBatch`es.
+    /// Stateful: owns the per-source `streaming_prev_snapshots` map, which
+    /// `checkpoint_full`/`restore_full` carry (IVM-AUD-CORE-27), so it cannot be
+    /// a `DeltaBatch` constructor. Use `feed` directly if your producer already
+    /// emits `DeltaBatch`es.
+    ///
+    /// IVM-AUD-INT-F8: this is a **seam you call**, not a wired integration.
+    /// Nothing in the engine pipes a `StreamingJob`'s output into it — every
+    /// caller repo-wide is a user-facing surface (the Python handle, MCP, the
+    /// coordinator's `/stream-bridge` route) handing over batches the caller
+    /// already has. Running a streaming job into an incremental view is
+    /// application code: drain the job, call this.
     pub fn feed_snapshot(
         &self,
         source_name: impl Into<String>,
@@ -1052,7 +1197,9 @@ impl IncrementalFlow {
                     stats.last_tick_inserts = inserts;
                     stats.last_tick_retracts = retracts;
                 }
-                let _ = view.publish_output(delta);
+                // The caller supplied this delta; nothing advanced the diff
+                // baseline for it, so it must advance here (IVM-AUD-CORE-18).
+                let _ = view.apply_output_delta(&delta);
             }
         }
         Ok(StepSummary {
@@ -1122,6 +1269,7 @@ impl IncrementalFlow {
     ) -> IvmResult<StepSummary> {
         // ── Phase 1 (lock): drain pending + snapshot state ────────────────────
         let (
+            epoch_at_read,
             raw_pending,
             current_snapshots,
             view_specs,
@@ -1164,7 +1312,12 @@ impl IncrementalFlow {
                 .collect();
             // Snapshot of precise SQL deps for dirty-bit detection.
             let deps = inner.view_deps.clone();
+            // IVM-AUD-CORE-19: everything above was read under this epoch. If
+            // it moves before Phase 5 commits, the results computed from it are
+            // stale and must not be written back.
+            let epoch = inner.state_epoch;
             (
+                epoch,
                 raw,
                 snapshots,
                 specs,
@@ -1320,7 +1473,15 @@ impl IncrementalFlow {
             // incremental path would leave the view empty. Diffing the full
             // result against the cleared (None) baseline republishes the whole
             // view, which is exactly what a restore needs.
-            let plan_is_incremental = if force_diff_based || rebuild_all_views {
+            // A recursive view is never O(Δ): its value is the fixed point of
+            // its own body, which `run_recursive_fixpoint` reaches by re-running
+            // the SQL. Nothing checked this before, so a recursive declaration
+            // whose body happened to lower to an Aggregate/Distinct/Join plan
+            // (`DECLARE RECURSIVE VIEW v AS SELECT k, SUM(x) … GROUP BY k` is
+            // legal, if pointless) skipped the fixpoint loop altogether and was
+            // maintained as if the RECURSIVE keyword were absent.
+            let plan_is_incremental = if force_diff_based || rebuild_all_views || spec.is_recursive
+            {
                 false
             } else if views_needing_plans.contains(view_name) {
                 let plan = crate::plan::build_view_plan(
@@ -1434,47 +1595,25 @@ impl IncrementalFlow {
                 }
 
                 if spec.is_recursive {
-                    // Fixpoint iteration: re-run SQL until output stabilises.
-                    let mut iter = 0usize;
-                    loop {
-                        let new_full = match execute_view_sql(ctx, spec).await {
-                            Ok(rb) => rb,
-                            Err(e) => {
-                                tracing::warn!(
-                                    view = %view_name,
-                                    error = %e,
-                                    "view SQL execution failed; using empty batch"
-                                );
-                                make_empty_batch!(spec)
-                            }
-                        };
-                        let prev = view_full_outputs.get(view_name).map(|b| b as &RecordBatch);
-                        let converged = differentiate(&spec.output_schema, prev, &new_full)
-                            .map(|d| d.is_empty())
-                            .unwrap_or(true);
-                        let hit_limit = iter >= MAX_FIXPOINT_ITERS;
-                        if hit_limit {
+                    let seed = view_full_outputs.get(view_name).cloned();
+                    match run_recursive_fixpoint(spec, view_name, seed, &mut tables).await {
+                        Ok(fixed_point) => {
+                            view_full_outputs.insert(view_name.clone(), fixed_point);
+                        }
+                        Err(e) => {
                             tracing::warn!(
                                 view = %view_name,
-                                "recursive view reached MAX_FIXPOINT_ITERS without convergence"
+                                kind = ?e.kind,
+                                error = %e.message,
+                                "recursive view did not produce a fixed point this tick; \
+                                 its previous value is left in place"
                             );
+                            // Leave `view_full_outputs[view_name]` at the
+                            // previous value: Phase 5 diffs it against the same
+                            // baseline and publishes nothing, so the view holds
+                            // its last fixed point instead of a fabricated one.
+                            pre_lock_view_errors.push(e);
                         }
-                        view_full_outputs.insert(view_name.clone(), new_full.clone());
-                        if converged || hit_limit {
-                            break;
-                        }
-                        // Register updated self-view for the next iteration.
-                        if new_full.num_rows() > 0
-                            && let Err(e) = tables.register(view_name.as_str(), &new_full)
-                        {
-                            tracing::warn!(
-                                view = %view_name,
-                                error = %e,
-                                "fixpoint: failed to register updated view; \
-                                 next iteration will use stale data"
-                            );
-                        }
-                        iter += 1;
                     }
                 } else {
                     let new_full = match execute_view_sql(ctx, spec).await {
@@ -1500,6 +1639,22 @@ impl IncrementalFlow {
 
         // ── Phase 5+6 (lock): apply plans / diff, publish, update state ───────
         let mut inner = self.inner.lock().map_err(lock_err)?;
+        // IVM-AUD-CORE-19: refuse to commit onto state that moved underneath
+        // this tick. `new_snapshots` was derived from the Phase 1 snapshot and
+        // the SQL results were computed against it, so assigning it now would
+        // erase whatever landed in between — a restore, a mirrored remote tick,
+        // or a concurrent tick — silently and completely. Drop the guard before
+        // returning so the custody guard can reclaim the lock and put this
+        // tick's deltas back in `pending`.
+        if inner.state_epoch != epoch_at_read {
+            drop(inner);
+            return Err(IvmError::execution(
+                "IVM tick aborted: the flow's state was replaced while this tick was running \
+                 (a restore, a remote tick, or a concurrent step). The drained input deltas \
+                 have been returned to the pending queue; step again.",
+            ));
+        }
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
         inner.source_snapshots = new_snapshots;
         inner.last_step_outputs.clear();
         inner.tick += 1;
@@ -1817,7 +1972,26 @@ impl IncrementalFlow {
             inner
                 .last_step_outputs
                 .insert(view_name.clone(), output_delta.clone());
-            match view.publish_output(output_delta) {
+            // IVM-AUD-CORE-18: which publish is correct depends on whether the
+            // diff baseline has already been advanced this tick.
+            //
+            //   * DiffBased ran `diff_and_update` a few lines up, which set the
+            //     baseline to the full SQL result; `publish_output` must not
+            //     advance it a second time.
+            //   * The O(Δ) path never touched the baseline, so the publish has
+            //     to advance it — and `publish_output` did that only for
+            //     MATERIALIZED views. A non-materialized view maintained
+            //     incrementally therefore kept `full_output = None` for its
+            //     whole life, and the first pass that recomputed it in full (a
+            //     `force_diff_based` executor tick, a plan invalidation, a
+            //     restore) diffed against `None` and re-emitted the entire view
+            //     as insertions. `apply_output_delta` advances both halves.
+            let published = if plan_kind == ViewPlanKind::Incremental {
+                view.apply_output_delta(&output_delta)
+            } else {
+                view.publish_output(output_delta)
+            };
+            match published {
                 Ok(()) => {
                     // Stamp the tick the watch value now holds (PART-11).
                     let published_at = inner.tick;
@@ -1885,6 +2059,24 @@ impl IncrementalFlow {
     pub fn late_dropped_rows(&self, source: &str) -> IvmResult<u64> {
         let inner = self.inner.lock().map_err(lock_err)?;
         Ok(inner.late_dropped_rows.get(source).copied().unwrap_or(0))
+    }
+
+    /// Duplicate row copies this source lost to `restore_delta`'s
+    /// set-materialization (IVM-AUD-CORE-29).
+    ///
+    /// `restore_delta` collapses each row to one copy so that re-applying the
+    /// same delta slice is idempotent (G2). That trade is deliberate, but for a
+    /// multiset source it is data loss, and a comment at the call site is not
+    /// something an operator can query. Non-zero here means the restored source
+    /// is not multiset-equal to the checkpointed one; `checkpoint_full` /
+    /// `restore_full` preserve multiplicity and this counter stays 0 for them.
+    pub fn delta_restore_collapsed_rows(&self, source: &str) -> IvmResult<u64> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .delta_restore_collapsed_rows
+            .get(source)
+            .copied()
+            .unwrap_or(0))
     }
 
     /// Cumulative insert/retract counters for one view (#94), if it has
@@ -2033,14 +2225,14 @@ impl IncrementalFlow {
         let inner = self.inner.lock().map_err(lock_err)?;
         let mut out: Vec<u8> = Vec::new();
         let entries: Vec<(&String, &RecordBatch)> = inner.source_snapshots.iter().collect();
-        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, entries.len(), "source count")?;
         for (name, snapshot) in entries {
             let delta = DeltaBatch::from_inserts(snapshot.clone()).map_err(delta_err)?;
             let ipc = serialize_delta_batch(&delta).map_err(delta_err)?;
             let name_bytes = name.as_bytes();
-            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            write_u32_len(&mut out, name_bytes.len(), "source name")?;
             out.extend_from_slice(name_bytes);
-            out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+            write_u32_len(&mut out, ipc.len(), "source snapshot")?;
             out.extend_from_slice(&ipc);
         }
         Ok(out)
@@ -2085,6 +2277,7 @@ impl IncrementalFlow {
             }
         }
         inner.rebuild_all_views = true;
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -2129,6 +2322,7 @@ impl IncrementalFlow {
         }
 
         inner.tick += 1;
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
         let mut total_output_rows = 0usize;
         let mut total_inserted_rows = 0u64;
         let mut total_retracted_rows = 0u64;
@@ -2169,6 +2363,24 @@ impl IncrementalFlow {
     /// After this call the coordinator's materialized state matches the
     /// resident flow's exactly, which is what makes central fallback and
     /// re-attach (from `checkpoint_full` of this mirror) correct.
+    ///
+    /// # All-or-nothing (IVM-AUD-INT-F10)
+    ///
+    /// An error from this call leaves the mirror **as it was**, so the caller
+    /// can re-feed the input deltas it drained and recompute the tick centrally
+    /// without applying anything twice. Before, the source snapshots were
+    /// committed one at a time and the tick counter bumped before any view was
+    /// touched, so a failure part-way left a mirror that had eaten some of its
+    /// input — a re-feed would have double-counted it, and not re-feeding lost
+    /// it. That is why `submit_resident_ivm_step` used to skip its `refeed`
+    /// guard on this path and let the deltas go.
+    ///
+    /// Two things a rollback here cannot take back, because they have already
+    /// left the process: a delta emitted to a view's `subscribe` /
+    /// `subscribe_deltas` channels, and the `last_output` value behind
+    /// `view_output_peek`. A subscriber that saw a rolled-back delta will see
+    /// the equivalent delta again when the central fallback recomputes the same
+    /// tick — at-least-once, which is what that change feed already is.
     pub fn apply_remote_tick(
         &self,
         local_pending: HashMap<String, Vec<DeltaBatch>>,
@@ -2177,15 +2389,20 @@ impl IncrementalFlow {
         let inputs = coalesce_pending(local_pending)?;
         let mut inner = self.inner.lock().map_err(lock_err)?;
 
-        // Advance source snapshots deterministically (mirrors step_datafusion).
+        // Phase 1 — compute the advanced source snapshots but do NOT commit
+        // them (mirrors step_datafusion's arithmetic, not its commit point).
+        let mut advanced_sources: Vec<(String, RecordBatch)> = Vec::with_capacity(inputs.len());
         for (name, delta) in &inputs {
-            let current = inner.source_snapshots.remove(name);
+            let current = inner.source_snapshots.get(name).cloned();
             let updated = apply_delta(current, delta).map_err(delta_err)?;
-            inner.source_snapshots.insert(name.clone(), updated);
+            advanced_sources.push((name.clone(), updated));
         }
 
-        inner.tick += 1;
-        inner.last_step_outputs.clear();
+        // Phase 2 — mirror the executor's per-view output deltas, remembering
+        // each view's prior (snapshot, baseline) so a failure part-way can put
+        // every already-applied view back.
+        let mut undo: Vec<(String, Option<RecordBatch>, Option<RecordBatch>)> = Vec::new();
+        let mut applied: Vec<(String, DeltaBatch)> = Vec::new();
         let mut total_output_rows = 0usize;
         let mut total_inserted_rows = 0u64;
         let mut total_retracted_rows = 0u64;
@@ -2194,22 +2411,47 @@ impl IncrementalFlow {
             if delta.is_empty() {
                 continue;
             }
-            if let Ok(view) = inner.view_registry.get(&name) {
-                view.apply_output_delta(&delta).map_err(delta_err)?;
-                total_output_rows += delta.num_rows();
-                active_views += 1;
-                let (inserts, retracts) = delta_insert_retract_counts(&delta);
-                total_inserted_rows += inserts;
-                total_retracted_rows += retracts;
-                let stats = inner.view_delta_stats.entry(name.clone()).or_default();
-                stats.rows_inserted_total += inserts;
-                stats.rows_retracted_total += retracts;
-                stats.last_tick_inserts = inserts;
-                stats.last_tick_retracts = retracts;
-                let published_at = inner.tick;
-                inner.view_output_ticks.insert(name.clone(), published_at);
-                inner.last_step_outputs.insert(name, delta);
+            let Ok(view) = inner.view_registry.get(&name) else {
+                continue;
+            };
+            let before_snapshot = view.snapshot().map_err(delta_err)?;
+            let before_baseline = view.full_output_baseline().map_err(delta_err)?;
+            if let Err(e) = view.apply_output_delta(&delta) {
+                for (undo_name, snapshot, baseline) in undo {
+                    if let Ok(undo_view) = inner.view_registry.get(&undo_name) {
+                        // Best effort: the only way this fails is a poisoned
+                        // view lock, which the apply above would have hit first.
+                        let _ = undo_view.restore_state(snapshot, baseline);
+                    }
+                }
+                return Err(delta_err(e));
             }
+            undo.push((name.clone(), before_snapshot, before_baseline));
+            total_output_rows += delta.num_rows();
+            active_views += 1;
+            let (inserts, retracts) = delta_insert_retract_counts(&delta);
+            total_inserted_rows += inserts;
+            total_retracted_rows += retracts;
+            applied.push((name, delta));
+        }
+
+        // Phase 3 — commit. Nothing from here on can fail.
+        for (name, batch) in advanced_sources {
+            inner.source_snapshots.insert(name, batch);
+        }
+        inner.tick += 1;
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
+        inner.last_step_outputs.clear();
+        let published_at = inner.tick;
+        for (name, delta) in applied {
+            let (inserts, retracts) = delta_insert_retract_counts(&delta);
+            let stats = inner.view_delta_stats.entry(name.clone()).or_default();
+            stats.rows_inserted_total += inserts;
+            stats.rows_retracted_total += retracts;
+            stats.last_tick_inserts = inserts;
+            stats.last_tick_retracts = retracts;
+            inner.view_output_ticks.insert(name.clone(), published_at);
+            inner.last_step_outputs.insert(name, delta);
         }
         Ok(StepSummary {
             total_output_rows,
@@ -2233,6 +2475,7 @@ impl IncrementalFlow {
         inner.view_plans.clear();
         inner.view_plan_sqls.clear();
         inner.pending_plan_state.clear();
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -2260,12 +2503,12 @@ impl IncrementalFlow {
         let inner = self.inner.lock().map_err(lock_err)?;
         let mut out: Vec<u8> = Vec::new();
         let sources: Vec<(&String, &RecordBatch)> = inner.source_snapshots.iter().collect();
-        out.extend_from_slice(&(sources.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, sources.len(), "source count")?;
         for (name, snap) in sources {
             encode_named_batch(&mut out, name, snap)?;
         }
         let names = inner.view_registry.view_names().map_err(delta_err)?;
-        out.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, names.len(), "view count")?;
         for name in &names {
             let view = inner.view_registry.get(name).map_err(delta_err)?;
             let snap = view.snapshot().map_err(delta_err)?;
@@ -2283,13 +2526,14 @@ impl IncrementalFlow {
             .iter()
             .filter_map(|(name, plan)| plan.checkpoint_state().map(|b| (name, b)))
             .collect();
-        out.extend_from_slice(&(plan_states.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, plan_states.len(), "plan-state count")?;
         for (name, bytes) in plan_states {
-            out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+            write_u32_len(&mut out, name.len(), "view name")?;
             out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            write_u32_len(&mut out, bytes.len(), "operator state")?;
             out.extend_from_slice(&bytes);
         }
+        encode_exact_state(&mut out, &inner)?;
         Ok(out)
     }
 
@@ -2309,7 +2553,20 @@ impl IncrementalFlow {
             HashMap::with_capacity(bounded_capacity(n_views, bytes.len()));
         for _ in 0..n_views {
             let (name, snap) = decode_named_batch_opt(bytes, &mut pos)?;
-            let (_name2, full) = decode_named_batch_opt(bytes, &mut pos)?;
+            let (paired_name, full) = decode_named_batch_opt(bytes, &mut pos)?;
+            // IVM-AUD-CORE-28: `checkpoint_full` writes the view name twice —
+            // once with the snapshot, once with the full-output baseline — and
+            // this used to drop the second copy unread. A blob whose two halves
+            // had drifted out of step (a truncated write, a framing bug, two
+            // writers) then restored view A's snapshot together with view B's
+            // baseline, and every later diff was against the wrong view. The
+            // second name is a checksum on the pairing; read it.
+            if paired_name != name {
+                return Err(IvmError::execution(format!(
+                    "checkpoint view entry is inconsistent: snapshot is labelled '{name}' but \
+                     the full-output baseline that follows it is labelled '{paired_name}'"
+                )));
+            }
             view_state.insert(name, (snap, full));
         }
         // Plan-state section (optional for forward-compat with older blobs that
@@ -2330,6 +2587,10 @@ impl IncrementalFlow {
                 pending_plan_state.insert(name, data);
             }
         }
+        // Exact-state section (IVM-AUD-CORE-27), absent from blobs written
+        // before it existed. Decoded before the lock is taken so a malformed
+        // blob cannot leave the flow half-restored.
+        let exact = decode_exact_state(bytes, &mut pos)?;
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
         // Drop any stale cached plans so the next step rebuilds them fresh and
@@ -2344,6 +2605,10 @@ impl IncrementalFlow {
                 view.restore_state(snap, full).map_err(delta_err)?;
             }
         }
+        if let Some(exact) = exact {
+            apply_exact_state(&mut inner, exact);
+        }
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -2358,7 +2623,7 @@ impl IncrementalFlow {
         let deltas = std::mem::take(&mut inner.checkpoint_deltas);
         let mut out: Vec<u8> = Vec::new();
         let entries: Vec<(String, Vec<DeltaBatch>)> = deltas.into_iter().collect();
-        out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, entries.len(), "source count")?;
         for (name, delta_list) in entries {
             let combined = if delta_list.len() == 1 {
                 delta_list
@@ -2370,9 +2635,9 @@ impl IncrementalFlow {
             };
             let ipc = serialize_delta_batch(&combined).map_err(delta_err)?;
             let name_bytes = name.as_bytes();
-            out.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            write_u32_len(&mut out, name_bytes.len(), "source name")?;
             out.extend_from_slice(name_bytes);
-            out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+            write_u32_len(&mut out, ipc.len(), "accumulated delta")?;
             out.extend_from_slice(&ipc);
         }
         Ok(out)
@@ -2413,6 +2678,30 @@ impl IncrementalFlow {
             // trade: duplicate-row sources restored through *delta*
             // checkpoints collapse to one copy (the modern `checkpoint_full`
             // path restores multiplicity losslessly via operator state).
+            // IVM-AUD-CORE-29: the collapse above was guarded only by the
+            // comment. It is a real, silent loss — a source holding the same
+            // row twice comes back holding it once — so count it and say so.
+            // `filter_positive` keeps one copy per positive row; the weights
+            // it is about to discard are exactly the lost copies.
+            let collapsed: u64 = consolidated
+                .weights()
+                .iter()
+                .flatten()
+                .filter(|w| *w > 1)
+                .map(|w| (w - 1) as u64)
+                .sum();
+            if collapsed > 0 {
+                tracing::warn!(
+                    source = %name,
+                    collapsed_copies = collapsed,
+                    "restore_delta is set-materializing: duplicate row copies in this source \
+                     were collapsed to one. Restore from checkpoint_full to keep multiplicity."
+                );
+                *inner
+                    .delta_restore_collapsed_rows
+                    .entry(name.clone())
+                    .or_insert(0) += collapsed;
+            }
             let snapshot = consolidated.filter_positive().map_err(delta_err)?;
             inner.source_snapshots.insert(name, snapshot);
         }
@@ -2429,6 +2718,7 @@ impl IncrementalFlow {
             }
         }
         inner.rebuild_all_views = true;
+        inner.state_epoch = inner.state_epoch.wrapping_add(1);
         Ok(())
     }
 }
@@ -2574,6 +2864,61 @@ impl Drop for DrainedPending {
 /// allowed. Matching is case-insensitive because DataFusion lowercases
 /// unquoted identifiers while callers name sources however they like
 /// (IVM-AUD-CORE-24).
+/// Drop insertion rows this source has already delivered, recording the ones
+/// admitted, and keep the retained-hash set within `capacity`.
+///
+/// Returns the surviving delta and how many old hashes were evicted.
+/// Retractions always pass: a retraction is not a re-delivery, and dropping one
+/// would strand its insertion.
+///
+/// IVM-AUD-CORE-26: the capacity check used to run once per `feed`, *before* any
+/// row was inserted, so one batch of N rows pushed the set N entries past the
+/// cap — `DEDUP_SEEN_CAPACITY` bounded the set only for a caller feeding a row
+/// at a time, which no caller does. The check is per admitted row here, so the
+/// set never exceeds `capacity` regardless of batch size.
+///
+/// Eviction is FIFO and takes `evict_batch` entries at a time (1% of the cap in
+/// production) so a burst can re-admit only that small window of rows, rather
+/// than the whole history a full clear would re-admit.
+fn dedup_filter(
+    order: &mut VecDeque<u64>,
+    set: &mut AHashSet<u64>,
+    batch: DeltaBatch,
+    capacity: usize,
+    evict_batch: usize,
+) -> IvmResult<(DeltaBatch, usize)> {
+    let data = batch.data_batch();
+    let weights = batch.weights();
+    let mut evicted = 0usize;
+    let mask: arrow::array::BooleanArray = (0..data.num_rows())
+        .map(|row| -> IvmResult<Option<bool>> {
+            if weights.value(row) <= 0 {
+                return Ok(Some(true)); // retractions always pass
+            }
+            let h = hash_row(&data, row)?;
+            if set.contains(&h) {
+                return Ok(Some(false)); // already seen
+            }
+            if set.len() >= capacity {
+                for _ in 0..evict_batch.max(1) {
+                    match order.pop_front() {
+                        Some(old) => {
+                            set.remove(&old);
+                            evicted += 1;
+                        }
+                        None => break,
+                    }
+                }
+            }
+            set.insert(h);
+            order.push_back(h);
+            Ok(Some(true))
+        })
+        .collect::<IvmResult<arrow::array::BooleanArray>>()?;
+    let filtered = batch.filter_mask(&mask).map_err(delta_err)?;
+    Ok((filtered, evicted))
+}
+
 fn validate_feed_target(inner: &IncrementalFlowInner, source_name: &str) -> IvmResult<()> {
     if inner.view_deps.is_empty() {
         return Ok(());
@@ -2618,6 +2963,125 @@ pub fn coalesce_pending(
             Ok((name, consolidated))
         })
         .collect()
+}
+
+/// A schema-only batch shaped like `spec`'s declared output.
+fn empty_output_batch(spec: &IncrementalViewSpec) -> IvmResult<RecordBatch> {
+    let cols: Vec<_> = spec
+        .output_schema
+        .fields()
+        .iter()
+        .map(|f| arrow::array::new_empty_array(f.data_type()))
+        .collect();
+    RecordBatch::try_new(spec.output_schema.clone(), cols)
+        .map_err(|e| IvmError::execution(e.to_string()))
+}
+
+/// Rows that appear more than once in `batch` (counting multiplicity above the
+/// first copy). Zero means the batch is a set.
+///
+/// Used only to explain a divergence: it is the difference between "your body
+/// is not set-semantic" and "your recursion genuinely enumerates unboundedly
+/// many distinct rows", and those need different fixes.
+fn duplicate_row_count(batch: &RecordBatch) -> IvmResult<i64> {
+    if batch.num_rows() == 0 {
+        return Ok(0);
+    }
+    let schema = batch.schema();
+    let as_delta = DeltaBatch::from_inserts(batch.clone()).map_err(delta_err)?;
+    let consolidated = consolidate_batch(as_delta, &[], &schema).map_err(delta_err)?;
+    Ok(consolidated
+        .weights()
+        .iter()
+        .flatten()
+        .filter(|w| *w > 1)
+        .map(|w| w - 1)
+        .sum())
+}
+
+/// Iterate a recursive view's body to a fixed point, inside one tick.
+///
+/// Naive evaluation: the view's own current value is registered as a table, the
+/// body SQL is re-run against it, and the result becomes the next iterate. The
+/// loop ends when an iterate equals its predecessor — an actual fixed point —
+/// and in no other way. Every other outcome is an `Err`, never a value:
+///
+/// * the body SQL failed (IVM-AUD-CORE-11: this used to substitute an empty
+///   batch and record nothing, so a recursive view whose SQL broke retracted
+///   itself entirely and the tick reported success);
+/// * the convergence diff failed (IVM-AUD-CORE-10: `differentiate(..)
+///   .map(|d| d.is_empty()).unwrap_or(true)` read a *failed* comparison as
+///   "converged" and stopped the loop at a non-fixed point);
+/// * `MAX_FIXPOINT_ITERS` was reached (IVM-AUD-CORE-12: the cap used to publish
+///   the Nth iterate as the view's answer, so a diverging query returned a
+///   truncated result with no error and nothing in the step summary).
+///
+/// On `Err` the caller leaves the view at its previous value and the error
+/// travels out in [`StepSummary::errored_views`].
+///
+/// The self-reference is seeded here. A recursive body reads its own name, and
+/// the tick registers a table for a view only when it has a non-empty previous
+/// output — so on the first tick `ctx.sql()` failed with "table not found",
+/// that failure was swallowed as above, and the view stayed empty forever.
+/// A `DECLARE RECURSIVE VIEW` produced no rows at all, on any input, and
+/// reported a clean tick while doing it.
+async fn run_recursive_fixpoint(
+    spec: &IncrementalViewSpec,
+    view_name: &str,
+    seed: Option<RecordBatch>,
+    tables: &mut TickTables<'_>,
+) -> Result<RecordBatch, ViewError> {
+    let err = |kind: ViewErrorKind, message: String| ViewError {
+        view: view_name.to_string(),
+        kind,
+        message,
+    };
+    let sql_err = |e: &dyn std::fmt::Display| err(ViewErrorKind::ViewSql, e.to_string());
+
+    let mut current = match seed {
+        Some(b) => b,
+        None => empty_output_batch(spec).map_err(|e| sql_err(&e))?,
+    };
+    tables
+        .register(view_name, &current)
+        .map_err(|e| sql_err(&e))?;
+
+    for _ in 0..MAX_FIXPOINT_ITERS {
+        let next = execute_view_sql(tables.ctx, spec)
+            .await
+            .map_err(|e| sql_err(&e))?;
+        let delta =
+            differentiate(&spec.output_schema, Some(&current), &next).map_err(|e| sql_err(&e))?;
+        if delta.is_empty() {
+            return Ok(next);
+        }
+        tables.register(view_name, &next).map_err(|e| sql_err(&e))?;
+        current = next;
+    }
+
+    // IVM-AUD-CORE-13: nothing checks that a recursive body is set-semantic
+    // before running it, and nothing can — the body is opaque SQL. What is
+    // knowable is why THIS body failed to converge, and the two causes need
+    // opposite fixes, so say which one it is.
+    let dups = duplicate_row_count(&current).unwrap_or(0);
+    let rows = current.num_rows();
+    let message = if dups > 0 {
+        format!(
+            "recursive view did not reach a fixed point in {MAX_FIXPOINT_ITERS} iterations; \
+             its {rows}-row iterate carries {dups} duplicate rows, so the body is not \
+             set-semantic — a UNION ALL recursion over a cyclic input grows without bound. \
+             Write the body with UNION (or SELECT DISTINCT) so each derived row is produced \
+             once. Nothing de-duplicates it for you."
+        )
+    } else {
+        format!(
+            "recursive view did not reach a fixed point in {MAX_FIXPOINT_ITERS} iterations; \
+             the iterate reached {rows} distinct rows and was still growing, so the recursion \
+             enumerates unboundedly many rows (an unbounded counter, or a join that widens \
+             every round). Bound it in the body."
+        )
+    };
+    Err(err(ViewErrorKind::FixpointNotConverged, message))
 }
 
 async fn execute_view_sql(
@@ -2827,6 +3291,77 @@ fn slice_err() -> IvmError {
     IvmError::execution("checkpoint bytes truncated")
 }
 
+fn read_u64(bytes: &[u8], pos: &mut usize) -> IvmResult<u64> {
+    let slice = bytes.get(*pos..*pos + 8).ok_or_else(slice_err)?;
+    *pos += 8;
+    let mut arr = [0u8; 8];
+    arr.copy_from_slice(slice);
+    Ok(u64::from_le_bytes(arr))
+}
+
+fn read_i64(bytes: &[u8], pos: &mut usize) -> IvmResult<i64> {
+    Ok(read_u64(bytes, pos)? as i64)
+}
+
+fn write_u64(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+fn write_i64(out: &mut Vec<u8>, v: i64) {
+    out.extend_from_slice(&v.to_le_bytes());
+}
+
+/// `u32 len || name bytes`.
+fn write_name(out: &mut Vec<u8>, name: &str) -> IvmResult<()> {
+    write_u32_len(out, name.len(), "name")?;
+    out.extend_from_slice(name.as_bytes());
+    Ok(())
+}
+
+/// `u32 count || (u32 ipc_len || delta ipc)*`
+fn write_delta_list(out: &mut Vec<u8>, deltas: &[DeltaBatch]) -> IvmResult<()> {
+    write_u32_len(out, deltas.len(), "delta count")?;
+    for d in deltas {
+        let ipc = serialize_delta_batch(d).map_err(delta_err)?;
+        write_u32_len(out, ipc.len(), "delta payload")?;
+        out.extend_from_slice(&ipc);
+    }
+    Ok(())
+}
+
+fn read_delta_list(bytes: &[u8], pos: &mut usize) -> IvmResult<Vec<DeltaBatch>> {
+    let n = read_u32(bytes, pos)? as usize;
+    let mut out = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let len = read_u32(bytes, pos)? as usize;
+        let data = bytes.get(*pos..*pos + len).ok_or_else(slice_err)?;
+        *pos += len;
+        out.push(deserialize_delta_batch(data).map_err(delta_err)?);
+    }
+    Ok(out)
+}
+
+/// Append a `u32` little-endian length prefix, refusing anything that does not
+/// fit.
+///
+/// IVM-AUD-CORE-30: every length in these frames used to be written as
+/// `(len as u32)`, which does not fail above 4 GiB — it truncates. A 4 GiB + 1
+/// byte payload wrote the length `1`, the reader took one byte and then read
+/// the rest of the payload as the next frame's fields: a corrupt blob that
+/// decodes without error into wrong state. `as` casts cannot be trusted at a
+/// format boundary, so the boundary refuses instead.
+fn write_u32_len(out: &mut Vec<u8>, len: usize, what: &str) -> IvmResult<()> {
+    let n = u32::try_from(len).map_err(|_| {
+        IvmError::execution(format!(
+            "{what} is {len} bytes, past the {} the checkpoint frame can address; \
+             the frame uses u32 length prefixes",
+            u32::MAX
+        ))
+    })?;
+    out.extend_from_slice(&n.to_le_bytes());
+    Ok(())
+}
+
 fn delta_err(e: DeltaError) -> IvmError {
     IvmError::execution(e.to_string())
 }
@@ -2835,14 +3370,318 @@ fn lock_err<T>(_: T) -> IvmError {
     IvmError::execution("incremental flow lock poisoned")
 }
 
+// ── Exact-state section of `checkpoint_full` (IVM-AUD-CORE-27) ───────────────
+//
+// `checkpoint_full` used to capture source snapshots, view snapshot/baseline
+// pairs and operator accumulators — and nothing else. Everything else the flow
+// holds was silently reset by a restore:
+//
+//   * `tick` went back to 0, so `view_output_tick` and every fence built on the
+//     tick counter went backwards after a coordinator restart;
+//   * `pending` — deltas already accepted (`/feed` answered 200) but not yet
+//     stepped — was **dropped**;
+//   * `streaming_prev_snapshots` was lost, so the next `feed_snapshot` had no
+//     previous snapshot to differentiate against and re-inserted the ENTIRE
+//     snapshot as insertions, double-counting every row still present;
+//   * `source_ordinals` was lost, so `feed_if_advanced` no longer recognised an
+//     offset it had already processed and re-applied it;
+//   * watermarks reset to `i64::MIN`, so a LATENESS bound stopped dropping late
+//     rows until it re-observed a high-water mark;
+//   * the delta-checkpoint accumulator, the per-view counters and the drop/
+//     collapse counters all reset to zero.
+//
+// The section below carries all of it. It is appended AFTER the plan-state
+// section behind a magic tag, so: a blob written before this exists has no tag
+// and restores exactly as it used to (the fields above keep whatever the live
+// flow had); and a binary predating this reads a new blob up to the plan-state
+// section and ignores the rest. Neither direction needs a version bump.
+const EXACT_STATE_MAGIC: &[u8; 5] = b"IVMF2";
+
+/// Flow state that is neither a source snapshot, a view baseline nor an
+/// operator accumulator, captured so a restore reproduces the flow exactly.
+struct ExactState {
+    tick: u64,
+    pending: HashMap<String, Vec<DeltaBatch>>,
+    streaming_prev_snapshots: HashMap<String, RecordBatch>,
+    source_ordinals: Vec<(String, Vec<u8>)>,
+    watermarks: Vec<(String, LatenessSpec, i64)>,
+    checkpoint_deltas: HashMap<String, Vec<DeltaBatch>>,
+    view_delta_stats: Vec<(String, ViewDeltaStats)>,
+    late_dropped_rows: Vec<(String, u64)>,
+    delta_restore_collapsed_rows: Vec<(String, u64)>,
+    input_dedup_enabled: bool,
+    delta_checkpoint_enabled: bool,
+    force_diff_based: bool,
+    rebuild_all_views: bool,
+    /// Per source, the retained row hashes in FIFO (eviction) order.
+    ///
+    /// Written only when dedup is enabled. It is the one part of this section
+    /// that can be large — `DEDUP_SEEN_CAPACITY` is 10 M hashes, i.e. up to
+    /// 80 MB per source — and it is here because dropping it silently breaks
+    /// the at-most-once guarantee the caller opted into: after a restore every
+    /// row already applied would be admitted again.
+    dedup_hashes: Vec<(String, Vec<u64>)>,
+}
+
+fn encode_exact_state(out: &mut Vec<u8>, inner: &IncrementalFlowInner) -> IvmResult<()> {
+    out.extend_from_slice(EXACT_STATE_MAGIC);
+    write_u64(out, inner.tick);
+
+    write_u32_len(out, inner.pending.len(), "pending source count")?;
+    for (name, deltas) in &inner.pending {
+        write_name(out, name)?;
+        write_delta_list(out, deltas)?;
+    }
+
+    write_u32_len(
+        out,
+        inner.streaming_prev_snapshots.len(),
+        "streaming snapshot count",
+    )?;
+    for (name, batch) in &inner.streaming_prev_snapshots {
+        encode_named_batch(out, name, batch)?;
+    }
+
+    write_u32_len(out, inner.source_ordinals.len(), "ordinal count")?;
+    for (name, ordinal) in &inner.source_ordinals {
+        write_name(out, name)?;
+        write_u32_len(out, ordinal.len(), "ordinal")?;
+        out.extend_from_slice(ordinal);
+    }
+
+    write_u32_len(out, inner.watermark_trackers.len(), "watermark count")?;
+    for (name, tracker) in &inner.watermark_trackers {
+        write_name(out, name)?;
+        write_name(out, tracker.lateness_column())?;
+        write_i64(out, tracker.lateness_ms());
+        write_i64(out, tracker.max_observed_ts());
+    }
+
+    write_u32_len(
+        out,
+        inner.checkpoint_deltas.len(),
+        "delta accumulator count",
+    )?;
+    for (name, deltas) in &inner.checkpoint_deltas {
+        write_name(out, name)?;
+        write_delta_list(out, deltas)?;
+    }
+
+    write_u32_len(out, inner.view_delta_stats.len(), "view stats count")?;
+    for (name, stats) in &inner.view_delta_stats {
+        write_name(out, name)?;
+        write_u64(out, stats.rows_inserted_total);
+        write_u64(out, stats.rows_retracted_total);
+        write_u64(out, stats.last_tick_inserts);
+        write_u64(out, stats.last_tick_retracts);
+    }
+
+    write_u32_len(out, inner.late_dropped_rows.len(), "late-drop count")?;
+    for (name, n) in &inner.late_dropped_rows {
+        write_name(out, name)?;
+        write_u64(out, *n);
+    }
+
+    write_u32_len(
+        out,
+        inner.delta_restore_collapsed_rows.len(),
+        "collapse count",
+    )?;
+    for (name, n) in &inner.delta_restore_collapsed_rows {
+        write_name(out, name)?;
+        write_u64(out, *n);
+    }
+
+    let flags = (inner.input_dedup_enabled as u8)
+        | ((inner.delta_checkpoint_enabled as u8) << 1)
+        | ((inner.force_diff_based as u8) << 2)
+        | ((inner.rebuild_all_views as u8) << 3);
+    out.push(flags);
+
+    // Dedup hashes, in eviction order, only when the feature is on.
+    let dedup: Vec<(&String, &VecDeque<u64>)> = if inner.input_dedup_enabled {
+        inner
+            .seen_input_hashes
+            .iter()
+            .map(|(name, (order, _))| (name, order))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    write_u32_len(out, dedup.len(), "dedup source count")?;
+    for (name, order) in dedup {
+        write_name(out, name)?;
+        write_u32_len(out, order.len(), "dedup hash count")?;
+        for h in order {
+            write_u64(out, *h);
+        }
+    }
+    Ok(())
+}
+
+/// Read the exact-state section if this blob has one.
+///
+/// Returns `Ok(None)` for a blob written before the section existed, which is
+/// how a restore of an old checkpoint keeps its old (lossy) behaviour instead
+/// of failing.
+fn decode_exact_state(bytes: &[u8], pos: &mut usize) -> IvmResult<Option<ExactState>> {
+    match bytes.get(*pos..*pos + EXACT_STATE_MAGIC.len()) {
+        Some(tag) if tag == EXACT_STATE_MAGIC.as_slice() => {}
+        _ => return Ok(None),
+    }
+    *pos += EXACT_STATE_MAGIC.len();
+
+    let tick = read_u64(bytes, pos)?;
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut pending = HashMap::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        pending.insert(name, read_delta_list(bytes, pos)?);
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut streaming_prev_snapshots = HashMap::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let (name, batch) = decode_named_batch(bytes, pos)?;
+        streaming_prev_snapshots.insert(name, batch);
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut source_ordinals = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        let len = read_u32(bytes, pos)? as usize;
+        let ordinal = bytes.get(*pos..*pos + len).ok_or_else(slice_err)?.to_vec();
+        *pos += len;
+        source_ordinals.push((name, ordinal));
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut watermarks = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        let column = decode_name(bytes, pos)?;
+        let lateness_ms = read_i64(bytes, pos)?;
+        let max_observed_ts = read_i64(bytes, pos)?;
+        watermarks.push((
+            name,
+            LatenessSpec::new(column, lateness_ms),
+            max_observed_ts,
+        ));
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut checkpoint_deltas = HashMap::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        checkpoint_deltas.insert(name, read_delta_list(bytes, pos)?);
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut view_delta_stats = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        view_delta_stats.push((
+            name,
+            ViewDeltaStats {
+                rows_inserted_total: read_u64(bytes, pos)?,
+                rows_retracted_total: read_u64(bytes, pos)?,
+                last_tick_inserts: read_u64(bytes, pos)?,
+                last_tick_retracts: read_u64(bytes, pos)?,
+            },
+        ));
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut late_dropped_rows = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        late_dropped_rows.push((name, read_u64(bytes, pos)?));
+    }
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut delta_restore_collapsed_rows = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        delta_restore_collapsed_rows.push((name, read_u64(bytes, pos)?));
+    }
+
+    let flags = *bytes.get(*pos).ok_or_else(slice_err)?;
+    *pos += 1;
+
+    let n = read_u32(bytes, pos)? as usize;
+    let mut dedup_hashes = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        let count = read_u32(bytes, pos)? as usize;
+        // Each hash is 8 bytes, so a blob of `len` bytes cannot hold more than
+        // `len / 8` of them — a corrupt count must not become a huge alloc.
+        let mut hashes = Vec::with_capacity(count.min(bytes.len() / 8));
+        for _ in 0..count {
+            hashes.push(read_u64(bytes, pos)?);
+        }
+        dedup_hashes.push((name, hashes));
+    }
+
+    Ok(Some(ExactState {
+        tick,
+        pending,
+        streaming_prev_snapshots,
+        source_ordinals,
+        watermarks,
+        checkpoint_deltas,
+        view_delta_stats,
+        late_dropped_rows,
+        delta_restore_collapsed_rows,
+        input_dedup_enabled: flags & 1 != 0,
+        delta_checkpoint_enabled: flags & 2 != 0,
+        force_diff_based: flags & 4 != 0,
+        rebuild_all_views: flags & 8 != 0,
+        dedup_hashes,
+    }))
+}
+
+fn apply_exact_state(inner: &mut IncrementalFlowInner, exact: ExactState) {
+    inner.tick = exact.tick;
+    inner.pending = exact.pending;
+    inner.streaming_prev_snapshots = exact.streaming_prev_snapshots;
+    inner.source_ordinals = exact.source_ordinals.into_iter().collect();
+    inner.watermark_trackers = exact
+        .watermarks
+        .into_iter()
+        .map(|(name, spec, max_observed_ts)| {
+            let mut tracker = WatermarkTracker::new(spec);
+            tracker.observe(max_observed_ts);
+            (name, tracker)
+        })
+        .collect();
+    inner.checkpoint_deltas = exact.checkpoint_deltas;
+    inner.view_delta_stats = exact.view_delta_stats.into_iter().collect();
+    inner.late_dropped_rows = exact.late_dropped_rows.into_iter().collect();
+    inner.delta_restore_collapsed_rows = exact.delta_restore_collapsed_rows.into_iter().collect();
+    inner.input_dedup_enabled = exact.input_dedup_enabled;
+    inner.delta_checkpoint_enabled = exact.delta_checkpoint_enabled;
+    inner.force_diff_based = exact.force_diff_based;
+    inner.rebuild_all_views = exact.rebuild_all_views;
+    inner.seen_input_hashes = exact
+        .dedup_hashes
+        .into_iter()
+        .map(|(name, hashes)| {
+            let set: AHashSet<u64> = hashes.iter().copied().collect();
+            (name, (VecDeque::from(hashes), set))
+        })
+        .collect();
+}
+
 // ── RecordBatch framing helpers (for checkpoint_full / restore_full) ──────────
 
 /// Encode `name` + a required `RecordBatch` as Arrow IPC into `out`.
 fn encode_named_batch(out: &mut Vec<u8>, name: &str, batch: &RecordBatch) -> IvmResult<()> {
-    out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    write_u32_len(out, name.len(), "entry name")?;
     out.extend_from_slice(name.as_bytes());
     let ipc = encode_record_batch_ipc(batch)?;
-    out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+    write_u32_len(out, ipc.len(), "entry payload")?;
     out.extend_from_slice(&ipc);
     Ok(())
 }
@@ -2946,7 +3785,7 @@ fn empty_batch_for_view(view: &krishiv_delta::IncrementalView) -> IvmResult<Reco
 /// `u32 count || (u32 name_len || name || u32 ipc_len || arrow_ipc)*`
 pub fn encode_batch_map(map: &HashMap<String, RecordBatch>) -> IvmResult<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    write_u32_len(&mut out, map.len(), "view count")?;
     for (name, batch) in map {
         encode_named_batch(&mut out, name, batch)?;
     }
@@ -2979,12 +3818,12 @@ const DELTA_MAP_MAGIC: &[u8; 5] = b"IVMD1";
 pub fn encode_delta_map(map: &HashMap<String, DeltaBatch>) -> IvmResult<Vec<u8>> {
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(DELTA_MAP_MAGIC);
-    out.extend_from_slice(&(map.len() as u32).to_le_bytes());
+    write_u32_len(&mut out, map.len(), "view count")?;
     for (name, delta) in map {
         let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
-        out.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, name.len(), "view name")?;
         out.extend_from_slice(name.as_bytes());
-        out.extend_from_slice(&(ipc.len() as u32).to_le_bytes());
+        write_u32_len(&mut out, ipc.len(), "output delta")?;
         out.extend_from_slice(&ipc);
     }
     Ok(out)
@@ -3011,6 +3850,16 @@ pub fn decode_delta_map(bytes: &[u8]) -> IvmResult<HashMap<String, DeltaBatch>> 
 // ── Fragment encoding helpers (coordinator-authoritative executor dispatch) ───
 
 /// Encode a coordinator-authoritative IVM dispatch fragment.
+///
+/// **No production caller** (IVM-AUD-INT-F20). The coordinator's resident
+/// dispatch encodes [`encode_ivm_attach_fragment`] + [`encode_ivm_tick_fragment`]
+/// instead; the only callers of this function, of
+/// [`encode_ivm_ckpt_fragment`], and of the executor's `execute_ivm_fragment`
+/// that decodes them are tests. The receiving half is still wired into the
+/// executor's task runner, so a `delta:step:` fragment WOULD execute if one were
+/// ever sent — nothing sends one. Kept, unremoved, only because deleting it
+/// means deleting the executor half too; do not read its existence as evidence
+/// that the stateless dispatch path is in use.
 ///
 /// Format: `delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}`
 ///
@@ -3131,6 +3980,18 @@ fn encode_specs_b64(specs: &[IncrementalViewSpec]) -> IvmResult<String> {
     Ok(b64.encode(specs_json))
 }
 
+/// Base64 of JSON of base64 of Arrow IPC.
+///
+/// IVM-AUD-INT-F19: this is the `delta:tick:` payload — the wire whose stated
+/// purpose is "O(Δ)". Each delta is base64'd (×4/3), embedded in a JSON array
+/// (a per-entry string quote/escape pass plus the field names), and the whole
+/// array is base64'd again (×4/3): ≈1.78× the IPC bytes, plus one full buffer
+/// copy per layer. [`encode_delta_map`] already frames the same map in binary
+/// at ×1.0, and [`decode_delta_map`] already reads it — the `delta:tick:`
+/// fragment could carry `b64(encode_delta_map(..))` for ×1.33 and one copy.
+/// Not changed here because the decoder lives in `krishiv-executor` and both
+/// ends must move together, which also means a mixed-version cluster needs a
+/// negotiated cutover.
 fn encode_deltas_b64(pending: &HashMap<String, DeltaBatch>) -> IvmResult<String> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
@@ -3174,6 +4035,9 @@ pub fn encode_ivm_tick_fragment(
 }
 
 /// Encode a `delta:ckpt:` fragment (resident flow → `checkpoint_full` bytes).
+///
+/// **No production caller** (IVM-AUD-INT-F20) — see
+/// [`encode_ivm_step_fragment`].
 pub fn encode_ivm_ckpt_fragment(job_id: &str) -> String {
     format!("delta:ckpt:{job_id}")
 }
@@ -4507,5 +5371,681 @@ mod integration_tests {
             );
         }
         assert!((running - 195.0).abs() < 1e-9); // 185 + 2*5
+    }
+
+    // ── IVM-AUD-CORE-10/11/12/13: recursive-view fixpoint ────────────────────
+    //
+    // Before these, `DECLARE RECURSIVE VIEW` was a silent no-op end to end: the
+    // tick registers a table for a view only when it already has a non-empty
+    // output, so the body's self-reference resolved to nothing, the SQL failed
+    // with "table not found", the failure was swallowed into an empty batch,
+    // and the empty batch diffed to nothing against an empty baseline. The
+    // step summary said `errored_views: []`.
+
+    mod recursive_views {
+        use super::*;
+        use krishiv_delta::IncrementalViewSpec;
+
+        use crate::flow::{ViewErrorKind, ViewExecution};
+
+        fn edge_batch(srcs: &[i32], dsts: &[i32]) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("src", DataType::Int32, false),
+                    Field::new("dst", DataType::Int32, false),
+                ])),
+                vec![
+                    Arc::new(Int32Array::from(srcs.to_vec())) as arrow::array::ArrayRef,
+                    Arc::new(Int32Array::from(dsts.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn reach_spec(body: &str) -> IncrementalViewSpec {
+            IncrementalViewSpec {
+                name: "reach".into(),
+                body_sql: body.into(),
+                output_schema: Arc::new(Schema::new(vec![
+                    Field::new("src", DataType::Int32, true),
+                    Field::new("dst", DataType::Int32, true),
+                ])),
+                is_materialized: true,
+                is_recursive: true,
+                lateness: vec![],
+            }
+        }
+
+        /// `reach` as a set of (src, dst) pairs.
+        fn pairs(flow: &IncrementalFlow) -> Vec<(i32, i32)> {
+            let Some(snap) = flow.snapshot("reach").unwrap() else {
+                return Vec::new();
+            };
+            let src = snap
+                .column_by_name("src")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let dst = snap
+                .column_by_name("dst")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let mut out: Vec<(i32, i32)> = (0..snap.num_rows())
+                .map(|i| (src.value(i), dst.value(i)))
+                .collect();
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+
+        const SET_BODY: &str = "SELECT src, dst FROM edges \
+             UNION SELECT e.src, r.dst FROM edges e JOIN reach r ON e.dst = r.src";
+        const MULTISET_BODY: &str = "SELECT src, dst FROM edges \
+             UNION ALL SELECT e.src, r.dst FROM edges e JOIN reach r ON e.dst = r.src";
+
+        /// The whole feature, end to end: a set-semantic body over an acyclic
+        /// graph reaches its transitive closure. This produced ZERO rows before
+        /// the self-reference was seeded — `snapshot()` was `None`.
+        #[tokio::test]
+        async fn a_recursive_view_reaches_its_transitive_closure() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(reach_spec(SET_BODY)).unwrap();
+            flow.feed(
+                "edges",
+                DeltaBatch::from_inserts(edge_batch(&[1, 2], &[2, 3])).unwrap(),
+            )
+            .unwrap();
+            let summary = flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                summary.errored_views,
+                Vec::new(),
+                "a converging recursive view must not report an error"
+            );
+            assert_eq!(
+                pairs(&flow),
+                vec![(1, 2), (1, 3), (2, 3)],
+                "1→2→3 closes over 1→3"
+            );
+        }
+
+        /// IVM-AUD-CORE-12: a body that cannot converge must NOT have its last
+        /// iterate published as the view's value. The cap is a guard, not a
+        /// silent truncation — and the view keeps the fixed point it last had.
+        #[tokio::test]
+        async fn a_diverging_recursive_view_keeps_its_last_fixed_point_and_reports() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(reach_spec(MULTISET_BODY)).unwrap();
+
+            // Tick 1: acyclic, so even the UNION ALL body converges.
+            flow.feed(
+                "edges",
+                DeltaBatch::from_inserts(edge_batch(&[1], &[2])).unwrap(),
+            )
+            .unwrap();
+            let first = flow.step_datafusion().await.unwrap();
+            assert_eq!(first.errored_views, Vec::new());
+            assert_eq!(pairs(&flow), vec![(1, 2)]);
+
+            // Tick 2: close the cycle. `UNION ALL` re-derives every round, so
+            // the iterate grows forever.
+            flow.feed(
+                "edges",
+                DeltaBatch::from_inserts(edge_batch(&[2], &[1])).unwrap(),
+            )
+            .unwrap();
+            let second = flow.step_datafusion().await.unwrap();
+
+            let e = second
+                .errored_views
+                .iter()
+                .find(|e| e.view == "reach")
+                .expect("divergence must be reported in the step summary");
+            assert_eq!(e.kind, ViewErrorKind::FixpointNotConverged);
+            assert!(
+                e.message.contains("not set-semantic"),
+                "the message must name the cause: {}",
+                e.message
+            );
+            // The view is unchanged — NOT the 100th iterate, which is a wrong
+            // answer that looks like a right one.
+            assert_eq!(
+                pairs(&flow),
+                vec![(1, 2)],
+                "a non-converged iterate must never be published as the view's value"
+            );
+        }
+
+        /// IVM-AUD-CORE-11: the recursive branch recorded no `ViewError` where
+        /// the non-recursive branch does, so a recursive view whose SQL cannot
+        /// run reported a clean tick.
+        #[tokio::test]
+        async fn a_recursive_view_whose_sql_fails_is_reported() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(reach_spec(
+                "SELECT src, dst FROM edges \
+                 UNION SELECT src, dst FROM no_such_table",
+            ))
+            .unwrap();
+            flow.feed(
+                "edges",
+                DeltaBatch::from_inserts(edge_batch(&[1], &[2])).unwrap(),
+            )
+            .unwrap();
+            let summary = flow.step_datafusion().await.unwrap();
+            let e = summary
+                .errored_views
+                .iter()
+                .find(|e| e.view == "reach")
+                .expect("a failing recursive body must surface as a ViewError");
+            assert_eq!(e.kind, ViewErrorKind::ViewSql);
+            assert!(
+                e.message.contains("no_such_table"),
+                "the error must name what failed: {}",
+                e.message
+            );
+        }
+
+        /// A recursive view has no O(Δ) plan, so reporting it as "not yet
+        /// planned — no tick has executed" after many ticks was false.
+        #[tokio::test]
+        async fn a_recursive_view_reports_how_it_actually_executes() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(reach_spec(SET_BODY)).unwrap();
+            flow.feed(
+                "edges",
+                DeltaBatch::from_inserts(edge_batch(&[1], &[2])).unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            let (execution, reason) = flow.view_execution("reach").unwrap().unwrap();
+            assert_eq!(execution, ViewExecution::DiffBased);
+            assert!(reason.contains("fixed point"), "{reason}");
+        }
+    }
+
+    // ── IVM-AUD-CORE-27: checkpoint_full / restore_full reproduce exact state ─
+
+    mod checkpoint_fidelity {
+        use super::*;
+        use arrow::array::Int64Array;
+        use krishiv_delta::{IncrementalViewSpec, LatenessSpec};
+
+        fn ids_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+        }
+
+        fn ids_view() -> IncrementalViewSpec {
+            IncrementalViewSpec {
+                name: "v".into(),
+                body_sql: "SELECT id FROM src".into(),
+                output_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                is_materialized: true,
+                is_recursive: false,
+                lateness: vec![],
+            }
+        }
+
+        fn fresh_with_view() -> IncrementalFlow {
+            let flow = IncrementalFlow::new();
+            flow.register_view(ids_view()).unwrap();
+            flow
+        }
+
+        /// The streaming→IVM bridge differentiates each snapshot against the
+        /// previous one. `checkpoint_full` did not carry that previous
+        /// snapshot, so the first `feed_snapshot` after a restore had nothing to
+        /// diff against and re-inserted the whole snapshot: every row still
+        /// present was counted twice.
+        #[tokio::test]
+        async fn a_restored_flow_does_not_re_insert_the_streaming_snapshot() {
+            let flow = fresh_with_view();
+            let snap = RecordBatch::try_new(
+                ids_schema(),
+                vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+            )
+            .unwrap();
+            flow.feed_snapshot("src", std::slice::from_ref(&snap))
+                .unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(flow.source_snapshot("src").unwrap().unwrap().num_rows(), 3);
+
+            let blob = flow.checkpoint_full().unwrap();
+            let restored = fresh_with_view();
+            restored.restore_full(&blob).unwrap();
+
+            // The same snapshot again is NO change.
+            restored
+                .feed_snapshot("src", std::slice::from_ref(&snap))
+                .unwrap();
+            restored.step_datafusion().await.unwrap();
+            assert_eq!(
+                restored.source_snapshot("src").unwrap().unwrap().num_rows(),
+                3,
+                "an unchanged streaming snapshot must produce no delta after a restore"
+            );
+        }
+
+        /// Deltas already accepted but not yet stepped are part of the flow's
+        /// state. Dropping them on restore loses input the caller was told had
+        /// been accepted; resetting `tick` to 0 makes every tick-stamped read
+        /// go backwards.
+        #[tokio::test]
+        async fn a_restored_flow_keeps_its_tick_and_its_un_stepped_deltas() {
+            let flow = fresh_with_view();
+            flow.feed(
+                "src",
+                DeltaBatch::from_inserts(
+                    RecordBatch::try_new(ids_schema(), vec![Arc::new(Int64Array::from(vec![1]))])
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            let tick_before = flow.tick().unwrap();
+            assert_eq!(tick_before, 1);
+
+            // Accepted, not yet stepped.
+            flow.feed(
+                "src",
+                DeltaBatch::from_inserts(
+                    RecordBatch::try_new(ids_schema(), vec![Arc::new(Int64Array::from(vec![2]))])
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+
+            let blob = flow.checkpoint_full().unwrap();
+            let restored = fresh_with_view();
+            restored.restore_full(&blob).unwrap();
+
+            assert_eq!(
+                restored.tick().unwrap(),
+                tick_before,
+                "the tick counter must not go backwards across a restore"
+            );
+            restored.step_datafusion().await.unwrap();
+            assert_eq!(
+                restored.source_snapshot("src").unwrap().unwrap().num_rows(),
+                2,
+                "the un-stepped delta must survive the checkpoint"
+            );
+        }
+
+        /// Dedup, ordinals, watermarks and the per-view counters are all state
+        /// a caller can observe and depend on; all of them reset to zero.
+        #[tokio::test]
+        async fn a_restored_flow_keeps_dedup_ordinals_watermarks_and_counters() {
+            let flow = fresh_with_view();
+            flow.enable_input_dedup().unwrap();
+            // `id` is Int64, which the engine reads as epoch milliseconds —
+            // the only shape a watermark can advance from.
+            flow.register_lateness("src", LatenessSpec::new("id", 1))
+                .unwrap();
+
+            let row1 = || {
+                DeltaBatch::from_inserts(
+                    RecordBatch::try_new(ids_schema(), vec![Arc::new(Int64Array::from(vec![100]))])
+                        .unwrap(),
+                )
+                .unwrap()
+            };
+            flow.feed_if_advanced("src", row1(), b"offset-1".to_vec())
+                .unwrap();
+            flow.step_datafusion().await.unwrap();
+            let stats_before = flow.view_delta_stats("v").unwrap().unwrap();
+            let watermark_before = flow.watermark_for("src").unwrap();
+            assert!(stats_before.rows_inserted_total > 0);
+            assert_ne!(watermark_before, i64::MIN);
+
+            let blob = flow.checkpoint_full().unwrap();
+            let restored = fresh_with_view();
+            restored.restore_full(&blob).unwrap();
+
+            assert_eq!(
+                restored.watermark_for("src").unwrap(),
+                watermark_before,
+                "the LATENESS watermark must survive the restore"
+            );
+            assert_eq!(
+                restored.view_delta_stats("v").unwrap().unwrap(),
+                stats_before,
+                "per-view counters must survive the restore"
+            );
+
+            // The same offset is still a no-op...
+            restored
+                .feed_if_advanced("src", row1(), b"offset-1".to_vec())
+                .unwrap();
+            // ...and the same row is still a duplicate even at a new offset.
+            restored
+                .feed_if_advanced("src", row1(), b"offset-2".to_vec())
+                .unwrap();
+            restored.step_datafusion().await.unwrap();
+            assert_eq!(
+                restored.source_snapshot("src").unwrap().unwrap().num_rows(),
+                1,
+                "a re-delivered row must still be deduped after a restore"
+            );
+        }
+
+        /// A checkpoint written before the exact-state section existed has no
+        /// magic tag; it must still restore, with the pre-existing (lossy)
+        /// behaviour rather than an error.
+        #[tokio::test]
+        async fn a_checkpoint_without_the_exact_state_section_still_restores() {
+            let flow = fresh_with_view();
+            flow.feed(
+                "src",
+                DeltaBatch::from_inserts(
+                    RecordBatch::try_new(ids_schema(), vec![Arc::new(Int64Array::from(vec![7]))])
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            let blob = flow.checkpoint_full().unwrap();
+
+            // Cut the blob back to what the previous format produced.
+            let cut = blob
+                .windows(super::super::EXACT_STATE_MAGIC.len())
+                .position(|w| w == super::super::EXACT_STATE_MAGIC.as_slice())
+                .expect("a fresh checkpoint carries the exact-state section");
+            let legacy = &blob[..cut];
+
+            let restored = fresh_with_view();
+            restored.restore_full(legacy).unwrap();
+            assert_eq!(
+                restored.source_snapshot("src").unwrap().unwrap().num_rows(),
+                1
+            );
+            assert_eq!(restored.tick().unwrap(), 0, "an old blob carries no tick");
+        }
+
+        /// IVM-AUD-CORE-28: the view name is written twice per view entry and
+        /// the second copy was read and thrown away. Corrupt the second copy
+        /// and the restore must refuse rather than pair view A's snapshot with
+        /// view B's baseline.
+        #[tokio::test]
+        async fn a_view_entry_whose_two_halves_disagree_is_refused() {
+            let flow = fresh_with_view();
+            flow.feed(
+                "src",
+                DeltaBatch::from_inserts(
+                    RecordBatch::try_new(ids_schema(), vec![Arc::new(Int64Array::from(vec![1]))])
+                        .unwrap(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            let mut blob = flow.checkpoint_full().unwrap();
+
+            // The view is named "v"; both copies are the single byte b'v'.
+            // Flip the SECOND one — the one the decoder used to discard.
+            let occurrences: Vec<usize> = blob
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'v')
+                .map(|(i, _)| i)
+                .collect();
+            assert!(
+                occurrences.len() >= 2,
+                "expected the view name twice in the blob"
+            );
+            blob[occurrences[1]] = b'w';
+
+            let restored = fresh_with_view();
+            let err = restored
+                .restore_full(&blob)
+                .expect_err("a mismatched view-entry pair must be refused");
+            assert!(
+                err.to_string().contains("inconsistent"),
+                "the error must say what is wrong: {err}"
+            );
+        }
+    }
+
+    // ── IVM-AUD-CORE-18 / 19 / 25 / 26 ───────────────────────────────────────
+
+    mod state_discipline {
+        use super::*;
+        use arrow::array::{Int64Array, StringArray};
+        use krishiv_delta::{IncrementalViewSpec, LatenessSpec};
+
+        use crate::flow::ViewExecution;
+
+        fn orders(ks: &[&str], vs: &[i64]) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Utf8, false),
+                    Field::new("v", DataType::Int64, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(ks.to_vec())) as arrow::array::ArrayRef,
+                    Arc::new(Int64Array::from(vs.to_vec())),
+                ],
+            )
+            .unwrap()
+        }
+
+        fn totals_spec(is_materialized: bool) -> IncrementalViewSpec {
+            IncrementalViewSpec {
+                name: "totals".into(),
+                body_sql: "SELECT k, SUM(v) AS total FROM orders GROUP BY k".into(),
+                output_schema: Arc::new(Schema::new(vec![
+                    Field::new("k", DataType::Utf8, true),
+                    Field::new("total", DataType::Int64, true),
+                ])),
+                is_materialized,
+                is_recursive: false,
+                lateness: vec![],
+            }
+        }
+
+        /// IVM-AUD-CORE-18: `publish_output` advanced the diff baseline only for
+        /// materialized views, so a NON-materialized view maintained by an O(Δ)
+        /// operator kept `full_output = None`. The first full recompute then
+        /// diffed against nothing and re-emitted the whole view as insertions —
+        /// every group counted twice downstream.
+        #[tokio::test]
+        async fn a_non_materialized_view_keeps_its_diff_baseline_across_a_recompute() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(totals_spec(false)).unwrap();
+            flow.feed(
+                "orders",
+                DeltaBatch::from_inserts(orders(&["a", "b"], &[10, 5])).unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            // Without an O(Δ) plan this test proves nothing: the DiffBased path
+            // advances the baseline through `diff_and_update` either way.
+            assert_eq!(
+                flow.view_execution("totals").unwrap().unwrap().0,
+                ViewExecution::Incremental,
+                "the first tick must have built an O(Δ) plan"
+            );
+
+            // Now make the next tick recompute in full.
+            flow.force_diff_based().unwrap();
+            flow.feed(
+                "orders",
+                DeltaBatch::from_inserts(orders(&["a"], &[1])).unwrap(),
+            )
+            .unwrap();
+            let summary = flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                (summary.total_inserted_rows, summary.total_retracted_rows),
+                (1, 1),
+                "the recompute must emit only the changed group (retract a=10, insert a=11); \
+                 re-emitting the whole view means the baseline was lost"
+            );
+        }
+
+        /// IVM-AUD-CORE-19: a tick reads the source snapshots under the lock,
+        /// runs view SQL with the lock RELEASED, then assigns the snapshots back
+        /// wholesale. A restore landing in that window used to be erased without
+        /// a trace. The gate UDF below holds the tick inside its SQL phase so
+        /// the interleaving is exact, not raced.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn a_restore_during_a_tick_aborts_the_tick_instead_of_being_erased() {
+            use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+            use datafusion::prelude::SessionContext;
+
+            // The body calls `gate`, so executing it parks the tick inside
+            // Phase 4 — the unlocked window this test is about.
+            let mut gated = totals_spec(true);
+            gated.body_sql = "SELECT k, SUM(gate(v)) AS total FROM orders GROUP BY k".into();
+            let flow = IncrementalFlow::new();
+            flow.register_view(gated).unwrap();
+            // Force SQL execution so the tick actually reaches the gate.
+            flow.force_diff_based().unwrap();
+            flow.feed(
+                "orders",
+                DeltaBatch::from_inserts(orders(&["a"], &[10])).unwrap(),
+            )
+            .unwrap();
+
+            // A checkpoint of a DIFFERENT state, to restore mid-tick.
+            let other = IncrementalFlow::new();
+            other.register_view(totals_spec(true)).unwrap();
+            other
+                .feed(
+                    "orders",
+                    DeltaBatch::from_inserts(orders(&["z"], &[999])).unwrap(),
+                )
+                .unwrap();
+            other.step_datafusion().await.unwrap();
+            let blob = other.checkpoint_full().unwrap();
+
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let once = Arc::new(std::sync::Mutex::new(Some((entered_tx, release_rx))));
+            let gate = create_udf(
+                "gate",
+                vec![DataType::Int64],
+                DataType::Int64,
+                Volatility::Volatile,
+                Arc::new(move |args: &[ColumnarValue]| {
+                    if let Some((entered, release)) = once.lock().expect("gate lock").take() {
+                        let _ = entered.send(());
+                        let _ = release.recv();
+                    }
+                    Ok(args[0].clone())
+                }),
+            );
+            let ctx = SessionContext::new();
+            ctx.register_udf(gate);
+
+            let stepping = flow.clone();
+            let tick = tokio::spawn(async move {
+                let ctx = ctx;
+                stepping.step_datafusion_with_ctx(&ctx).await
+            });
+
+            // The tick is now inside its unlocked SQL phase.
+            entered_rx.recv().expect("the view SQL must reach the gate");
+            flow.restore_full(&blob).unwrap();
+            let _ = release_tx.send(());
+
+            let result = tick.await.expect("the tick task must not panic");
+            let err = result.expect_err(
+                "a tick whose state was replaced underneath it must not commit its \
+                 pre-restore snapshots",
+            );
+            assert!(err.to_string().contains("aborted"), "{err}");
+
+            // The restore stands...
+            let snap = flow.source_snapshot("orders").unwrap().unwrap();
+            let ks = snap
+                .column_by_name("k")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(
+                ks.value(0),
+                "z",
+                "the restored source must survive the tick"
+            );
+            // ...and the aborted tick's input is back in the queue, not lost.
+            assert_eq!(
+                flow.take_pending().unwrap().get("orders").map(Vec::len),
+                Some(1),
+                "the aborted tick must return its drained deltas to pending"
+            );
+        }
+
+        /// IVM-AUD-CORE-25: nine per-source and seven per-view maps, and no way
+        /// to give any of them back. `drop_view` pruned four of the seven;
+        /// there was no `drop_source` at all.
+        #[tokio::test]
+        async fn dropping_a_view_and_a_source_reclaims_every_map() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(totals_spec(true)).unwrap();
+            flow.enable_input_dedup().unwrap();
+            flow.enable_delta_checkpoints().unwrap();
+            flow.register_lateness("orders", LatenessSpec::new("v", 1))
+                .unwrap();
+            flow.feed_if_advanced(
+                "orders",
+                DeltaBatch::from_inserts(orders(&["a"], &[10])).unwrap(),
+                b"off-1".to_vec(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+            flow.feed_snapshot("orders", &[orders(&["a"], &[10])])
+                .unwrap();
+
+            let before = flow.retained_state().unwrap();
+            assert!(before.sources_with_snapshots > 0);
+            assert!(before.sources_with_pending > 0);
+            assert!(before.sources_with_dedup_hashes > 0);
+            assert!(before.dedup_hashes_retained > 0);
+            assert!(before.sources_with_checkpoint_deltas > 0);
+            assert!(before.sources_with_streaming_snapshots > 0);
+            assert!(before.sources_with_ordinals > 0);
+            assert!(before.sources_with_watermarks > 0);
+            assert!(before.views_with_plans > 0);
+            assert!(before.views_with_stats > 0);
+
+            assert!(flow.drop_view("totals").unwrap());
+            assert!(flow.drop_source("orders").unwrap());
+
+            assert_eq!(
+                flow.retained_state().unwrap(),
+                super::super::RetainedState::default(),
+                "dropping the only view and the only source must leave nothing behind"
+            );
+        }
+
+        /// IVM-AUD-CORE-26: the dedup set's capacity check ran once per `feed`,
+        /// before any row was inserted, so one batch of N rows overshot the cap
+        /// by N. Ten rows into a cap of four must leave four.
+        #[test]
+        fn the_dedup_set_is_bounded_per_row_not_per_feed() {
+            let mut order: std::collections::VecDeque<u64> = Default::default();
+            let mut set: ahash::AHashSet<u64> = Default::default();
+            let batch =
+                DeltaBatch::from_inserts(make_batch(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10])).unwrap();
+            let (kept, evicted) =
+                super::super::dedup_filter(&mut order, &mut set, batch, 4, 2).unwrap();
+            assert_eq!(kept.num_rows(), 10, "no row is a duplicate, so all pass");
+            assert!(
+                set.len() <= 4,
+                "the retained-hash set must respect its cap; got {}",
+                set.len()
+            );
+            assert_eq!(set.len(), order.len(), "queue and set must stay in step");
+            assert!(
+                evicted > 0,
+                "reaching the cap must be reported to the caller"
+            );
+        }
     }
 }

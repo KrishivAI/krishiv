@@ -28,6 +28,17 @@ impl IvmJob {
         Ok(Self::Embedded(EmbeddedIvmJob::create(registry, name)?))
     }
 
+    /// Create (or attach to) an embedded IVM job **pinned to a single flow**,
+    /// so it can host a view-DAG. The embedded twin of
+    /// [`remote_unpartitioned`](Self::remote_unpartitioned) — one mechanism for
+    /// "pin single" on both sides (IVM-AUD-API-A4). Errors if a job of that
+    /// name already exists and is key-partitioned.
+    pub fn embedded_unpartitioned(registry: &SharedIvmJobRegistry, name: &str) -> Result<Self> {
+        Ok(Self::Embedded(EmbeddedIvmJob::create_unpartitioned(
+            registry, name,
+        )?))
+    }
+
     /// Create a remote IVM job on the coordinator at `coordinator_http`.
     pub async fn remote(coordinator_http: &str, name: &str) -> Result<Self> {
         Ok(Self::Remote(
@@ -122,6 +133,28 @@ impl IvmJob {
         }
     }
 
+    /// Delete this job: the flow, its state, and (distributed) its durable
+    /// snapshot on the coordinator. Returns `false` when there was no such job
+    /// to remove, which is not an error.
+    ///
+    /// **Must be called explicitly.** IVM-AUD-API-A7: Rust has no async `Drop`,
+    /// so dropping the handle cannot do this — and before this method existed a
+    /// remote job could not be removed at all through any Rust API, so every
+    /// distributed `DataFrame::to_incremental` leaked a coordinator job for the
+    /// coordinator's lifetime. An embedded job is dropped from its registry
+    /// (the private one a `to_incremental` handle owns is freed with the handle
+    /// either way; a `Session::ivm` job is not).
+    ///
+    /// After this, every other handle to the same job id is stale: embedded
+    /// calls fail with "no longer exists", remote calls 404 until something
+    /// recreates the job.
+    pub async fn close(&self) -> Result<bool> {
+        Ok(match self {
+            Self::Embedded(j) => j.delete(),
+            Self::Remote(j) => j.delete().await?,
+        })
+    }
+
     /// Whether this job auto-partitioned (its first view was key-shardable),
     /// or `None` when the answer is not knowable.
     ///
@@ -142,6 +175,79 @@ impl IvmJob {
                 None
             }),
         }
+    }
+}
+
+/// Turn a coordinator step response into a [`StepReport`].
+///
+/// IVM-AUD-API-A5. This used to be two unconditional `Vec::new()`s, and those
+/// two vectors are the *only* view-level failure channel there is (a failing
+/// view does not make `step` return `Err`), so a distributed caller could not
+/// see a failed view at all — a broken view and a healthy one produced
+/// byte-identical reports.
+///
+/// `RemoteStepSummary::view_health` is `None` exactly when there is no signal:
+/// a coordinator that predates the `/step` `view_health` field, or a tick the
+/// coordinator dispatched to a resident executor — the resident tick result
+/// carries per-view output deltas only, so the coordinator's mirror has nothing
+/// to report. Both cases become [`ViewHealth::Unreported`] rather than an empty
+/// report, because "nobody looked" is not "nothing failed".
+fn remote_step_report(job_id: &str, s: krishiv_runtime::RemoteStepSummary) -> StepReport {
+    match s.view_health {
+        Some(h) => StepReport {
+            active_views: s.active_views,
+            total_output_rows: s.total_output_rows,
+            tick: s.tick,
+            degraded_views: h.degraded_views,
+            errored_views: h
+                .errored_views
+                .into_iter()
+                .map(|e| super::job::ViewError {
+                    view: e.view,
+                    kind: remote_view_error_kind(&e.kind),
+                    message: match remote_view_error_kind(&e.kind) {
+                        // An unrecognised kind must not be lost: keep the
+                        // coordinator's own word for it in the message rather
+                        // than dropping it on the floor.
+                        super::job::ViewErrorKind::Unrecognized => {
+                            format!("[{}] {}", e.kind, e.message)
+                        }
+                        _ => e.message,
+                    },
+                })
+                .collect(),
+            view_health: super::job::ViewHealth::Reported,
+        },
+        None => StepReport {
+            active_views: s.active_views,
+            total_output_rows: s.total_output_rows,
+            tick: s.tick,
+            degraded_views: Vec::new(),
+            errored_views: Vec::new(),
+            view_health: super::job::ViewHealth::Unreported(format!(
+                "the coordinator reported no per-view health for remote IVM job '{job_id}': \
+                 either it predates the /step view_health field, or this tick ran on a \
+                 resident executor whose result carries output deltas only"
+            )),
+        },
+    }
+}
+
+/// Map a coordinator-reported failure-kind name onto this crate's enum.
+///
+/// A name this binary does not know maps to
+/// [`ViewErrorKind::Unrecognized`](super::job::ViewErrorKind::Unrecognized) —
+/// never onto one of the known kinds. A newer coordinator can name a failure
+/// mode that did not exist when this client was built, and calling it
+/// `ViewSql` would be a false diagnosis of a real failure.
+fn remote_view_error_kind(name: &str) -> super::job::ViewErrorKind {
+    use super::job::ViewErrorKind as K;
+    match name {
+        "operator_apply" => K::OperatorApply,
+        "view_sql" => K::ViewSql,
+        "publish" => K::Publish,
+        "fixpoint_not_converged" => K::FixpointNotConverged,
+        _ => K::Unrecognized,
     }
 }
 
@@ -200,35 +306,17 @@ impl FeedableJob for IvmJob {
                                 krishiv_ivm::ViewErrorKind::Publish => {
                                     super::job::ViewErrorKind::Publish
                                 }
+                                krishiv_ivm::ViewErrorKind::FixpointNotConverged => {
+                                    super::job::ViewErrorKind::FixpointNotConverged
+                                }
                             },
                             message: e.message,
                         })
                         .collect(),
+                    view_health: super::job::ViewHealth::Reported,
                 }
             }
-            Self::Remote(j) => {
-                let s = j.step().await?;
-                // API-A5 (still OPEN — see docs/implementation/ivm-audit-register.md).
-                // The coordinator's /step response carries counters only
-                // (`ivm_http::StepResponse` = active_views / total_output_rows /
-                // tick), so there is no view-health signal to relay. The two
-                // vectors below are empty BECAUSE NOTHING WAS REPORTED, not
-                // because every view is healthy, and a caller cannot tell those
-                // apart through `StepReport` — distributed IVM currently has no
-                // view-level failure channel at all. Closing this needs a health
-                // field on the wire (krishiv-scheduler/src/ivm_http.rs +
-                // krishiv-runtime/src/coordinator_http_client.rs) *and* an
-                // explicitly-unknown representation in `StepReport`
-                // (krishiv-api/src/compute/job.rs); all three files are outside
-                // this change's ownership, so nothing here may claim otherwise.
-                StepReport {
-                    active_views: s.active_views,
-                    total_output_rows: s.total_output_rows,
-                    tick: s.tick,
-                    degraded_views: Vec::new(),
-                    errored_views: Vec::new(),
-                }
-            }
+            Self::Remote(j) => remote_step_report(j.job_id(), j.step().await?),
         })
     }
 
@@ -345,6 +433,188 @@ mod tests {
         };
         assert!(err.contains("remote-job"), "error must name the job: {err}");
         assert!(err.contains("revenue"), "error must name the view: {err}");
+    }
+
+    /// IVM-AUD-API-A5. `degraded_views`/`errored_views` are the only view-level
+    /// failure channel there is, and this arm used to fill both with
+    /// `Vec::new()` unconditionally, so a distributed caller could not see a
+    /// failed view at all. A reported health object must arrive intact.
+    #[test]
+    fn a_reported_remote_failure_reaches_the_step_report() {
+        use krishiv_runtime::{RemoteStepSummary, RemoteViewError, RemoteViewHealth};
+
+        let report = super::remote_step_report(
+            "remote-job",
+            RemoteStepSummary {
+                active_views: 1,
+                total_output_rows: 3,
+                tick: 9,
+                view_health: Some(RemoteViewHealth {
+                    degraded_views: vec!["slow".into()],
+                    errored_views: vec![RemoteViewError {
+                        view: "broken".into(),
+                        kind: "view_sql".into(),
+                        message: "column 'nope' not found".into(),
+                    }],
+                }),
+            },
+        );
+        assert_eq!(report.tick, 9);
+        assert_eq!(report.degraded_views, vec!["slow".to_string()]);
+        assert_eq!(report.errored_views.len(), 1);
+        assert_eq!(report.errored_views[0].view, "broken");
+        assert_eq!(report.errored_views[0].kind, crate::ViewErrorKind::ViewSql);
+        assert_eq!(
+            report.errored_views[0].message, "column 'nope' not found",
+            "a recognised kind must not have the kind name spliced into its message"
+        );
+        assert_eq!(report.view_health, crate::ViewHealth::Reported);
+    }
+
+    /// IVM-AUD-API-A5, the other half: a tick with no health signal — an older
+    /// coordinator, or a tick dispatched to a resident executor whose result
+    /// wire carries output deltas only — must be reported as *unknown*. Empty
+    /// vectors plus `Reported` would be the original lie in a new place.
+    #[test]
+    fn an_unreported_remote_tick_says_so_instead_of_claiming_health() {
+        use krishiv_runtime::RemoteStepSummary;
+
+        let report = super::remote_step_report(
+            "remote-job",
+            RemoteStepSummary {
+                active_views: 2,
+                total_output_rows: 7,
+                tick: 4,
+                view_health: None,
+            },
+        );
+        assert!(report.errored_views.is_empty());
+        match &report.view_health {
+            crate::ViewHealth::Reported => {
+                panic!("a tick nobody reported health for must not claim to be a health report")
+            }
+            crate::ViewHealth::Unreported(why) => {
+                assert!(why.contains("remote-job"), "must name the job: {why}");
+            }
+        }
+        assert!(!report.view_health.is_reported());
+    }
+
+    /// A failure kind this binary does not know must stay unknown. Relabelling
+    /// it as one of the kinds we do know would be a false diagnosis of a real
+    /// failure, and the coordinator's own word for it is kept in the message.
+    #[test]
+    fn an_unknown_remote_failure_kind_is_not_relabelled() {
+        use krishiv_runtime::{RemoteStepSummary, RemoteViewError, RemoteViewHealth};
+
+        let report = super::remote_step_report(
+            "remote-job",
+            RemoteStepSummary {
+                active_views: 0,
+                total_output_rows: 0,
+                tick: 1,
+                view_health: Some(RemoteViewHealth {
+                    degraded_views: Vec::new(),
+                    errored_views: vec![RemoteViewError {
+                        view: "v".into(),
+                        kind: "some_future_kind".into(),
+                        message: "boom".into(),
+                    }],
+                }),
+            },
+        );
+        assert_eq!(
+            report.errored_views[0].kind,
+            crate::ViewErrorKind::Unrecognized
+        );
+        assert!(
+            report.errored_views[0].message.contains("some_future_kind"),
+            "the coordinator's name for the kind must survive: {}",
+            report.errored_views[0].message
+        );
+    }
+
+    /// IVM-AUD-API-A4. "Pin this job to a single flow" had two spellings: the
+    /// remote path called `create_unpartitioned`, the embedded path built a
+    /// whole registry with `with_default_shards(1)`. The second pins every job
+    /// in that registry rather than this one, and it stops working the moment
+    /// the registry is shared — which is exactly what INT-F15 required. This
+    /// asserts the pin survives a registry that would otherwise shard.
+    #[tokio::test]
+    async fn embedded_unpartitioned_pins_a_job_in_a_sharding_registry() {
+        let registry: SharedIvmJobRegistry = Arc::new(IvmJobRegistry::with_default_shards(3));
+
+        let pinned = IvmJob::embedded_unpartitioned(&registry, "pinned").unwrap();
+        pinned.register_view(revenue_spec()).await.unwrap();
+        assert_eq!(
+            pinned.is_partitioned().unwrap(),
+            Some(false),
+            "a pinned job must stay single even though this registry shards by default"
+        );
+
+        // Same registry, same view shape, unpinned: this is what the pin is
+        // protecting against, so the contrast is part of the claim.
+        let sharded = IvmJob::embedded(&registry, "sharded").unwrap();
+        sharded.register_view(revenue_spec()).await.unwrap();
+        assert_eq!(sharded.is_partitioned().unwrap(), Some(true));
+    }
+
+    /// IVM-AUD-INT-F16, embedded half. `Session::ivm` auto-partitions and
+    /// `DataFrame::to_incremental` pins single; they now share the session's
+    /// registry, so the same name can be asked for in both shapes. The registry
+    /// records the pin and no-ops on an existing job, so asking for single
+    /// would have handed back a partitioned flow with the pin merely claimed —
+    /// and a partitioned flow never cascades to derived views, so the caller's
+    /// view-DAG would sit empty with nothing said.
+    #[tokio::test]
+    async fn pinning_a_name_already_held_by_a_partitioned_job_is_refused() {
+        let registry: SharedIvmJobRegistry = Arc::new(IvmJobRegistry::with_default_shards(3));
+        let sharded = IvmJob::embedded(&registry, "agg").unwrap();
+        sharded.register_view(revenue_spec()).await.unwrap();
+        assert_eq!(
+            sharded.is_partitioned().unwrap(),
+            Some(true),
+            "precondition"
+        );
+
+        let err = match IvmJob::embedded_unpartitioned(&registry, "agg") {
+            Ok(job) => panic!(
+                "a partitioned job must not be handed back as pinned single; got partitioned={:?}",
+                job.is_partitioned()
+            ),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("agg"), "the error must name the job: {err}");
+        assert!(
+            err.contains("partitioned"),
+            "the error must say what the conflict is: {err}"
+        );
+    }
+
+    /// IVM-AUD-API-A7. Before `close()` existed there was no way to remove an
+    /// IVM job through this handle at all — remotely the coordinator job
+    /// outlived the process, and embedded a `Session::ivm` job stayed in the
+    /// session registry forever. The embedded half is the half a unit test can
+    /// prove without a coordinator.
+    #[tokio::test]
+    async fn close_removes_an_embedded_job_from_its_registry() {
+        let registry: SharedIvmJobRegistry = Arc::new(IvmJobRegistry::with_default_shards(1));
+        let job = IvmJob::embedded(&registry, "closable").unwrap();
+        job.register_view(revenue_spec()).await.unwrap();
+        assert!(registry.get("closable").is_some(), "precondition");
+
+        assert!(
+            job.close().await.unwrap(),
+            "the first close removes the job"
+        );
+        assert!(
+            registry.get("closable").is_none(),
+            "the job must be gone from the registry, not merely reported gone"
+        );
+        assert!(
+            !job.close().await.unwrap(),
+            "closing an already-closed job is false, not an error"
+        );
     }
 
     /// The shape of a remote job is unknown to this handle — not `false`.

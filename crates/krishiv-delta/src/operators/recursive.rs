@@ -13,18 +13,25 @@
 //!
 //! **Nothing routes a recursive view through this operator today**
 //! (IVM-AUD-DDL-E3). `DECLARE RECURSIVE VIEW` is executed by the IVM tick as a
-//! plain fixpoint loop over the view's SQL (`IncrementalFlow::step_datafusion`,
-//! the `spec.is_recursive` branch), which does not de-duplicate between
-//! iterations and does not raise on hitting its cap — it publishes the last
-//! iterate as the view's value. So the DISTINCT and the cycle guard described
-//! above are properties of this type, NOT guarantees of the system: a
-//! `UNION ALL` recursion over a cyclic input still fails to converge, and the
-//! SQL-layer docs tell users to write the body set-semantically themselves.
+//! naive fixpoint loop over the view's SQL
+//! (`IncrementalFlow::run_recursive_fixpoint`). So the DISTINCT described above
+//! is a property of this type, NOT a guarantee of the system: a `UNION ALL`
+//! recursion over a cyclic input still fails to converge, and the SQL-layer
+//! docs tell users to write the body set-semantically themselves.
 //!
-//! It is kept rather than deleted because it is the right vehicle for closing
-//! that gap (see CORE-10/11/12/13 in the audit register), but until it is
-//! wired, its doc must not read as a description of how recursive views
-//! behave.
+//! What has changed (IVM-AUD-CORE-10/11/12/13) is that non-convergence is no
+//! longer silent: the tick's loop raises `FixpointNotConverged` at its cap
+//! instead of publishing the last iterate, and the error says whether the
+//! iterate carried duplicate rows (a non-set-semantic body) or grew in distinct
+//! rows. That closed the dishonesty without adopting this operator's semantics.
+//!
+//! It is kept rather than deleted because it remains the right vehicle IF the
+//! product decision is that recursive views should be set-semantic by
+//! construction (IVM-AUD-REC-OP-1 records why wiring it was rejected for now:
+//! `apply` takes a sync step function while the tick's body is async SQL, and
+//! its cross-tick `accumulated`/DISTINCT state has no checkpoint path). Until
+//! that decision is made and it is wired, this doc must not read as a
+//! description of how recursive views behave.
 
 use crate::delta_batch::DeltaBatch;
 use crate::error::{DeltaError, DeltaResult};

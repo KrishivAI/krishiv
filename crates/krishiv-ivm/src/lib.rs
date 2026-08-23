@@ -15,10 +15,10 @@ pub mod vector_sink;
 
 pub use error::{IvmError, IvmResult};
 pub use flow::{
-    IncrementalFlow, StepSummary, ViewDeltaStats, ViewError, ViewErrorKind, ViewExecution,
-    coalesce_pending, decode_batch_map, decode_delta_map, encode_batch_map, encode_delta_map,
-    encode_ivm_attach_fragment, encode_ivm_ckpt_fragment, encode_ivm_detach_fragment,
-    encode_ivm_step_fragment, encode_ivm_tick_fragment,
+    IncrementalFlow, RetainedState, StepSummary, ViewDeltaStats, ViewError, ViewErrorKind,
+    ViewExecution, coalesce_pending, decode_batch_map, decode_delta_map, encode_batch_map,
+    encode_delta_map, encode_ivm_attach_fragment, encode_ivm_ckpt_fragment,
+    encode_ivm_detach_fragment, encode_ivm_step_fragment, encode_ivm_tick_fragment,
 };
 pub use partitioned::PartitionedIncrementalFlow;
 pub use plan::{ViewPlan, ViewPlanKind, build_view_plan, partition_key_from_sql};

@@ -105,6 +105,16 @@ impl WatermarkTracker {
     pub fn max_observed_ts(&self) -> i64 {
         self.max_observed_ts
     }
+
+    /// The declared bound, in milliseconds.
+    ///
+    /// Not derivable from `watermark()`: before the first `observe` the
+    /// watermark is `i64::MIN` regardless of the bound, so a checkpoint that
+    /// tried to recover the bound by subtraction would restore a
+    /// never-observed tracker with a bound of 0 (IVM-AUD-CORE-27).
+    pub fn lateness_ms(&self) -> i64 {
+        self.spec.lateness_ms
+    }
 }
 
 /// Per-source ordinal watermark for skip-if-unchanged optimization.

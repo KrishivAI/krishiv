@@ -74,7 +74,18 @@ impl IncrementalView {
         (view, receiver)
     }
 
-    /// Publish a new output delta (called by the step engine).
+    /// Publish an output delta whose diff baseline has **already** been
+    /// advanced — i.e. the DiffBased path, where [`Self::diff_and_update`] set
+    /// `full_output` to the fresh full result immediately before this call.
+    ///
+    /// It advances the materialized `snapshot` and re-syncs `full_output` to it,
+    /// which is a no-op against what `diff_and_update` just wrote.
+    ///
+    /// IVM-AUD-CORE-18: any path that produces a delta WITHOUT a preceding
+    /// `diff_and_update` — an O(Δ) operator, a caller-supplied delta, a
+    /// mirrored remote tick — must use [`Self::apply_output_delta`] instead.
+    /// This one leaves `full_output` at `None` for a non-materialized view, and
+    /// a `None` baseline makes the next full recompute re-emit the whole view.
     pub fn publish_output(&self, output: DeltaBatch) -> DeltaResult<()> {
         {
             let mut guard = self
@@ -294,11 +305,17 @@ impl IncrementalView {
 
     /// Apply an **output delta** to the view's materialized state (AUD-6).
     ///
-    /// Used by the coordinator to mirror a tick computed on a resident
-    /// executor: both the diff baseline (`full_output`) and, for materialized
-    /// views, the `snapshot` advance by the delta, keeping them in lockstep
-    /// with the executor's flow without ever shipping the full output. The
-    /// delta is also published to subscribers and stored as `last_output`.
+    /// The publish for every path that computes a delta directly rather than by
+    /// diffing a full result: an O(Δ) operator, a caller-supplied delta in
+    /// `step_with`, and a tick mirrored from a resident executor. Both the diff
+    /// baseline (`full_output`) and, for materialized views, the `snapshot`
+    /// advance by the delta — unconditionally, because the baseline is what a
+    /// later full recompute diffs against and is needed whether or not the view
+    /// is materialized (IVM-AUD-CORE-18). The delta is also published to
+    /// subscribers and stored as `last_output`.
+    ///
+    /// The counterpart is [`Self::publish_output`], for the DiffBased path
+    /// where `diff_and_update` has already advanced the baseline.
     pub fn apply_output_delta(&self, delta: &DeltaBatch) -> DeltaResult<()> {
         // IVM-AUD-CORE-15: same take-then-`?` hazard as publish_output, twice.
         // A failed mirror of a resident-executor tick used to leave both the

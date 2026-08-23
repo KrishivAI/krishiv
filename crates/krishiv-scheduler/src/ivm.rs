@@ -117,6 +117,20 @@ struct PersistedIvmJob {
     /// exactly the behaviour they have today.
     #[serde(default)]
     pinned_single: bool,
+    /// Whether the job had delta-checkpoint accumulation switched on
+    /// ([`IvmJobRegistry::enable_delta_checkpoints`]).
+    ///
+    /// IVM-AUD-DIST-C1: the flag lives inside the flow and `checkpoint_full`
+    /// does not carry it, so a rehydrated job silently stopped accumulating —
+    /// the next `/checkpoint-delta` would answer an empty frame and the
+    /// caller's incremental-backup chain would have a hole in it with nothing
+    /// said.
+    ///
+    /// Added under **version 1 with `serde(default)`** for the same reason as
+    /// `pinned_single`: `restore_durable_snapshot` rejects unknown versions, so
+    /// a bump would make every already-persisted IVM job unloadable.
+    #[serde(default)]
+    delta_checkpoints: bool,
 }
 
 /// A coordinator-hosted IVM job: a single flow, or one auto-partitioned by key.
@@ -187,6 +201,14 @@ impl IvmJob {
         match self {
             IvmJob::Single(f) => f.step_datafusion().await,
             IvmJob::Partitioned(p) => p.step_datafusion().await,
+        }
+    }
+
+    /// Queued input bytes not yet consumed by a tick (IVM-AUD-INT-F11).
+    pub fn pending_bytes(&self) -> IvmResult<usize> {
+        match self {
+            IvmJob::Single(f) => f.pending_bytes(),
+            IvmJob::Partitioned(p) => p.pending_bytes(),
         }
     }
 
@@ -425,6 +447,40 @@ impl IvmJob {
     }
 }
 
+/// Default ingress backlog cap for one IVM job, in bytes.
+///
+/// IVM-AUD-INT-F11: there was no cap of any kind. `IncrementalFlow::pending` is
+/// an unbounded `Vec` per source, the HTTP body limit is 512 MiB per request
+/// and there is no concurrency limiter, so a producer feeding faster than
+/// anything calls `/step` grew the coordinator's heap until the process died —
+/// while every `/feed` answered `success: true`.
+///
+/// 1 GiB is chosen to be larger than any single accepted body (so the cap can
+/// never make a legal request permanently unsatisfiable) while still bounding
+/// the backlog. `KRISHIV_IVM_MAX_PENDING_BYTES=0` restores the old unbounded
+/// behaviour for an operator who would rather have the OOM.
+pub(crate) const DEFAULT_IVM_MAX_PENDING_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Pure policy for [`default_max_pending_bytes`], split out for testing.
+///
+/// An explicit `0` means unlimited and is honoured. Anything unparseable falls
+/// back to the default rather than to unlimited: a typo in an environment
+/// variable must not silently switch protection off.
+pub(crate) fn resolve_max_pending_bytes(env_override: Option<&str>) -> u64 {
+    match env_override.map(str::trim).map(str::parse::<u64>) {
+        Some(Ok(bytes)) => bytes,
+        _ => DEFAULT_IVM_MAX_PENDING_BYTES,
+    }
+}
+
+fn default_max_pending_bytes() -> u64 {
+    resolve_max_pending_bytes(
+        std::env::var("KRISHIV_IVM_MAX_PENDING_BYTES")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Hard cap on auto-derived IVM shard fan-out (keeps tiny jobs from spawning a
 /// flow per core on large machines).
 const MAX_AUTO_IVM_SHARDS: usize = 8;
@@ -476,6 +532,33 @@ pub struct IvmDispatchRecord {
 }
 
 /// Phase 57 (AUD-6): resident-dispatch bookkeeping for one IVM job.
+///
+/// # Why this is deliberately not durable (IVM-AUD-DIST-B3)
+///
+/// It was filed as a gap that `attached` / `fence` live only in this process
+/// and are reset by [`IvmJobRegistry::restore_durable_snapshot`], so safety
+/// after a restart "rests on `delta:attach:` happening to replace the executor
+/// map entry". Persisting the fence would make it **less** safe, not more.
+///
+/// The invariant `submit_resident_ivm_step` maintains is that a `delta:tick:`
+/// is only ever sent while `attached` is true, and `attached` is set true only
+/// immediately after a `delta:attach:` this process sent succeeded. An attach
+/// replaces the executor's whole entry — flow state *and* fence — so after it,
+/// the coordinator's `fence` and the executor's agree by construction, whatever
+/// either was before. Resetting to zero on rehydration therefore costs one
+/// state ship and is always correct.
+///
+/// Carrying a fence across a restart removes exactly that guarantee: a tick at
+/// fence N+1 reaching a *stale* resident flow that happens to sit at N would be
+/// **accepted**, and the executor would apply deltas on top of state the new
+/// coordinator has never mirrored. With the reset, that same stale flow answers
+/// "fence mismatch" and the coordinator re-attaches. The fence's job is to
+/// detect drift, and a persisted fence is the one value that would hide it.
+///
+/// Two things this does *not* protect against, both filed separately: a tick
+/// landing on an executor that never received the attach (IVM-AUD-DIST-A2 —
+/// there is no placement pin), and a demoted coordinator attaching at all
+/// (IVM-AUD-DIST-E1 — fixed by `ensure_active_leader`).
 #[derive(Debug, Clone, Default)]
 pub struct IvmDispatchState {
     /// True while a resident executor flow is believed attached.
@@ -505,6 +588,14 @@ pub struct IvmJobRegistry {
     step_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Phase 57: per-job resident dispatch state (fence, attach, last decision).
     dispatch: Mutex<HashMap<String, IvmDispatchState>>,
+    /// Jobs with delta-checkpoint accumulation switched on. Mirrors the flag
+    /// inside the flow so [`durable_snapshot`](IvmJobRegistry::durable_snapshot)
+    /// can carry it across a rehydration (IVM-AUD-DIST-C1).
+    delta_checkpoints: Mutex<std::collections::HashSet<String>>,
+    /// Ingress backlog cap in bytes, `0` = unlimited (IVM-AUD-INT-F11). Read by
+    /// `ivm_http::ensure_pending_headroom` before every feed. Held here rather
+    /// than read from the environment at each call so a test can set it.
+    max_pending_bytes: std::sync::atomic::AtomicU64,
     /// Vector views registered on each job: `job_id -> view_name -> view`.
     ///
     /// IVM-AUD-DIST-H3: `POST /vector-views` built an `InMemoryVectorSink`,
@@ -597,6 +688,8 @@ impl Default for IvmJobRegistry {
             pinned_single: Mutex::new(std::collections::HashSet::new()),
             step_locks: Mutex::new(HashMap::new()),
             dispatch: Mutex::new(HashMap::new()),
+            delta_checkpoints: Mutex::new(std::collections::HashSet::new()),
+            max_pending_bytes: std::sync::atomic::AtomicU64::new(default_max_pending_bytes()),
             vector_views: Mutex::new(HashMap::new()),
         }
     }
@@ -615,6 +708,8 @@ impl IvmJobRegistry {
             pinned_single: Mutex::new(std::collections::HashSet::new()),
             step_locks: Mutex::new(HashMap::new()),
             dispatch: Mutex::new(HashMap::new()),
+            delta_checkpoints: Mutex::new(std::collections::HashSet::new()),
+            max_pending_bytes: std::sync::atomic::AtomicU64::new(default_max_pending_bytes()),
             vector_views: Mutex::new(HashMap::new()),
         }
     }
@@ -627,6 +722,50 @@ impl IvmJobRegistry {
             pinned.insert(job_id.clone());
         }
         self.create(job_id)
+    }
+
+    /// The ingress backlog cap in bytes; `0` means unlimited.
+    pub fn max_pending_bytes(&self) -> u64 {
+        self.max_pending_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Override the ingress backlog cap (`0` = unlimited).
+    pub fn set_max_pending_bytes(&self, bytes: u64) {
+        self.max_pending_bytes
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Switch on delta-checkpoint accumulation for `job_id`, and remember that
+    /// it is on so a rehydration re-applies it.
+    ///
+    /// IVM-AUD-DIST-C1: nothing in the coordinator ever called
+    /// [`IvmJob::enable_delta_checkpoints`], so `checkpoint_delta` answered a
+    /// well-formed `count = 0` frame forever — an incremental backup that was
+    /// reported as taken and contained nothing. The flag is per-flow and
+    /// `checkpoint_full` does not carry it, so it is tracked here too and
+    /// written into the durable snapshot; otherwise a coordinator restart or a
+    /// standby promotion would silently switch accumulation back off.
+    ///
+    /// Idempotent, and monotone by construction: the flow has no
+    /// "disable" (accumulated deltas are drained by `checkpoint_delta`).
+    pub fn enable_delta_checkpoints(&self, job_id: &str) -> Result<(), IvmError> {
+        let job = self
+            .get(job_id)
+            .ok_or_else(|| IvmError::execution(format!("IVM job not found: {job_id}")))?;
+        job.enable_delta_checkpoints()?;
+        if let Ok(mut on) = self.delta_checkpoints.lock() {
+            on.insert(job_id.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Whether delta-checkpoint accumulation is on for `job_id`.
+    pub fn delta_checkpoints_enabled(&self, job_id: &str) -> bool {
+        self.delta_checkpoints
+            .lock()
+            .map(|on| on.contains(job_id))
+            .unwrap_or(false)
     }
 
     /// Snapshot the resident-dispatch state for a job (default when unset).
@@ -764,6 +903,7 @@ impl IvmJobRegistry {
         // Drop the per-job step lock so a recreated same-id job gets a fresh one.
         let _ = self.step_locks.lock().map(|mut l| l.remove(job_id));
         let _ = self.pinned_single.lock().map(|mut p| p.remove(job_id));
+        let _ = self.delta_checkpoints.lock().map(|mut d| d.remove(job_id));
         // Drop dispatch bookkeeping (a recreated job starts unattached).
         let _ = self.dispatch.lock().map(|mut d| d.remove(job_id));
         // Stop this job's vector-view maintenance tasks (DIST-H3: they used to
@@ -910,6 +1050,7 @@ impl IvmJobRegistry {
                 .lock()
                 .map(|p| p.contains(job_id))
                 .unwrap_or(false),
+            delta_checkpoints: self.delta_checkpoints_enabled(job_id),
         };
         serde_json::to_vec(&persisted).map_err(|e| IvmError::execution(e.to_string()))
     }
@@ -954,6 +1095,16 @@ impl IvmJobRegistry {
             && let Ok(mut pinned) = self.pinned_single.lock()
         {
             pinned.insert(job_id.to_owned());
+        }
+        // Re-arm delta-checkpoint accumulation (IVM-AUD-DIST-C1). Note what
+        // this does NOT restore: the deltas accumulated before the snapshot
+        // was taken. `checkpoint_full` captures the state they produced, so
+        // the next `/checkpoint-delta` is an increment on top of *this*
+        // snapshot, not on top of whatever full checkpoint the caller last
+        // took — the same discontinuity a `checkpoint_delta()` call itself
+        // creates, since it drains what it returns.
+        if persisted.delta_checkpoints {
+            self.enable_delta_checkpoints(job_id)?;
         }
         self.update_dispatch(job_id, |dispatch| *dispatch = IvmDispatchState::default());
         Ok(())
@@ -1016,6 +1167,40 @@ fn check_view_fits_partitioning(
              it on a separate job."
         ))),
     }
+}
+
+/// What a durable IVM snapshot says about a job, without rehydrating it.
+///
+/// IVM-AUD-DIST-C4: `GET /api/v1/ivm/jobs` listed snapshot-only jobs with a
+/// hardcoded `partitioned: false` and an empty `view_names`, which for the
+/// canonical auto-partitioned job is simply a wrong answer — and the shape is
+/// the one property of an IVM job a client cannot change later. The bytes were
+/// already in hand (`list_ivm_snapshots` returns them); nothing read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IvmSnapshotSummary {
+    /// Whether the persisted job was auto-partitioned.
+    pub partitioned: bool,
+    /// The views the snapshot records, in persisted order.
+    pub view_names: Vec<String>,
+}
+
+/// Read [`IvmSnapshotSummary`] out of durable snapshot bytes.
+///
+/// Deliberately cheap and total: it parses the JSON envelope only — it does
+/// **not** rebuild the flow or apply `checkpoint_full` — so a listing endpoint
+/// can describe every persisted job without pulling them all into memory
+/// (which is the separate leak filed as IVM-AUD-DIST-H5). Returns `None` for
+/// bytes this build cannot parse, so an unreadable snapshot degrades to the
+/// old "no detail" answer rather than failing the whole listing.
+pub fn read_ivm_snapshot_summary(bytes: &[u8]) -> Option<IvmSnapshotSummary> {
+    let persisted: PersistedIvmJob = serde_json::from_slice(bytes).ok()?;
+    if persisted.version != IVM_DURABLE_SNAPSHOT_VERSION {
+        return None;
+    }
+    Some(IvmSnapshotSummary {
+        partitioned: matches!(persisted.shape, PersistedIvmShape::Partitioned { .. }),
+        view_names: persisted.views.into_iter().map(|v| v.name).collect(),
+    })
 }
 
 /// Shared, reference-counted handle to the IVM job registry.

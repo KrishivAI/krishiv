@@ -142,8 +142,77 @@ async fn persist_ivm_job(
         })
 }
 
+/// Whether this coordinator can actually make IVM state durable, warning once
+/// per process when it cannot.
+///
+/// IVM-AUD-DIST-C5: with no metadata store configured,
+/// `SharedCoordinator::save_ivm_snapshot` returns `Ok(())` without writing
+/// anything. Every IVM handler then reported success for a write that never
+/// happened, `/restore` answered `{"success": true}` for a rewind that existed
+/// only in this process's memory, and a restart lost the lot — silently, with
+/// no line in the log and no field in any response. Handlers that claim
+/// durability now report this back, so "not durable" is a fact the caller can
+/// read rather than something it discovers after a restart.
+async fn ivm_writes_are_durable(coordinator: &SharedCoordinator) -> bool {
+    let durable = coordinator.has_metadata_store().await;
+    if !durable {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                "this coordinator has no metadata store configured: IVM job state is held in \
+                 memory only, every persist is a no-op, and a restart loses all of it. IVM \
+                 responses report `durable: false` while this is the case."
+            );
+        });
+    }
+    durable
+}
+
+/// Refuse a feed when the job's un-stepped backlog is already at the cap.
+///
+/// IVM-AUD-INT-F11: nothing anywhere applied backpressure. `pending` is an
+/// unbounded `Vec` per source, the body limit is 512 MiB per request and there
+/// is no concurrency limiter, so a producer feeding faster than the stepper
+/// drains grew the coordinator's heap until the process died — with every
+/// `/feed` answering `success: true` right up to the end. `429 Too Many
+/// Requests` is the answer that lets a client back off instead.
+///
+/// The check is deliberately coarse: it reads the backlog *before* admitting
+/// this delta, so N concurrent feeds can each pass and overshoot the cap by up
+/// to N bodies. That bounds the overshoot by the concurrency, which is the
+/// property that was missing; making it exact would need the admission to be
+/// atomic with the feed, and the feed is the thing being protected.
+fn ensure_pending_headroom(
+    registry: &SharedIvmJobRegistry,
+    flow: &crate::ivm::IvmJob,
+    job_id: &str,
+) -> Result<(), StatusCode> {
+    let cap = registry.max_pending_bytes();
+    if cap == 0 {
+        return Ok(());
+    }
+    let pending = flow.pending_bytes().map_err(ivm_err)? as u64;
+    if pending >= cap {
+        tracing::warn!(
+            job_id,
+            pending_bytes = pending,
+            cap_bytes = cap,
+            "IVM feed refused: the job's un-stepped backlog is at the cap (step it, or raise \
+             KRISHIV_IVM_MAX_PENDING_BYTES)"
+        );
+        return Err(StatusCode::TOO_MANY_REQUESTS);
+    }
+    Ok(())
+}
+
 // ── schema JSON ───────────────────────────────────────────────────────────────
 
+/// A field of the **legacy** type-name schema wire.
+///
+/// This form can only express the types [`parse_schema`] whitelists; anything
+/// else is a 400. New clients send `output_schema_ipc_b64` instead (see
+/// [`RegisterViewRequest::output_schema_ipc_b64`], IVM-AUD-API-A1) and this
+/// remains only so an older client keeps working.
 #[derive(Debug, Deserialize)]
 pub struct SchemaFieldJson {
     pub name: String,
@@ -197,6 +266,24 @@ fn parse_schema(s: &SchemaJson) -> Option<arrow::datatypes::SchemaRef> {
     Some(std::sync::Arc::new(Schema::new(fields?)))
 }
 
+/// Decode an Arrow IPC **schema** message (base64 of a stream whose only
+/// required content is the schema header) back into a `SchemaRef`.
+///
+/// IVM-AUD-API-A1: the type-name wire above is a closed whitelist, so a
+/// DataFrame whose output schema contains `Decimal128`, a timezoned
+/// `Timestamp`, `Time32`/`Time64`, `List`, `Struct`, `Interval`, `Null` or
+/// `FixedSizeBinary` could be registered embedded and 400'd distributed. Arrow's
+/// own encoding carries every type — including field metadata, nested children
+/// and dictionary ids — so shipping it removes the whole class instead of
+/// widening the match arm by arm.
+fn parse_schema_ipc(b64: &str) -> Result<arrow::datatypes::SchemaRef, String> {
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+        .map_err(|e| format!("output_schema_ipc_b64 base64 decode: {e}"))?;
+    let reader = arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(bytes), None)
+        .map_err(|e| format!("output_schema_ipc_b64 is not an Arrow IPC stream: {e}"))?;
+    Ok(reader.schema())
+}
+
 // ── POST /api/v1/ivm/jobs ─────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -208,11 +295,35 @@ pub struct CreateJobRequest {
     /// output). Absent / `Some(true)` keeps the default auto-partitioning.
     #[serde(default)]
     pub partitioned: Option<bool>,
+    /// Accumulate every fed delta so `POST .../checkpoint-delta` returns a real
+    /// incremental backup.
+    ///
+    /// IVM-AUD-DIST-C1: nothing in the HTTP API switched accumulation on and
+    /// there was no field to ask for it, so `/checkpoint-delta` answered a
+    /// well-formed **count = 0** frame forever and `/restore-delta` composed
+    /// nothing — a caller taking incremental backups got success responses and
+    /// backups containing none of the input since the last full checkpoint.
+    ///
+    /// Off by default, because it is not free: every accepted delta is retained
+    /// in memory until a `/checkpoint-delta` call drains it, so a job nobody
+    /// backs up would grow without bound.
+    ///
+    /// This route is idempotent (an existing job is rehydrated, not replaced),
+    /// so posting it again with `delta_checkpoints: true` is also how
+    /// accumulation is switched on for a job that already exists. There is no
+    /// way to switch it back off: the flow has no disable, and pretending
+    /// otherwise is the bug this field fixes.
+    #[serde(default)]
+    pub delta_checkpoints: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct CreateJobResponse {
     pub job_id: String,
+    /// Whether this coordinator can persist the job at all (IVM-AUD-DIST-C5).
+    /// `false` means the job is memory-only and a coordinator restart loses it,
+    /// which is otherwise indistinguishable from a durable create.
+    pub durable: bool,
 }
 
 /// Bring `job_id` into the live registry and make it durable.
@@ -226,14 +337,26 @@ pub struct CreateJobResponse {
 /// save it either, because the id *is* present, just empty.
 ///
 /// `partitioned == Some(false)` pins the job to a single flow so it can host a
-/// view-DAG; absent / `Some(true)` keeps the default auto-partitioning. Only
-/// consulted when the job is genuinely new — a rehydrated job keeps whatever
-/// shape its snapshot recorded.
+/// view-DAG; absent / `Some(true)` keeps the default auto-partitioning. The
+/// shape is chosen only when the job is genuinely new — a job that already
+/// exists (live or rehydrated) keeps the shape it has.
+///
+/// # A shape request that cannot be honoured is a 409, not a success
+///
+/// IVM-AUD-INT-F16: `partitioned` used to be consulted *only* on the create
+/// branch, so asking for an unpartitioned job under a name that already held a
+/// partitioned one returned `200 {job_id}` and a job that was still
+/// partitioned. That is exactly the `Session::ivm` (auto-partitioning) vs
+/// `DataFrame::to_incremental` (pinned single) collision under one name — and
+/// the caller who asked for single did so because a partitioned flow never
+/// cascades a base view's output to derived views, so their view-DAG would sit
+/// empty forever with nothing said. The request is now refused.
 pub(crate) async fn create_or_rehydrate_ivm_job(
     registry: &SharedIvmJobRegistry,
     coordinator: &SharedCoordinator,
     job_id: &str,
     partitioned: Option<bool>,
+    delta_checkpoints: bool,
 ) -> Result<(), StatusCode> {
     if registry.get(job_id).is_none() {
         if let Some(snapshot) = coordinator.load_ivm_snapshot(job_id).await {
@@ -248,6 +371,23 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
             registry.create(job_id.to_owned()).map_err(ivm_err)?;
         }
     }
+    // IVM-AUD-INT-F16. Checked after the branch above so it covers all three
+    // arrivals — already live, just rehydrated, just created — and a freshly
+    // created unpartitioned job passes it by construction.
+    if partitioned == Some(false) && registry.get(job_id).is_some_and(|job| job.is_partitioned()) {
+        tracing::warn!(
+            job_id,
+            "IVM create refused: an unpartitioned job was requested under a name that already \
+             holds a key-partitioned one"
+        );
+        return Err(StatusCode::CONFLICT);
+    }
+    // Applied to a rehydrated job too, unlike `partitioned`: accumulation is
+    // monotone and cheap to re-assert, so this route doubles as the "turn it on
+    // for a job that already exists" surface (IVM-AUD-DIST-C1).
+    if delta_checkpoints {
+        registry.enable_delta_checkpoints(job_id).map_err(ivm_err)?;
+    }
     persist_ivm_job(registry, coordinator, job_id).await
 }
 
@@ -260,8 +400,16 @@ pub async fn api_ivm_create_job(
     let job_id = body
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    create_or_rehydrate_ivm_job(&registry, &coordinator, &job_id, body.partitioned).await?;
-    Ok(Json(CreateJobResponse { job_id }))
+    create_or_rehydrate_ivm_job(
+        &registry,
+        &coordinator,
+        &job_id,
+        body.partitioned,
+        body.delta_checkpoints,
+    )
+    .await?;
+    let durable = ivm_writes_are_durable(&coordinator).await;
+    Ok(Json(CreateJobResponse { job_id, durable }))
 }
 
 // ── GET /api/v1/ivm/jobs ──────────────────────────────────────────────────────
@@ -289,14 +437,20 @@ pub async fn api_ivm_list_jobs(
     State(registry): State<SharedIvmJobRegistry>,
     State(coordinator): State<SharedCoordinator>,
 ) -> Json<ListJobsResponse> {
+    // IVM-AUD-DIST-C4: `list_ivm_snapshots` hands back the snapshot bytes and
+    // this used to drop them with `|(job_id, _)|`, then fabricate
+    // `partitioned: false` for every job it had not rehydrated. For the
+    // canonical IVM workload — a single-column `GROUP BY` first view, which
+    // auto-partitions — that is simply the wrong answer, about the one property
+    // of a job a client can never change afterwards. Read the persisted shape.
+    let mut summaries: HashMap<String, crate::ivm::IvmSnapshotSummary> = HashMap::new();
     let mut job_ids = registry.job_ids();
-    job_ids.extend(
-        coordinator
-            .list_ivm_snapshots()
-            .await
-            .into_iter()
-            .map(|(job_id, _)| job_id),
-    );
+    for (job_id, snapshot) in coordinator.list_ivm_snapshots().await {
+        if let Some(summary) = crate::ivm::read_ivm_snapshot_summary(&snapshot) {
+            summaries.insert(job_id.clone(), summary);
+        }
+        job_ids.push(job_id);
+    }
     job_ids.sort();
     job_ids.dedup();
     let jobs = job_ids
@@ -308,12 +462,17 @@ pub async fn api_ivm_list_jobs(
                 partitioned: job.is_partitioned(),
                 live: true,
             },
-            None => IvmJobSummary {
-                job_id: id.clone(),
-                view_names: Vec::new(),
-                partitioned: false,
-                live: false,
-            },
+            // Snapshot-only. A snapshot this build cannot parse leaves no
+            // summary, and then the honest answer is still the old empty one.
+            None => {
+                let summary = summaries.get(id);
+                IvmJobSummary {
+                    job_id: id.clone(),
+                    view_names: summary.map(|s| s.view_names.clone()).unwrap_or_default(),
+                    partitioned: summary.is_some_and(|s| s.partitioned),
+                    live: false,
+                }
+            }
         })
         .collect();
     Json(ListJobsResponse { job_ids, jobs })
@@ -337,10 +496,12 @@ pub async fn api_ivm_delete_job(
     // concurrent tick: the tick reads its snapshot, we remove it here, then the
     // tick's trailing `persist_ivm_job` writes the snapshot back — resurrecting
     // a deleted job on disk. Taking the lock makes deletion either win outright
-    // (the next tick's `ensure_ivm_job` 404s) or wait for the in-flight tick to
-    // finish first (whose `persist` then no-ops because the registry entry is
-    // gone). The wait is bounded by one tick's timeout now that both the
-    // resident and central step paths are time-bounded (#224 B).
+    // (the waiting tick then sees the job gone and 404s without computing —
+    // IVM-AUD-DIST-H6) or wait for an in-flight tick to finish first. The wait
+    // is bounded by one tick's timeout now that both the resident and central
+    // step paths are time-bounded (#224 B) — and that bound is
+    // `KRISHIV_IVM_DISPATCH_TIMEOUT_SECS` (IVM-AUD-DIST-H7), so an operator who
+    // needs deletion to give up sooner has a lever.
     let _step_guard = registry.step_lock(&job_id).lock_owned().await;
 
     // Best-effort detach of the resident executor flow (Phase 57): fire the
@@ -372,7 +533,22 @@ pub async fn api_ivm_delete_job(
 pub struct RegisterViewRequest {
     pub name: String,
     pub body_sql: String,
+    /// Legacy type-name schema. Still required on the wire so that a client
+    /// which predates `output_schema_ipc_b64` is unaffected; ignored whenever
+    /// that field is present.
     pub output_schema: SchemaJson,
+    /// IVM-AUD-API-A1. Base64 of an Arrow IPC stream whose schema header is the
+    /// view's output schema — the authoritative form when present.
+    ///
+    /// The type-name form above cannot express `Decimal128`, a timezoned
+    /// `Timestamp`, `Time32`/`Time64`, `List`, `Struct`, `Interval`, `Null` or
+    /// `FixedSizeBinary`, so `DataFrame::to_incremental` on a query returning
+    /// any of them worked embedded and answered 400 distributed — the same
+    /// DataFrame, a different answer per mode. `#[serde(default)]` keeps an
+    /// older client working: it omits the field and gets exactly the whitelist
+    /// behaviour it already had.
+    #[serde(default)]
+    pub output_schema_ipc_b64: Option<String>,
     #[serde(default)]
     pub is_materialized: bool,
     #[serde(default)]
@@ -408,8 +584,14 @@ pub async fn api_ivm_register_view(
     // Existence is enforced by the registry (which also decides, on the first
     // view, whether to auto-partition the job by a single-column GROUP BY key).
     ensure_ivm_job(&registry, &coordinator, &job_id).await?;
-    let output_schema =
-        parse_schema(&body.output_schema).ok_or_else(|| ivm_err("invalid output_schema"))?;
+    // Prefer the Arrow IPC schema when the client sent one (IVM-AUD-API-A1);
+    // fall back to the type-name whitelist for older clients that cannot.
+    let output_schema = match &body.output_schema_ipc_b64 {
+        Some(b64) => parse_schema_ipc(b64).map_err(ivm_err)?,
+        None => {
+            parse_schema(&body.output_schema).ok_or_else(|| ivm_err("invalid output_schema"))?
+        }
+    };
     let spec = IncrementalViewSpec {
         name: body.name,
         body_sql: body.body_sql,
@@ -467,6 +649,7 @@ pub async fn api_ivm_feed_source(
 ) -> Result<Json<FeedSourceResponse>, StatusCode> {
     ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
+    ensure_pending_headroom(&registry, &flow, &job_id)?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.delta_ipc_b64,
@@ -506,6 +689,7 @@ pub async fn api_ivm_feed_stream_delta(
 ) -> Result<Json<FeedStreamDeltaResponse>, StatusCode> {
     ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
+    ensure_pending_headroom(&registry, &flow, &job_id)?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.delta_ipc_b64,
@@ -528,6 +712,99 @@ pub struct StepResponse {
     pub active_views: usize,
     pub total_output_rows: usize,
     pub tick: u64,
+    /// IVM-AUD-API-A5. Per-view health for this tick.
+    ///
+    /// A view whose SQL or operator fails does **not** fail the tick: the flow
+    /// skips it, keeps going and reports it here. Before this field existed the
+    /// response carried counters only, so a distributed caller had no view-level
+    /// failure signal at all — `krishiv_api::StepReport` filled both of its
+    /// vectors with `Vec::new()` and a broken view was byte-identical to a
+    /// healthy one.
+    ///
+    /// Serialized as a nested object (rather than two sibling arrays) so that a
+    /// client can tell "the coordinator reported health and nothing failed"
+    /// from "this coordinator does not report health": an older coordinator
+    /// omits the object entirely, and the client decodes that as `None`.
+    pub view_health: ViewHealthJson,
+}
+
+/// Per-view health for one tick. See [`StepResponse::view_health`].
+///
+/// `reported` exists because one of the two dispatch routes genuinely has no
+/// health to give: a **resident** tick runs on an executor and its result wire
+/// carries per-view output deltas only, so the coordinator's mirror
+/// (`IncrementalFlow::apply_remote_tick`) constructs its summary with empty
+/// health vectors. Serializing those as if they were a report would replace one
+/// silent lie with another.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewHealthJson {
+    /// Whether the engine that ran this tick reported per-view health at all.
+    /// When false the two vectors below are empty for lack of a signal, not
+    /// because every view is healthy.
+    pub reported: bool,
+    /// Why health is unavailable, when `reported` is false. Empty otherwise.
+    #[serde(default)]
+    pub unreported_reason: String,
+    /// Views that ran on the O(state) DiffBased path this tick.
+    pub degraded_views: Vec<String>,
+    /// Views that failed and were skipped this tick.
+    pub errored_views: Vec<ViewErrorJson>,
+}
+
+impl ViewHealthJson {
+    /// A real report from a tick the coordinator computed itself.
+    fn reported(summary: &krishiv_ivm::StepSummary) -> Self {
+        Self {
+            reported: true,
+            unreported_reason: String::new(),
+            degraded_views: summary.degraded_views.clone(),
+            errored_views: summary
+                .errored_views
+                .iter()
+                .map(|e| ViewErrorJson {
+                    view: e.view.clone(),
+                    kind: view_error_kind_name(&e.kind).to_owned(),
+                    message: e.message.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    /// No signal, and why.
+    fn unreported(reason: &str) -> Self {
+        Self {
+            reported: false,
+            unreported_reason: reason.to_owned(),
+            degraded_views: Vec::new(),
+            errored_views: Vec::new(),
+        }
+    }
+}
+
+/// Wire form of `krishiv_ivm::ViewError`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewErrorJson {
+    pub view: String,
+    /// Snake-case name of `krishiv_ivm::ViewErrorKind` — see
+    /// [`view_error_kind_name`]. A client that does not recognise the name must
+    /// say so rather than substituting a kind it does know.
+    pub kind: String,
+    pub message: String,
+}
+
+/// Wire name for a view-failure kind.
+///
+/// Exhaustive on purpose: adding a `ViewErrorKind` variant must be a compile
+/// error here, because the alternative is a catch-all that silently relabels a
+/// new failure mode as an old one.
+fn view_error_kind_name(kind: &krishiv_ivm::ViewErrorKind) -> &'static str {
+    use krishiv_ivm::ViewErrorKind as K;
+    match kind {
+        K::OperatorApply => "operator_apply",
+        K::ViewSql => "view_sql",
+        K::Publish => "publish",
+        K::FixpointNotConverged => "fixpoint_not_converged",
+    }
 }
 
 pub async fn api_ivm_step(
@@ -544,6 +821,17 @@ pub async fn api_ivm_step(
     let step_lock = registry.step_lock(&job_id);
     let _guard = step_lock.lock().await;
 
+    // IVM-AUD-DIST-H6: `ensure_ivm_job` ran before the lock, so a `DELETE` that
+    // won the race has already removed both the registry entry and the durable
+    // snapshot by the time we get here — while `flow` above is still a live
+    // `Arc` to the orphaned flow. Without this re-check the handler computed a
+    // whole tick on that orphan and only then failed, in `persist_ivm_job`,
+    // with a bare 400 (`durable_snapshot` cannot find the job) — expensive,
+    // and the wrong status for "this job no longer exists".
+    if registry.get(&job_id).is_none() {
+        return Err(ivm_not_found(&job_id));
+    }
+
     let executor_count = coordinator
         .read()
         .await
@@ -557,12 +845,24 @@ pub async fn api_ivm_step(
     // Partitioned jobs always compute centrally (their shards already run in
     // parallel in-process). Every route is recorded as a queryable dispatch
     // decision; nothing falls back silently.
-    let summary = if executor_count > 0 && matches!(flow, crate::ivm::IvmJob::Single(_)) {
+    //
+    // The route also decides whether this tick has any per-view health to
+    // report (IVM-AUD-API-A5): a central tick computes the views here and its
+    // `StepSummary` is a real report; a resident tick is computed on an
+    // executor whose result wire carries view output deltas only, so the
+    // coordinator's mirror has nothing to say and must say exactly that.
+    let (summary, health) = if executor_count > 0 && matches!(flow, crate::ivm::IvmJob::Single(_)) {
         let crate::ivm::IvmJob::Single(inner_flow) = &flow else {
             unreachable!("matched above")
         };
         match submit_resident_ivm_step(&coordinator, &registry, inner_flow, &job_id).await {
-            Ok(sum) => sum,
+            Ok(sum) => (
+                sum,
+                ViewHealthJson::unreported(
+                    "this tick ran on a resident executor; the resident tick result carries \
+                     per-view output deltas only, so no per-view health was reported",
+                ),
+            ),
             Err(step_err) => {
                 // Recorded central fallback: submit_resident_ivm_step re-feeds
                 // pending before failing, so this tick observes the same input.
@@ -584,7 +884,9 @@ pub async fn api_ivm_step(
                         at_unix_ms: krishiv_common::async_util::unix_now_ms(),
                     });
                 });
-                central_step_with_timeout(&flow, &job_id).await?
+                let sum = central_step_with_timeout(&flow, &job_id).await?;
+                let health = ViewHealthJson::reported(&sum);
+                (sum, health)
             }
         }
     } else {
@@ -602,7 +904,9 @@ pub async fn api_ivm_step(
                 at_unix_ms: krishiv_common::async_util::unix_now_ms(),
             });
         });
-        central_step_with_timeout(&flow, &job_id).await?
+        let sum = central_step_with_timeout(&flow, &job_id).await?;
+        let health = ViewHealthJson::reported(&sum);
+        (sum, health)
     };
 
     let tick = flow.tick().unwrap_or(0);
@@ -611,11 +915,41 @@ pub async fn api_ivm_step(
         active_views: summary.active_views,
         total_output_rows: summary.total_output_rows,
         tick,
+        view_health: health,
     }))
 }
 
-/// Timeout for a dispatched IVM fragment before falling back to central compute.
-const IVM_DISPATCH_TIMEOUT_SECS: u64 = 300;
+/// Default timeout for a dispatched IVM fragment before falling back to
+/// central compute. Override with `KRISHIV_IVM_DISPATCH_TIMEOUT_SECS`.
+const DEFAULT_IVM_DISPATCH_TIMEOUT_SECS: u64 = 300;
+
+/// Pure policy for [`ivm_dispatch_timeout_secs`], split out so it is testable
+/// without touching the process environment.
+///
+/// A value that is absent, unparseable or zero falls back to the default: zero
+/// would make every tick time out instantly, which is a worse failure than the
+/// misconfiguration it came from.
+fn resolve_ivm_dispatch_timeout_secs(env_override: Option<&str>) -> u64 {
+    env_override
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_IVM_DISPATCH_TIMEOUT_SECS)
+}
+
+/// How long one IVM tick may run before it is abandoned.
+///
+/// IVM-AUD-DIST-H7: this was a hardcoded 300 s with no way to change it, and
+/// it bounds more than the tick — `DELETE /jobs/{id}` takes the same per-job
+/// step lock, so a job whose tick is wedged cannot be deleted for up to this
+/// long either. An operator with a workload that legitimately needs longer (or
+/// a control plane that wants deletion to give up sooner) had no lever at all.
+fn ivm_dispatch_timeout_secs() -> u64 {
+    resolve_ivm_dispatch_timeout_secs(
+        std::env::var("KRISHIV_IVM_DISPATCH_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// Run one **central** (in-coordinator) IVM tick under the same safety timeout
 /// the resident-dispatch path already enforces (#224 B).
@@ -631,8 +965,9 @@ async fn central_step_with_timeout(
     flow: &crate::ivm::IvmJob,
     job_id: &str,
 ) -> Result<krishiv_ivm::StepSummary, StatusCode> {
+    let timeout_secs = ivm_dispatch_timeout_secs();
     match tokio::time::timeout(
-        std::time::Duration::from_secs(IVM_DISPATCH_TIMEOUT_SECS),
+        std::time::Duration::from_secs(timeout_secs),
         flow.step_datafusion(),
     )
     .await
@@ -643,11 +978,7 @@ async fn central_step_with_timeout(
             Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
         Err(_elapsed) => {
-            tracing::error!(
-                job_id,
-                timeout_secs = IVM_DISPATCH_TIMEOUT_SECS,
-                "IVM central step timed out"
-            );
+            tracing::error!(job_id, timeout_secs, "IVM central step timed out");
             Err(StatusCode::SERVICE_UNAVAILABLE)
         }
     }
@@ -692,14 +1023,15 @@ async fn run_ivm_fragment_job(
         coord.notify().clone()
     };
 
-    // Poll until terminal (bounded by IVM_DISPATCH_TIMEOUT_SECS). The recheck
+    // Poll until terminal (bounded by `ivm_dispatch_timeout_secs`). The recheck
     // right before sleeping closes the missed-Notify gap (H-20).
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(IVM_DISPATCH_TIMEOUT_SECS);
+    let timeout_secs = ivm_dispatch_timeout_secs();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
     let succeeded = loop {
         if tokio::time::Instant::now() >= deadline {
             tracing::error!(
                 job_id = %sched_job_id,
-                timeout_secs = IVM_DISPATCH_TIMEOUT_SECS,
+                timeout_secs,
                 "IVM dispatch job timed out"
             );
             break false;
@@ -804,7 +1136,11 @@ async fn submit_resident_ivm_step(
         // The executor's flow owns the live accumulators from here on; the
         // coordinator's cached plans are stale and must never apply another
         // delta (a later central fallback rebuilds + reseeds from the mirror).
-        flow.invalidate_view_plans().map_err(|e| e.to_string())?;
+        // IVM-AUD-INT-F10: this used to drop the drained deltas on the floor —
+        // `refeed` was in scope and simply not applied, so a failure here lost
+        // every delta this tick had taken custody of.
+        flow.invalidate_view_plans()
+            .map_err(|e| refeed(format!("invalidate_view_plans: {e}")))?;
         registry.update_dispatch(ivm_job_id, |d| d.attached = true);
         disp.attached = true;
         tracing::info!(
@@ -827,9 +1163,16 @@ async fn submit_resident_ivm_step(
         .map_err(|e| refeed(format!("decode delta map: {e}")))?;
 
     // 4. Mirror the tick on the coordinator's authoritative state.
+    //
+    // IVM-AUD-INT-F10: this path skipped `refeed` too, and the consequence was
+    // worse than a lost delta — the executor had applied the tick and the
+    // coordinator had not, so the two diverged and the next tick's fence check
+    // was the first thing to notice. `apply_remote_tick` is now all-or-nothing
+    // (see its docs), which is what makes re-feeding here safe rather than a
+    // double-apply.
     let summary = flow
-        .apply_remote_tick(local_pending, view_deltas)
-        .map_err(|e| e.to_string())?;
+        .apply_remote_tick(local_pending.clone(), view_deltas)
+        .map_err(|e| refeed(format!("apply_remote_tick: {e}")))?;
     let tick = flow.tick().unwrap_or(0);
     registry.update_dispatch(ivm_job_id, |d| {
         d.fence = fence;
@@ -921,9 +1264,25 @@ pub async fn api_ivm_snapshot(
 
 // ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/output ───────────────────
 
+/// Query string of `GET .../views/{view}/output`.
+#[derive(Debug, Deserialize, Default)]
+pub struct ViewOutputQuery {
+    /// Serve the held delta only if it was published *after* this tick.
+    ///
+    /// IVM-AUD-INT-F5. Without it, this endpoint is a non-consuming peek at a
+    /// coalescing watch: polling twice between ticks hands back the same delta
+    /// twice, and a consumer with no way to tell them apart double-applies it.
+    /// Pass the `tick` from the previous response and a repeat read answers
+    /// `delta_ipc_b64: null` instead.
+    #[serde(default)]
+    pub since_tick: Option<u64>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ViewOutputResponse {
-    /// Base64-encoded Arrow IPC of the latest delta (may be None if no output yet).
+    /// Base64-encoded Arrow IPC of the held delta. `None` when the view has
+    /// published nothing yet, or when `since_tick` says the caller already has
+    /// this one.
     pub delta_ipc_b64: Option<String>,
     pub num_rows: usize,
     /// The flow tick this delta was published at; `None` when there is none.
@@ -932,18 +1291,52 @@ pub struct ViewOutputResponse {
     /// per-shard deltas as "the latest delta" with nothing saying which tick
     /// they belonged to — and the shards' coalescing watches meant they need
     /// not have belonged to the same one. The merge now only combines shards
-    /// that published at the same tick, and this reports which. (It is a
-    /// label, not a cursor: a consumer polling slower than `/step` still
-    /// misses deltas — that is INT-F5, and it is still open.)
+    /// that published at the same tick, and this reports which.
+    ///
+    /// Reported even when `delta_ipc_b64` is `None` because of `since_tick`, so
+    /// the caller can carry its cursor forward.
     pub tick: Option<u64>,
+    /// Total rows this view has ever published (inserts + retractions), summed
+    /// across shards.
+    ///
+    /// IVM-AUD-INT-F5, the detection half. The channel behind this endpoint is
+    /// a **coalescing watch**: it holds one value per view, so a consumer
+    /// polling slower than `/step` loses every delta but the newest, and used
+    /// to lose them with no trace. This counter makes the loss measurable:
+    /// remember it alongside the delta you were served, and on the next poll
+    ///
+    /// ```text
+    /// rows_lost = published_rows_total - previous_published_rows_total - num_rows
+    /// ```
+    ///
+    /// is the number of published rows that passed through the watch and were
+    /// overwritten. Zero means nothing was missed. **It does not recover them**
+    /// — this endpoint is still lossy by construction, and making it lossless
+    /// needs the broadcast stream (`IncrementalFlow::view_output_stream`)
+    /// exposed over HTTP, which is not done.
+    ///
+    /// Two things it is not: (1) monotone across a restore — `restore`/
+    /// `restore_full` reset the counters (IVM-AUD-CORE-27), so a consumer must
+    /// treat a *decrease* as "cursor invalid, resync from `/snap`", not as
+    /// negative loss; (2) exact for a partitioned job — the served delta merges
+    /// only the shards that published at `tick`, while this counts every
+    /// shard, so a job whose shards publish at different ticks reports
+    /// nonzero loss for rows that are merely still in flight.
+    pub published_rows_total: u64,
 }
 
 pub async fn api_ivm_view_output(
     State(registry): State<SharedIvmJobRegistry>,
     State(coordinator): State<SharedCoordinator>,
     Path((job_id, view_name)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<ViewOutputQuery>,
 ) -> Result<Json<ViewOutputResponse>, StatusCode> {
     let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
+    let published_rows_total = job
+        .view_delta_stats(&view_name)
+        .map_err(ivm_err)?
+        .map(|s| s.rows_inserted_total + s.rows_retracted_total)
+        .unwrap_or(0);
     // Peek the latest output delta (for a partitioned job, the shards that
     // published at the newest tick — see `view_output_peek_at_tick`).
     match job.view_output_peek_at_tick(&view_name).map_err(ivm_err)? {
@@ -951,7 +1344,18 @@ pub async fn api_ivm_view_output(
             delta_ipc_b64: None,
             num_rows: 0,
             tick: None,
+            published_rows_total,
         })),
+        // Already delivered: the watch is non-consuming, so without this the
+        // same delta comes back on every poll (IVM-AUD-INT-F5).
+        Some((tick, _)) if query.since_tick.is_some_and(|since| tick <= since) => {
+            Ok(Json(ViewOutputResponse {
+                delta_ipc_b64: None,
+                num_rows: 0,
+                tick: Some(tick),
+                published_rows_total,
+            }))
+        }
         Some((tick, delta)) => {
             let num_rows = delta.num_rows();
             let ipc = serialize_delta_batch(&delta).map_err(ivm_err)?;
@@ -960,6 +1364,7 @@ pub async fn api_ivm_view_output(
                 delta_ipc_b64: Some(b64),
                 num_rows,
                 tick: Some(tick),
+                published_rows_total,
             }))
         }
     }
@@ -1093,6 +1498,10 @@ pub struct RestoreRequest {
 #[derive(Debug, Serialize)]
 pub struct RestoreResponse {
     pub success: bool,
+    /// Whether the restored state was written anywhere it survives this
+    /// process (IVM-AUD-DIST-C5). `success: true, durable: false` means the
+    /// rewind happened in memory and the next restart undoes it.
+    pub durable: bool,
 }
 
 pub async fn api_ivm_restore(
@@ -1108,6 +1517,13 @@ pub async fn api_ivm_restore(
         &body.checkpoint_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
+    // IVM-AUD-DIST-B1: a rewind must not interleave with a tick. Only `/step`
+    // and `DELETE` took this lock, so a restore landing mid-tick let the
+    // in-flight tick apply its input deltas and the executor's output deltas
+    // (`apply_remote_tick`) on top of the state we had just replaced — half of
+    // the rewind silently undone, answered `{"success": true}`. Take the same
+    // per-job lock a tick takes, so the two orders are the only two outcomes.
+    let _step_guard = registry.step_lock(&job_id).lock_owned().await;
     // Matches `api_ivm_checkpoint`'s full checkpoint (sources + view baselines).
     flow.restore_full(&bytes).map_err(ivm_err)?;
     // Persist, like every other handler that changes authoritative state
@@ -1116,7 +1532,10 @@ pub async fn api_ivm_restore(
     // and `ensure_ivm_job` rehydrates the *pre-restore* snapshot — silently
     // undoing the rewind the operator was told had happened.
     persist_ivm_job(&registry, &coordinator, &job_id).await?;
-    Ok(Json(RestoreResponse { success: true }))
+    Ok(Json(RestoreResponse {
+        success: true,
+        durable: ivm_writes_are_durable(&coordinator).await,
+    }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/checkpoint-delta ──────────────────────────
@@ -1150,6 +1569,8 @@ pub struct RestoreDeltaRequest {
 #[derive(Debug, Serialize)]
 pub struct RestoreDeltaResponse {
     pub success: bool,
+    /// See [`RestoreResponse::durable`] (IVM-AUD-DIST-C5).
+    pub durable: bool,
 }
 
 pub async fn api_ivm_restore_delta(
@@ -1165,10 +1586,15 @@ pub async fn api_ivm_restore_delta(
         &body.checkpoint_delta_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
+    // Same reason as `api_ivm_restore` (IVM-AUD-DIST-B1).
+    let _step_guard = registry.step_lock(&job_id).lock_owned().await;
     flow.restore_delta(&bytes).map_err(ivm_err)?;
     // Same reason as `api_ivm_restore`.
     persist_ivm_job(&registry, &coordinator, &job_id).await?;
-    Ok(Json(RestoreDeltaResponse { success: true }))
+    Ok(Json(RestoreDeltaResponse {
+        success: true,
+        durable: ivm_writes_are_durable(&coordinator).await,
+    }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge ───────
@@ -1192,6 +1618,7 @@ pub async fn api_ivm_stream_bridge(
 ) -> Result<Json<StreamBridgeResponse>, StatusCode> {
     ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
+    ensure_pending_headroom(&registry, &flow, &job_id)?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.snapshot_ipc_b64,
@@ -1477,9 +1904,15 @@ mod tests {
         let coordinator = crate::SharedCoordinator::new(crate::Coordinator::active(
             krishiv_proto::CoordinatorId::try_new("coord-ivm-list").unwrap(),
         ));
-        create_or_rehydrate_ivm_job(&registry, &coordinator, "job-list-views", Some(false))
-            .await
-            .unwrap();
+        create_or_rehydrate_ivm_job(
+            &registry,
+            &coordinator,
+            "job-list-views",
+            Some(false),
+            false,
+        )
+        .await
+        .unwrap();
         let job = registry.get("job-list-views").unwrap();
         job.register_view(krishiv_ivm::IncrementalViewSpec {
             name: "v_total".to_string(),
@@ -1597,6 +2030,7 @@ mod tests {
                     },
                 ],
             },
+            output_schema_ipc_b64: None,
             is_materialized: true,
             is_recursive: false,
             lateness: Vec::new(),
@@ -1615,6 +2049,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some(job_id.to_owned()),
                 partitioned: None,
+                delta_checkpoints: false,
             }),
         )
         .await
@@ -1662,6 +2097,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: None,
                 partitioned: None,
+                delta_checkpoints: false,
             }),
         )
         .await
@@ -1682,6 +2118,7 @@ mod tests {
                 Json(CreateJobRequest {
                     job_id: Some("job-a".into()),
                     partitioned: None,
+                    delta_checkpoints: false,
                 }),
             )
             .await
@@ -1723,6 +2160,74 @@ mod tests {
     }
 
     // ── view registration ─────────────────────────────────────────────────────
+
+    /// IVM-AUD-INT-F16. `partitioned` was consulted only on the create branch,
+    /// so asking for an unpartitioned job under a name that already held a
+    /// partitioned one answered `200 {job_id}` and left the job partitioned.
+    /// The caller asked for single because a partitioned flow never cascades a
+    /// base view's output to derived views, so their view-DAG would sit empty
+    /// forever with nothing said.
+    #[tokio::test]
+    async fn pinning_an_existing_partitioned_job_is_a_conflict_not_a_success() {
+        let (registry, coordinator) = test_deps_with_shards(3);
+        // Default (auto-partitioning) create, then a GROUP BY first view: the
+        // registry shards the job on registration.
+        create_revenue_job(&registry, &coordinator, "agg").await;
+        assert!(
+            registry.get("agg").unwrap().is_partitioned(),
+            "precondition: the job must really be partitioned"
+        );
+
+        let status = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some("agg".to_owned()),
+                partitioned: Some(false),
+                delta_checkpoints: false,
+            }),
+        )
+        .await;
+        let status = match status {
+            Ok(_) => panic!("asking for single under a partitioned name must not succeed"),
+            Err(status) => status,
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            registry.get("agg").unwrap().is_partitioned(),
+            "the refusal must leave the existing job alone"
+        );
+    }
+
+    /// The same request against a name nobody holds still creates the pinned
+    /// job — the conflict check must not have turned the pin into an error.
+    #[tokio::test]
+    async fn pinning_a_fresh_name_still_creates_an_unpartitioned_job() {
+        let (registry, coordinator) = test_deps_with_shards(3);
+        let _ = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some("fresh".to_owned()),
+                partitioned: Some(false),
+                delta_checkpoints: false,
+            }),
+        )
+        .await
+        .expect("a fresh pinned create must succeed");
+        let _ = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("fresh".to_owned()),
+            Json(revenue_view_request()),
+        )
+        .await
+        .expect("register view");
+        assert!(
+            !registry.get("fresh").unwrap().is_partitioned(),
+            "a GROUP BY first view must not shard a pinned job"
+        );
+    }
 
     #[tokio::test]
     async fn register_view_404s_on_missing_job() {
@@ -1774,6 +2279,139 @@ mod tests {
         .await
         .expect("Utf8View output schema must be accepted");
         assert!(resp.0.success);
+    }
+
+    /// IVM-AUD-API-A1. The type-name schema wire is a closed whitelist, so a
+    /// view whose output carries `Decimal128`, a timezoned `Timestamp`,
+    /// `Time32`/`Time64`, `List`, `Struct`, `Interval`, `Null` or
+    /// `FixedSizeBinary` was a 400 here and a success embedded. The request now
+    /// also accepts the schema as Arrow IPC, which carries all of them.
+    ///
+    /// The request is built from raw JSON on purpose: the field NAME is the
+    /// contract with `krishiv-runtime`'s client, and a struct literal would not
+    /// pin it. Every one of these types is asserted to arrive intact via
+    /// `view_spec`, so a fix that accepted the field and dropped its contents
+    /// would still fail.
+    #[tokio::test]
+    async fn register_view_accepts_an_arrow_ipc_output_schema() {
+        use arrow::datatypes::{Fields, IntervalUnit, TimeUnit};
+
+        let wide: Arc<Schema> = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(20, 4), false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+                true,
+            ),
+            Field::new("t32", DataType::Time32(TimeUnit::Second), true),
+            Field::new("t64", DataType::Time64(TimeUnit::Nanosecond), true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "addr",
+                DataType::Struct(Fields::from(vec![Field::new("zip", DataType::Int32, true)])),
+                true,
+            ),
+            Field::new("gap", DataType::Interval(IntervalUnit::MonthDayNano), true),
+            Field::new("nothing", DataType::Null, true),
+            Field::new("hash", DataType::FixedSizeBinary(16), true),
+        ]));
+        let mut buf = Vec::new();
+        {
+            let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &wide).unwrap();
+            w.finish().unwrap();
+        }
+        let ipc_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
+
+        // Sanity: the legacy wire genuinely cannot express this schema, so the
+        // acceptance below is caused by the IPC field and nothing else.
+        let legacy = SchemaJson {
+            fields: wide
+                .fields()
+                .iter()
+                .map(|f| SchemaFieldJson {
+                    name: f.name().clone(),
+                    data_type: format!("{:?}", f.data_type()),
+                    nullable: f.is_nullable(),
+                })
+                .collect(),
+        };
+        assert!(
+            parse_schema(&legacy).is_none(),
+            "the type-name whitelist must still reject these types"
+        );
+
+        let raw = serde_json::json!({
+            "name": "wide",
+            "body_sql": "SELECT * FROM t",
+            "output_schema": { "fields": [] },
+            "output_schema_ipc_b64": ipc_b64,
+            "is_materialized": true,
+        });
+        let req: RegisterViewRequest = serde_json::from_value(raw).expect("request decodes");
+
+        let (registry, coordinator) = test_deps_with_shards(1);
+        registry.create("j".into()).unwrap();
+        let resp = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(req),
+        )
+        .await
+        .expect("an Arrow IPC output schema must be accepted");
+        assert!(resp.0.success);
+
+        let spec = registry
+            .get("j")
+            .unwrap()
+            .view_spec("wide")
+            .unwrap()
+            .expect("view registered");
+        assert_eq!(
+            spec.output_schema.as_ref(),
+            wide.as_ref(),
+            "every field must reach the flow unchanged"
+        );
+    }
+
+    /// A client that predates `output_schema_ipc_b64` omits it, and must get
+    /// exactly the whitelist behaviour it already had — acceptance for a listed
+    /// type, 400 for an unlisted one (the sibling test above).
+    #[tokio::test]
+    async fn register_view_without_the_ipc_field_still_uses_the_type_names() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        registry.create("j".into()).unwrap();
+        let raw = serde_json::json!({
+            "name": "revenue",
+            "body_sql": "SELECT region, SUM(amount) AS total FROM orders GROUP BY region",
+            "output_schema": { "fields": [
+                { "name": "region", "data_type": "Utf8", "nullable": true },
+                { "name": "total", "data_type": "Float64", "nullable": true },
+            ]},
+            "is_materialized": true,
+        });
+        let req: RegisterViewRequest = serde_json::from_value(raw).expect("request decodes");
+        assert!(req.output_schema_ipc_b64.is_none());
+        let resp = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(req),
+        )
+        .await
+        .expect("the legacy body must keep working");
+        assert!(resp.0.success);
+        let spec = registry
+            .get("j")
+            .unwrap()
+            .view_spec("revenue")
+            .unwrap()
+            .expect("view registered");
+        assert_eq!(spec.output_schema.field(1).data_type(), &DataType::Float64);
     }
 
     /// IVM-AUD-DDL-B1. The request struct had no `lateness` field and this
@@ -1830,6 +2468,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("j2".into()),
                 partitioned: None,
+                delta_checkpoints: false,
             }),
         )
         .await;
@@ -2084,6 +2723,76 @@ mod tests {
 
     // ── dispatch decision visibility ──────────────────────────────────────────
 
+    /// IVM-AUD-API-A5. `/step` answered with counters only, and those counters
+    /// are identical whether every view evaluated or one of them blew up — a
+    /// failing view does not fail the tick. So a distributed caller had no
+    /// view-level failure signal at all: `krishiv_api::IvmJob::step` filled
+    /// `degraded_views`/`errored_views` with `Vec::new()` because there was
+    /// nothing on the wire to fill them from.
+    #[tokio::test]
+    async fn step_reports_a_failed_view_through_view_health() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        // A second view on the same job that cannot evaluate.
+        let mut broken = revenue_view_request();
+        broken.name = "broken".into();
+        broken.body_sql = "SELECT region, no_such_column FROM orders".into();
+        let _ = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".to_owned()),
+            Json(broken),
+        )
+        .await
+        .expect("register broken view");
+
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".to_owned(), "orders".to_owned())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[10])),
+            }),
+        )
+        .await
+        .expect("feed");
+
+        let resp = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".to_owned()),
+        )
+        .await
+        .expect("step succeeds even though a view failed");
+
+        let health = &resp.0.view_health;
+        assert!(
+            health.reported,
+            "a tick this coordinator computed itself has real health to report"
+        );
+        assert!(health.unreported_reason.is_empty());
+        assert!(
+            health.errored_views.iter().any(|e| e.view == "broken"),
+            "the failed view must be named on the wire: {:?}",
+            health.errored_views
+        );
+        let e = health
+            .errored_views
+            .iter()
+            .find(|e| e.view == "broken")
+            .unwrap();
+        assert_eq!(
+            e.kind, "view_sql",
+            "the failure kind must travel as a stable snake-case name"
+        );
+        assert!(!e.message.is_empty(), "the failure must carry its message");
+
+        // The counters this endpoint used to return alone: identical in shape
+        // to a healthy tick, which is exactly why they were not enough.
+        assert_eq!(resp.0.tick, 1);
+    }
+
     #[tokio::test]
     async fn step_records_the_central_dispatch_decision() {
         let (registry, coordinator) = test_deps_with_shards(1);
@@ -2175,6 +2884,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("mat-flag".into()),
                 partitioned: Some(false),
+                delta_checkpoints: false,
             }),
         )
         .await
@@ -2250,6 +2960,7 @@ mod tests {
             State(registry.clone()),
             State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
+            axum::extract::Query(ViewOutputQuery::default()),
         )
         .await
         .expect("output");
@@ -2283,11 +2994,100 @@ mod tests {
             State(registry.clone()),
             State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
+            axum::extract::Query(ViewOutputQuery::default()),
         )
         .await
         .expect("output");
         assert!(out.delta_ipc_b64.is_some());
         assert!(out.num_rows > 0);
+    }
+
+    /// IVM-AUD-INT-F5. `/output` is a non-consuming peek at a **coalescing**
+    /// watch, so it had two silent failures: polling twice between ticks handed
+    /// back the same delta twice (a consumer with no way to tell them apart
+    /// double-applies), and a consumer polling slower than `/step` lost every
+    /// delta but the newest with nothing recording that it happened.
+    ///
+    /// `since_tick` closes the first. `published_rows_total` measures the
+    /// second — it does not recover the lost deltas, and this test asserts the
+    /// arithmetic that makes the loss visible, not that nothing was lost.
+    #[tokio::test]
+    async fn view_output_carries_a_cursor_and_makes_coalesced_loss_measurable() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let feed_and_step = async |regions: &'static [&'static str], amounts: &'static [i64]| {
+            let _ = api_ivm_feed_source(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path(("j".to_owned(), "orders".to_owned())),
+                Json(FeedSourceRequest {
+                    delta_ipc_b64: delta_b64(orders(regions, amounts)),
+                }),
+            )
+            .await
+            .expect("feed");
+            let _ = api_ivm_step(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path("j".to_owned()),
+            )
+            .await
+            .expect("step");
+        };
+        let read = async |since: Option<u64>| {
+            api_ivm_view_output(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path(("j".to_owned(), "revenue".to_owned())),
+                axum::extract::Query(ViewOutputQuery { since_tick: since }),
+            )
+            .await
+            .expect("output")
+            .0
+        };
+
+        feed_and_step(&["US"], &[10]).await;
+        let first = read(None).await;
+        assert!(first.delta_ipc_b64.is_some());
+        let cursor = first.tick.expect("a published delta has a tick");
+        let seen_rows = first.published_rows_total;
+        assert_eq!(
+            seen_rows, first.num_rows as u64,
+            "the first publication accounts for every published row so far"
+        );
+
+        // Same tick, polled again with the cursor: no delta, but the tick is
+        // still reported so the caller can carry the cursor forward.
+        let again = read(Some(cursor)).await;
+        assert!(
+            again.delta_ipc_b64.is_none(),
+            "a delta already delivered must not come back a second time"
+        );
+        assert_eq!(again.tick, Some(cursor));
+        // …while a cursorless poll still re-serves it (the old behaviour, kept
+        // for callers that have no cursor).
+        assert!(read(None).await.delta_ipc_b64.is_some());
+
+        // Two more ticks with no poll in between: the watch coalesces, so the
+        // middle delta is GONE. It is not recovered here — it is counted.
+        feed_and_step(&["EU"], &[5]).await;
+        feed_and_step(&["APAC"], &[7]).await;
+
+        let latest = read(Some(cursor)).await;
+        assert!(latest.delta_ipc_b64.is_some(), "the newest delta is served");
+        assert!(
+            latest.tick.expect("tick") > cursor + 1,
+            "at least one tick published between the cursor and this value"
+        );
+        let lost = latest.published_rows_total - seen_rows - latest.num_rows as u64;
+        assert!(
+            lost > 0,
+            "the coalesced tick's rows must be reported as lost: total={} seen={} served={}",
+            latest.published_rows_total,
+            seen_rows,
+            latest.num_rows
+        );
     }
 
     #[tokio::test]
@@ -2474,8 +3274,44 @@ mod tests {
 
     #[tokio::test]
     async fn delta_checkpoint_round_trips() {
+        // IVM-AUD-DIST-C1 / IVM-AUD-DIST-H1. This test used to call
+        // checkpoint-delta then restore-delta and assert *nothing*, so it
+        // passed on the 4-byte `count = 0` frame that was the only thing
+        // /checkpoint-delta could produce: no handler ever switched
+        // accumulation on. It now asserts the frame carries the source and
+        // that composing full + delta actually replays the input.
         let (registry, coordinator) = test_deps_with_shards(1);
-        create_revenue_job(&registry, &coordinator, "j").await;
+        let _ = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some("j".to_owned()),
+                partitioned: None,
+                delta_checkpoints: true,
+            }),
+        )
+        .await
+        .expect("create job");
+        let _ = api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".to_owned()),
+            Json(revenue_view_request()),
+        )
+        .await
+        .expect("register view");
+
+        // A full checkpoint of the empty job: the base the delta rides on.
+        let base = api_ivm_checkpoint(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint")
+        .0
+        .checkpoint_b64;
+
         let _ = api_ivm_feed_source(
             State(registry.clone()),
             State(coordinator.clone()),
@@ -2501,17 +3337,62 @@ mod tests {
         )
         .await
         .expect("checkpoint-delta")
-        .0;
+        .0
+        .checkpoint_delta_b64;
+
+        // The frame is `u32 count` then one length-prefixed entry per source.
+        // Pre-fix this decoded to exactly `[0,0,0,0]`.
+        let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &delta_ckpt)
+            .unwrap();
+        let count = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+        assert_eq!(count, 1, "delta checkpoint must carry the fed source");
+        assert!(
+            String::from_utf8_lossy(&raw).contains("orders"),
+            "delta checkpoint must name the source it accumulated"
+        );
+
+        // Rewind to the empty base, then compose the delta back on top.
+        let _ = api_ivm_restore(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(RestoreRequest {
+                checkpoint_b64: base,
+            }),
+        )
+        .await
+        .expect("restore full");
         let _ = api_ivm_restore_delta(
             State(registry.clone()),
             State(coordinator.clone()),
             Path("j".into()),
             Json(RestoreDeltaRequest {
-                checkpoint_delta_b64: delta_ckpt.checkpoint_delta_b64,
+                checkpoint_delta_b64: delta_ckpt,
             }),
         )
         .await
         .expect("restore-delta");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step after restore");
+
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snap")
+        .0;
+        assert_eq!(
+            decode_delta_rows(&snap.snapshot_ipc_b64.expect("snapshot present")),
+            vec![("US".to_owned(), 5.0)],
+            "full + delta must reproduce the input the delta accumulated"
+        );
     }
 
     #[tokio::test]
@@ -2746,6 +3627,7 @@ mod tests {
             State(registry.clone()),
             State(coordinator.clone()),
             Path(("j".into(), "revenue".into())),
+            axum::extract::Query(ViewOutputQuery::default()),
         )
         .await
         .expect("/output must rehydrate, not 404");
@@ -2994,6 +3876,649 @@ mod tests {
             })
             .is_none(),
             "unknown type must reject the whole schema"
+        );
+    }
+
+    /// IVM-AUD-INT-F11: a producer that outruns the stepper must be told to
+    /// slow down, not allowed to grow the coordinator's heap until it dies.
+    /// Revert-proof: drop the `ensure_pending_headroom` call from
+    /// `api_ivm_feed_source` and the second feed succeeds.
+    #[tokio::test]
+    async fn a_feed_is_refused_once_the_backlog_hits_the_cap() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        // A cap of one byte: any accepted delta puts the backlog over it.
+        registry.set_max_pending_bytes(1);
+
+        // The first feed sees an empty backlog and is admitted.
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+            }),
+        )
+        .await
+        .expect("first feed is admitted");
+        assert!(
+            registry.get("j").unwrap().pending_bytes().unwrap() > 0,
+            "precondition: the first feed left a backlog"
+        );
+
+        // The second sees the backlog and is refused, on every feed route.
+        let status = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[6])),
+            }),
+        )
+        .await
+        .expect_err("feed past the cap must be refused");
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        let status = api_ivm_feed_stream_delta(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedStreamDeltaRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[6])),
+            }),
+        )
+        .await
+        .expect_err("stream-delta past the cap must be refused");
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        let status = api_ivm_stream_bridge(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(StreamBridgeRequest {
+                snapshot_ipc_b64: ipc_stream_b64(&orders(&["US"], &[6])),
+            }),
+        )
+        .await
+        .expect_err("stream-bridge past the cap must be refused");
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // Stepping drains the backlog, which is what re-opens the gate — the
+        // point of backpressure is that it lifts.
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[6])),
+            }),
+        )
+        .await
+        .expect("a drained backlog re-opens the gate");
+    }
+
+    /// IVM-AUD-INT-F11: a typo in the environment must not silently disable
+    /// the cap; an explicit `0` must.
+    #[test]
+    fn the_backlog_cap_is_configurable_and_fails_closed_on_nonsense() {
+        use crate::ivm::resolve_max_pending_bytes;
+        assert_eq!(
+            resolve_max_pending_bytes(None),
+            crate::ivm::DEFAULT_IVM_MAX_PENDING_BYTES
+        );
+        assert_eq!(resolve_max_pending_bytes(Some(" 4096 ")), 4096);
+        assert_eq!(
+            resolve_max_pending_bytes(Some("0")),
+            0,
+            "an explicit 0 is the documented opt-out"
+        );
+        assert_eq!(
+            resolve_max_pending_bytes(Some("1GiB")),
+            crate::ivm::DEFAULT_IVM_MAX_PENDING_BYTES,
+            "an unparseable value must fall back to the default, not to unlimited"
+        );
+    }
+
+    // ── resident dispatch harness (IVM-AUD-DIST-A3) ──────────────────────────
+
+    /// Play the executor for the resident-IVM dispatch protocol.
+    ///
+    /// IVM-AUD-DIST-A3: nothing exercised `submit_resident_ivm_step` through
+    /// `api_ivm_step`, because that path submits `ivm-attach` / `ivm-tick`
+    /// scheduler jobs and then *waits for an executor* to drive them to a
+    /// terminal state — so with no executor in the test the handler could only
+    /// sit there until the dispatch timeout. This stands in for one: it polls
+    /// the coordinator for those jobs, launches them and terminates each,
+    /// letting `responder` decide per job id whether the job succeeds
+    /// (`Ok(blob)`) or is cancelled (`Err(())`) — the fork the fence protocol
+    /// and the re-feed-on-failure guard hang off.
+    ///
+    /// It deliberately does not decode the fragment: a fake executor that
+    /// re-implemented the wire would be testing itself. It keys off the job id
+    /// prefix the coordinator chose (`ivm-attach-…` / `ivm-tick-…`) and returns
+    /// whatever blob the test wants that step to observe.
+    fn spawn_fake_ivm_executor(
+        coordinator: SharedCoordinator,
+        executor_id: krishiv_proto::ExecutorId,
+        lease: krishiv_proto::LeaseGeneration,
+        responder: impl Fn(&str) -> Result<Option<Vec<u8>>, ()> + Send + 'static,
+    ) -> tokio::task::JoinHandle<()> {
+        use krishiv_proto::{TaskOutputMetadata, TaskState, TaskStatusUpdate};
+        tokio::spawn(async move {
+            let mut handled: std::collections::HashSet<String> = std::collections::HashSet::new();
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let fresh: Vec<JobId> = {
+                    let coord = coordinator.read().await;
+                    coord
+                        .job_snapshots()
+                        .into_iter()
+                        .filter(|j| j.job_id().as_str().starts_with("ivm-"))
+                        .filter(|j| !handled.contains(j.job_id().as_str()))
+                        .map(|j| j.job_id().clone())
+                        .collect()
+                };
+                for job_id in fresh {
+                    handled.insert(job_id.as_str().to_owned());
+                    let reply = responder(job_id.as_str());
+                    let mut coord = coordinator.write().await;
+                    if let Err(()) = reply {
+                        let _ = coord.cancel_job(&job_id);
+                        continue;
+                    }
+                    let Ok(blob) = reply else { continue };
+                    let Ok(mut assignments) = coord.launch_assigned_task_assignments(&job_id)
+                    else {
+                        continue;
+                    };
+                    if assignments.is_empty() {
+                        handled.remove(job_id.as_str());
+                        continue;
+                    }
+                    let assignment = assignments.remove(0);
+                    let meta = TaskOutputMetadata::new("ivm", 0, 0, 0)
+                        .with_inline_record_batch_ipc(blob.into_iter().collect());
+                    let update = TaskStatusUpdate::new(
+                        job_id,
+                        assignment.stage_id().clone(),
+                        assignment.task_id().clone(),
+                        executor_id.clone(),
+                        TaskState::Succeeded,
+                        assignment.attempt_id().as_u32(),
+                    )
+                    .with_lease_generation(lease)
+                    .with_output_metadata(meta);
+                    let _ = coord.apply_task_update(update);
+                    let _ = coord.take_pending_sink_finalize();
+                }
+            }
+        })
+    }
+
+    /// A coordinator with one live executor, plus the lease to report under.
+    async fn coordinator_with_one_executor() -> (
+        SharedCoordinator,
+        krishiv_proto::ExecutorId,
+        krishiv_proto::LeaseGeneration,
+    ) {
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        let executor_id = krishiv_proto::ExecutorId::try_new("exec-ivm").unwrap();
+        let lease = coordinator
+            .write()
+            .await
+            .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                executor_id.clone(),
+                "pod-ivm",
+                4,
+            ))
+            .expect("register executor");
+        (coordinator, executor_id, lease)
+    }
+
+    /// The per-view output-delta blob a resident executor returns for a tick.
+    fn revenue_output_blob(region: &str, total: f64) -> Vec<u8> {
+        let rb = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("region", DataType::Utf8, true),
+                Field::new("total", DataType::Float64, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![region])),
+                Arc::new(Float64Array::from(vec![total])),
+            ],
+        )
+        .unwrap();
+        let mut map = HashMap::new();
+        map.insert("revenue".to_owned(), DeltaBatch::from_inserts(rb).unwrap());
+        krishiv_ivm::encode_delta_map(&map).unwrap()
+    }
+
+    /// IVM-AUD-DIST-A3: the first test to drive `submit_resident_ivm_step`
+    /// through `api_ivm_step` — attach, fenced tick, and the coordinator-side
+    /// mirror of the executor's output deltas.
+    #[tokio::test]
+    async fn a_resident_tick_attaches_fences_and_mirrors_the_output_delta() {
+        let (registry, _) = test_deps_with_shards(1);
+        let (coordinator, executor_id, lease) = coordinator_with_one_executor().await;
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let fake = spawn_fake_ivm_executor(coordinator.clone(), executor_id, lease, |job_id| {
+            if job_id.starts_with("ivm-attach") {
+                Ok(None)
+            } else {
+                Ok(Some(revenue_output_blob("US", 5.0)))
+            }
+        });
+
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+            }),
+        )
+        .await
+        .expect("feed");
+        let step = tokio::time::timeout(
+            Duration::from_secs(20),
+            api_ivm_step(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path("j".into()),
+            ),
+        )
+        .await
+        .expect("step did not finish")
+        .expect("step");
+        fake.abort();
+
+        let dispatch = registry.dispatch_state("j");
+        assert_eq!(
+            dispatch.last.as_ref().map(|d| d.mode.as_str()),
+            Some("resident"),
+            "the tick must have been dispatched to the resident executor, not computed centrally"
+        );
+        assert!(dispatch.attached, "the job must be recorded as attached");
+        assert_eq!(dispatch.fence, 1, "the first tick fence is 1");
+        assert_eq!(step.0.total_output_rows, 1);
+
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snap")
+        .0;
+        assert_eq!(
+            decode_delta_rows(&snap.snapshot_ipc_b64.expect("snapshot present")),
+            vec![("US".to_owned(), 5.0)],
+            "the coordinator mirror must carry the executor's output delta"
+        );
+    }
+
+    /// IVM-AUD-INT-F10: when mirroring the resident tick fails, the deltas that
+    /// tick drained must go back to `pending` so the central fallback computes
+    /// them. Pre-fix `apply_remote_tick`'s error path skipped the `refeed`
+    /// guard entirely and the deltas were simply gone — the fallback then ran
+    /// on nothing and the view silently under-counted.
+    ///
+    /// The distinguishing assertion is the total: the fallback exists in both
+    /// versions, so "the answer is right" only separates them because without
+    /// the re-feed the fallback has no input at all.
+    #[tokio::test]
+    async fn a_failed_remote_mirror_returns_its_deltas_to_the_central_fallback() {
+        let (registry, _) = test_deps_with_shards(1);
+        let (coordinator, executor_id, lease) = coordinator_with_one_executor().await;
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        // Tick 1 succeeds, establishing the view baseline (region, total).
+        // Tick 2 returns a delta whose schema cannot be applied to it, so the
+        // coordinator's mirror fails after the executor has already applied it.
+        let ticks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let fake = spawn_fake_ivm_executor(coordinator.clone(), executor_id, lease, {
+            let ticks = Arc::clone(&ticks);
+            move |job_id| {
+                if job_id.starts_with("ivm-attach") {
+                    return Ok(None);
+                }
+                let n = ticks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if n == 0 {
+                    Ok(Some(revenue_output_blob("US", 5.0)))
+                } else {
+                    let rb = RecordBatch::try_new(
+                        Arc::new(Schema::new(vec![Field::new(
+                            "not_the_view_schema",
+                            DataType::Int64,
+                            true,
+                        )])),
+                        vec![Arc::new(Int64Array::from(vec![1i64]))],
+                    )
+                    .unwrap();
+                    let mut map = HashMap::new();
+                    map.insert("revenue".to_owned(), DeltaBatch::from_inserts(rb).unwrap());
+                    Ok(Some(krishiv_ivm::encode_delta_map(&map).unwrap()))
+                }
+            }
+        });
+
+        for amount in [5i64, 7i64] {
+            let _ = api_ivm_feed_source(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path(("j".into(), "orders".into())),
+                Json(FeedSourceRequest {
+                    delta_ipc_b64: delta_b64(orders(&["US"], &[amount])),
+                }),
+            )
+            .await
+            .expect("feed");
+            let _ = tokio::time::timeout(
+                Duration::from_secs(20),
+                api_ivm_step(
+                    State(registry.clone()),
+                    State(coordinator.clone()),
+                    Path("j".into()),
+                ),
+            )
+            .await
+            .expect("step did not finish")
+            .expect("step");
+        }
+        fake.abort();
+
+        // Precondition, not the proof: the second tick did take the fallback.
+        assert_eq!(
+            registry
+                .dispatch_state("j")
+                .last
+                .as_ref()
+                .map(|d| d.mode.as_str()),
+            Some("central-fallback"),
+            "the mirror failure must have been recorded as a central fallback"
+        );
+
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+        )
+        .await
+        .expect("snap")
+        .0;
+        assert_eq!(
+            decode_delta_rows(&snap.snapshot_ipc_b64.expect("snapshot present")),
+            vec![("US".to_owned(), 12.0)],
+            "the deltas the failed mirror drained must have been re-fed to the fallback"
+        );
+    }
+
+    /// IVM-AUD-DIST-B1: a `/restore` must serialize against an in-flight tick.
+    /// Only `/step` and `DELETE` took the per-job step lock, so a rewind could
+    /// land mid-tick and be half-undone by the tick's own writes while the
+    /// caller was told `{"success": true}`. Same shape as
+    /// `delete_waits_for_the_per_job_step_lock`: hold the lock a tick holds and
+    /// prove the handler waits. Revert-proof: drop the `_step_guard` line in
+    /// `api_ivm_restore` and this fails at the `!restore.is_finished()` assert.
+    #[tokio::test]
+    async fn restore_waits_for_the_per_job_step_lock() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let checkpoint = api_ivm_checkpoint(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint")
+        .0
+        .checkpoint_b64;
+
+        let held = registry.step_lock("j").lock_owned().await;
+        let restore = tokio::spawn({
+            let (registry, coordinator) = (registry.clone(), coordinator.clone());
+            async move {
+                api_ivm_restore(
+                    State(registry),
+                    State(coordinator),
+                    Path("j".into()),
+                    Json(RestoreRequest {
+                        checkpoint_b64: checkpoint,
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !restore.is_finished(),
+            "restore ran straight through a held step lock — it can interleave with a tick"
+        );
+
+        drop(held);
+        let resp = tokio::time::timeout(Duration::from_secs(2), restore)
+            .await
+            .expect("restore did not finish within 2s of lock release")
+            .expect("restore task panicked");
+        assert!(resp.expect("restore must succeed").success);
+    }
+
+    /// IVM-AUD-DIST-B1, the delta half. Revert-proof: drop the `_step_guard`
+    /// line in `api_ivm_restore_delta`.
+    #[tokio::test]
+    async fn restore_delta_waits_for_the_per_job_step_lock() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let delta_ckpt = api_ivm_checkpoint_delta(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint-delta")
+        .0
+        .checkpoint_delta_b64;
+
+        let held = registry.step_lock("j").lock_owned().await;
+        let restore = tokio::spawn({
+            let (registry, coordinator) = (registry.clone(), coordinator.clone());
+            async move {
+                api_ivm_restore_delta(
+                    State(registry),
+                    State(coordinator),
+                    Path("j".into()),
+                    Json(RestoreDeltaRequest {
+                        checkpoint_delta_b64: delta_ckpt,
+                    }),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !restore.is_finished(),
+            "restore-delta ran straight through a held step lock"
+        );
+
+        drop(held);
+        let resp = tokio::time::timeout(Duration::from_secs(2), restore)
+            .await
+            .expect("restore-delta did not finish within 2s of lock release")
+            .expect("restore-delta task panicked");
+        assert!(resp.expect("restore-delta must succeed").success);
+    }
+
+    /// IVM-AUD-DIST-H6: a `/step` that loses the race with `DELETE` must not
+    /// compute a tick it can never persist. Pre-fix it computed the whole tick
+    /// on the orphaned flow and then answered 400 from `persist_ivm_job`; the
+    /// tick assertion is the one that cannot pass both ways, because a bare
+    /// status change could be produced by any number of edits.
+    #[tokio::test]
+    async fn a_step_that_loses_the_race_with_delete_burns_no_tick() {
+        let (registry, _) = test_deps_with_shards(1);
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        create_revenue_job(&registry, &coordinator, "j").await;
+        // Hold the handle so the flow (and its tick counter) outlives deletion.
+        let flow = registry.get("j").expect("job live");
+        assert_eq!(flow.tick().unwrap(), 0);
+
+        // A tick is in flight: it has already passed `ensure_ivm_job` and is
+        // waiting on the step lock.
+        let held = registry.step_lock("j").lock_owned().await;
+        let step = tokio::spawn({
+            let (registry, coordinator) = (registry.clone(), coordinator.clone());
+            async move { api_ivm_step(State(registry), State(coordinator), Path("j".into())).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // DELETE wins: registry entry and durable snapshot both gone.
+        registry.delete("j");
+        coordinator.remove_ivm_snapshot("j").await.unwrap();
+        drop(held);
+
+        let status = tokio::time::timeout(Duration::from_secs(2), step)
+            .await
+            .expect("step did not finish")
+            .expect("step task panicked")
+            .expect_err("a step on a deleted job must not succeed");
+        // The tick assertion first: it is the behavioural claim. A status-only
+        // assertion could be satisfied by any edit that changes the error path.
+        assert_eq!(
+            flow.tick().unwrap(),
+            0,
+            "the step must not have burned a tick on the orphaned flow"
+        );
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "a step on a job that was deleted under it is a 404, not a 400"
+        );
+    }
+
+    /// IVM-AUD-DIST-C5: a coordinator with no metadata store persists nothing,
+    /// and every handler used to report success anyway. Revert-proof: hardcode
+    /// `durable: true` in either handler and the store-less half fails.
+    #[tokio::test]
+    async fn responses_say_whether_the_write_was_actually_durable() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        let created = api_ivm_create_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Json(CreateJobRequest {
+                job_id: Some("nostore".into()),
+                partitioned: None,
+                delta_checkpoints: false,
+            }),
+        )
+        .await
+        .expect("create")
+        .0;
+        assert!(
+            !created.durable,
+            "a coordinator with no metadata store must not claim a durable create"
+        );
+
+        let (registry, _) = test_deps_with_shards(1);
+        let stored = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("stored-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        create_revenue_job(&registry, &stored, "j").await;
+        let checkpoint = api_ivm_checkpoint(
+            State(registry.clone()),
+            State(stored.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("checkpoint")
+        .0
+        .checkpoint_b64;
+        let restored = api_ivm_restore(
+            State(registry.clone()),
+            State(stored.clone()),
+            Path("j".into()),
+            Json(RestoreRequest {
+                checkpoint_b64: checkpoint,
+            }),
+        )
+        .await
+        .expect("restore")
+        .0;
+        assert!(
+            restored.durable,
+            "a store-backed coordinator must report the restore as durable"
+        );
+    }
+
+    /// IVM-AUD-DIST-C4: a job present only as a durable snapshot was listed
+    /// with a fabricated `partitioned: false` and no views. Revert-proof: put
+    /// `partitioned: false, view_names: Vec::new()` back in the `None` arm.
+    #[tokio::test]
+    async fn a_snapshot_only_job_is_listed_with_its_persisted_shape() {
+        // 3 shards so the GROUP BY view really does auto-partition.
+        let registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(3));
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        create_revenue_job(&registry, &coordinator, "j").await;
+        assert!(
+            registry.get("j").expect("live").is_partitioned(),
+            "precondition: the revenue view must auto-partition at 3 shards"
+        );
+
+        // Evict it from this process, leaving only the durable snapshot.
+        registry.delete("j");
+
+        let listed = api_ivm_list_jobs(State(registry.clone()), State(coordinator.clone()))
+            .await
+            .0;
+        let entry = listed
+            .jobs
+            .iter()
+            .find(|j| j.job_id == "j")
+            .expect("snapshot-only job listed");
+        assert!(!entry.live, "precondition: the job is snapshot-only");
+        assert!(
+            entry.partitioned,
+            "a snapshot-only job must report the shape it was persisted with"
+        );
+        assert_eq!(entry.view_names, vec!["revenue".to_owned()]);
+    }
+
+    /// IVM-AUD-DIST-H7: the dispatch/delete bound is configurable, and a
+    /// misconfiguration must not turn every tick into an instant timeout.
+    #[test]
+    fn the_dispatch_timeout_is_configurable_and_rejects_nonsense() {
+        assert_eq!(
+            resolve_ivm_dispatch_timeout_secs(None),
+            DEFAULT_IVM_DISPATCH_TIMEOUT_SECS
+        );
+        assert_eq!(resolve_ivm_dispatch_timeout_secs(Some(" 45 ")), 45);
+        assert_eq!(
+            resolve_ivm_dispatch_timeout_secs(Some("0")),
+            DEFAULT_IVM_DISPATCH_TIMEOUT_SECS,
+            "0 would time out every tick instantly; fall back to the default"
+        );
+        assert_eq!(
+            resolve_ivm_dispatch_timeout_secs(Some("soon")),
+            DEFAULT_IVM_DISPATCH_TIMEOUT_SECS
         );
     }
 

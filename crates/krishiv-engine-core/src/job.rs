@@ -219,7 +219,15 @@ pub struct CompiledJob {
     pub sources: Vec<SourceSpec>,
     /// Output sinks.
     pub sinks: Vec<SinkSpec>,
-    /// Delivery guarantee requested for this job.
+    /// Delivery guarantee **requested** for this job.
+    ///
+    /// IVM-AUD-INT-F4: requested, and nothing more — no `ComputeEngine`
+    /// implementation reads this field. It travels with the job, is carried
+    /// through serialization, and does not change what any engine does; the
+    /// effective guarantee of a path is whatever its source/sink/checkpoint
+    /// machinery actually provides (see the delivery matrix in
+    /// `krishiv_connectors::cert_matrix`). Setting it stronger than the path
+    /// can deliver is not an error and buys nothing.
     pub delivery: DeliveryContract,
     /// State policy implied by the engine.
     pub state: StatePolicy,

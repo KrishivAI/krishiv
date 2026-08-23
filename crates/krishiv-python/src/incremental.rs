@@ -272,6 +272,8 @@ impl From<krishiv_api::compute::job::ViewError> for PyViewError {
             ViewErrorKind::OperatorApply => "operator_apply",
             ViewErrorKind::ViewSql => "view_sql",
             ViewErrorKind::Publish => "publish",
+            ViewErrorKind::FixpointNotConverged => "fixpoint_not_converged",
+            ViewErrorKind::Unrecognized => "unrecognized",
         };
         Self {
             view: e.view,

@@ -57,7 +57,7 @@ pub use catalog::{
 };
 pub use compute::{
     Checkpointable, FeedableJob, IncrementalDataFrame, IvmJob, Job, JobKind, StepReport, ViewError,
-    ViewErrorKind,
+    ViewErrorKind, ViewHealth,
 };
 pub use connector_runtime::{
     ConnectorSinkProvider, ConnectorSourceProvider, DebeziumCdcSourceProvider,
