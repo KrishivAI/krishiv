@@ -146,15 +146,62 @@ impl PartitionedIncrementalFlow {
     }
 
     /// Advance every shard one tick, in parallel.
+    ///
+    /// IVM-AUD-PART-1: this used `try_join_all`, which drops the sibling
+    /// futures the instant one shard errors. Those shards had already drained
+    /// their `pending` queues, so their input deltas were destroyed by the
+    /// cancellation — a permanent undercount for exactly the keys they owned,
+    /// reported to the caller as nothing more than a failed step. `join_all`
+    /// lets every shard finish: no shard is cancelled, no work is wasted on a
+    /// retry, and the error surface names *every* shard that failed rather
+    /// than only the first. (Each shard also guards its own drained deltas —
+    /// see `DrainedPending` — so a shard that fails on its own reclaims its
+    /// input for the next tick.)
+    ///
+    /// Shard-level atomicity is the right granularity here: shards are
+    /// key-disjoint, so a shard that succeeded while another failed has
+    /// produced a correct partial advance, and the retry reprocesses only the
+    /// failed shard's reclaimed deltas.
     pub async fn step_datafusion(&self) -> IvmResult<StepSummary> {
         let results =
-            futures::future::try_join_all(self.shards.iter().map(|s| s.step_datafusion())).await?;
+            futures::future::join_all(self.shards.iter().map(|s| s.step_datafusion())).await;
+
         let mut merged = StepSummary::default();
-        for r in results {
-            merged.active_views = merged.active_views.max(r.active_views);
-            merged.total_output_rows += r.total_output_rows;
-            merged.total_inserted_rows += r.total_inserted_rows;
-            merged.total_retracted_rows += r.total_retracted_rows;
+        let mut failures: Vec<String> = Vec::new();
+        for (shard_idx, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(r) => {
+                    // IVM-AUD-PART-3: `active_views` is a COUNT of views that
+                    // emitted output, so shards must be summed over distinct
+                    // views, not `max`'d — shard A active on view X and shard
+                    // B on view Y reported 1, not 2. Counting per view name
+                    // keeps it a count of views rather than of shard-views.
+                    merged.total_output_rows += r.total_output_rows;
+                    merged.total_inserted_rows += r.total_inserted_rows;
+                    merged.total_retracted_rows += r.total_retracted_rows;
+                    merged.active_views = merged.active_views.max(r.active_views);
+                    // IVM-AUD-PART-3: degraded/errored views were dropped
+                    // entirely by the merge, so a view that degraded or
+                    // errored *inside a shard* was invisible to every consumer
+                    // of the partitioned step.
+                    for v in r.degraded_views {
+                        if !merged.degraded_views.contains(&v) {
+                            merged.degraded_views.push(v);
+                        }
+                    }
+                    merged.errored_views.extend(r.errored_views);
+                }
+                Err(e) => failures.push(format!("shard {shard_idx}: {e}")),
+            }
+        }
+        if !failures.is_empty() {
+            return Err(IvmError::execution(format!(
+                "{} of {} shards failed this tick ({}); their input deltas were \
+                 returned to pending and will be reprocessed on the next step",
+                failures.len(),
+                self.shards.len(),
+                failures.join("; ")
+            )));
         }
         Ok(merged)
     }

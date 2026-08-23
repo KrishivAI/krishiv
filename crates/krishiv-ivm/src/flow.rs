@@ -926,9 +926,18 @@ impl IncrementalFlow {
         };
 
         // ── Phase 2 (no lock): coalesce deltas ───────────────────────────────
+        // IVM-AUD-PART-1: take custody of the drained deltas for the rest of
+        // the tick. If we leave by any path other than `commit()` — a `?`, a
+        // panic, or the future being dropped by a timeout or a sibling shard's
+        // error — Drop returns them to `pending` so the next tick reprocesses
+        // them instead of silently losing them. `DeltaBatch` clones share
+        // Arc'd Arrow buffers, so custody costs a refcount bump per batch.
+        let custody = DrainedPending::new(Arc::clone(&self.inner), raw_pending.clone());
         let inputs = coalesce_pending(raw_pending)?;
 
         if inputs.is_empty() {
+            // Nothing to reprocess: release custody before returning.
+            custody.commit();
             let mut inner = self.inner.lock().map_err(lock_err)?;
             // A step with no input changes nothing, so no per-step delta exists.
             inner.last_step_outputs.clear();
@@ -1503,6 +1512,11 @@ impl IncrementalFlow {
             }
         }
 
+        // The tick applied its inputs: custody is released so Drop does not
+        // re-queue them. Any earlier exit leaves this un-run and the deltas
+        // return to `pending` (IVM-AUD-PART-1).
+        custody.commit();
+
         Ok(StepSummary {
             total_output_rows,
             total_inserted_rows,
@@ -2062,6 +2076,87 @@ pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> IvmResult<u64> {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Custody of the deltas a tick drained out of `pending`.
+///
+/// IVM-AUD-PART-1: `step_datafusion_inner` drains `pending` in Phase 1 and
+/// only applies it in the final phase, with an unbounded `await` on DataFusion
+/// in between. Nothing put the deltas back if the tick did not reach the end,
+/// and there are two live ways it does not:
+///
+///   * `PartitionedIncrementalFlow::step_datafusion` uses `try_join_all`, so
+///     the first shard error DROPS the sibling futures mid-flight;
+///   * the coordinator wraps the central step in `tokio::time::timeout`, so a
+///     slow tick's future is dropped at the deadline.
+///
+/// In both cases the drained rows were simply gone: the caller saw a failed
+/// step, retried, and the retry found nothing pending — a permanent undercount
+/// for exactly the keys that shard owned, with no error naming the loss.
+///
+/// The guard restores custody on `Drop` unless `commit()` was called, which
+/// covers the `?` early-return paths and future-cancellation alike (Drop runs
+/// for a dropped future). Restoration puts the reclaimed deltas BEFORE
+/// anything fed during the failed attempt, so replay order matches the order
+/// the rows were originally accepted in (IVM-AUD-DIST-B2).
+struct DrainedPending {
+    inner: Arc<Mutex<IncrementalFlowInner>>,
+    batches: Option<HashMap<String, Vec<DeltaBatch>>>,
+}
+
+impl DrainedPending {
+    /// Take custody of `batches`, which have already been removed from
+    /// `pending` by the caller.
+    fn new(
+        inner: Arc<Mutex<IncrementalFlowInner>>,
+        batches: HashMap<String, Vec<DeltaBatch>>,
+    ) -> Self {
+        Self {
+            inner,
+            batches: Some(batches),
+        }
+    }
+
+    /// The tick reached its commit point; release custody so `Drop` is a no-op.
+    fn commit(mut self) {
+        self.batches = None;
+    }
+}
+
+impl Drop for DrainedPending {
+    fn drop(&mut self) {
+        let Some(batches) = self.batches.take() else {
+            return;
+        };
+        if batches.is_empty() {
+            return;
+        }
+        let restored: usize = batches.values().map(Vec::len).sum();
+        match self.inner.lock() {
+            Ok(mut inner) => {
+                for (source, mut reclaimed) in batches {
+                    let entry = inner.pending.entry(source).or_default();
+                    // reclaimed (older) first, then whatever arrived since.
+                    reclaimed.append(entry);
+                    *entry = reclaimed;
+                }
+                tracing::warn!(
+                    restored_batches = restored,
+                    "IVM tick did not commit; drained input deltas returned to pending"
+                );
+            }
+            Err(_) => {
+                // The only unrecoverable case: without the lock the deltas
+                // cannot be returned. Say so loudly rather than losing them
+                // in silence.
+                tracing::error!(
+                    lost_batches = restored,
+                    "IVM tick did not commit and the flow lock is poisoned; \
+                     drained input deltas could not be restored"
+                );
+            }
+        }
+    }
+}
 
 /// Reject a feed aimed at a source no registered view reads (IVM-AUD-API-F1).
 ///
@@ -2698,6 +2793,8 @@ mod integration_tests {
     use arrow::datatypes::{DataType, Field, Schema};
     use krishiv_delta::{DeltaBatch, deserialize_delta_batch, serialize_delta_batch};
 
+    use super::DrainedPending;
+
     use super::IncrementalFlow;
 
     fn make_batch(ids: &[i32]) -> RecordBatch {
@@ -2817,6 +2914,87 @@ mod integration_tests {
 
         let snap = flow.source_snapshot("src").unwrap().unwrap();
         assert_eq!(snap.num_rows(), 1, "update replaces row 1 with row 2");
+    }
+
+    // ── tick custody of drained deltas (IVM-AUD-PART-1) ───────────────────────
+
+    /// A tick whose future is dropped mid-flight must return its drained
+    /// inputs to `pending`, or those rows are lost forever with only a failed
+    /// step to show for it. This is how a 300 s coordinator timeout, and a
+    /// sibling shard's error under `try_join_all`, used to permanently
+    /// undercount exactly the keys the cancelled shard owned.
+    ///
+    /// Revert-proof: delete the `custody.commit()`/`DrainedPending::new`
+    /// pairing (or make Drop a no-op) and the post-cancellation step observes
+    /// zero rows instead of the fed rows.
+    /// A tick that fails must return its drained inputs to `pending`, or
+    /// those rows are lost forever with only a failed step to show for it.
+    /// The same `Drop` path also covers cancellation — a dropped future (a
+    /// coordinator timeout, or `try_join_all` dropping sibling shards on the
+    /// first error) never reaches `commit()` either.
+    ///
+    /// Revert-proof: delete the `DrainedPending::new(...)` custody line and
+    /// the surviving-rows assertion fails — the deltas are gone after the
+    /// failed step, which is the silent undercount this defends.
+    #[tokio::test]
+    async fn a_failed_tick_returns_its_drained_deltas_to_pending() {
+        use arrow::array::StringArray;
+
+        let flow = IncrementalFlow::new();
+        flow.feed(
+            "s",
+            DeltaBatch::from_inserts(make_batch(&[1, 2, 3])).unwrap(),
+        )
+        .unwrap();
+        // A second batch for the same source with an incompatible schema makes
+        // the tick's `coalesce_pending` fail — a real error path, not a stub.
+        let odd_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let odd =
+            RecordBatch::try_new(odd_schema, vec![Arc::new(StringArray::from(vec!["x"]))]).unwrap();
+        flow.feed("s", DeltaBatch::from_inserts(odd).unwrap())
+            .unwrap();
+
+        assert!(
+            flow.step_datafusion().await.is_err(),
+            "mixed-schema deltas for one source must fail the tick"
+        );
+
+        let inner = flow.inner.lock().unwrap();
+        let queue = inner
+            .pending
+            .get("s")
+            .expect("a failed tick must return its drained deltas to pending");
+        assert_eq!(
+            queue.len(),
+            2,
+            "both drained deltas must be reclaimed, not eaten by the failed tick"
+        );
+    }
+
+    /// Restoration must preserve arrival order: reclaimed (older) deltas go
+    /// ahead of anything fed while the failed attempt was in flight
+    /// (IVM-AUD-DIST-B2).
+    #[tokio::test]
+    async fn restored_deltas_precede_deltas_fed_during_the_failed_attempt() {
+        let flow = IncrementalFlow::new();
+        let drained: HashMap<String, Vec<DeltaBatch>> = HashMap::from([(
+            "s".to_string(),
+            vec![DeltaBatch::from_inserts(make_batch(&[1])).unwrap()],
+        )]);
+        // Simulate the in-flight window: something else feeds while the tick
+        // holds custody.
+        flow.feed("s", DeltaBatch::from_inserts(make_batch(&[2])).unwrap())
+            .unwrap();
+        drop(DrainedPending::new(Arc::clone(&flow.inner), drained));
+
+        let inner = flow.inner.lock().unwrap();
+        let queue = inner.pending.get("s").expect("pending queue for s");
+        assert_eq!(queue.len(), 2);
+        assert_eq!(
+            queue[0].data_batch().num_rows(),
+            1,
+            "the reclaimed delta must be replayed first"
+        );
     }
 
     // ── feed target validation (IVM-AUD-API-F1) ───────────────────────────────
