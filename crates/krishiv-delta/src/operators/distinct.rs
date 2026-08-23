@@ -73,7 +73,7 @@ impl IncrementalDistinctOp {
             // string "NULL" must count as distinct rows.
             let row_key: Vec<String> = (0..n_cols)
                 .map(|ci| scalar_to_group_key(data.column(ci), row))
-                .collect();
+                .collect::<DeltaResult<Vec<_>>>()?;
 
             let old_count = *self.counts.get(&row_key).unwrap_or(&0);
             let w = weights.value(row);
@@ -197,7 +197,7 @@ fn build_output(
         for orig_row in 0..original_data.num_rows() {
             let orig_key: Vec<String> = (0..n_cols)
                 .map(|ci| scalar_to_group_key(original_data.column(ci), orig_row))
-                .collect();
+                .collect::<DeltaResult<Vec<_>>>()?;
             if &orig_key == key {
                 row_indices.push(orig_row);
                 continue 'outer;

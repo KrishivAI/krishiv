@@ -629,21 +629,21 @@ impl IncrementalFlow {
             let data = batch.data_batch();
             let weights = batch.weights();
             let mask: arrow::array::BooleanArray = (0..data.num_rows())
-                .map(|row| {
+                .map(|row| -> IvmResult<Option<bool>> {
                     if weights.value(row) > 0 {
-                        let h = hash_row(&data, row);
+                        let h = hash_row(&data, row)?;
                         if set.contains(&h) {
-                            Some(false) // already seen
+                            Ok(Some(false)) // already seen
                         } else {
                             set.insert(h);
                             order.push_back(h);
-                            Some(true)
+                            Ok(Some(true))
                         }
                     } else {
-                        Some(true) // retractions always pass
+                        Ok(Some(true)) // retractions always pass
                     }
                 })
-                .collect();
+                .collect::<IvmResult<arrow::array::BooleanArray>>()?;
             batch.filter_mask(&mask).map_err(delta_err)?
         } else {
             batch
@@ -1152,19 +1152,19 @@ impl IncrementalFlow {
         // Each row is hashed with its weight encoded so rows that differ only
         // in multiplicity produce distinct provenance entries (G5 fix).
         let input_hashes: Option<Vec<u64>> = if inner.provenance.is_some() {
-            let hashes = inputs
-                .values()
-                .flat_map(|delta| {
-                    let data = delta.data_batch();
-                    let weights = delta.weights();
-                    (0..data.num_rows()).map(move |row| {
-                        let base = hash_row(&data, row);
-                        let w = weights.value(row);
-                        // Mix weight into the hash so weight=+1 ≠ weight=+2.
-                        base.wrapping_add(w.unsigned_abs().wrapping_mul(0x9e37_79b9_7f4a_7c15))
-                    })
-                })
-                .collect();
+            let mut hashes: Vec<u64> = Vec::new();
+            for delta in inputs.values() {
+                let data = delta.data_batch();
+                let weights = delta.weights();
+                for row in 0..data.num_rows() {
+                    let base = hash_row(&data, row)?;
+                    let w = weights.value(row);
+                    // Mix weight into the hash so weight=+1 ≠ weight=+2.
+                    hashes.push(
+                        base.wrapping_add(w.unsigned_abs().wrapping_mul(0x9e37_79b9_7f4a_7c15)),
+                    );
+                }
+            }
             Some(hashes)
         } else {
             None
@@ -1435,7 +1435,7 @@ impl IncrementalFlow {
             if plan_kind == ViewPlanKind::DiffBased
                 && let (Some(input_hs), Some(prov)) = (&input_hashes, &mut inner.provenance)
             {
-                let output_hs = crate::provenance::hash_all_rows(&output_delta.data_batch());
+                let output_hs = crate::provenance::hash_all_rows(&output_delta.data_batch())?;
                 for &ih in input_hs {
                     prov.record_many(ih, output_hs.iter().copied());
                 }
@@ -2020,18 +2020,25 @@ impl std::fmt::Debug for IncrementalFlow {
 /// Uses string representations with null-byte separators so different column
 /// counts cannot collide.  Retractions (weight < 0) are never hashed —
 /// callers must gate on weight before calling.
-pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
+pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> IvmResult<u64> {
     let mut combined: Vec<u8> = Vec::with_capacity(64);
     for col in batch.columns() {
         // Null-unambiguous encoding (crate-13 audit): the plain
         // `scalar_to_string` renders SQL null as the sentinel "NULL", which a
         // Utf8 value "NULL" collides with — dedup would silently drop the
         // legitimate row. `scalar_to_group_key` prefixes real values.
-        let s = krishiv_delta::operators::key_util::scalar_to_group_key(col.as_ref(), row);
+        // IVM-AUD-1: an unencodable type is an error, never a constant. A
+        // constant would make every such row hash alike, and dedup drops
+        // rows that hash alike — silent data loss.
+        let s = krishiv_delta::operators::key_util::scalar_to_group_key(col.as_ref(), row)
+            .map_err(|e| IvmError::execution(e.to_string()))?;
         combined.extend_from_slice(s.as_bytes());
         combined.push(0u8);
     }
-    twox_hash::XxHash64::oneshot(0xcafe_babe_dead_beef_u64, &combined)
+    Ok(twox_hash::XxHash64::oneshot(
+        0xcafe_babe_dead_beef_u64,
+        &combined,
+    ))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

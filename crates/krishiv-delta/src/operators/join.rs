@@ -237,7 +237,7 @@ impl IncrementalJoinOp {
                     &right_data,
                     &right_key_indices,
                     ri,
-                ) {
+                )? {
                     out_left_rows.push(li);
                     out_right_rows.push(ri);
                     out_weights.push(left_weights.value(li) * right_weights.value(ri));
@@ -319,7 +319,7 @@ impl IncrementalJoinOp {
                     &right_data,
                     &right_key_indices,
                     ri,
-                ) {
+                )? {
                     out_left_rows.push(li);
                     out_right_rows.push(ri);
                     out_weights.push(left_weights.value(li) * right_weights.value(ri));
@@ -367,7 +367,7 @@ impl IncrementalJoinOp {
                     right_data,
                     &right_key_indices,
                     ri,
-                ) {
+                )? {
                     out_left_rows.push(li);
                     out_right_rows.push(ri);
                     out_weights.push(left_weights.value(li) * right_weights.value(ri));
@@ -415,7 +415,7 @@ impl IncrementalJoinOp {
                 let rki = col_indices(&rd, &self.right_key_cols)?;
                 let mut m: AHashMap<Vec<Option<String>>, i64> = AHashMap::new();
                 for ri in 0..rd.num_rows() {
-                    *m.entry(extract_key(&rd, ri, &rki)).or_insert(0) += rw.value(ri);
+                    *m.entry(extract_key(&rd, ri, &rki)?).or_insert(0) += rw.value(ri);
                 }
                 m
             } else {
@@ -487,7 +487,7 @@ impl IncrementalJoinOp {
         let mut matched_rows: Vec<usize> = Vec::new();
 
         for li in 0..left_data.num_rows() {
-            let key = extract_key(&left_data, li, &lki);
+            let key = extract_key(&left_data, li, &lki)?;
             let cur_rw = self.right_key_group_weights.get(&key).copied().unwrap_or(0);
             let eff_rw = cur_rw + rw_delta.get(&key).copied().unwrap_or(0);
             if eff_rw == 0 {
@@ -541,7 +541,7 @@ impl IncrementalJoinOp {
         let mut delta_by_key: AHashMap<Vec<Option<String>>, i64> = AHashMap::new();
         for ri in 0..right_data.num_rows() {
             *delta_by_key
-                .entry(extract_key(&right_data, ri, &rki))
+                .entry(extract_key(&right_data, ri, &rki)?)
                 .or_insert(0) += right_weights.value(ri);
         }
 
@@ -732,7 +732,11 @@ impl IncrementalJoinOp {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /// Extract key column values from a single row as `Vec<Option<String>>`.
-fn extract_key(batch: &RecordBatch, row: usize, key_indices: &[usize]) -> Vec<Option<String>> {
+fn extract_key(
+    batch: &RecordBatch,
+    row: usize,
+    key_indices: &[usize],
+) -> DeltaResult<Vec<Option<String>>> {
     key_indices
         .iter()
         .map(|&i| scalar_to_key(batch.column(i).as_ref(), row))
@@ -901,51 +905,54 @@ fn keys_match(
     right: &RecordBatch,
     right_indices: &[usize],
     ri: usize,
-) -> bool {
-    left_indices
-        .iter()
-        .zip(right_indices.iter())
-        .all(|(&lk, &rk)| {
-            let la = left.column(lk);
-            let ra = right.column(rk);
-            scalar_eq(la, li, ra, ri)
-        })
+) -> DeltaResult<bool> {
+    for (&lk, &rk) in left_indices.iter().zip(right_indices.iter()) {
+        let la = left.column(lk);
+        let ra = right.column(rk);
+        if !scalar_eq(la, li, ra, ri)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
-fn scalar_eq(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> bool {
+fn scalar_eq(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> DeltaResult<bool> {
     use arrow::array::{Int32Array, Int64Array, StringArray};
     if a.is_null(ai) && b.is_null(bi) {
-        return true;
+        return Ok(true);
     }
     if a.is_null(ai) || b.is_null(bi) {
-        return false;
+        return Ok(false);
     }
     if let (Some(av), Some(bv)) = (
         a.as_any().downcast_ref::<Int64Array>(),
         b.as_any().downcast_ref::<Int64Array>(),
     ) {
-        return av.value(ai) == bv.value(bi);
+        return Ok(av.value(ai) == bv.value(bi));
     }
     if let (Some(av), Some(bv)) = (
         a.as_any().downcast_ref::<Int32Array>(),
         b.as_any().downcast_ref::<Int32Array>(),
     ) {
-        return av.value(ai) == bv.value(bi);
+        return Ok(av.value(ai) == bv.value(bi));
     }
     if let (Some(av), Some(bv)) = (
         a.as_any().downcast_ref::<StringArray>(),
         b.as_any().downcast_ref::<StringArray>(),
     ) {
-        return av.value(ai) == bv.value(bi);
+        return Ok(av.value(ai) == bv.value(bi));
     }
     // Crate-13 audit: other key types (Utf8View, Int16, floats, temporals,
     // binary, …) previously returned `false` unconditionally, so a join keyed
     // on them silently matched nothing on the delta-probe paths. Fall back to
     // the shared injective key encoding; genuinely unsupported (nested) types
     // stay non-matching rather than colliding.
-    match (scalar_to_key(a, ai), scalar_to_key(b, bi)) {
-        (Some(x), Some(y)) => x == y,
-        _ => false,
+    // Nulls were handled above, so both sides encode to `Some` here; an
+    // unencodable type is now an `Err` rather than a silent non-match, which
+    // is what made a Decimal/Dictionary join key match nothing (IVM-AUD-1).
+    match (scalar_to_key(a, ai)?, scalar_to_key(b, bi)?) {
+        (Some(x), Some(y)) => Ok(x == y),
+        _ => Ok(false),
     }
 }
 

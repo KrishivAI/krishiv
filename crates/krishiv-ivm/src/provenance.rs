@@ -137,12 +137,12 @@ impl ProvenanceIndex {
 ///
 /// Uses the same algorithm as the IVM content-addressed dedup so hashes are
 /// consistent between dedup and provenance tracking.
-pub fn hash_batch_row(batch: &RecordBatch, row: usize) -> u64 {
+pub fn hash_batch_row(batch: &RecordBatch, row: usize) -> crate::IvmResult<u64> {
     hash_row(batch, row)
 }
 
 /// Hash all rows in `batch` and return a `Vec<u64>` of row hashes.
-pub fn hash_all_rows(batch: &RecordBatch) -> Vec<u64> {
+pub fn hash_all_rows(batch: &RecordBatch) -> crate::IvmResult<Vec<u64>> {
     (0..batch.num_rows())
         .map(|row| hash_row(batch, row))
         .collect()

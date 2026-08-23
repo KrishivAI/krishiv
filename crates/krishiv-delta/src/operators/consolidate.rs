@@ -69,10 +69,14 @@ pub fn consolidate_batch(
         let row_key: Vec<String> = col_indices
             .iter()
             .map(|&idx| scalar_to_group_key(data.column(idx), row))
-            .collect();
+            .collect::<DeltaResult<Vec<_>>>()?;
         let w = weights.value(row);
         if let Some(entry) = groups.get_mut(&row_key) {
-            entry.1 += w;
+            // IVM-AUD-CORE-3: saturating, not wrapping. An i64 weight overflow
+            // panics in debug and wraps in release — a wrapped weight flips a
+            // row's presence in the view. Saturation is the honest clamp: the
+            // multiplicity is already beyond anything expressible.
+            entry.1 = entry.1.saturating_add(w);
         } else {
             key_order.push(row_key.clone());
             groups.insert(row_key, (row, w));

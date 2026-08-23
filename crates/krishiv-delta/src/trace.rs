@@ -179,14 +179,14 @@ impl Trace {
         // Use sequential indices [0..N] to extract tuples from the probe batch,
         // while using `self.key_col_indices` to index into the trace's own batches.
         let probe_indices: Vec<usize> = (0..self.key_col_names.len()).collect();
-        let key_set = build_key_set(keys, &probe_indices);
+        let key_set = build_key_set(keys, &probe_indices)?;
 
         let mut result_batches = Vec::new();
         for level in &self.levels {
             for batch in level {
                 let data = batch.data_batch();
                 let weights = batch.weights();
-                let mask = make_key_match_mask(&data, &self.key_col_indices, &key_set);
+                let mask = make_key_match_mask(&data, &self.key_col_indices, &key_set)?;
                 let filtered = arrow::compute::filter_record_batch(batch.inner(), &mask)?;
                 if filtered.num_rows() > 0 {
                     result_batches.push(
@@ -398,7 +398,7 @@ impl std::fmt::Debug for Trace {
 
 type KeyTuple = Vec<String>;
 
-fn extract_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> KeyTuple {
+fn extract_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> DeltaResult<KeyTuple> {
     key_indices
         .iter()
         .map(|&idx| {
@@ -413,27 +413,30 @@ fn extract_key(batch: &RecordBatch, key_indices: &[usize], row: usize) -> KeyTup
 /// Utf8View / LargeUtf8 / temporal / binary types, which all collapsed into
 /// one `<unsupported:…>` bucket and falsely matched each other in probes.
 /// Now delegates to the shared null-unambiguous helper.
-fn array_scalar_to_string(arr: &dyn Array, row: usize) -> String {
+fn array_scalar_to_string(arr: &dyn Array, row: usize) -> DeltaResult<String> {
     crate::operators::key_util::scalar_to_group_key(arr, row)
 }
 
-fn build_key_set(keys: &RecordBatch, key_indices: &[usize]) -> ahash::AHashSet<KeyTuple> {
+fn build_key_set(
+    keys: &RecordBatch,
+    key_indices: &[usize],
+) -> DeltaResult<ahash::AHashSet<KeyTuple>> {
     let mut set = ahash::AHashSet::new();
     for row in 0..keys.num_rows() {
-        set.insert(extract_key(keys, key_indices, row));
+        set.insert(extract_key(keys, key_indices, row)?);
     }
-    set
+    Ok(set)
 }
 
 fn make_key_match_mask(
     data: &RecordBatch,
     key_indices: &[usize],
     key_set: &ahash::AHashSet<KeyTuple>,
-) -> BooleanArray {
+) -> DeltaResult<BooleanArray> {
     (0..data.num_rows())
         .map(|row| {
-            let key = extract_key(data, key_indices, row);
-            Some(key_set.contains(&key))
+            let key = extract_key(data, key_indices, row)?;
+            Ok(Some(key_set.contains(&key)))
         })
         .collect()
 }
