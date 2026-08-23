@@ -135,24 +135,164 @@ pub fn build_observability_report(
             job_name,
             job_kind: job.kind().to_string(),
             state: job.state().to_string(),
-            submitted_at_ms: 0,
+            // The coordinator records no submission wall clock; None is the
+            // honest value (this was a hardcoded 0 — the 1970 epoch).
+            submitted_at_ms: None,
             priority: job.priority(),
             namespace_id: job.namespace_id().map(str::to_owned),
-            elapsed_ms: 0,
+            elapsed_ms: None,
         },
         stages,
         executors,
         checkpoint,
         shuffle_partitions: None,
         streaming_state: None,
-        recent_events: Vec::new(),
+        recent_events: recent_events_for_job(coordinator, job_id),
         connector_metrics: None,
     })
+}
+
+/// Last 50 event-log entries touching `job_id`, oldest first. Entries carry
+/// no wall clock (the store records order only), so `timestamp_ms` is None —
+/// never fabricated.
+fn recent_events_for_job(
+    coordinator: &Coordinator,
+    job_id: &krishiv_proto::JobId,
+) -> Vec<krishiv_metrics::observability_report::ReportEvent> {
+    use crate::EventLogEvent as E;
+    let Some(store) = coordinator.store.as_ref() else {
+        return Vec::new();
+    };
+    let guard = store.inner();
+    guard
+        .events()
+        .iter()
+        .filter_map(|event| {
+            let (kind, event_job, stage, task, detail) = match event {
+                E::JobSubmitted { job_id } => ("JobSubmitted", job_id, None, None, String::new()),
+                E::StagePlanned { job_id, stage_id } => (
+                    "StagePlanned",
+                    job_id,
+                    Some(stage_id.to_string()),
+                    None,
+                    String::new(),
+                ),
+                E::TaskAssigned {
+                    job_id,
+                    stage_id,
+                    task_id,
+                    executor_id,
+                } => (
+                    "TaskAssigned",
+                    job_id,
+                    Some(stage_id.to_string()),
+                    Some(task_id.to_string()),
+                    format!("executor {executor_id}"),
+                ),
+                E::TaskStarted {
+                    job_id,
+                    stage_id,
+                    task_id,
+                    attempt,
+                } => (
+                    "TaskStarted",
+                    job_id,
+                    Some(stage_id.to_string()),
+                    Some(task_id.to_string()),
+                    format!("attempt {}", attempt.as_u32()),
+                ),
+                E::TaskSucceeded {
+                    job_id,
+                    stage_id,
+                    task_id,
+                    attempt,
+                } => (
+                    "TaskSucceeded",
+                    job_id,
+                    Some(stage_id.to_string()),
+                    Some(task_id.to_string()),
+                    format!("attempt {}", attempt.as_u32()),
+                ),
+                E::TaskFailed {
+                    job_id,
+                    stage_id,
+                    task_id,
+                    attempt,
+                    reason,
+                } => (
+                    "TaskFailed",
+                    job_id,
+                    Some(stage_id.to_string()),
+                    Some(task_id.to_string()),
+                    format!("attempt {}: {reason}", attempt.as_u32()),
+                ),
+                E::JobCancelled { job_id } => ("JobCancelled", job_id, None, None, String::new()),
+                E::JobCompleted {
+                    job_id,
+                    final_state,
+                } => ("JobCompleted", job_id, None, None, final_state.clone()),
+                E::ExecutorLost { .. } => return None,
+            };
+            (event_job == job_id).then(|| krishiv_metrics::observability_report::ReportEvent {
+                timestamp_ms: None,
+                event_kind: kind.to_string(),
+                detail,
+                job_id: Some(event_job.to_string()),
+                stage_id: stage,
+                task_id: task,
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .take(50)
+        .rev()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The report's event feed must come from the real event log — it was a
+    /// hardcoded empty Vec (with submitted_at_ms a hardcoded 0 rendering as
+    /// the 1970 epoch). Revert-proof: restore `recent_events: Vec::new()`
+    /// and this fails.
+    #[test]
+    fn report_carries_the_jobs_event_log_entries() {
+        use krishiv_proto::{JobId, JobKind, JobSpec, StageId, StageSpec, TaskId, TaskSpec};
+        let mut coordinator = Coordinator::active(
+            krishiv_proto::CoordinatorId::try_new("coord-report-events").unwrap(),
+        );
+        coordinator.attach_store(crate::InMemoryMetadataStore::default());
+        let job_id = JobId::try_new("job-report-events").unwrap();
+        let spec = JobSpec::new(job_id.clone(), "report", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-report").unwrap(), "stage").with_task(
+                TaskSpec::new(TaskId::try_new("task-report").unwrap(), "w:r"),
+            ),
+        );
+        coordinator.submit_job(spec).unwrap();
+
+        let report = build_observability_report(&coordinator, &job_id).unwrap();
+        assert!(
+            report
+                .recent_events
+                .iter()
+                .any(|e| e.event_kind == "JobSubmitted"),
+            "event feed must carry the submission: {:?}",
+            report.recent_events
+        );
+        // No fabricated clocks: submission time is not recorded, so both
+        // report fields are honestly absent rather than epoch zero.
+        assert_eq!(report.job.submitted_at_ms, None);
+        assert_eq!(report.job.elapsed_ms, None);
+        assert!(
+            report
+                .recent_events
+                .iter()
+                .all(|e| e.timestamp_ms.is_none())
+        );
+    }
     use krishiv_proto::{
         CoordinatorId, ExecutorDescriptor, ExecutorHeartbeat, ExecutorState, JobKind, JobSpec,
         StageId, StageSpec, TaskId, TaskSpec,

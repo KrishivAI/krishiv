@@ -49,14 +49,17 @@ pub struct ReportJob {
     pub job_name: String,
     pub job_kind: String,
     pub state: String,
-    /// UNIX ms since epoch when the job was submitted.
-    pub submitted_at_ms: u64,
+    /// UNIX ms since epoch when the job was submitted. `None` when the
+    /// coordinator does not record submission time (it currently does not) —
+    /// previously this was a hardcoded 0, which rendered as the 1970 epoch.
+    pub submitted_at_ms: Option<u64>,
     /// Scheduling priority (0–255).
     pub priority: u8,
     /// Assigned namespace, if any.
     pub namespace_id: Option<String>,
-    /// Total elapsed wall-clock time in ms since submission.
-    pub elapsed_ms: u64,
+    /// Total elapsed wall-clock time in ms since submission; `None` whenever
+    /// `submitted_at_ms` is.
+    pub elapsed_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -172,8 +175,9 @@ pub struct ReportStreamingState {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ReportEvent {
-    /// UNIX ms timestamp.
-    pub timestamp_ms: u64,
+    /// UNIX ms timestamp. `None` for entries sourced from the metadata
+    /// store's event log, which records order but no wall clock.
+    pub timestamp_ms: Option<u64>,
     /// Event kind (e.g. "JobSubmitted", "TaskFailed").
     pub event_kind: String,
     /// Human-readable detail string.
@@ -216,10 +220,10 @@ mod tests {
                 job_name: String::new(),
                 job_kind: String::new(),
                 state: String::new(),
-                submitted_at_ms: 0,
+                submitted_at_ms: None,
                 priority: 128,
                 namespace_id: None,
-                elapsed_ms: 0,
+                elapsed_ms: None,
             },
             stages: Vec::new(),
             executors: Vec::new(),
@@ -245,10 +249,10 @@ mod tests {
                 job_name: String::new(),
                 job_kind: String::new(),
                 state: String::new(),
-                submitted_at_ms: 0,
+                submitted_at_ms: None,
                 priority: 128,
                 namespace_id: None,
-                elapsed_ms: 0,
+                elapsed_ms: None,
             },
             stages: Vec::new(),
             executors: Vec::new(),
@@ -316,10 +320,10 @@ mod tests {
                 job_name: String::new(),
                 job_kind: String::new(),
                 state: String::new(),
-                submitted_at_ms: 0,
+                submitted_at_ms: None,
                 priority: 128,
                 namespace_id: None,
-                elapsed_ms: 0,
+                elapsed_ms: None,
             },
             stages: Vec::new(),
             executors: Vec::new(),
@@ -373,10 +377,10 @@ mod tests {
                 job_name: String::new(),
                 job_kind: String::new(),
                 state: String::new(),
-                submitted_at_ms: 0,
+                submitted_at_ms: None,
                 priority: 128,
                 namespace_id: None,
-                elapsed_ms: 0,
+                elapsed_ms: None,
             },
             stages: Vec::new(),
             executors: Vec::new(),
@@ -418,10 +422,10 @@ mod tests {
                 job_name: String::new(),
                 job_kind: String::new(),
                 state: String::new(),
-                submitted_at_ms: 0,
+                submitted_at_ms: None,
                 priority: 128,
                 namespace_id: None,
-                elapsed_ms: 0,
+                elapsed_ms: None,
             },
             stages: Vec::new(),
             executors: Vec::new(),
@@ -432,7 +436,7 @@ mod tests {
             connector_metrics: None,
         };
         report.recent_events.push(ReportEvent {
-            timestamp_ms: 1_700_000_000_000,
+            timestamp_ms: Some(1_700_000_000_000),
             event_kind: "TaskFailed".into(),
             detail: "executor lost during task execution".into(),
             job_id: Some("job-a".into()),
