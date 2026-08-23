@@ -334,6 +334,15 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).unwrap();
         assert!(body.contains("<div id=\"root\">"));
 
+        // The trailing-slash form must serve the shell too — browsers and
+        // link normalizers produce "/console/", and axum's wildcard alone
+        // does not cover it (revert the explicit route and this goes 404).
+        let slash = router(demo_state().unwrap())
+            .oneshot(Request::builder().uri("/console/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(slash.status(), StatusCode::OK);
+
         let redirect = router(demo_state().unwrap())
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await

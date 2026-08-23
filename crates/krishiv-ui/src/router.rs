@@ -119,6 +119,9 @@ pub fn router_with_token(state: UiState, token: Option<&str>) -> Router {
         // call, which the coordinator's own middleware enforces — the static
         // assets carry no data, so they stay public like /assets/*.
         .route("/console", get(crate::console::serve))
+        // Explicit trailing-slash route: axum's {*path} wildcard does not
+        // match an empty tail, so "/console/" 404'd while "/console" worked.
+        .route("/console/", get(crate::console::serve))
         .route("/console/{*path}", get(crate::console::serve));
 
     let protected = Router::new()
@@ -168,6 +171,9 @@ pub fn embedded_router(state: UiState) -> Router {
         // call, which the coordinator's own middleware enforces — the static
         // assets carry no data, so they stay public like /assets/*.
         .route("/console", get(crate::console::serve))
+        // Explicit trailing-slash route: axum's {*path} wildcard does not
+        // match an empty tail, so "/console/" 404'd while "/console" worked.
+        .route("/console/", get(crate::console::serve))
         .route("/console/{*path}", get(crate::console::serve));
 
     // NOTE: API routes (/api/v1/jobs, /api/v1/executors, etc.) are served by
