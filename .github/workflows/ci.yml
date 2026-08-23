@@ -55,6 +55,34 @@ jobs:
         with:
           command: check advisories bans licenses sources
 
+  # ── Console (TypeScript) build + committed-dist freshness ───────────────────
+  # The SPA's Vite build output (crates/krishiv-ui/console/dist) is COMMITTED
+  # so cargo builds and release images need no node toolchain. That makes
+  # staleness the failure mode: a PR that edits console/src without rebuilding
+  # dist would silently ship the old UI inside every binary. This job
+  # typechecks + builds the console (tsc runs inside `npm run build`) and then
+  # fails if the freshly built dist differs from the committed one.
+  console:
+    name: Console (tsc + dist freshness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/krishiv-ui/console/package-lock.json
+      - run: npm ci
+        working-directory: crates/krishiv-ui/console
+      - run: npm run build
+        working-directory: crates/krishiv-ui/console
+      - name: Committed dist matches the source
+        run: |
+          git diff --exit-code -- crates/krishiv-ui/console/dist || {
+            echo "::error::console/dist is stale — run 'npm run build' in crates/krishiv-ui/console and commit the result"
+            exit 1
+          }
+
   # ── Feature-mode compilation matrix ─────────────────────────────────────────
   check-modes:
     name: check (${{ matrix.mode }})

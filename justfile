@@ -635,3 +635,9 @@ web-build:
 # Type-check the public website.
 web-typecheck:
     cd web && npm run typecheck
+
+# Build the embedded engine console (crates/krishiv-ui/console/dist is
+# COMMITTED — rebuild + commit after changing console/src; CI enforces
+# freshness with a diff gate).
+console-build:
+    cd crates/krishiv-ui/console && npm run build
