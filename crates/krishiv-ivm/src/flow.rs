@@ -129,33 +129,118 @@ fn max_epoch_ms(arr: &dyn arrow::array::Array) -> Option<i64> {
     None
 }
 
-/// AUD-8 (retention): advance a source's LATENESS watermark from a fed batch.
+/// One row's event time as epoch milliseconds, for the same column types
+/// `max_epoch_ms` accepts.
+fn epoch_ms_at(arr: &dyn arrow::array::Array, row: usize) -> Option<i64> {
+    use arrow::array::{Int64Array, TimestampMillisecondArray};
+    if arr.is_null(row) {
+        return None;
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
+        return Some(a.value(row));
+    }
+    if let Some(a) = arr.as_any().downcast_ref::<TimestampMillisecondArray>() {
+        return Some(a.value(row));
+    }
+    None
+}
+
+/// Enforce this source's LATENESS bound on an incoming delta, and advance its
+/// watermark.
 ///
-/// No-op unless the source has a registered [`WatermarkTracker`]. Retraction
-/// rows carry event times that were necessarily observed on their earlier
-/// insertion, so taking the column max over all rows never moves the watermark
-/// backward — the tracker itself is monotonic (`observe` only raises it).
-fn observe_source_watermark(
+/// Returns the batch to actually ingest and how many rows the bound dropped.
+///
+/// IVM-AUD-CORE-7: `lateness.rs` states the contract plainly — "records
+/// arriving with `ts < watermark` are dropped at ingestion" — but
+/// `WatermarkTracker::is_late` had ZERO production callers, so a record three
+/// days late mutated the aggregate exactly like an on-time one while the
+/// module claimed otherwise. It is enforced here now, with two deliberate
+/// rules:
+///
+///   * **Only insertions are dropped.** Dropping a retraction would strand its
+///     insertion in the Z-set forever — the view would never converge. A late
+///     retraction is always applied.
+///   * **The bound is evaluated against the watermark from PRIOR batches**, so
+///     a batch can never make its own rows late.
+///
+/// IVM-AUD-CORE-9: the tracker for a source is created here, on first sight of
+/// a batch that actually carries a declared lateness column. That is what lets
+/// a join view (two sources, previously skipped as "ambiguous") get a
+/// watermark per side.
+fn apply_lateness(
     inner: &mut IncrementalFlowInner,
     source_name: &str,
-    batch: &DeltaBatch,
-) {
+    batch: DeltaBatch,
+) -> IvmResult<(DeltaBatch, usize)> {
+    let data = batch.data_batch();
+    let schema = data.schema();
+
+    // Resolve (and lazily create) this source's tracker from the declarations.
+    if !inner.watermark_trackers.contains_key(source_name)
+        && let Some(spec) = inner
+            .declared_lateness
+            .iter()
+            .find(|l| schema.index_of(&l.column).is_ok())
+            .cloned()
+    {
+        inner
+            .watermark_trackers
+            .insert(source_name.to_string(), WatermarkTracker::new(spec));
+    }
     let Some(column) = inner
         .watermark_trackers
         .get(source_name)
         .map(|t| t.lateness_column().to_string())
     else {
-        return;
+        return Ok((batch, 0));
     };
-    let data = batch.data_batch();
-    let Ok(idx) = data.schema().index_of(&column) else {
-        return;
+    let Ok(idx) = schema.index_of(&column) else {
+        return Ok((batch, 0));
     };
-    if let Some(max_ts) = max_epoch_ms(data.column(idx).as_ref())
+
+    // Evaluate lateness against the watermark established by earlier batches.
+    let prior_watermark = inner
+        .watermark_trackers
+        .get(source_name)
+        .map(|t| t.watermark());
+    let mut dropped = 0usize;
+    let kept = if let Some(watermark) = prior_watermark {
+        let weights = batch.weights();
+        let ts = data.column(idx);
+        let mask: arrow::array::BooleanArray = (0..data.num_rows())
+            .map(|row| {
+                // Retractions are never dropped: stranding an insertion would
+                // stop the view from ever converging.
+                if weights.value(row) < 0 {
+                    return Some(true);
+                }
+                match epoch_ms_at(ts.as_ref(), row) {
+                    Some(v) if v < watermark => {
+                        dropped += 1;
+                        Some(false)
+                    }
+                    _ => Some(true),
+                }
+            })
+            .collect();
+        if dropped == 0 {
+            batch
+        } else {
+            batch.filter_mask(&mask).map_err(delta_err)?
+        }
+    } else {
+        batch
+    };
+
+    // Advance the watermark from the rows actually ingested.
+    let kept_data = kept.data_batch();
+    if let Ok(kept_idx) = kept_data.schema().index_of(&column)
+        && let Some(max_ts) = max_epoch_ms(kept_data.column(kept_idx).as_ref())
         && let Some(tracker) = inner.watermark_trackers.get_mut(source_name)
     {
         tracker.observe(max_ts);
     }
+    Ok((kept, dropped))
 }
 
 /// One incremental view's failure during a step.
@@ -214,6 +299,20 @@ struct IncrementalFlowInner {
 
     // Gap 6: LATENESS / watermark trackers per source.
     watermark_trackers: AHashMap<String, WatermarkTracker>,
+    /// Rows dropped per source by a LATENESS bound, so the enforcement is
+    /// observable rather than silent (IVM-AUD-CORE-7).
+    late_dropped_rows: AHashMap<String, u64>,
+    /// Union of every registered view's LATENESS declarations.
+    ///
+    /// IVM-AUD-CORE-9: association used to happen at register time and only
+    /// for a view with EXACTLY ONE source dependency, so a join view — by
+    /// construction two deps, and the only shape whose state GC actually
+    /// matters — never got a tracker at all. Trackers are now resolved at feed
+    /// time by schema membership: the source whose batch actually carries the
+    /// declared timestamp column is the source that watermark applies to,
+    /// which is unambiguous for single-source, multi-source and join views
+    /// alike.
+    declared_lateness: Vec<krishiv_delta::LatenessSpec>,
 
     // Coordinator-authoritative distributed IVM: when true, step_datafusion
     // never uses cached incremental plans (whose accumulator state is not
@@ -226,6 +325,13 @@ struct IncrementalFlowInner {
     // Views absent from this map fall back to the conservative sql_identifiers
     // tokenizer for dirty-bit detection (see extract_sql_table_refs).
     view_deps: AHashMap<String, HashSet<String>>,
+    /// Set by `restore`/`restore_delta`: the sources were replaced wholesale,
+    /// so every view's derived state was cleared and must be recomputed from
+    /// the restored inputs on the next tick — even a tick with no new input.
+    /// Without it a restored flow never rebuilds: a view is recomputed only
+    /// when a dependency is dirty, and a restore makes nothing dirty
+    /// (IVM-AUD-CORE-16).
+    rebuild_all_views: bool,
 
     // Per-step output deltas, keyed by view name, captured during the most
     // recent `step_datafusion`. Cleared at the start of each step. Lets a caller
@@ -345,8 +451,11 @@ impl IncrementalFlow {
                 view_plan_sqls: AHashMap::new(),
                 source_ordinals: AHashMap::new(),
                 watermark_trackers: AHashMap::new(),
+                late_dropped_rows: AHashMap::new(),
+                declared_lateness: Vec::new(),
                 force_diff_based: false,
                 view_deps: AHashMap::new(),
+                rebuild_all_views: false,
                 last_step_outputs: AHashMap::new(),
                 view_delta_stats: AHashMap::new(),
                 pending_plan_state: HashMap::new(),
@@ -365,6 +474,16 @@ impl IncrementalFlow {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.provenance = Some(crate::provenance::ProvenanceIndex::new());
         Ok(())
+    }
+
+    /// The LATENESS bounds declared on this flow's registered views.
+    ///
+    /// Exposed so a caller can verify a bound actually reached the engine —
+    /// the distributed register-view path used to drop it at the wire
+    /// (IVM-AUD-DDL-B1).
+    pub fn declared_lateness(&self) -> IvmResult<Vec<krishiv_delta::LatenessSpec>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner.declared_lateness.clone())
     }
 
     /// Query the provenance index for output hashes derived from `input_hash`.
@@ -447,9 +566,20 @@ impl IncrementalFlow {
     pub fn register_view(&self, spec: IncrementalViewSpec) -> IvmResult<()> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         if let Ok(existing) = inner.view_registry.get(&spec.name) {
+            // IVM-AUD-CORE-E4: `lateness` belongs in this comparison. Leaving
+            // it out meant re-registering a view with only its LATENESS
+            // changed hit the early return and silently kept the old
+            // watermark — the declaration was accepted and had no effect.
             let unchanged = existing.spec.body_sql == spec.body_sql
                 && existing.spec.is_materialized == spec.is_materialized
-                && existing.spec.is_recursive == spec.is_recursive;
+                && existing.spec.is_recursive == spec.is_recursive
+                && existing.spec.lateness.len() == spec.lateness.len()
+                && existing
+                    .spec
+                    .lateness
+                    .iter()
+                    .zip(spec.lateness.iter())
+                    .all(|(a, b)| a.column == b.column && a.lateness_ms == b.lateness_ms);
             if unchanged {
                 // Identical re-registration — keep the view and its state.
                 return Ok(());
@@ -467,33 +597,25 @@ impl IncrementalFlow {
             inner.view_deps.insert(spec.name.clone(), deps);
         }
 
-        // AUD-8 (retention): activate LATENESS. Each declared spec creates a
-        // watermark tracker so the tick loop's per-plan `gc_watermark` actually
-        // advances and prunes stale join/aggregate trace entries instead of the
-        // mechanism sitting inert with zero callers. A bare `LatenessSpec` names
-        // only the timestamp column, so it is associated with the view's source
-        // — unambiguous for a single-source view. Multi-source association needs
-        // an explicit source qualifier (view-spec / SQL surface, Phase 60) and
-        // is skipped with a warning rather than guessed.
-        if !spec.lateness.is_empty() {
-            match inner.view_deps.get(&spec.name) {
-                Some(deps) if deps.len() == 1 => {
-                    let source = deps.iter().next().cloned().unwrap_or_default();
-                    for l in &spec.lateness {
-                        inner
-                            .watermark_trackers
-                            .entry(source.clone())
-                            .or_insert_with(|| WatermarkTracker::new(l.clone()));
-                    }
-                }
-                other => {
-                    tracing::warn!(
-                        view = %spec.name,
-                        sources = other.map(|d| d.len()).unwrap_or(0),
-                        "LATENESS declared but the source is ambiguous (need exactly \
-                         one source dependency); watermark tracker not created"
-                    );
-                }
+        // AUD-8 / IVM-AUD-CORE-9: record the declaration. Which SOURCE each
+        // declaration governs is resolved at feed time by schema membership
+        // (see `apply_lateness`), so a join view's two sources each get their
+        // own watermark instead of the whole view being skipped as
+        // "ambiguous".
+        for l in &spec.lateness {
+            if !inner
+                .declared_lateness
+                .iter()
+                .any(|d| d.column == l.column && d.lateness_ms == l.lateness_ms)
+            {
+                // A changed bound for the same column replaces the old one,
+                // and any tracker built from the old bound is discarded so the
+                // new bound actually takes effect (IVM-AUD-CORE-E4).
+                inner.declared_lateness.retain(|d| d.column != l.column);
+                inner
+                    .watermark_trackers
+                    .retain(|_, t| t.lateness_column() != l.column);
+                inner.declared_lateness.push(l.clone());
             }
         }
 
@@ -661,8 +783,24 @@ impl IncrementalFlow {
             return Ok(());
         }
 
-        // AUD-8 (retention): advance this source's LATENESS watermark.
-        observe_source_watermark(&mut inner, &source_name, &batch);
+        // AUD-8 / IVM-AUD-CORE-7: enforce the LATENESS bound and advance the
+        // watermark. Drops are counted and logged — a declared bound silently
+        // discarding rows would be its own kind of dishonesty.
+        let (batch, dropped_late) = apply_lateness(&mut inner, &source_name, batch)?;
+        if dropped_late > 0 {
+            tracing::warn!(
+                source = %source_name,
+                dropped = dropped_late,
+                "LATENESS bound dropped late insertion rows at ingestion"
+            );
+            *inner
+                .late_dropped_rows
+                .entry(source_name.clone())
+                .or_insert(0) += dropped_late as u64;
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
 
         // Accumulate for delta checkpoints.
         if inner.delta_checkpoint_enabled {
@@ -692,8 +830,22 @@ impl IncrementalFlow {
         if batch.is_empty() {
             return Ok(());
         }
-        // AUD-8 (retention): advance this source's LATENESS watermark.
-        observe_source_watermark(&mut inner, &source_name, &batch);
+        // AUD-8 / IVM-AUD-CORE-7: same bound on the coalesced path.
+        let (batch, dropped_late) = apply_lateness(&mut inner, &source_name, batch)?;
+        if dropped_late > 0 {
+            tracing::warn!(
+                source = %source_name,
+                dropped = dropped_late,
+                "LATENESS bound dropped late insertion rows at ingestion"
+            );
+            *inner
+                .late_dropped_rows
+                .entry(source_name.clone())
+                .or_insert(0) += dropped_late as u64;
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
         // IVM-AUD-CORE-20: keep the delta-checkpoint accumulator consistent
         // with `pending`. This path REPLACES the pending delta (that is the
         // point — snapshot sources coalesce), so the accumulator must replace
@@ -935,7 +1087,15 @@ impl IncrementalFlow {
         let custody = DrainedPending::new(Arc::clone(&self.inner), raw_pending.clone());
         let inputs = coalesce_pending(raw_pending)?;
 
-        if inputs.is_empty() {
+        // A restore replaced the sources and cleared every view's derived
+        // state, so this tick must rebuild the views even though no input
+        // arrived (IVM-AUD-CORE-16).
+        let rebuild_all_views = {
+            let mut inner = self.inner.lock().map_err(lock_err)?;
+            std::mem::take(&mut inner.rebuild_all_views)
+        };
+
+        if inputs.is_empty() && !rebuild_all_views {
             // Nothing to reprocess: release custody before returning.
             custody.commit();
             let mut inner = self.inner.lock().map_err(lock_err)?;
@@ -1020,6 +1180,14 @@ impl IncrementalFlow {
         // Newly built plans to insert in Phase 5: (name, plan, body_sql)
         let mut new_plans: Vec<(String, ViewPlan, String)> = Vec::new();
 
+        // Pass A — resolve, in topo order, which views this tick touches and
+        // which of them get an O(Δ) incremental plan. This is separated from
+        // the execution pass below because a view's execution needs to know
+        // whether any *downstream* view will run SQL against its output, and
+        // that is only knowable once every plan kind is resolved
+        // (IVM-AUD-CORE-17).
+        let mut dirty_order: Vec<String> = Vec::new();
+        let mut plan_is_incremental_by_view: HashMap<String, bool> = HashMap::new();
         for view_name in &topo {
             let spec = match spec_map.get(view_name.as_str()) {
                 Some(s) => s,
@@ -1039,7 +1207,7 @@ impl IncrementalFlow {
                             || dirty_views.contains(token.as_str())
                     })
                 });
-            if !is_dirty {
+            if !is_dirty && !rebuild_all_views {
                 continue;
             }
             dirty_views.insert(view_name_lower);
@@ -1047,13 +1215,20 @@ impl IncrementalFlow {
             // Determine if this view gets an incremental plan (skip SQL) or DiffBased (run SQL).
             // `force_diff_based` (transient executor flows) never uses incremental
             // plans: their accumulator state is not transferable via checkpoint.
-            let plan_is_incremental = if force_diff_based {
+            // On a rebuild tick every view recomputes its full output from
+            // SQL: the incremental operators were cleared by the restore, and
+            // an operator seeded from the restored state emits no delta, so an
+            // incremental path would leave the view empty. Diffing the full
+            // result against the cleared (None) baseline republishes the whole
+            // view, which is exactly what a restore needs.
+            let plan_is_incremental = if force_diff_based || rebuild_all_views {
                 false
             } else if views_needing_plans.contains(view_name) {
                 let plan = crate::plan::build_view_plan(
                     &spec.body_sql,
                     &spec.output_schema,
                     &available_schemas,
+                    &spec.lateness,
                 )
                 .await;
                 let is_incr = matches!(plan.kind(), ViewPlanKind::Incremental);
@@ -1066,8 +1241,56 @@ impl IncrementalFlow {
                     .map(|k| k == ViewPlanKind::Incremental)
                     .unwrap_or(false)
             };
+            dirty_order.push(view_name.clone());
+            plan_is_incremental_by_view.insert(view_name.clone(), plan_is_incremental);
+        }
 
-            if plan_is_incremental {
+        // A dirty view that will run SQL this tick needs every view it reads to
+        // exist as a table holding *this* tick's output. An incremental view
+        // does not otherwise produce one during this phase — its operator runs
+        // later, under the lock — so name the incremental views that owe a
+        // fresh full output to a SQL-running dependent.
+        let owes_full_output_to_a_sql_dependent: HashSet<String> = dirty_order
+            .iter()
+            .filter(|v| {
+                plan_is_incremental_by_view
+                    .get(v.as_str())
+                    .copied()
+                    .unwrap_or(false)
+            })
+            .filter(|v| {
+                let v_lower = v.to_lowercase();
+                dirty_order.iter().any(|w| {
+                    if plan_is_incremental_by_view
+                        .get(w.as_str())
+                        .copied()
+                        .unwrap_or(false)
+                    {
+                        return false;
+                    }
+                    match view_deps.get(w.as_str()) {
+                        Some(deps) => deps.contains(&v_lower),
+                        None => spec_map
+                            .get(w.as_str())
+                            .is_some_and(|s| sql_identifiers(&s.body_sql).contains(&v_lower)),
+                    }
+                })
+            })
+            .cloned()
+            .collect();
+
+        // Pass B — execute.
+        for view_name in &dirty_order {
+            let spec = match spec_map.get(view_name.as_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let plan_is_incremental = plan_is_incremental_by_view
+                .get(view_name.as_str())
+                .copied()
+                .unwrap_or(false);
+
+            if plan_is_incremental && !owes_full_output_to_a_sql_dependent.contains(view_name) {
                 // Register the previous snapshot for downstream DiffBased views.
                 match view_full_outputs.get(view_name) {
                     Some(prev) if prev.num_rows() > 0 => {
@@ -1077,7 +1300,18 @@ impl IncrementalFlow {
                     _ => tables.remove(view_name.as_str()),
                 }
             } else {
-                // DiffBased: register all upstream outputs, then execute SQL.
+                // DiffBased — or an incremental view that owes a fresh full
+                // output to a SQL-running dependent. In the latter case the
+                // view pays one full recompute this tick purely to give its
+                // dependent a table to read; its own output delta still comes
+                // from its O(Δ) operator under the lock, so the incremental
+                // plan is not abandoned. The cost is real and is the price of
+                // attaching a non-incrementalizable view to an incremental
+                // one; the alternative (processing the DAG level by level,
+                // alternating locked operator application with unlocked SQL)
+                // avoids the recompute and is the better long-term shape.
+                //
+                // Register all upstream outputs, then execute SQL.
                 for (up_name, up_batch) in &view_full_outputs {
                     if up_batch.num_rows() == 0 {
                         // Keep parity with a fresh context: no table at all.
@@ -1527,6 +1761,16 @@ impl IncrementalFlow {
         })
     }
 
+    /// Rows this source has had dropped by its LATENESS bound (IVM-AUD-CORE-7).
+    ///
+    /// Enforcement of a declared bound is real data loss — intentional and
+    /// requested, but never something to hide. This counter (plus the WARN on
+    /// every drop) is how an operator sees it happening.
+    pub fn late_dropped_rows(&self, source: &str) -> IvmResult<u64> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner.late_dropped_rows.get(source).copied().unwrap_or(0))
+    }
+
     /// Cumulative insert/retract counters for one view (#94), if it has
     /// produced any output.
     pub fn view_delta_stats(&self, view: &str) -> IvmResult<Option<ViewDeltaStats>> {
@@ -1686,12 +1930,23 @@ impl IncrementalFlow {
         }
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
+        // IVM-AUD-CORE-16: the sources were just replaced, so any cached
+        // incremental operator holds accumulators built from the PREVIOUS
+        // inputs. `restore_full` clears them for exactly this reason; this
+        // path did not, so the next tick applied fresh deltas to a stale
+        // accumulator. Clear them here too, and reset each view's baseline AND
+        // snapshot together (see `reset_state`) so the recompute cannot land
+        // on top of stale materialized rows.
+        inner.view_plans.clear();
+        inner.view_plan_sqls.clear();
+        inner.pending_plan_state.clear();
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         for name in &names {
             if let Ok(view) = inner.view_registry.get(name) {
-                let _ = view.reset_full_output();
+                view.reset_state().map_err(delta_err)?;
             }
         }
+        inner.rebuild_all_views = true;
         Ok(())
     }
 
@@ -2021,13 +2276,19 @@ impl IncrementalFlow {
             let snapshot = consolidated.filter_positive().map_err(delta_err)?;
             inner.source_snapshots.insert(name, snapshot);
         }
-        // Reset view baselines so the next step re-diffs from current state.
+        // IVM-AUD-CORE-16: same treatment as `restore` — stale cached plans
+        // must go, and the baseline and snapshot must be cleared together or
+        // the next tick republishes the whole view on top of stale rows.
+        inner.view_plans.clear();
+        inner.view_plan_sqls.clear();
+        inner.pending_plan_state.clear();
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         for name in &names {
             if let Ok(view) = inner.view_registry.get(name) {
-                let _ = view.reset_full_output();
+                view.reset_state().map_err(delta_err)?;
             }
         }
+        inner.rebuild_all_views = true;
         Ok(())
     }
 }
@@ -3182,12 +3443,138 @@ mod integration_tests {
         flow.feed("events", batch(&[20_000], &[3.0])).unwrap();
         assert_eq!(flow.watermark_for("events").unwrap(), 19_000);
 
-        // An older batch never moves the watermark backward (monotonic).
+        // IVM-AUD-CORE-7/CORE-8: the old version of this test stopped here —
+        // it asserted only `watermark_for`, a getter over the setter it had
+        // just called, so it could not observe that NOTHING enforced the
+        // bound. `WatermarkTracker::is_late` had zero production callers and a
+        // record three days late mutated the view exactly like an on-time one.
+        // These assertions are what that test was missing.
+        // Materialize what has been fed so far, so `before_rows` is the real
+        // snapshot size rather than `None` (source snapshots only advance on a
+        // step).
+        flow.step_datafusion().await.unwrap();
+        let before_rows = flow
+            .source_snapshot("events")
+            .unwrap()
+            .map(|b| b.num_rows())
+            .unwrap_or(0);
+        assert_eq!(before_rows, 3, "three on-time rows were fed");
+
+        // ts 5_000 is far below the 19_000 watermark: dropped at ingestion.
+        flow.feed("events", batch(&[5_000], &[99.0])).unwrap();
+        assert_eq!(
+            flow.late_dropped_rows("events").unwrap(),
+            1,
+            "a late insertion must be dropped by the declared LATENESS bound"
+        );
+        flow.step_datafusion().await.unwrap();
+        assert_eq!(
+            flow.source_snapshot("events")
+                .unwrap()
+                .map(|b| b.num_rows())
+                .unwrap_or(0),
+            before_rows,
+            "the dropped row must not reach the source snapshot"
+        );
+
+        // A late RETRACTION is never dropped: stranding its insertion would
+        // stop the view from ever converging.
+        let retraction = DeltaBatch::from_deletes(
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(Int64Array::from(vec![10_000_i64])) as Arc<dyn Array>,
+                    Arc::new(Float64Array::from(vec![1.0_f64])) as Arc<dyn Array>,
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        flow.feed("events", retraction).unwrap();
+        assert_eq!(
+            flow.late_dropped_rows("events").unwrap(),
+            1,
+            "the retraction must NOT be counted as dropped"
+        );
+        flow.step_datafusion().await.unwrap();
+        assert_eq!(
+            flow.source_snapshot("events")
+                .unwrap()
+                .map(|b| b.num_rows())
+                .unwrap_or(0),
+            before_rows - 1,
+            "the late retraction must have been applied"
+        );
+
+        // The watermark stays monotonic: an older batch neither moves it back
+        // nor survives the bound (it is dropped, raising the drop counter).
         flow.feed("events", batch(&[5_000], &[4.0])).unwrap();
         assert_eq!(
             flow.watermark_for("events").unwrap(),
             19_000,
             "watermark must be monotonic"
+        );
+        assert_eq!(flow.late_dropped_rows("events").unwrap(), 2);
+    }
+
+    /// IVM-AUD-CORE-9: a join view has TWO source dependencies, and the old
+    /// register-time association skipped any view without exactly one — so the
+    /// only shape whose state GC actually matters never got a watermark at
+    /// all. Association now happens at feed time by schema membership, so each
+    /// side gets its own.
+    ///
+    /// Revert-proof: restrict tracker creation to single-dep views again and
+    /// both `watermark_for` assertions return `i64::MIN`.
+    #[tokio::test]
+    async fn a_join_view_gets_a_watermark_per_side() {
+        use arrow::array::{Array, Int64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use krishiv_delta::{DeltaBatch, LatenessSpec};
+
+        let flow = IncrementalFlow::new();
+        let left = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        let right = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, false),
+        ]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "joined".into(),
+            body_sql: "SELECT o.id, o.ts FROM orders o JOIN shipments s ON o.id = s.id".into(),
+            output_schema: left.clone(),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![LatenessSpec::new("ts", 1_000)],
+        })
+        .unwrap();
+
+        let row = |schema: &Arc<Schema>, id: i64, ts: i64| {
+            DeltaBatch::from_inserts(
+                RecordBatch::try_new(
+                    schema.clone(),
+                    vec![
+                        Arc::new(Int64Array::from(vec![id])) as Arc<dyn Array>,
+                        Arc::new(Int64Array::from(vec![ts])) as Arc<dyn Array>,
+                    ],
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        flow.feed("orders", row(&left, 1, 50_000)).unwrap();
+        flow.feed("shipments", row(&right, 1, 40_000)).unwrap();
+
+        assert_eq!(
+            flow.watermark_for("orders").unwrap(),
+            49_000,
+            "the left side of a join must get its own watermark"
+        );
+        assert_eq!(
+            flow.watermark_for("shipments").unwrap(),
+            39_000,
+            "the right side of a join must get its own watermark"
         );
     }
 

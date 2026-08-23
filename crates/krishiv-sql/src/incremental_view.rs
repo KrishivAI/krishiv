@@ -2,29 +2,58 @@
 
 //! `CREATE INCREMENTAL VIEW` and `DECLARE RECURSIVE VIEW` SQL extensions.
 //!
-//! Supported DDL:
+//! **These statements only *declare* a view.** Executing one writes an entry
+//! into the SQL-layer [`IncrementalViewRegistry`] and does nothing else: no
+//! operator state is built, no data is read, and no view is maintained. This
+//! crate has no incremental engine — it is a parser and a metadata registry.
+//! In particular there is **no** `INSERT INTO base` → view-maintenance path:
+//! writing to a base table never updates a declared view.
+//!
+//! A declared view only becomes live when a pipeline that references it is
+//! started, which needs all four statements below. `START PIPELINE` is executed
+//! by `krishiv-api`'s `Session` (the layer that owns the IVM engine), not here:
 //!
 //! ```sql
-//! -- Non-recursive incremental view (IVM)
+//! CREATE SOURCE orders AS SELECT * FROM orders_raw;
+//!
+//! -- Declares the view. Maintains nothing on its own.
 //! CREATE INCREMENTAL VIEW revenue AS
 //!   SELECT customer_id, SUM(amount) AS total FROM orders GROUP BY customer_id
 //!   LATENESS event_ts INTERVAL '5' MINUTE;
 //!
-//! -- Materialized variant (keeps a full snapshot in memory)
+//! CREATE SINK out FROM revenue;
+//! START PIPELINE out;   -- ← the only statement that runs the IVM engine
+//! ```
+//!
+//! Other accepted declaration forms:
+//!
+//! ```sql
+//! -- Materialized variant (the engine keeps a full snapshot in memory)
 //! CREATE MATERIALIZED INCREMENTAL VIEW revenue AS ...;
 //!
-//! -- Recursive view (fixed-point iteration, auto-DISTINCT)
+//! -- ANSI/Spark spelling of the same thing, for JDBC/BI clients
+//! CREATE [OR REPLACE] MATERIALIZED VIEW [IF NOT EXISTS] revenue AS ...;
+//!
+//! -- Recursive view (fixed-point iteration)
 //! DECLARE RECURSIVE VIEW reachable AS
 //!   SELECT dst FROM edges WHERE src = 0
-//!   UNION ALL
+//!   UNION
 //!   SELECT e.dst FROM edges e JOIN reachable r ON e.src = r.dst;
 //!
-//! -- Force a re-step (no-op for streaming; useful in batch/test mode)
-//! REFRESH INCREMENTAL VIEW revenue;
-//!
-//! -- Remove view and its cached Trace state
+//! -- Remove the declaration (and, once started, its cached Trace state)
 //! DROP INCREMENTAL VIEW revenue;
 //! ```
+//!
+//! Two deliberate non-features, both of which used to be documented as working:
+//!
+//! * **No auto-DISTINCT on `DECLARE RECURSIVE VIEW`.** Nothing rewrites the
+//!   body, so a `UNION ALL` recursion over a cyclic input does not converge; it
+//!   runs until the engine's fixpoint iteration cap. Write the body
+//!   set-semantically (`UNION`, or an explicit `DISTINCT`) yourself.
+//! * **`REFRESH INCREMENTAL VIEW` / `REFRESH MATERIALIZED VIEW` are rejected.**
+//!   No code path re-runs a view from them; they used to return an empty result
+//!   set that the caller could not distinguish from success. Re-run the
+//!   pipeline instead: `START PIPELINE <sink>` or `REFRESH PIPELINE <sink>`.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -50,10 +79,16 @@ pub enum IncrementalViewStatement {
         body_sql: String,
         is_materialized: bool,
         lateness: Vec<LatenessAnnotation>,
+        /// `CREATE … IF NOT EXISTS`: leave an already-declared view alone
+        /// instead of replacing its definition.
+        if_not_exists: bool,
     },
     DeclareRecursive {
         name: String,
         body_sql: String,
+        /// `LATENESS` annotations are accepted on a recursive declaration too
+        /// and are carried into the registry entry like any other view's.
+        lateness: Vec<LatenessAnnotation>,
     },
     Refresh {
         name: String,
@@ -117,13 +152,6 @@ impl IncrementalViewRegistry {
             .map(|v| v.contains_key(name))
             .unwrap_or(false)
     }
-
-    pub fn view_names(&self) -> SqlResult<Vec<String>> {
-        let views = self.views.read().map_err(|_| SqlError::DataFusion {
-            message: "incremental view registry lock poisoned".into(),
-        })?;
-        Ok(views.keys().cloned().collect())
-    }
 }
 
 // ── Parser ────────────────────────────────────────────────────────────────────
@@ -149,6 +177,7 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
             .ok_or_else(|| SqlError::Unsupported {
                 feature: "CREATE INCREMENTAL VIEW".into(),
             })?;
+        let (if_not_exists, rest) = split_if_not_exists(rest);
         let (name, body_with_lateness) = split_name_and_body(rest)?;
         let (body_sql, lateness) = split_body_and_lateness(&body_with_lateness)?;
         return Ok(Some(IncrementalViewStatement::Create {
@@ -156,6 +185,7 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
             body_sql,
             is_materialized,
             lateness,
+            if_not_exists,
         }));
     }
 
@@ -173,11 +203,21 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
         None
     };
     if let Some(prefix) = mv_prefix {
+        let or_replace = prefix.starts_with("CREATE OR REPLACE");
         let rest = trimmed
             .get(prefix.len()..)
             .ok_or_else(|| SqlError::Unsupported {
                 feature: "CREATE MATERIALIZED VIEW".into(),
             })?;
+        let (if_not_exists, rest) = split_if_not_exists(rest);
+        if or_replace && if_not_exists {
+            return Err(SqlError::Unsupported {
+                feature: "CREATE OR REPLACE MATERIALIZED VIEW … IF NOT EXISTS: OR REPLACE \
+                          (always replace) and IF NOT EXISTS (never replace) are mutually \
+                          exclusive — pick one"
+                    .into(),
+            });
+        }
         let (name, body_with_lateness) = split_name_and_body(rest)?;
         let (body_sql, lateness) = split_body_and_lateness(&body_with_lateness)?;
         return Ok(Some(IncrementalViewStatement::Create {
@@ -185,6 +225,7 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
             body_sql,
             is_materialized: true,
             lateness,
+            if_not_exists,
         }));
     }
 
@@ -196,10 +237,11 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
                 feature: "DECLARE RECURSIVE VIEW".into(),
             })?;
         let (name, body_sql) = split_name_and_body(rest)?;
-        let (body_sql, _lateness) = split_body_and_lateness(&body_sql)?;
+        let (body_sql, lateness) = split_body_and_lateness(&body_sql)?;
         return Ok(Some(IncrementalViewStatement::DeclareRecursive {
             name,
             body_sql,
+            lateness,
         }));
     }
 
@@ -266,23 +308,26 @@ pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<Increment
     Ok(None)
 }
 
-/// Apply a parsed incremental-view DDL statement to the registry.
-///
-/// Returns `Some(name)` if the statement was an incremental-view DDL (so the
-/// caller knows to return an empty DDL result rather than forwarding to
-/// DataFusion), or `None` if the SQL was not an incremental-view DDL.
-/// Result of executing an incremental view DDL statement.
+/// Result of executing an incremental-view DDL statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IncrementalViewResult {
     /// View was created or replaced.
     Created(String),
+    /// `CREATE … IF NOT EXISTS` matched an existing declaration, which was left
+    /// untouched. The statement succeeded; nothing changed.
+    Existed(String),
     /// View was dropped.
     Dropped(String),
-    /// REFRESH was called — the caller should re-run the pipeline for this view.
-    Refresh(String),
     /// A recursive view was created.
     Recursive(String),
 }
 
+/// Apply a parsed incremental-view DDL statement to the registry.
+///
+/// Returns `Ok(Some(_))` if the statement was an incremental-view DDL (so the
+/// caller knows to return an empty DDL result rather than forwarding to
+/// DataFusion), `Ok(None)` if the SQL was not an incremental-view DDL, and
+/// `Err` if it was one this engine cannot honour.
 pub fn execute_incremental_view_ddl(
     registry: &IncrementalViewRegistry,
     sql: &str,
@@ -297,7 +342,13 @@ pub fn execute_incremental_view_ddl(
             ref body_sql,
             is_materialized,
             ref lateness,
+            if_not_exists,
         } => {
+            // Honoured, not merely parsed: an existing definition survives and
+            // the statement still succeeds.
+            if if_not_exists && registry.contains(name) {
+                return Ok(Some(IncrementalViewResult::Existed(name.clone())));
+            }
             registry.register(
                 name.clone(),
                 IncrementalViewEntry {
@@ -313,6 +364,7 @@ pub fn execute_incremental_view_ddl(
         IncrementalViewStatement::DeclareRecursive {
             ref name,
             ref body_sql,
+            ref lateness,
         } => {
             registry.register(
                 name.clone(),
@@ -320,20 +372,32 @@ pub fn execute_incremental_view_ddl(
                     body_sql: body_sql.clone(),
                     is_materialized: false,
                     is_recursive: true,
-                    lateness: vec![],
+                    // IVM-AUD-DDL-B3: the parser binds the clause and this
+                    // used to hardcode `vec![]` — LATENESS on a recursive view
+                    // was accepted, validated, and thrown away. It travels
+                    // with the spec like every other view's now.
+                    lateness: lateness.clone(),
                 },
             )?;
             Ok(Some(IncrementalViewResult::Recursive(name.clone())))
         }
 
-        IncrementalViewStatement::Refresh { ref name } => {
-            if !registry.contains(name) {
-                return Err(SqlError::Unsupported {
-                    feature: format!("REFRESH INCREMENTAL VIEW: view '{name}' is not registered"),
-                });
-            }
-            Ok(Some(IncrementalViewResult::Refresh(name.clone())))
-        }
+        // IVM-AUD-DDL-F2: REFRESH is rejected rather than accepted-and-ignored.
+        // Nothing in the engine re-runs a view because of this statement — the
+        // arm used to return an empty result set indistinguishable from a
+        // successful refresh, so a BI client's "refresh my materialized view"
+        // silently did nothing. (An incremental view is maintained by feeding
+        // its sources and stepping; there is no separate refresh action to
+        // perform, which is why the honest answer is an error naming the real
+        // mechanism rather than a no-op that looks like success.)
+        IncrementalViewStatement::Refresh { ref name } => Err(SqlError::Unsupported {
+            feature: format!(
+                "REFRESH INCREMENTAL VIEW {name}: an incremental view is maintained by \
+                 feeding its sources and stepping the flow (START PIPELINE, or \
+                 IncrementalDataFrame::apply/step), not by a refresh statement; this \
+                 statement previously succeeded while doing nothing"
+            ),
+        }),
 
         IncrementalViewStatement::Drop { ref name } => {
             registry.remove(name)?;
@@ -364,6 +428,43 @@ fn split_name_and_body(rest: &str) -> SqlResult<(String, String)> {
     Ok((name, body))
 }
 
+/// Strip a leading `IF NOT EXISTS` from `rest`, returning whether it was there.
+///
+/// Without this, `CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS …` registered a
+/// view literally named `"IF NOT EXISTS mv"` — on the branch advertised as the
+/// SQL-standard front door for JDBC/BI clients.
+fn split_if_not_exists(rest: &str) -> (bool, &str) {
+    // IVM-AUD-DDL-B5: this used to discard the strip and return `(false, rest)`,
+    // so `CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS …` registered a view
+    // literally named "IF NOT EXISTS mv" — on the branch advertised as the
+    // SQL-standard front door for JDBC/BI clients, where that spelling is the
+    // most common one a tool emits.
+    match strip_leading_words(rest, &["IF", "NOT", "EXISTS"]) {
+        Some(remainder) => (true, remainder),
+        None => (false, rest),
+    }
+}
+
+/// Consume `words` (ASCII, case-insensitive, whitespace-separated) from the
+/// front of `rest`, returning the remainder. `None` if they are not all there.
+fn strip_leading_words<'a>(rest: &'a str, words: &[&str]) -> Option<&'a str> {
+    let mut rest = rest;
+    for word in words {
+        let trimmed = rest.trim_start();
+        let head = trimmed.get(..word.len())?;
+        if !head.eq_ignore_ascii_case(word) {
+            return None;
+        }
+        let tail = trimmed.get(word.len()..)?;
+        // The word must end here, not merely prefix a longer identifier.
+        if !tail.starts_with(char::is_whitespace) {
+            return None;
+        }
+        rest = tail;
+    }
+    Some(rest.trim_start())
+}
+
 /// Split the view body from trailing `LATENESS` annotations.
 ///
 /// Grammar: `<body_sql> LATENESS <col> INTERVAL '<n>' <unit> [, ...]`
@@ -377,8 +478,10 @@ fn split_body_and_lateness(
     // arbitrary user SQL and may contain non-ASCII string literals.
     let upper = body_with_lateness.to_ascii_uppercase();
 
-    // Find the LAST occurrence of LATENESS (it follows the body SQL).
-    // We look for the keyword followed by a valid column name and INTERVAL.
+    // Find the FIRST top-level LATENESS *clause*: the clause list is the tail
+    // of the grammar, so everything from there on belongs to
+    // `parse_lateness_clauses`, which walks the remaining `, LATENESS …`
+    // clauses itself.
     let Some(lat_pos) = find_lateness_clause_start(&upper) else {
         return Ok((body_with_lateness.trim().to_string(), vec![]));
     };
@@ -390,97 +493,214 @@ fn split_body_and_lateness(
 }
 
 /// Find the byte offset of the first top-level LATENESS keyword in `upper`.
+#[allow(clippy::indexing_slicing)]
 fn find_lateness_clause_start(upper: &str) -> Option<usize> {
-    // Simple scan: look for the word LATENESS not inside parentheses.
+    // IVM-AUD-DDL-B4. The previous scan walked raw bytes tracking only paren
+    // depth, so `SELECT lateness FROM t` truncated the body to `"SELECT"` and
+    // returned Ok, and `WHERE msg = 'LATENESS …'` cut a string literal in half.
+    // Two rules fix the whole class:
+    //
+    //   1. Skip regions where SQL keywords are not syntax — single-quoted
+    //      literals (with '' escaping), double-quoted identifiers, `--` line
+    //      comments and `/* */` block comments.
+    //   2. Commit only on a LATENESS occurrence that is actually FOLLOWED by a
+    //      clause (`<ident> INTERVAL`). The keyword alone is ambiguous — it is
+    //      a legal column name — so the lookahead, not the keyword, is what
+    //      distinguishes syntax from data. That is also why a column literally
+    //      called `lateness` can still carry a LATENESS clause.
+    //
+    // `_` counts as a word byte, so `max_lateness` is one identifier — without
+    // that, `WHERE max_lateness BETWEEN INTERVAL '1' DAY AND INTERVAL '2' DAY`
+    // matches the `<ident> INTERVAL` lookahead and truncates the body at
+    // `max_`.
+    //
+    // One ambiguity is irreducible: a column named exactly `lateness` used as
+    // `WHERE lateness BETWEEN INTERVAL '1' DAY AND …` is indistinguishable from
+    // a clause by any local rule. It is rejected with "unexpected tokens after
+    // a LATENESS clause" rather than silently mis-parsed; quoting the column
+    // (`"lateness"`) takes the quoted-identifier path above and is exact.
     let bytes = upper.as_bytes();
     let keyword = b"LATENESS";
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     let mut depth = 0usize;
     let mut i = 0usize;
-    while i + keyword.len() <= bytes.len() {
-        let Some(&b) = bytes.get(i) else {
-            break;
-        };
-        match b {
-            b'(' => {
-                depth += 1;
-                i += 1;
-            }
-            b')' => {
-                depth = depth.saturating_sub(1);
-                i += 1;
-            }
-            _ if depth == 0 && bytes.get(i..).is_some_and(|s| s.starts_with(keyword)) => {
-                let before_ok =
-                    i == 0 || bytes.get(i - 1).is_some_and(|b| !b.is_ascii_alphanumeric());
-                let after = i + keyword.len();
-                let after_ok = bytes.get(after).is_none_or(|b| !b.is_ascii_alphanumeric());
-                if before_ok && after_ok {
-                    return Some(i);
+    while i < bytes.len() {
+        let Some(&b) = bytes.get(i) else { break };
+        // ── skip non-syntax regions ──
+        if b == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes.get(i) == Some(&b'\'') {
+                    // '' is an escaped quote, not the end of the literal.
+                    if bytes.get(i + 1) == Some(&b'\'') {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
                 }
                 i += 1;
             }
-            _ => {
+            continue;
+        }
+        if b == b'"' {
+            i += 1;
+            while i < bytes.len() && bytes.get(i) != Some(&b'"') {
                 i += 1;
             }
+            i += 1;
+            continue;
         }
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            while i < bytes.len() && bytes.get(i) != Some(&b'\n') {
+                i += 1;
+            }
+            continue;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < bytes.len()
+                && !(bytes.get(i) == Some(&b'*') && bytes.get(i + 1) == Some(&b'/'))
+            {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'(' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if b == b')' {
+            depth = depth.saturating_sub(1);
+            i += 1;
+            continue;
+        }
+        // ── candidate keyword at depth 0 ──
+        if depth == 0 && bytes.get(i..).is_some_and(|s| s.starts_with(keyword)) {
+            let before_ok = i == 0 || bytes.get(i - 1).is_none_or(|&b| !is_word(b));
+            let after = i + keyword.len();
+            let after_ok = bytes.get(after).is_none_or(|&b| !is_word(b));
+            if before_ok && after_ok && lookahead_is_clause(upper.get(after..).unwrap_or("")) {
+                return Some(i);
+            }
+        }
+        i += 1;
     }
     None
 }
 
+/// True when the text right after a `LATENESS` keyword looks like the rest of
+/// a clause: `<identifier> INTERVAL`. Keying on INTERVAL (rather than on the
+/// column's spelling) is what lets `LATENESS lateness INTERVAL '1' DAY` parse
+/// while `SELECT lateness FROM t` does not.
+fn lookahead_is_clause(after_keyword: &str) -> bool {
+    let mut tokens = after_keyword.split_whitespace();
+    let Some(column) = tokens.next() else {
+        return false;
+    };
+    // The column must be shaped like an identifier. Without this,
+    // `WHERE d > lateness + INTERVAL '1' DAY` — a column named `lateness`
+    // compared against an interval literal — reads as `LATENESS + INTERVAL`
+    // and truncates the body at `lateness`.
+    let identifier_shaped = column
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '"');
+    if !identifier_shaped {
+        return false;
+    }
+    tokens
+        .next()
+        .is_some_and(|kw| kw.eq_ignore_ascii_case("INTERVAL"))
+}
+
+/// Split off the next token. Commas are their own token so a clause list can
+/// be walked without guessing where one clause ends and the next begins.
+fn next_token(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    if let Some(rest) = s.strip_prefix(',') {
+        return Some((",", rest));
+    }
+    let end = s
+        .find(|c: char| c.is_whitespace() || c == ',')
+        .unwrap_or(s.len());
+    Some((s.get(..end)?, s.get(end..)?))
+}
+
 /// Parse one or more `LATENESS <col> INTERVAL '<n>' <unit>` clauses.
+///
+/// IVM-AUD-DDL-B4: the previous implementation walked the text with
+/// `split_whitespace()` and a `break` on anything it did not recognise, then
+/// re-found the *next* clause with `find("LATENESS")` from offset 1 — so a
+/// clause missing its unit, a second malformed clause, and arbitrary trailing
+/// SQL all parsed as success while the body had already been truncated at the
+/// keyword. Every exit from this loop is now either a complete clause or an
+/// error.
 fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotation>> {
     let mut result = Vec::new();
-    let mut remaining = lateness_str.trim();
+    let mut rest = lateness_str.trim();
 
-    loop {
-        let upper_rem = remaining.to_ascii_uppercase();
-        let stripped = if upper_rem.starts_with("LATENESS ") {
-            &remaining["LATENESS ".len()..]
-        } else if upper_rem.starts_with(", LATENESS ") {
-            &remaining[", LATENESS ".len()..]
-        } else {
-            break;
+    while !rest.trim().is_empty() {
+        // Optional comma separating this clause from the previous one.
+        if let Some((",", tail)) = next_token(rest) {
+            rest = tail;
+        }
+        let incomplete = |what: &str| SqlError::Unsupported {
+            feature: format!(
+                "incomplete LATENESS clause: expected {what} in \
+                 LATENESS <column> INTERVAL '<n>' <unit>"
+            ),
         };
 
-        // Parse: <col> INTERVAL '<n>' <unit>
-        // `split_whitespace` collapses runs; `splitn(_, char::is_whitespace)`
-        // does not, so a second space shifted every field by one and the
-        // INTERVAL keyword landed where the value was read from.
-        let tokens: Vec<&str> = stripped.split_whitespace().collect();
-        if tokens.len() < 4 {
+        let Some((keyword, tail)) = next_token(rest) else {
             break;
-        }
-        let col = tokens
-            .first()
-            .copied()
-            .unwrap_or("")
-            .trim_matches(',')
-            .to_string();
-        // The comment here used to say "tokens[1] should be INTERVAL" without
-        // checking it, so `LATENESS ts NOTINTERVAL '5' MINUTE` parsed happily.
-        let keyword = tokens.get(1).copied().unwrap_or("");
-        if !keyword.eq_ignore_ascii_case("INTERVAL") {
+        };
+        if !keyword.eq_ignore_ascii_case("LATENESS") {
             return Err(SqlError::Unsupported {
                 feature: format!(
-                    "LATENESS {col} expects the INTERVAL keyword before the value, got '{keyword}'"
+                    "unexpected tokens after a LATENESS clause: '{}'",
+                    rest.trim()
                 ),
             });
         }
-        let interval_str = tokens.get(2).copied().unwrap_or("").trim_matches('\'');
-        let unit_str = tokens.get(3).copied().unwrap_or("").trim_matches(',');
+        let (col, tail) = next_token(tail).ok_or_else(|| incomplete("a column name"))?;
+        if col == "," {
+            return Err(incomplete("a column name"));
+        }
+        let (interval_kw, tail) = next_token(tail).ok_or_else(|| incomplete("INTERVAL"))?;
+        if !interval_kw.eq_ignore_ascii_case("INTERVAL") {
+            return Err(SqlError::Unsupported {
+                feature: format!(
+                    "LATENESS {col} expects the INTERVAL keyword before the value, \
+                     got '{interval_kw}'"
+                ),
+            });
+        }
+        let (value_tok, tail) = next_token(tail).ok_or_else(|| incomplete("an interval value"))?;
+        let (unit_tok, tail) = next_token(tail).ok_or_else(|| incomplete("an interval unit"))?;
+        if value_tok == "," || unit_tok == "," {
+            return Err(incomplete("an interval value and unit"));
+        }
+
+        let interval_str = value_tok.trim_matches('\'');
         let n: u64 = interval_str.parse().map_err(|_| SqlError::Unsupported {
             feature: format!("LATENESS INTERVAL value '{interval_str}' is not a valid integer"),
         })?;
-        let ms = match unit_str.to_uppercase().as_str() {
-            "SECOND" | "SECONDS" => n * 1000,
-            "MINUTE" | "MINUTES" => n * 60_000,
-            "HOUR" | "HOURS" => n * 3_600_000,
-            "DAY" | "DAYS" => n * 86_400_000,
+        let ms = match unit_tok.trim_matches('\'').to_ascii_uppercase().as_str() {
+            "SECOND" | "SECONDS" => n.saturating_mul(1000),
+            "MINUTE" | "MINUTES" => n.saturating_mul(60_000),
+            "HOUR" | "HOURS" => n.saturating_mul(3_600_000),
+            "DAY" | "DAYS" => n.saturating_mul(86_400_000),
             "MILLISECOND" | "MILLISECONDS" | "MS" => n,
-            _ => {
+            other => {
                 return Err(SqlError::Unsupported {
                     feature: format!(
-                        "LATENESS interval unit '{unit_str}' is not supported \
+                        "LATENESS interval unit '{other}' is not supported \
                          (expected SECOND, MINUTE, HOUR, DAY, or MILLISECOND)"
                     ),
                 });
@@ -488,21 +708,25 @@ fn parse_lateness_clauses(lateness_str: &str) -> SqlResult<Vec<LatenessAnnotatio
         };
 
         result.push(LatenessAnnotation {
-            column: col,
+            column: col.trim_matches('"').to_string(),
             lateness_ms: ms,
         });
+        rest = tail;
 
-        // Advance to the next LATENESS clause, if any. `remaining` always begins
-        // at a LATENESS/", LATENESS" token here, so skipping one byte before
-        // searching cannot split a character.
-        let next = remaining
-            .get(1..)
-            .and_then(|tail| tail.to_ascii_uppercase().find("LATENESS"));
-        match next {
-            Some(pos) => {
-                remaining = &remaining[1 + pos..];
-            }
-            None => break,
+        // Only another clause may follow. Anything else is trailing SQL that
+        // the body no longer contains — rejecting it is the whole point.
+        let peek = rest.trim_start();
+        if peek.is_empty() {
+            break;
+        }
+        let is_next_clause = peek.starts_with(',')
+            || peek
+                .get(.."LATENESS".len())
+                .is_some_and(|w| w.eq_ignore_ascii_case("LATENESS"));
+        if !is_next_clause {
+            return Err(SqlError::Unsupported {
+                feature: format!("unexpected tokens after a LATENESS clause: '{peek}'"),
+            });
         }
     }
 
@@ -556,10 +780,18 @@ mod folding_and_whitespace_tests {
 
     /// The token after the column must actually be INTERVAL; the code carried a
     /// comment saying so but never checked.
+    ///
+    /// The check bites once the scanner has committed to a clause list, which
+    /// it does on the unambiguous `LATENESS <col> INTERVAL` shape. A *first*
+    /// clause whose keyword is mistyped is not recognised as a clause at all —
+    /// see `a_mistyped_interval_keyword_leaves_the_body_intact`; guessing at
+    /// near-misses is exactly what truncated bodies containing a column named
+    /// `lateness`.
     #[test]
     fn lateness_requires_the_interval_keyword() {
         let err = parse_incremental_view_statement(
-            "CREATE INCREMENTAL VIEW v AS SELECT 1 LATENESS ts NOTINTERVAL '5' MINUTE",
+            "CREATE INCREMENTAL VIEW v AS SELECT 1 \
+             LATENESS a INTERVAL '5' MINUTE, LATENESS b NOTINTERVAL '2' HOUR",
         )
         .expect_err("a missing INTERVAL keyword must be rejected");
         assert!(err.to_string().contains("INTERVAL"), "{err}");
@@ -747,18 +979,381 @@ mod tests {
         assert!(!reg.contains("v"));
     }
 
+    /// DDL-F2: REFRESH used to return an empty result set indistinguishable
+    /// from a real refresh, for a statement no engine path acts on. It must
+    /// fail, and the failure must name the door that does work.
     #[test]
-    fn execute_ddl_refresh_returns_refresh_variant() {
+    fn execute_ddl_refresh_is_rejected_and_names_the_pipeline_alternative() {
         let reg = IncrementalViewRegistry::new();
         execute_incremental_view_ddl(&reg, "CREATE INCREMENTAL VIEW v AS SELECT 1").unwrap();
-        let result = execute_incremental_view_ddl(&reg, "REFRESH INCREMENTAL VIEW v").unwrap();
-        assert!(matches!(result, Some(IncrementalViewResult::Refresh(_))));
+        for sql in [
+            "REFRESH INCREMENTAL VIEW v",
+            "REFRESH MATERIALIZED VIEW v",
+            // …registered or not: there is nothing to refresh either way.
+            "REFRESH INCREMENTAL VIEW nonexistent",
+        ] {
+            let err = execute_incremental_view_ddl(&reg, sql)
+                .expect_err("REFRESH must be rejected, not silently accepted");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("START PIPELINE"),
+                "the error must name the working alternative; got {msg}"
+            );
+        }
+    }
+}
+
+// ── Regression tests for the delta-batch DDL audit ────────────────────────────
+
+#[cfg(test)]
+mod ivm_audit_regression_tests {
+    use super::*;
+
+    fn create_stmt(sql: &str) -> IncrementalViewStatement {
+        parse_incremental_view_statement(sql)
+            .expect("parses")
+            .expect("is incremental-view DDL")
+    }
+
+    fn body_and_lateness(sql: &str) -> (String, Vec<LatenessAnnotation>) {
+        match create_stmt(sql) {
+            IncrementalViewStatement::Create {
+                body_sql, lateness, ..
+            } => (body_sql, lateness),
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    // ── DDL-B4: the LATENESS scanner ──────────────────────────────────────────
+
+    /// A column *named* `lateness` is not a LATENESS clause. The raw-byte scan
+    /// truncated the body to `"SELECT"` here and returned `Ok`.
+    #[test]
+    fn a_column_named_lateness_does_not_truncate_the_body() {
+        let (body, lateness) =
+            body_and_lateness("CREATE INCREMENTAL VIEW v AS SELECT lateness FROM t");
+        assert_eq!(
+            body, "SELECT lateness FROM t",
+            "the body must survive whole"
+        );
+        assert!(lateness.is_empty(), "no annotation was written");
+    }
+
+    /// `_` is a word byte: `max_lateness` is one identifier, not a keyword.
+    #[test]
+    fn an_identifier_ending_in_lateness_is_not_a_clause() {
+        let (body, lateness) =
+            body_and_lateness("CREATE INCREMENTAL VIEW v AS SELECT max_lateness FROM t");
+        assert_eq!(body, "SELECT max_lateness FROM t");
+        assert!(lateness.is_empty());
+    }
+
+    /// The keyword inside a string literal is data, not syntax — even when the
+    /// literal contains a whole well-formed-looking clause.
+    #[test]
+    fn lateness_inside_a_string_literal_is_not_a_clause() {
+        let sql = "CREATE INCREMENTAL VIEW v AS \
+                   SELECT * FROM t WHERE msg = 'LATENESS ts INTERVAL x'";
+        let (body, lateness) = body_and_lateness(sql);
+        assert_eq!(
+            body, "SELECT * FROM t WHERE msg = 'LATENESS ts INTERVAL x'",
+            "the literal must not be cut in half"
+        );
+        assert!(lateness.is_empty());
+    }
+
+    /// …and a doubled quote inside a literal must not end it early.
+    #[test]
+    fn lateness_after_an_escaped_quote_inside_a_literal_is_not_a_clause() {
+        let sql = "CREATE INCREMENTAL VIEW v AS \
+                   SELECT * FROM t WHERE msg = 'it''s LATENESS ts INTERVAL x'";
+        let (body, lateness) = body_and_lateness(sql);
+        assert_eq!(
+            body,
+            "SELECT * FROM t WHERE msg = 'it''s LATENESS ts INTERVAL x'"
+        );
+        assert!(lateness.is_empty());
+    }
+
+    /// A quoted identifier is the same story.
+    #[test]
+    fn lateness_as_a_quoted_identifier_is_not_a_clause() {
+        let sql = "CREATE INCREMENTAL VIEW v AS SELECT \"LATENESS ts INTERVAL x\" FROM t";
+        let (body, lateness) = body_and_lateness(sql);
+        assert_eq!(body, "SELECT \"LATENESS ts INTERVAL x\" FROM t");
+        assert!(lateness.is_empty());
+    }
+
+    /// A commented-out clause is not a clause.
+    #[test]
+    fn lateness_inside_a_comment_is_not_a_clause() {
+        let line = "CREATE INCREMENTAL VIEW v AS SELECT 1 -- LATENESS ts INTERVAL '5' MINUTE";
+        let (body, lateness) = body_and_lateness(line);
+        assert_eq!(body, "SELECT 1 -- LATENESS ts INTERVAL '5' MINUTE");
+        assert!(lateness.is_empty());
+
+        let block = "CREATE INCREMENTAL VIEW v AS \
+                     SELECT 1 /* LATENESS ts INTERVAL '5' MINUTE */ FROM t";
+        let (body, lateness) = body_and_lateness(block);
+        assert_eq!(
+            body,
+            "SELECT 1 /* LATENESS ts INTERVAL '5' MINUTE */ FROM t"
+        );
+        assert!(lateness.is_empty());
+    }
+
+    /// The real clause still parses, and still leaves the body clean.
+    /// Revert-proof for the `_`-is-a-word-byte rule: `BETWEEN INTERVAL` is a
+    /// real interval comparison, and satisfies the `<ident> INTERVAL`
+    /// lookahead. Only the word boundary tells `max_lateness` from a clause.
+    #[test]
+    fn an_identifier_ending_in_lateness_before_an_interval_literal_is_not_a_clause() {
+        let sql = "CREATE INCREMENTAL VIEW v AS \
+             SELECT * FROM t WHERE max_lateness BETWEEN INTERVAL '1' DAY AND INTERVAL '2' DAY";
+        let (body, lateness) = body_and_lateness(sql);
+        assert_eq!(
+            body,
+            "SELECT * FROM t WHERE max_lateness BETWEEN INTERVAL '1' DAY AND INTERVAL '2' DAY",
+            "the body must survive intact"
+        );
+        assert!(lateness.is_empty(), "got {lateness:?}");
+    }
+
+    /// Revert-proof for the identifier-shape rule: a column named `lateness`
+    /// compared against an interval literal puts `+` where the column would go.
+    #[test]
+    fn a_lateness_column_added_to_an_interval_literal_is_not_a_clause() {
+        let sql =
+            "CREATE INCREMENTAL VIEW v AS SELECT * FROM t WHERE d > lateness + INTERVAL '1' DAY";
+        let (body, lateness) = body_and_lateness(sql);
+        assert_eq!(
+            body, "SELECT * FROM t WHERE d > lateness + INTERVAL '1' DAY",
+            "the body must survive intact"
+        );
+        assert!(lateness.is_empty(), "got {lateness:?}");
     }
 
     #[test]
-    fn execute_ddl_refresh_missing_returns_error() {
+    fn a_real_lateness_clause_is_still_found() {
+        let (body, lateness) = body_and_lateness(
+            "CREATE INCREMENTAL VIEW v AS SELECT lateness FROM t \
+             LATENESS event_ts INTERVAL '5' MINUTE",
+        );
+        assert_eq!(body, "SELECT lateness FROM t");
+        assert_eq!(lateness.len(), 1);
+        let a = lateness.first().expect("one");
+        assert_eq!(a.column, "event_ts");
+        assert_eq!(a.lateness_ms, 300_000);
+    }
+
+    /// Two comma-separated clauses.
+    #[test]
+    fn two_lateness_clauses_are_both_parsed() {
+        let (body, lateness) = body_and_lateness(
+            "CREATE INCREMENTAL VIEW v AS SELECT * FROM t \
+             LATENESS a INTERVAL '5' MINUTE, LATENESS b INTERVAL '2' HOUR",
+        );
+        assert_eq!(body, "SELECT * FROM t");
+        assert_eq!(lateness.len(), 2, "both annotations survive");
+        assert_eq!(lateness.first().expect("first").column, "a");
+        assert_eq!(lateness.get(1).expect("second").column, "b");
+        assert_eq!(lateness.get(1).expect("second").lateness_ms, 7_200_000);
+    }
+
+    /// A clause with a column even called `lateness` still parses — the
+    /// lookahead keys on the INTERVAL keyword, not on the column's spelling.
+    #[test]
+    fn a_lateness_clause_over_a_column_named_lateness_parses() {
+        let (body, lateness) = body_and_lateness(
+            "CREATE INCREMENTAL VIEW v AS SELECT * FROM t LATENESS lateness INTERVAL '1' DAY",
+        );
+        assert_eq!(body, "SELECT * FROM t");
+        assert_eq!(lateness.len(), 1);
+        let a = lateness.first().expect("one");
+        assert_eq!(a.column, "lateness");
+        assert_eq!(a.lateness_ms, 86_400_000);
+    }
+
+    /// The scanner commits only on `LATENESS <col> INTERVAL`. A mistyped
+    /// keyword is therefore not a clause, and the body keeps every byte the
+    /// user wrote rather than being cut at the guess. (Body SQL is validated
+    /// when a pipeline runs it, not here — a nonsense body has always been
+    /// registered as written.)
+    #[test]
+    fn a_mistyped_interval_keyword_leaves_the_body_intact() {
+        let (body, lateness) = body_and_lateness(
+            "CREATE INCREMENTAL VIEW v AS SELECT 1 LATENESS ts NOTINTERVAL '5' MINUTE",
+        );
+        assert_eq!(
+            body, "SELECT 1 LATENESS ts NOTINTERVAL '5' MINUTE",
+            "no guessing: the body is not truncated at a near-miss"
+        );
+        assert!(lateness.is_empty());
+    }
+
+    /// DDL-B4, second half: a malformed clause used to `break` — fail OPEN —
+    /// while its two sibling branches returned errors. It must fail closed.
+    #[test]
+    fn an_incomplete_lateness_clause_is_rejected() {
+        let err = parse_incremental_view_statement(
+            "CREATE INCREMENTAL VIEW v AS SELECT * FROM t LATENESS ts INTERVAL '5'",
+        )
+        .expect_err("a clause missing its unit must be rejected");
+        assert!(err.to_string().contains("incomplete"), "{err}");
+    }
+
+    /// Junk after a well-formed clause is a syntax error, not something to
+    /// silently drop off the end of the body.
+    #[test]
+    fn trailing_junk_after_a_lateness_clause_is_rejected() {
+        let err = parse_incremental_view_statement(
+            "CREATE INCREMENTAL VIEW v AS SELECT * FROM t \
+             LATENESS ts INTERVAL '5' MINUTE GROUP BY x",
+        )
+        .expect_err("trailing tokens must be rejected");
+        assert!(err.to_string().contains("unexpected"), "{err}");
+    }
+
+    /// A second clause that is malformed must not be silently forgotten.
+    #[test]
+    fn a_malformed_second_lateness_clause_is_rejected() {
+        let err = parse_incremental_view_statement(
+            "CREATE INCREMENTAL VIEW v AS SELECT * FROM t \
+             LATENESS a INTERVAL '5' MINUTE, LATENESS b INTERVAL '2'",
+        )
+        .expect_err("an incomplete second clause must be rejected");
+        assert!(err.to_string().contains("incomplete"), "{err}");
+    }
+
+    // ── DDL-B5: IF NOT EXISTS ─────────────────────────────────────────────────
+
+    /// The name used to come out as `"IF NOT EXISTS mv"` — on the branch sold
+    /// as the SQL-standard front door for JDBC/BI clients.
+    #[test]
+    fn create_materialized_view_if_not_exists_parses_the_bare_name() {
+        match create_stmt("CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 1") {
+            IncrementalViewStatement::Create {
+                name,
+                if_not_exists,
+                is_materialized,
+                ..
+            } => {
+                assert_eq!(
+                    name, "mv",
+                    "the IF NOT EXISTS clause is not part of the name"
+                );
+                assert!(if_not_exists, "the clause must be recorded, not dropped");
+                assert!(is_materialized);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_incremental_view_if_not_exists_parses_the_bare_name() {
+        match create_stmt("CREATE INCREMENTAL VIEW IF NOT EXISTS v AS SELECT 1") {
+            IncrementalViewStatement::Create {
+                name,
+                if_not_exists,
+                ..
+            } => {
+                assert_eq!(name, "v");
+                assert!(if_not_exists);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    /// IF NOT EXISTS is honoured, not merely parsed: the existing definition
+    /// survives, and no view is registered under the clause text.
+    #[test]
+    fn if_not_exists_keeps_the_existing_definition() {
         let reg = IncrementalViewRegistry::new();
-        let err = execute_incremental_view_ddl(&reg, "REFRESH INCREMENTAL VIEW nonexistent");
-        assert!(err.is_err());
+        execute_incremental_view_ddl(&reg, "CREATE MATERIALIZED VIEW mv AS SELECT 1 AS a").unwrap();
+
+        let result = execute_incremental_view_ddl(
+            &reg,
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 2 AS b",
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result, Some(IncrementalViewResult::Existed(ref n)) if n == "mv"),
+            "an existing view must be reported as untouched"
+        );
+        assert!(
+            reg.get("IF NOT EXISTS mv").unwrap().is_none(),
+            "nothing may be registered under the clause text"
+        );
+        assert_eq!(
+            reg.get("mv").unwrap().expect("mv is registered").body_sql,
+            "SELECT 1 AS a",
+            "IF NOT EXISTS must not replace the existing definition"
+        );
+    }
+
+    /// …and it still creates the view when there is none.
+    #[test]
+    fn if_not_exists_creates_when_absent() {
+        let reg = IncrementalViewRegistry::new();
+        let result = execute_incremental_view_ddl(
+            &reg,
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 1",
+        )
+        .unwrap();
+        assert!(matches!(result, Some(IncrementalViewResult::Created(_))));
+        assert!(reg.contains("mv"));
+    }
+
+    /// A view is not named `if`-something just because the clause is absent.
+    #[test]
+    fn a_view_named_if_is_not_mistaken_for_if_not_exists() {
+        match create_stmt("CREATE INCREMENTAL VIEW if AS SELECT 1") {
+            IncrementalViewStatement::Create {
+                name,
+                if_not_exists,
+                ..
+            } => {
+                assert_eq!(name, "if");
+                assert!(!if_not_exists);
+            }
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn or_replace_with_if_not_exists_is_rejected() {
+        let err = parse_incremental_view_statement(
+            "CREATE OR REPLACE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT 1",
+        )
+        .expect_err("the two clauses contradict each other");
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    // ── DDL-B3: LATENESS on DECLARE RECURSIVE VIEW ────────────────────────────
+
+    /// The annotation was parsed into `_lateness` and thrown away, and the
+    /// registry entry hardcoded `lateness: vec![]`.
+    #[test]
+    fn lateness_on_a_recursive_view_reaches_the_registry() {
+        let reg = IncrementalViewRegistry::new();
+        execute_incremental_view_ddl(
+            &reg,
+            "DECLARE RECURSIVE VIEW reach AS SELECT dst FROM edges \
+             LATENESS event_ts INTERVAL '10' SECOND",
+        )
+        .unwrap();
+
+        let entry = reg.get("reach").unwrap().expect("reach is registered");
+        assert!(entry.is_recursive);
+        assert_eq!(entry.body_sql, "SELECT dst FROM edges");
+        assert_eq!(
+            entry.lateness,
+            vec![LatenessAnnotation {
+                column: "event_ts".into(),
+                lateness_ms: 10_000,
+            }],
+            "a recursive view's LATENESS must not be discarded"
+        );
     }
 }

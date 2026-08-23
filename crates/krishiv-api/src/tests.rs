@@ -2139,14 +2139,17 @@ fn describe_and_live_table_sql_intercepts_work() {
     let describe = session.sql("DESCRIBE people").unwrap().collect().unwrap();
     assert_eq!(describe.row_count(), 2);
 
-    session
+    // IVM-AUD-DDL-F1: this used to assert that the statement succeeded and
+    // that the name landed in a registry — never that the table existed. It
+    // did not: the plan op had no handler, so `SELECT * FROM live_people`
+    // failed with "table not found" right after a reported success.
+    let err = session
         .sql("CREATE LIVE TABLE live_people AS SELECT id FROM people")
-        .unwrap();
+        .expect_err("CREATE LIVE TABLE must not report success for a no-op")
+        .to_string();
     assert!(
-        session
-            .live_table_registry()
-            .contains("live_people")
-            .unwrap()
+        err.contains("live tables are not implemented") && err.contains("live_people"),
+        "the rejection must name the statement and the table; got {err}"
     );
 }
 

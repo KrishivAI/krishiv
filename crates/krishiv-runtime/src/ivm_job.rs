@@ -47,6 +47,12 @@ use crate::{
 pub struct RemoteIvmJob {
     coordinator_http: String,
     job_id: String,
+    /// `true` only when this handle created the job through
+    /// [`create_unpartitioned`](Self::create_unpartitioned) and therefore
+    /// *knows* the coordinator pinned it to a single flow. `false` means
+    /// "unknown" — the coordinator's create/list responses do not report the
+    /// shape back — not "partitioned" (IVM-AUD-API-F4).
+    pinned_single: bool,
 }
 
 impl RemoteIvmJob {
@@ -59,6 +65,7 @@ impl RemoteIvmJob {
         Ok(Self {
             coordinator_http: coordinator_http.to_owned(),
             job_id,
+            pinned_single: false,
         })
     }
 
@@ -74,15 +81,27 @@ impl RemoteIvmJob {
         Ok(Self {
             coordinator_http: coordinator_http.to_owned(),
             job_id,
+            pinned_single: true,
         })
     }
 
     /// Wrap an existing job ID without creating a new one.
+    ///
+    /// The job's shape is unknown to this handle — it did not create the job —
+    /// so [`is_pinned_single`](Self::is_pinned_single) is `false`.
     pub fn from_job_id(coordinator_http: impl Into<String>, job_id: impl Into<String>) -> Self {
         Self {
             coordinator_http: coordinator_http.into(),
             job_id: job_id.into(),
+            pinned_single: false,
         }
+    }
+
+    /// `true` when this handle created the job pinned to a single flow, so a
+    /// view-DAG can safely be built on it. `false` means unknown, not
+    /// partitioned.
+    pub fn is_pinned_single(&self) -> bool {
+        self.pinned_single
     }
 
     /// The assigned job ID.

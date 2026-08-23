@@ -1997,6 +1997,18 @@ struct IvmRegisterViewBody<'a> {
     output_schema: IvmSchemaJson<'a>,
     is_materialized: bool,
     is_recursive: bool,
+    /// IVM-AUD-DDL-B1: this field did not exist, and the coordinator
+    /// hardcoded `lateness: vec![]`, so the same `CREATE INCREMENTAL VIEW …
+    /// LATENESS ts INTERVAL '5' MINUTE` had late-record dropping and join-trace
+    /// GC in embedded mode and neither in distributed mode — silently, with no
+    /// error and no log.
+    lateness: &'a [IvmLatenessJson],
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct IvmLatenessJson {
+    column: String,
+    lateness_ms: i64,
 }
 
 #[derive(serde::Serialize)]
@@ -2054,12 +2066,21 @@ pub async fn execute_coordinator_ivm_register_view(
             nullable: f.is_nullable(),
         })
         .collect();
+    let lateness: Vec<IvmLatenessJson> = spec
+        .lateness
+        .iter()
+        .map(|l| IvmLatenessJson {
+            column: l.column.clone(),
+            lateness_ms: l.lateness_ms,
+        })
+        .collect();
     let body = IvmRegisterViewBody {
         name: &spec.name,
         body_sql: &spec.body_sql,
         output_schema: IvmSchemaJson { fields: &fields },
         is_materialized: spec.is_materialized,
         is_recursive: spec.is_recursive,
+        lateness: &lateness,
     };
     let resp = apply_coordinator_bearer(
         client.post(format!("{base}/api/v1/ivm/jobs/{}/views", seg(job_id))),

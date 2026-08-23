@@ -2920,10 +2920,6 @@ impl Session {
     }
 
     /// Shared live-table registry backing `CREATE LIVE TABLE` DDL.
-    pub fn live_table_registry(&self) -> &Arc<krishiv_sql::live_table::LiveTableRegistry> {
-        self.sql_engine.live_table_registry()
-    }
-
     /// Shared incremental-view registry backing `CREATE INCREMENTAL VIEW` DDL.
     pub fn incremental_view_registry(
         &self,

@@ -1903,7 +1903,8 @@ existing IVM/streaming APIs.
     `feed_continuous_stream`, `drain_continuous_stream`
   - IVM: `create_incremental_view`, `feed_incremental_view`,
     `step_incremental_view`, `snapshot_incremental_view`,
-    `checkpoint_incremental_job`, `restore_incremental_job`
+    `checkpoint_incremental_job`, `restore_incremental_job`,
+    `enable_incremental_delta_checkpoints`
   - connectors: `list_connectors`, `validate_connector_config`,
     `register_source`, `register_sink`
 - MCP resources:

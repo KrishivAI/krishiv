@@ -180,12 +180,6 @@ pub enum NodeOp {
         /// Number of output partitions after coalescing.
         target_partitions: usize,
     },
-    /// Create a live table backed by a streaming query.
-    CreateLiveTable { name: String, query: String },
-    /// Refresh materialized state for a live table.
-    RefreshLiveTable { name: String },
-    /// Drop a live table.
-    DropLiveTable { name: String },
     /// Key stream by column before windowing.
     KeyBy { key_column: String },
     /// Event-time watermark on a keyed stream.

@@ -397,6 +397,15 @@ impl PartitionedIncrementalFlow {
     // Restore validates the shard count matches the live flow (the registry
     // re-creates the flow with its key/shape from the registered view first).
 
+    /// The LATENESS bounds that reached the shards. Every shard is registered
+    /// from the same spec, so the first shard's answer is the job's.
+    pub fn declared_lateness(&self) -> IvmResult<Vec<krishiv_delta::LatenessSpec>> {
+        match self.shards.first() {
+            Some(shard) => shard.declared_lateness(),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Full checkpoint: every shard's source snapshots plus the streaming-prev
     /// map, framed with the shard count for restore-time validation.
     pub fn checkpoint(&self) -> IvmResult<Vec<u8>> {

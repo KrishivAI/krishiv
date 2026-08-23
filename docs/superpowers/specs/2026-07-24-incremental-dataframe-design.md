@@ -91,8 +91,9 @@ with iv.transaction():                  # feed multiple sources → ONE atomic t
 
 # ── output (read results) ──
 iv.snapshot()                           # full materialized result (Arrow table) — "complete"
-async for change in iv.changes():       # change-feed of OUTPUT deltas — "update"
-    ...                                  # each item is an output DeltaBatch
+iv.next_change()                        # next unread OUTPUT delta — "update"
+                                         # (a DeltaBatch, or None if nothing new)
+iv.last_output()                        # non-consuming peek at the latest one
 
 # ── durability / lifecycle ──
 iv.checkpoint(); iv.restore()           # delegate to IvmJob checkpoint/restore
@@ -103,9 +104,13 @@ iv.name                                 # view identity
 - **Stepping:** `apply/insert/delete/upsert` auto-step by default (feed-and-step).
   `transaction()` buffers feeds across sources and issues one tick on exit — atomic
   multi-source updates.
-- **Output modes:** both `snapshot()` (full state) and `changes()` (output deltas)
+- **Output modes:** both `snapshot()` (full state) and `next_change()` (output deltas)
   are always available — Spark's complete and update modes, exposed as two reads.
-- **Async parity:** `changes()` is an async iterator (matches `StreamingDataFrame`);
+- **Change reads are synchronous:** `next_change()` returns the next unread output
+  delta or `None`. It reads the engine's coalescing change-feed watch, so it is not
+  lossless — several ticks between two calls collapse to the newest delta. The
+  lossless broadcast (`IncrementalFlow::view_output_stream`) is not reachable through
+  `IvmJob`/`IncrementalDataFrame`, so no async iterator is exposed;
   `snapshot()` is sync.
 
 ### 4.2.1 Composition — the live view DAG (in v1)
@@ -154,7 +159,7 @@ this — the same handoff `to_streaming()` already performs. No IVM-semantics ch
   | `.ingest_row(id, "delete")` | `.delete(...)` |
   | `.ingest_row(id, "update")` | `.upsert(...)` |
   | `.refresh()` | `.step()` (auto with `apply`) |
-  | `.change_feed()` | `.changes()` |
+  | `.change_feed()` | `.next_change()` |
   | `.drop()` | `.drop()` |
 
   `test_live_table.py` / `test_change_feed.py` are rewritten against
@@ -164,7 +169,7 @@ this — the same handoff `to_streaming()` already performs. No IVM-semantics ch
 
 `to_incremental()` inherits the session's execution mode (embedded vs distributed),
 same as the other two conversions. Distributed IVM already exists (Phase 57
-executor-resident state), so the distributed path reuses it; `snapshot()`/`changes()`
+executor-resident state), so the distributed path reuses it; `snapshot()`
 route to the coordinator in distributed mode.
 
 ## 5. Testing strategy
@@ -200,7 +205,7 @@ route to the coordinator in distributed mode.
 
 1. Engine plumbing: `register_view_from_plan` in krishiv-api (+ unit test).
 2. pyo3 `IncrementalDataFrame` + `DataFrame.to_incremental()` (feed/read/step, async
-   `changes()`), exported top-level + `.pyi`.
+   `next_change()`), exported top-level + `.pyi`.
 3. Composition: `s.view(iv)` / `iv.as_source()` + co-registration into the base job
    (view-DAG cascade).
 4. Retire Python `LiveTable`; migrate examples/tests per the mapping table.

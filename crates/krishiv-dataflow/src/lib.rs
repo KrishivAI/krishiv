@@ -66,7 +66,6 @@ pub mod delta_join;
 pub mod group_state;
 pub mod interval_join;
 pub mod join;
-pub mod live_table;
 pub mod memo;
 pub mod operator_config;
 pub mod operator_runtime;

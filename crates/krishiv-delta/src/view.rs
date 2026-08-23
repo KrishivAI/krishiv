@@ -228,6 +228,31 @@ impl IncrementalView {
         Ok(())
     }
 
+    /// Clear the diff baseline **and** the materialized snapshot together.
+    ///
+    /// IVM-AUD-CORE-16: a checkpoint restore replaces the source snapshots
+    /// wholesale, so the view's derived state no longer corresponds to its
+    /// inputs and must be recomputed. Clearing only `full_output` (what
+    /// `reset_full_output` does) left `snapshot = Some(old)`: the next
+    /// DiffBased tick diffed against `None`, emitted the ENTIRE result as
+    /// insertions, and `publish_output` applied those insertions on top of the
+    /// stale snapshot — every row doubled. Both halves must move together.
+    pub fn reset_state(&self) -> DeltaResult<()> {
+        {
+            let mut guard = self
+                .full_output
+                .lock()
+                .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+            *guard = None;
+        }
+        let mut snap = self
+            .snapshot
+            .lock()
+            .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+        *snap = None;
+        Ok(())
+    }
+
     /// Replace the view's full materialized state with `new_full`.
     ///
     /// Used by coordinator-authoritative IVM to apply a tick computed on a

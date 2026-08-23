@@ -4,9 +4,19 @@
 //!
 //! Each incremental source can annotate one timestamp column with a LATENESS
 //! bound. Records arriving with `ts < watermark` (where
-//! `watermark = max_observed_ts - lateness_ms`) are dropped at ingestion.
-//! Stateful operators (join Traces, aggregate state) can call
-//! `gc_below_watermark` to free entries older than the watermark.
+//! `watermark = max_observed_ts - lateness_ms`) are dropped at ingestion —
+//! enforced in `IncrementalFlow::feed` via `apply_lateness`, which drops late
+//! INSERTIONS only (dropping a retraction would strand its insertion in the
+//! Z-set forever) and counts every drop.
+//!
+//! Watermark-driven state GC applies to **join traces only**: a Trace retains
+//! the contributing rows and therefore their event times, so
+//! `gc_below_watermark` can free entries the watermark has passed. Aggregate
+//! and DISTINCT state is keyed with no time dimension — a SUM does not retain
+//! the timestamps folded into it — so no watermark can prove an entry
+//! evictable, and their `gc_watermark` honestly returns 0. This module
+//! previously claimed it pruned "aggregate state"; it never could
+//! (IVM-AUD-CORE-6).
 
 /// LATENESS annotation on one source column.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

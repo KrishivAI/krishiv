@@ -133,7 +133,19 @@ def test_ivm_checkpoint_restore():
     ckpt = job.checkpoint()
     assert len(ckpt) > 0
     job.restore(ckpt)
+
+    # `checkpoint()` serializes source snapshots, not derived view state, so a
+    # restore rebuilds the views on the next tick rather than resurrecting
+    # them in place (`restore_full` is the variant that carries view state).
+    # Before IVM-AUD-CORE-16 nothing rebuilt them: a restore made no source
+    # dirty, and a view is only recomputed when a dependency is dirty, so a
+    # restored flow kept whatever stale rows happened to be in memory — and a
+    # freshly started process kept an empty view forever.
+    job.step()
     snap2 = job.snapshot("cnt")
 
     assert snap2 is not None
     assert snap2.num_rows == snap1.num_rows
+    assert snap2.to_pydict() == snap1.to_pydict(), (
+        "the rebuilt view must equal the pre-checkpoint view, not merely exist"
+    )

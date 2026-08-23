@@ -346,6 +346,7 @@ pub async fn build_view_plan(
     body_sql: &str,
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
+    lateness: &[krishiv_delta::LatenessSpec],
 ) -> ViewPlan {
     use datafusion::datasource::MemTable;
     let ctx = SessionContext::new();
@@ -360,7 +361,8 @@ pub async fn build_view_plan(
         Err(_) => return ViewPlan::DiffBased,
     };
     let plan = df.logical_plan().clone();
-    try_build_from_logical(&plan, output_schema, available_schemas).unwrap_or(ViewPlan::DiffBased)
+    try_build_from_logical(&plan, output_schema, available_schemas, lateness)
+        .unwrap_or(ViewPlan::DiffBased)
 }
 
 // ── Auto-partition key inference ──────────────────────────────────────────────
@@ -441,17 +443,18 @@ fn try_build_from_logical(
     plan: &LogicalPlan,
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
+    lateness: &[krishiv_delta::LatenessSpec],
 ) -> Option<ViewPlan> {
     match plan {
         // Peel top-level projections transparently.
         LogicalPlan::Projection(Projection { input, .. }) => {
-            try_build_from_logical(input, output_schema, available_schemas)
+            try_build_from_logical(input, output_schema, available_schemas, lateness)
         }
         LogicalPlan::Aggregate(agg) => build_agg_plan(agg, output_schema, available_schemas),
         LogicalPlan::Join(join) => {
             // Only 2-source joins (source_of_plan returns None for multi-way joins
             // where one side is itself a Join node with 2 inputs).
-            build_join_plan(join, None, available_schemas)
+            build_join_plan(join, None, available_schemas, lateness)
         }
         // #160: `WHERE` above a join (`SELECT … FROM a JOIN b ON … WHERE …`)
         // plans as `Filter → Join`. Filter is linear, so conjuncts that touch
@@ -462,7 +465,9 @@ fn try_build_from_logical(
         // shapes are resolved inside the aggregate/distinct builders; a bare
         // filtered scan stays DiffBased).
         LogicalPlan::Filter(f) => match f.input.as_ref() {
-            LogicalPlan::Join(join) => build_join_plan(join, Some(&f.predicate), available_schemas),
+            LogicalPlan::Join(join) => {
+                build_join_plan(join, Some(&f.predicate), available_schemas, lateness)
+            }
             _ => None,
         },
         // DISTINCT — the inner plan is the first (and only) input.
@@ -551,6 +556,7 @@ fn build_join_plan(
     join: &Join,
     outer_filter: Option<&Expr>,
     available_schemas: &AHashMap<String, SchemaRef>,
+    lateness: &[krishiv_delta::LatenessSpec],
 ) -> Option<ViewPlan> {
     let incr_join_type = match join.join_type {
         JoinType::Inner => IncrJoinType::Inner,
@@ -666,12 +672,31 @@ fn build_join_plan(
     )
     .ok()?;
 
-    let op = IncrementalJoinOp::new(
+    // IVM-AUD-CORE-5: build the traces WITH the lateness column when the view
+    // declares one that both sides carry. Without it `Trace::gc_below_watermark`
+    // early-returns on `lateness_col_idx == None`, so the entire per-tick
+    // watermark-GC loop was a no-op and join traces grew unbounded — the exact
+    // failure `join.rs` documents ("without calling `with_lateness_column`,
+    // `gc_below_watermark` is a universal no-op"). Both sides must carry the
+    // column: a trace GC'd on one side only would drop rows that the other
+    // side can still legitimately match.
+    let lateness_col = lateness
+        .iter()
+        .map(|l| l.column.as_str())
+        .find(|col| left_schema.index_of(col).is_ok() && right_schema.index_of(col).is_ok());
+    if lateness_col.is_none() && !lateness.is_empty() {
+        tracing::debug!(
+            "LATENESS declared but no column is present on both join sides; \
+             join traces will not be watermark-GC'd"
+        );
+    }
+    let op = IncrementalJoinOp::new_with_lateness(
         left_schema.clone(),
         right_schema.clone(),
         left_key_cols,
         right_key_cols,
         incr_join_type,
+        lateness_col,
     )
     .ok()?;
 
@@ -813,6 +838,44 @@ fn expr_to_aggregation(expr: &Expr, output_col: &str) -> Option<Aggregation> {
     match expr {
         Expr::Alias(alias) => expr_to_aggregation(&alias.expr, output_col),
         Expr::AggregateFunction(agg_fn) => {
+            // IVM-AUD-CORE-22: `AggregateFunctionParams` carries `distinct`,
+            // `filter`, `order_by` and `null_treatment`, and NONE of them was
+            // read — so `COUNT(DISTINCT user_id)` lowered to a plain
+            // incremental COUNT and `SUM(x) FILTER (WHERE y > 0)` to an
+            // unfiltered SUM, both silently wrong. This is exactly the
+            // MIN_BY/MAX_BY class the code below already guards against; the
+            // guard was written for that one case and never generalized.
+            //
+            // Refusing to build an incremental plan degrades the view to
+            // DiffBased (full recompute + diff), which is slower and CORRECT.
+            // A wrong answer computed quickly is not a trade worth making.
+            if agg_fn.params.distinct {
+                tracing::warn!(
+                    output_col,
+                    "IVM plan degraded to O(state) DiffBased: DISTINCT inside an \
+                     aggregate has no incremental operator (a Z-set retraction \
+                     cannot tell whether the last copy of a value was removed \
+                     without holding per-value multiplicity)"
+                );
+                return None;
+            }
+            if agg_fn.params.filter.is_some() {
+                tracing::warn!(
+                    output_col,
+                    "IVM plan degraded to O(state) DiffBased: FILTER (WHERE …) on \
+                     an aggregate is not applied by the incremental operators"
+                );
+                return None;
+            }
+            if !agg_fn.params.order_by.is_empty() {
+                tracing::warn!(
+                    output_col,
+                    "IVM plan degraded to O(state) DiffBased: ORDER BY inside an \
+                     aggregate is order-sensitive and the incremental operators \
+                     are not"
+                );
+                return None;
+            }
             let func_name = agg_fn.func.name().to_lowercase();
             match func_name.as_str() {
                 "sum" => {
@@ -919,7 +982,7 @@ mod tests {
 
     async fn plan_for(sql: &str) -> ViewPlan {
         let (_ctx, schemas, out_schema) = join_ctx_and_schemas();
-        build_view_plan(sql, &out_schema, &schemas).await
+        build_view_plan(sql, &out_schema, &schemas, &[]).await
     }
 
     /// #160 regression pin: the SQL planner leaves the ON condition in
@@ -1019,6 +1082,7 @@ mod tests {
              FROM orders GROUP BY customer_id",
             &out_schema,
             &schemas,
+            &[],
         )
         .await;
         assert_eq!(
@@ -1031,6 +1095,7 @@ mod tests {
              FROM orders GROUP BY customer_id",
             &out_schema,
             &schemas,
+            &[],
         )
         .await;
         assert_eq!(plan.kind(), ViewPlanKind::DiffBased);

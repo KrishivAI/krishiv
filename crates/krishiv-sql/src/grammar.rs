@@ -827,7 +827,13 @@ static FEATURES: &[FeatureEntry] = &[
         "ddl.live_table",
         "DDL",
         "CREATE / REFRESH / DROP LIVE TABLE via session.sql()",
-        S,
+        PL,
+    )
+    .with_note(
+        "not implemented and rejected at the statement: the DDL parsed and produced plan ops no \
+         executor handled, so it reported success while the table did not exist. Use CREATE \
+         MATERIALIZED VIEW for an incrementally-maintained table, or \
+         Session::create_live_table(.., Refresh::Batch) for a one-shot snapshot",
     ),
     // ── CONNECTOR DDL (Phase 60) ─────────────────────────────────────────────
     FeatureEntry::batch_only(

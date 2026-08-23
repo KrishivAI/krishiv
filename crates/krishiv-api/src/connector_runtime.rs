@@ -241,35 +241,162 @@ pub async fn run_streaming_job_via_runtime(
     JobHandle::from_name(&job.name, JobStatus::Completed)
 }
 
+/// Row/time accounting for a bounded incremental feed loop's step cadence.
+///
+/// INT-F23: this loop used to `step()` after every input batch, which is
+/// [`RunPolicy::OnChange`](crate::RunPolicy::OnChange) hardcoded — the
+/// coalescing policies could not be expressed here at all. The pipeline driver
+/// (`pipeline/driver.rs`) carries its own private copy of this pacer; the two
+/// implement the same four-way policy and should become one, which needs an
+/// edit to that file.
+struct StepPacer {
+    rows_since_step: usize,
+    last_step: std::time::Instant,
+}
+
+impl StepPacer {
+    fn new() -> Self {
+        Self {
+            rows_since_step: 0,
+            last_step: std::time::Instant::now(),
+        }
+    }
+
+    fn record_rows(&mut self, n: usize) {
+        self.rows_since_step = self.rows_since_step.saturating_add(n);
+    }
+
+    /// Should the loop step now, given `policy` and what has been fed since the
+    /// last step? `Once` never steps mid-drain — the tail flush at the end of
+    /// the drain is its single step.
+    fn should_step(&self, policy: crate::RunPolicy) -> bool {
+        match policy {
+            crate::RunPolicy::Once => false,
+            crate::RunPolicy::OnChange => true,
+            crate::RunPolicy::EveryRows(n) => self.rows_since_step >= n.max(1),
+            crate::RunPolicy::EveryMs(ms) => {
+                self.rows_since_step > 0 && self.last_step.elapsed().as_millis() >= u128::from(ms)
+            }
+        }
+    }
+
+    fn reset(&mut self) {
+        self.rows_since_step = 0;
+        self.last_step = std::time::Instant::now();
+    }
+}
+
+/// One source opened for the bounded incremental drain: its spec, the reader
+/// that was opened **once**, and the batch already pulled from it to infer the
+/// view schema (`None` once that batch has been fed).
+struct OpenSource<'a> {
+    spec: &'a SourceSpec,
+    reader: Box<dyn SourceReader>,
+    probed: Option<ChangelogBatch>,
+    exhausted: bool,
+}
+
 /// Run a bounded **incremental** job through an [`IvmJob`](crate::IvmJob) — the
 /// distributed-stateful incremental path behind the unified `Session::submit`.
 ///
 /// `ivm` is mode-aware: embedded in-process, or a remote job on the coordinator
 /// in distributed mode (`Session::ivm`). I/O stays local — drain the bounded CDC
-/// source via the file connectors, feed each delta and step the view, then write
-/// the net materialized snapshot to the sink. The view maintenance runs wherever
-/// the `IvmJob` lives, so `submit()` reaches the same engine the dedicated
-/// `Session::ivm` API does.
+/// sources via the file connectors, feed each delta and step the view, then write
+/// the net materialized view to the sink.
+///
+/// `submit()` pins [`RunPolicy::OnChange`](crate::RunPolicy::OnChange) because
+/// [`CompiledJob`] carries no step-cadence field;
+/// [`run_incremental_job_via_ivm_with`] is the seam that takes one.
 pub async fn run_incremental_job_via_ivm(
     ivm: &crate::IvmJob,
     job: &CompiledJob,
 ) -> crate::Result<JobHandle> {
+    run_incremental_job_via_ivm_with(
+        ivm,
+        job,
+        &ConnectorSourceProvider,
+        crate::RunPolicy::OnChange,
+    )
+    .await
+}
+
+/// [`run_incremental_job_via_ivm`] with the source provider and the step cadence
+/// supplied by the caller.
+///
+/// Three contracts this path is required to keep, each of which it once broke:
+///
+/// - **Every source is opened exactly once** (API-E3/INT-F22). The schema probe
+///   used to read one batch, drop the reader, and re-open the source for the
+///   drain. A rewindable source replays, so this was invisible; a non-rewindable
+///   one (a queue, a socket, a cursor-based CDC feed) resumes *after* the probed
+///   batch, so that batch was consumed for its schema and then silently never
+///   processed — a data loss with no error anywhere.
+///   [`IncrementalEngine::run`](krishiv_engines::IncrementalEngine) fixed exactly
+///   this; the reader and its probed batch are carried into the drain here too.
+/// - **An empty source is an error, not a skip** (API-E4). A source that yields
+///   no batch contributes no schema, so the view is planned against a table that
+///   is missing from the probe — the embedded engine errors, and so does this.
+/// - **The sink sees the incremental sink contract** (API-E2). Output goes
+///   through [`connector_sink_provider(true)`] — the same provider the embedded
+///   incremental engine uses — so a sink that declares a `primary_key` gets the
+///   per-key upsert application (and the loud error when a key column is not in
+///   the view's output) instead of having its contract silently dropped.
+///
+/// Sources are drained **round-robin**, one batch at a time (API-E5): draining
+/// source #1 to EOF before opening #2 makes an incremental join emit a long run
+/// of one-sided deltas, and makes the change feed depend on the order the
+/// sources happen to be declared in. Round-robin does not make the change feed
+/// order-independent in general — DBSP guarantees that of the *final* view, not
+/// of the intermediate deltas — but it stops one side starving the other.
+///
+/// Note on the change feed: a row inserted and deleted within one tick
+/// consolidates to weight 0 and is never emitted. That is correct DBSP (the tick
+/// is the unit of observation, not the row), and it means this path is not a
+/// substitute for a CDC log of the input.
+pub async fn run_incremental_job_via_ivm_with(
+    ivm: &crate::IvmJob,
+    job: &CompiledJob,
+    sources: &dyn SourceProvider,
+    policy: crate::RunPolicy,
+) -> crate::Result<JobHandle> {
     use crate::FeedableJob;
     use krishiv_ivm::IncrementalViewSpec;
 
-    // API-3: Stream per-batch instead of buffering the entire source.
-    // The embedded path (engines.rs IVM-8) was rewritten to feed+step per
-    // batch for O(1 batch) peak memory; this distributed path gets the same
-    // treatment to avoid OOM on large CDC sources.
+    if job.sources.is_empty() {
+        return Err(crate::KrishivError::InvalidConfig {
+            message: format!(
+                "incremental job '{}' needs at least one source to maintain a view",
+                job.name
+            ),
+        });
+    }
 
-    // Phase 1: Open each source briefly to capture the schema.
-    let source_provider = ConnectorSourceProvider;
-    let mut source_schemas: Vec<(String, arrow::datatypes::SchemaRef)> = Vec::new();
+    // Phase 1: open each source ONCE, keeping the reader and the batch its
+    // schema came from. See the API-E3 note above for why re-opening is a data
+    // loss rather than a cheap probe.
+    let mut source_schemas: Vec<(String, arrow::datatypes::SchemaRef)> =
+        Vec::with_capacity(job.sources.len());
+    let mut open_sources: Vec<OpenSource<'_>> = Vec::with_capacity(job.sources.len());
     for spec in &job.sources {
-        let mut reader = source_provider.open(spec).await?;
-        if let Some(first) = reader.next_changelog().await? {
-            source_schemas.push((spec.name.clone(), first.batch().schema()));
-        }
+        let mut reader = sources.open(spec).await?;
+        let probed =
+            reader
+                .next_changelog()
+                .await?
+                .ok_or_else(|| crate::KrishivError::InvalidConfig {
+                    message: format!(
+                        "source '{}' (uri: '{}') produced no batches; the incremental engine \
+                     requires a non-empty source to infer the view schema",
+                        spec.name, spec.uri
+                    ),
+                })?;
+        source_schemas.push((spec.name.clone(), probed.batch().schema()));
+        open_sources.push(OpenSource {
+            spec,
+            reader,
+            probed: Some(probed),
+            exhausted: false,
+        });
     }
 
     let output_schema = crate::engines::infer_output_schema(&source_schemas, &job.query).await?;
@@ -285,21 +412,65 @@ pub async fn run_incremental_job_via_ivm(
     })
     .await?;
 
-    // Phase 2: Re-open each source and feed+step per batch (streaming, O(1) memory).
-    for spec in &job.sources {
-        let mut reader = source_provider.open(spec).await?;
-        while let Some(cl) = reader.next_changelog().await? {
-            if cl.num_rows() == 0 {
+    // Phase 2: round-robin feed+step, one batch per source per round. Peak
+    // memory stays O(#sources batches) because nothing is buffered beyond the
+    // batch in hand.
+    let mut pacer = StepPacer::new();
+    loop {
+        let mut progressed = false;
+        for open in open_sources.iter_mut() {
+            if open.exhausted {
                 continue;
             }
-            let delta = crate::engines::delta_from_changelog(&cl)?;
-            ivm.feed(&spec.name, &delta).await?;
-            ivm.step().await?;
+            let next = match open.probed.take() {
+                Some(probed) => Some(probed),
+                None => open.reader.next_changelog().await?,
+            };
+            let Some(changelog) = next else {
+                open.exhausted = true;
+                continue;
+            };
+            progressed = true;
+            if changelog.num_rows() == 0 {
+                continue;
+            }
+            let delta = crate::engines::delta_from_changelog(&changelog)?;
+            ivm.feed(&open.spec.name, &delta).await?;
+            pacer.record_rows(changelog.num_rows());
+            if pacer.should_step(policy) {
+                ivm.step().await?;
+                pacer.reset();
+            }
+        }
+        if !progressed {
+            break;
         }
     }
 
-    // Write the net materialized view (insert-only) to the job's sink(s).
-    let sink_provider = connector_sink_provider(false);
+    // Tail flush: whatever the policy coalesced away still has to land before
+    // the snapshot is read. A no-op when the last batch already stepped.
+    if pacer.rows_since_step > 0 {
+        ivm.step().await?;
+        pacer.reset();
+    }
+
+    // Write the net materialized view through the incremental sink provider —
+    // consolidating, or per-key upsert when the sink declares a primary key.
+    // The remote `IvmJob` has no change feed to replay (`IvmJob::view_output`
+    // returns `Unsupported` for a remote job, INT-F6), so the snapshot is what
+    // is written.
+    //
+    // What that buys, precisely: for a consolidating sink the changelog and
+    // the snapshot are the same net table — whole-row keys with an i64 weight
+    // consolidate order-independently — so this matches the embedded engine
+    // exactly. For an upsert sink with a declared primary key it matches on
+    // ROW COUNT but not necessarily on which row wins a duplicated key: the
+    // embedded engine writes the per-tick delta, so duplicates resolve by tick
+    // order (newest wins), whereas `UpsertSinkWriter` resolves by row order
+    // within the batch and a snapshot carries no tick order. Making the two
+    // identical means feeding the changelog rather than the snapshot, which
+    // needs the client binding INT-F6 is waiting on.
+    let sink_provider = connector_sink_provider(true);
     for spec in &job.sinks {
         let mut writer = sink_provider.open(spec).await?;
         if let Some(batch) = ivm.snapshot(&job.name).await?
@@ -2513,6 +2684,399 @@ mod tests {
         assert!(
             written.contains("\"total\":200"),
             "window1 b=200: {written}"
+        );
+    }
+
+    // ── Bounded incremental run: source custody, sink contract, pacing ───────
+    //
+    // API-E9: this path (the one `Session::submit` takes for a distributed
+    // incremental job) had a single happy-path test. The tests below pin the
+    // three contracts its doc comment now states, each against a source
+    // provider the test controls — the production entry pins
+    // `ConnectorSourceProvider`, which is rewindable and therefore cannot
+    // observe the custody bug at all.
+
+    /// A source that cannot be rewound: every `open` returns a reader that
+    /// continues from the shared per-source cursor, the way a queue or a
+    /// cursor-based CDC feed behaves. Re-opening does *not* replay.
+    ///
+    /// It also records, in order, the name of the source each successful read
+    /// came from — which is what makes the interleaving observable.
+    type ScriptedQueues =
+        Arc<Mutex<std::collections::BTreeMap<String, std::collections::VecDeque<RecordBatch>>>>;
+
+    #[derive(Clone)]
+    struct ScriptedSourceProvider {
+        queues: ScriptedQueues,
+        opens: Arc<std::sync::atomic::AtomicUsize>,
+        read_order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedSourceProvider {
+        fn new(scripts: &[(&str, Vec<RecordBatch>)]) -> Self {
+            let mut queues = std::collections::BTreeMap::new();
+            for (name, batches) in scripts {
+                queues.insert(
+                    (*name).to_string(),
+                    batches
+                        .iter()
+                        .cloned()
+                        .collect::<std::collections::VecDeque<_>>(),
+                );
+            }
+            Self {
+                queues: Arc::new(Mutex::new(queues)),
+                opens: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                read_order: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn opens(&self) -> usize {
+            self.opens.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn read_order(&self) -> Vec<String> {
+            self.read_order
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        }
+    }
+
+    struct ScriptedReader {
+        name: String,
+        queues: ScriptedQueues,
+        read_order: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl krishiv_engine_core::SourceReader for ScriptedReader {
+        async fn next(&mut self) -> krishiv_engine_core::EngineResult<Option<RecordBatch>> {
+            let next = self
+                .queues
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&self.name)
+                .and_then(|q| q.pop_front());
+            if next.is_some() {
+                self.read_order
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .push(self.name.clone());
+            }
+            Ok(next)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl krishiv_engine_core::SourceProvider for ScriptedSourceProvider {
+        async fn open(
+            &self,
+            spec: &crate::SourceSpec,
+        ) -> krishiv_engine_core::EngineResult<Box<dyn krishiv_engine_core::SourceReader>> {
+            self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::new(ScriptedReader {
+                name: spec.name.clone(),
+                queues: Arc::clone(&self.queues),
+                read_order: Arc::clone(&self.read_order),
+            }))
+        }
+    }
+
+    fn kv_batch(keys: &[&str], values: &[i64]) -> RecordBatch {
+        use arrow::array::StringArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Utf8, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(keys.to_vec())),
+                Arc::new(Int64Array::from(values.to_vec())),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn ivm_tick(job: &crate::IvmJob) -> u64 {
+        match job {
+            crate::IvmJob::Embedded(j) => j.tick().unwrap(),
+            crate::IvmJob::Remote(_) => panic!("this test drives the embedded IvmJob"),
+        }
+    }
+
+    /// API-E3 / INT-F22: the schema probe must not consume a batch it then never
+    /// processes.
+    ///
+    /// The probe used to read the first batch for its schema, drop the reader,
+    /// and re-open the source for the drain. A rewindable source replays, so the
+    /// bug was invisible through the file connectors; a non-rewindable one
+    /// resumes *after* the probed batch, so `a` was read, used for the schema,
+    /// and silently dropped — the count came out as 2 instead of 3, with no
+    /// error anywhere.
+    #[tokio::test]
+    async fn run_incremental_via_ivm_keeps_the_probed_batch_of_a_non_rewindable_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("count.ndjson");
+        let sources = ScriptedSourceProvider::new(&[(
+            "t",
+            vec![kv_batch(&["a"], &[1]), kv_batch(&["b", "c"], &[2, 3])],
+        )]);
+
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let ivm = session.ivm("probe-custody").await.unwrap();
+        let job = CompiledJob::new(
+            "probe-custody",
+            "SELECT COUNT(*) AS n FROM t",
+            vec![SourceSpec::cdc("t", "memory", "")],
+            vec![SinkSpec::new("out", "json", output.to_str().unwrap())],
+            false,
+        );
+        super::run_incremental_job_via_ivm_with(&ivm, &job, &sources, crate::RunPolicy::OnChange)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sources.opens(),
+            1,
+            "the source must be opened once, not re-opened for the drain"
+        );
+        let written = std::fs::read_to_string(&output).unwrap();
+        assert!(
+            written.contains("\"n\":3"),
+            "the probed first batch must still be counted: {written:?}"
+        );
+    }
+
+    /// API-E4: a source that yields nothing contributes no schema, so the view
+    /// is planned against a table the probe never saw. The embedded engine
+    /// errors on exactly this; the distributed path used to skip it silently and
+    /// then either fail deep inside the planner or maintain a different view.
+    #[tokio::test]
+    async fn run_incremental_via_ivm_rejects_an_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.ndjson");
+        let sources =
+            ScriptedSourceProvider::new(&[("t", vec![kv_batch(&["a"], &[1])]), ("u", vec![])]);
+
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let ivm = session.ivm("empty-source").await.unwrap();
+        let job = CompiledJob::new(
+            "empty-source",
+            "SELECT t.k, t.v FROM t JOIN u ON t.k = u.k",
+            vec![
+                SourceSpec::cdc("t", "memory", ""),
+                SourceSpec::cdc("u", "memory", ""),
+            ],
+            vec![SinkSpec::new("out", "json", output.to_str().unwrap())],
+            false,
+        );
+        let err = super::run_incremental_job_via_ivm_with(
+            &ivm,
+            &job,
+            &sources,
+            crate::RunPolicy::OnChange,
+        )
+        .await
+        .expect_err("an empty source must be an error, not a skip");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source 'u'") && msg.contains("produced no batches"),
+            "the error must name the empty source: {msg}"
+        );
+    }
+
+    /// API-E5: sources are drained round-robin, one batch at a time. Draining
+    /// source #1 to EOF before opening #2 starves one side of a join for the
+    /// whole run. The read log also shows each source is opened once (API-E3):
+    /// pre-fix it read `t, u` for the probe and then `t, t, u, u` from freshly
+    /// re-opened readers.
+    #[tokio::test]
+    async fn run_incremental_via_ivm_interleaves_its_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.ndjson");
+        let sources = ScriptedSourceProvider::new(&[
+            (
+                "t",
+                vec![
+                    kv_batch(&["a"], &[1]),
+                    kv_batch(&["b"], &[2]),
+                    kv_batch(&["c"], &[3]),
+                ],
+            ),
+            (
+                "u",
+                vec![
+                    kv_batch(&["a"], &[10]),
+                    kv_batch(&["b"], &[20]),
+                    kv_batch(&["c"], &[30]),
+                ],
+            ),
+        ]);
+
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let ivm = session.ivm("interleave").await.unwrap();
+        let job = CompiledJob::new(
+            "interleave",
+            "SELECT t.k, t.v + u.v AS total FROM t JOIN u ON t.k = u.k",
+            vec![
+                SourceSpec::cdc("t", "memory", ""),
+                SourceSpec::cdc("u", "memory", ""),
+            ],
+            vec![SinkSpec::new("out", "json", output.to_str().unwrap())],
+            false,
+        );
+        super::run_incremental_job_via_ivm_with(&ivm, &job, &sources, crate::RunPolicy::OnChange)
+            .await
+            .unwrap();
+
+        // Post-fix: one probe read per source, then one batch each per round.
+        // Pre-fix the probe re-opened, so the log read `t, u, t, t, u, u` — the
+        // whole of `t` before `u` was touched again.
+        assert_eq!(
+            sources.read_order(),
+            vec!["t", "u", "t", "u", "t", "u"],
+            "batches must alternate between the sources, through one reader each"
+        );
+        let written = std::fs::read_to_string(&output).unwrap();
+        assert!(
+            written.contains("\"total\":11"),
+            "a: 1+10 = 11: {written:?}"
+        );
+        assert!(
+            written.contains("\"total\":22"),
+            "b: 2+20 = 22: {written:?}"
+        );
+        assert!(
+            written.contains("\"total\":33"),
+            "c: 3+30 = 33: {written:?}"
+        );
+    }
+
+    /// INT-F23: the drain used to `step()` after every batch — `OnChange`
+    /// hardcoded, with no way to express the coalescing policies the pipeline
+    /// driver has. Two runs over the same three batches must differ in the
+    /// number of ticks and agree on the answer.
+    #[tokio::test]
+    async fn run_incremental_via_ivm_paces_steps_by_policy() {
+        async fn run(policy: crate::RunPolicy, name: &str, out: &std::path::Path) -> u64 {
+            let sources = ScriptedSourceProvider::new(&[(
+                "t",
+                vec![
+                    kv_batch(&["a"], &[1]),
+                    kv_batch(&["b"], &[2]),
+                    kv_batch(&["a"], &[3]),
+                ],
+            )]);
+            let session = crate::SessionBuilder::new().build().unwrap();
+            let ivm = session.ivm(name).await.unwrap();
+            let job = CompiledJob::new(
+                name,
+                "SELECT k, SUM(v) AS total FROM t GROUP BY k",
+                vec![SourceSpec::cdc("t", "memory", "")],
+                vec![SinkSpec::new("out", "json", out.to_str().unwrap())],
+                false,
+            );
+            super::run_incremental_job_via_ivm_with(&ivm, &job, &sources, policy)
+                .await
+                .unwrap();
+            let written = std::fs::read_to_string(out).unwrap();
+            assert!(written.contains("\"total\":4"), "a=4 ({name}): {written:?}");
+            assert!(written.contains("\"total\":2"), "b=2 ({name}): {written:?}");
+            ivm_tick(&ivm)
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let per_batch = run(
+            crate::RunPolicy::OnChange,
+            "pace-on-change",
+            &dir.path().join("a.ndjson"),
+        )
+        .await;
+        let coalesced = run(
+            crate::RunPolicy::EveryRows(1_000_000),
+            "pace-coalesced",
+            &dir.path().join("b.ndjson"),
+        )
+        .await;
+        assert_eq!(per_batch, 3, "OnChange steps once per input batch");
+        assert_eq!(
+            coalesced, 1,
+            "a coalescing policy must step once at the tail, not once per batch"
+        );
+    }
+
+    /// API-E2: the sink's `primary_key` upsert contract holds on this path too.
+    ///
+    /// The view emits two rows for key `a`; with a primary key on `k` the sink
+    /// applies them by key and the net table has one row per key. The old code
+    /// wrote the snapshot through a plain (non-consolidating, non-upserting)
+    /// connector sink, so the declared primary key was ignored and both rows
+    /// landed — the same command run embedded produced two rows, distributed
+    /// three.
+    #[tokio::test]
+    async fn run_incremental_via_ivm_applies_the_sink_primary_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("upsert.ndjson");
+        let sources = ScriptedSourceProvider::new(&[(
+            "t",
+            vec![kv_batch(&["a", "b"], &[1, 2]), kv_batch(&["a"], &[3])],
+        )]);
+
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let ivm = session.ivm("pk-upsert").await.unwrap();
+        let job = CompiledJob::new(
+            "pk-upsert",
+            "SELECT k, v FROM t",
+            vec![SourceSpec::cdc("t", "memory", "")],
+            vec![SinkSpec::new("out", "json", output.to_str().unwrap()).with_primary_key(["k"])],
+            false,
+        );
+        super::run_incremental_job_via_ivm_with(&ivm, &job, &sources, crate::RunPolicy::OnChange)
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(&output).unwrap();
+        let lines = written.lines().filter(|l| !l.trim().is_empty()).count();
+        assert_eq!(
+            lines, 2,
+            "one net row per primary key, not one per view row: {written:?}"
+        );
+        assert!(written.contains("\"k\":\"b\""), "b survives: {written:?}");
+    }
+
+    /// The other half of the same contract: a primary key naming a column the
+    /// view does not produce is a loud error, not a silently ignored spec.
+    #[tokio::test]
+    async fn run_incremental_via_ivm_rejects_a_primary_key_the_view_lacks() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("bad-pk.ndjson");
+        let sources = ScriptedSourceProvider::new(&[("t", vec![kv_batch(&["a"], &[1])])]);
+
+        let session = crate::SessionBuilder::new().build().unwrap();
+        let ivm = session.ivm("bad-pk").await.unwrap();
+        let job = CompiledJob::new(
+            "bad-pk",
+            "SELECT k FROM t",
+            vec![SourceSpec::cdc("t", "memory", "")],
+            vec![
+                SinkSpec::new("out", "json", output.to_str().unwrap())
+                    .with_primary_key(["not_a_column"]),
+            ],
+            false,
+        );
+        let err = super::run_incremental_job_via_ivm_with(
+            &ivm,
+            &job,
+            &sources,
+            crate::RunPolicy::OnChange,
+        )
+        .await
+        .expect_err("an unsatisfiable primary key must fail the run");
+        assert!(
+            err.to_string().contains("not_a_column"),
+            "the error must name the missing key column: {err}"
         );
     }
 }

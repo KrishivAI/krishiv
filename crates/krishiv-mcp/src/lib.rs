@@ -6,10 +6,10 @@
 //! Runtime mode, placement, scheduling, connector behavior, and durability stay
 //! behind existing Krishiv crate APIs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use arrow::array::Array;
 use arrow::datatypes::SchemaRef;
@@ -227,6 +227,13 @@ pub fn mcp_help() -> &'static str {
 pub struct KrishivMcpServer {
     session: Arc<Session>,
     config: McpConfig,
+    /// IVM jobs this server has armed for delta-checkpoint accumulation.
+    ///
+    /// Accumulation is a property of the live flow and the engine exposes no
+    /// getter for it, so the arming is remembered here. It is what lets
+    /// `checkpoint_incremental_job(delta = true)` refuse instead of handing
+    /// back an empty frame labelled `"delta"` (INT-F2).
+    delta_armed: Arc<Mutex<HashSet<String>>>,
 }
 
 impl KrishivMcpServer {
@@ -234,7 +241,25 @@ impl KrishivMcpServer {
         Self {
             session: Arc::new(session),
             config,
+            delta_armed: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    /// Record that `job_name`'s flow is accumulating input for delta
+    /// checkpoints from now on.
+    fn arm_delta_checkpoints(&self, job_name: &str) -> ToolResult<()> {
+        let mut armed = self.delta_armed.lock().map_err(|_| {
+            ToolError::Runtime("delta-checkpoint arming registry is poisoned".to_string())
+        })?;
+        armed.insert(job_name.to_string());
+        Ok(())
+    }
+
+    fn delta_checkpoints_armed(&self, job_name: &str) -> ToolResult<bool> {
+        let armed = self.delta_armed.lock().map_err(|_| {
+            ToolError::Runtime("delta-checkpoint arming registry is poisoned".to_string())
+        })?;
+        Ok(armed.contains(job_name))
     }
 
     /// Handle one JSON-RPC request or notification.
@@ -543,15 +568,21 @@ impl KrishivMcpServer {
                 ),
             ),
             tool(
+                "enable_incremental_delta_checkpoints",
+                "Enable Incremental Delta Checkpoints",
+                "Start accumulating per-source input deltas for an IVM job so checkpoint_incremental_job(delta=true) has something to return. Only input fed AFTER this call is captured, so call it before feeding; it is required before any delta checkpoint. Unsupported for distributed jobs, which have no coordinator endpoint for it.",
+                object_schema([("job_name", json!({ "type": "string" }))], ["job_name"]),
+            ),
+            tool(
                 "checkpoint_incremental_job",
                 "Checkpoint Incremental Job",
-                "Serialize an IVM job checkpoint through the mode-aware Session IVM API.",
+                "Serialize an IVM job checkpoint through the mode-aware Session IVM API. A delta checkpoint requires enable_incremental_delta_checkpoints to have been called first and returns the input fed since the previous delta checkpoint.",
                 object_schema(
                     [
                         ("job_name", json!({ "type": "string" })),
                         (
                             "delta",
-                            json!({ "type": "boolean", "description": "Return a delta checkpoint instead of a full checkpoint" }),
+                            json!({ "type": "boolean", "description": "Return a delta checkpoint (input accumulated since the last one) instead of a full checkpoint; requires enable_incremental_delta_checkpoints" }),
                         ),
                     ],
                     ["job_name"],
@@ -751,6 +782,10 @@ impl KrishivMcpServer {
             "feed_incremental_view" => self.tool_feed_incremental_view(&arguments).await,
             "step_incremental_view" => self.tool_step_incremental_view(&arguments).await,
             "snapshot_incremental_view" => self.tool_snapshot_incremental_view(&arguments).await,
+            "enable_incremental_delta_checkpoints" => {
+                self.tool_enable_incremental_delta_checkpoints(&arguments)
+                    .await
+            }
             "checkpoint_incremental_job" => self.tool_checkpoint_incremental_job(&arguments).await,
             "restore_incremental_job" => self.tool_restore_incremental_job(&arguments).await,
             "list_connectors" => self.tool_list_connectors(),
@@ -926,6 +961,14 @@ impl KrishivMcpServer {
                     "coordinator_ivm_checkpoint_api"
                 } else {
                     "session_ivm_registry_checkpoint_api"
+                },
+                // Delta checkpoints need accumulation armed on the live flow;
+                // no coordinator endpoint does that, so distributed jobs cannot
+                // take one at all (INT-F2 / DIST-C1).
+                "incremental_delta_checkpoints": if self.session.mode() == ExecutionMode::Distributed {
+                    "unsupported: no coordinator endpoint enables delta accumulation"
+                } else {
+                    "enable_incremental_delta_checkpoints, then checkpoint_incremental_job(delta=true)"
                 },
             },
             "control_plane_tools": {
@@ -1505,6 +1548,29 @@ impl KrishivMcpServer {
         }
     }
 
+    /// Arm delta-checkpoint accumulation for a job.
+    ///
+    /// This is its own tool because *when* it happens is the whole point:
+    /// accumulation starts at the call, so everything fed before it is outside
+    /// every subsequent delta checkpoint. `checkpoint_incremental_job` used to
+    /// call it inline and take the delta in the next statement, which meant the
+    /// blob was always empty while the response reported `"delta"` and a byte
+    /// length (INT-F2).
+    async fn tool_enable_incremental_delta_checkpoints(
+        &self,
+        arguments: &Map<String, Value>,
+    ) -> ToolResult<Value> {
+        let job_name = required_string(arguments, "job_name")?;
+        let job = self.session.ivm(job_name).await?;
+        job.enable_delta_checkpoints()?;
+        self.arm_delta_checkpoints(job_name)?;
+        Ok(json!({
+            "job_id": job.job_id(),
+            "delta_checkpoints": "enabled",
+            "captures": "input fed to this job after this call",
+        }))
+    }
+
     async fn tool_checkpoint_incremental_job(
         &self,
         arguments: &Map<String, Value>,
@@ -1513,7 +1579,15 @@ impl KrishivMcpServer {
         let delta = optional_bool(arguments, "delta")?.unwrap_or(false);
         let job = self.session.ivm(job_name).await?;
         let bytes = if delta {
-            job.enable_delta_checkpoints()?;
+            if !self.delta_checkpoints_armed(job_name)? {
+                return Err(ToolError::Unsupported(format!(
+                    "IVM job '{job_name}' is not accumulating deltas, so a delta checkpoint \
+                     would be an empty frame reported as a backup. Call \
+                     enable_incremental_delta_checkpoints for this job first, then feed and \
+                     step; enabling it here would start accumulation after everything already \
+                     fed."
+                )));
+            }
             job.checkpoint_delta().await?
         } else {
             job.checkpoint().await?
@@ -2402,6 +2476,7 @@ mod tests {
         assert!(names.contains(&"deployment_capabilities"));
         assert!(names.contains(&"execute_sql"));
         assert!(names.contains(&"create_incremental_view"));
+        assert!(names.contains(&"enable_incremental_delta_checkpoints"));
         assert!(names.contains(&"checkpoint_incremental_job"));
         assert!(names.contains(&"restore_incremental_job"));
         assert!(names.contains(&"create_continuous_stream"));
@@ -3149,6 +3224,198 @@ mod tests {
         assert_eq!(
             checkpoint3.pointer("/result/structuredContent/checkpoint_base64"),
             Some(&json!(checkpoint1_base64))
+        );
+        Ok(())
+    }
+
+    /// Build a one-view IVM job over a one-row parquet source. Returns the
+    /// server so the caller can drive checkpoints against it.
+    async fn ivm_server_with_view(
+        job: &str,
+        dir: &std::path::Path,
+    ) -> Result<KrishivMcpServer, String> {
+        let server = KrishivMcpServer::new(
+            Session::builder().build().map_err(|e| e.to_string())?,
+            McpConfig::default(),
+        );
+        let input = dir.join("orders.parquet");
+        write_one_row_parquet(&input)?;
+        server
+            .handle_json_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "register_source",
+                    "arguments": {
+                        "name": "orders",
+                        "kind": "parquet",
+                        "properties": { "path": input.display().to_string() }
+                    }
+                }
+            }))
+            .await
+            .ok_or_else(|| "expected source registration response".to_string())?;
+        server
+            .handle_json_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_incremental_view",
+                    "arguments": {
+                        "job_name": job,
+                        "view_name": "answers",
+                        "query": "SELECT answer FROM orders"
+                    }
+                }
+            }))
+            .await
+            .ok_or_else(|| "expected create view response".to_string())?;
+        Ok(server)
+    }
+
+    async fn call_tool_rpc(
+        server: &KrishivMcpServer,
+        id: i64,
+        name: &str,
+        arguments: Value,
+    ) -> Result<Value, String> {
+        server
+            .handle_json_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .ok_or_else(|| format!("expected a response from {name}"))
+    }
+
+    async fn feed_and_step(server: &KrishivMcpServer, job: &str, id: i64) -> Result<(), String> {
+        call_tool_rpc(
+            server,
+            id,
+            "feed_incremental_view",
+            json!({ "job_name": job, "source": "orders", "query": "SELECT answer FROM orders" }),
+        )
+        .await?;
+        call_tool_rpc(
+            server,
+            id + 1,
+            "step_incremental_view",
+            json!({ "job_name": job }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// INT-F2: `checkpoint(delta = true)` used to enable accumulation and take
+    /// the checkpoint in the next statement, so the blob was always empty while
+    /// the response reported `"delta"` and a byte length. An unarmed job must be
+    /// refused, not answered with a fabricated backup.
+    #[tokio::test]
+    async fn delta_checkpoint_without_arming_is_refused() -> Result<(), String> {
+        let dir = tempdir().map_err(|e| e.to_string())?;
+        let server = ivm_server_with_view("unarmed_job", dir.path()).await?;
+        feed_and_step(&server, "unarmed_job", 10).await?;
+
+        let response = call_tool_rpc(
+            &server,
+            20,
+            "checkpoint_incremental_job",
+            json!({ "job_name": "unarmed_job", "delta": true }),
+        )
+        .await?;
+        assert_eq!(
+            response.pointer("/result/isError"),
+            Some(&json!(true)),
+            "an unarmed delta checkpoint must fail rather than return an empty frame: {response}"
+        );
+        let message = response
+            .pointer("/result/structuredContent/error")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("error response missing message: {response}"))?;
+        assert!(
+            message.contains("enable_incremental_delta_checkpoints"),
+            "the error must name the tool that fixes it: {message}"
+        );
+        Ok(())
+    }
+
+    /// The full checkpoint path is untouched by the arming requirement.
+    #[tokio::test]
+    async fn full_checkpoint_needs_no_arming() -> Result<(), String> {
+        let dir = tempdir().map_err(|e| e.to_string())?;
+        let server = ivm_server_with_view("full_job", dir.path()).await?;
+        feed_and_step(&server, "full_job", 10).await?;
+        let response = call_tool_rpc(
+            &server,
+            20,
+            "checkpoint_incremental_job",
+            json!({ "job_name": "full_job", "delta": false }),
+        )
+        .await?;
+        assert_eq!(response.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(
+            response.pointer("/result/structuredContent/checkpoint_type"),
+            Some(&json!("full"))
+        );
+        Ok(())
+    }
+
+    /// INT-F2, the positive half: armed first, fed second, the delta checkpoint
+    /// actually carries the input. Compared against the frame taken right after
+    /// arming (nothing fed yet) so the assertion needs no knowledge of the
+    /// checkpoint framing.
+    #[tokio::test]
+    async fn armed_delta_checkpoint_carries_the_input_fed_after_arming() -> Result<(), String> {
+        let dir = tempdir().map_err(|e| e.to_string())?;
+        let server = ivm_server_with_view("armed_job", dir.path()).await?;
+
+        let armed = call_tool_rpc(
+            &server,
+            10,
+            "enable_incremental_delta_checkpoints",
+            json!({ "job_name": "armed_job" }),
+        )
+        .await?;
+        assert_eq!(armed.pointer("/result/isError"), Some(&json!(false)));
+
+        let empty = call_tool_rpc(
+            &server,
+            11,
+            "checkpoint_incremental_job",
+            json!({ "job_name": "armed_job", "delta": true }),
+        )
+        .await?;
+        let empty_len = empty
+            .pointer("/result/structuredContent/byte_len")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("checkpoint missing byte_len: {empty}"))?;
+
+        feed_and_step(&server, "armed_job", 12).await?;
+
+        let filled = call_tool_rpc(
+            &server,
+            20,
+            "checkpoint_incremental_job",
+            json!({ "job_name": "armed_job", "delta": true }),
+        )
+        .await?;
+        assert_eq!(filled.pointer("/result/isError"), Some(&json!(false)));
+        assert_eq!(
+            filled.pointer("/result/structuredContent/checkpoint_type"),
+            Some(&json!("delta"))
+        );
+        let filled_len = filled
+            .pointer("/result/structuredContent/byte_len")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("checkpoint missing byte_len: {filled}"))?;
+        assert!(
+            filled_len > empty_len,
+            "a delta checkpoint after a feed must carry more than the empty frame \
+             ({filled_len} vs {empty_len})"
         );
         Ok(())
     }

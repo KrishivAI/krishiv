@@ -29,7 +29,7 @@
 
 **Interfaces:**
 - Consumes: `krishiv_api::DataFrame::logical_plan()`, `DataFrame::schema()`, `Session::ivm(name)`, `krishiv_runtime::flight_client::plan_to_sql`, `IvmJob::register_view`, `krishiv_delta::IncrementalViewSpec`.
-- Produces: `struct IncrementalDataFrame { job: IvmJob, view: String, sources: Vec<String> }` with `apply(&self, source: Option<&str>, delta: &DeltaBatch)`, `step()`, `snapshot()`, `changes()` (returns a `DeltaBatch` stream), `checkpoint`/`restore`, `drop_view`, `name()`, `source_names()`.
+- Produces: `struct IncrementalDataFrame { job: IvmJob, view: String, sources: Vec<String> }` with `apply(&self, source: Option<&str>, delta: &DeltaBatch)`, `step()`, `snapshot()`, `last_output()` (the latest output `DeltaBatch`, or `None`), `checkpoint`/`restore`, `drop_view`, `name()`, `source_names()`.
 
 - [ ] **Step 1: Write the failing test** — in `incremental_df.rs`, a test that builds a DataFrame `SELECT k, SUM(v) AS total FROM src GROUP BY k`, calls `df.to_incremental("v").await`, feeds a `DeltaBatch::from_inserts` of 3 rows to source `src`, and asserts `snapshot()` matches a full batch recompute.
 - [ ] **Step 2: Run** `cargo test -p krishiv-api incremental_df -- --nocapture` → FAIL (no `to_incremental`).
@@ -65,7 +65,7 @@
 
 **Interfaces:**
 - Consumes: `krishiv_api::DataFrame::to_incremental`; existing `PyDeltaBatch` (`crate::incremental`), `PyBatch`.
-- Produces (Python): `df.to_incremental(name=None) -> IncrementalDataFrame`; methods `apply(delta, source=None)`, `insert(batch)`, `delete(batch)`, `upsert(batch, keys)`, `apply_cdc(event)`, `snapshot() -> QueryResult|None`, `changes()` (async iterator of `DeltaBatch`), `checkpoint()`, `restore(bytes)`, `drop()`, `name` (property), `source_names -> list[str]`, `transaction()` (context manager).
+- Produces (Python): `df.to_incremental(name=None) -> IncrementalDataFrame`; methods `apply(delta, source=None)`, `insert(batch)`, `delete(batch)`, `upsert(batch, keys)`, `apply_cdc(event)`, `snapshot() -> Batch|None`, `next_change() -> DeltaBatch|None` (each published delta at most once), `last_output() -> DeltaBatch|None` (non-consuming peek), `checkpoint()`, `restore(bytes)`, `drop()`, `name` (property), `source_names -> list[str]`, `transaction()` (context manager).
 
 - [ ] **Step 1: Write the failing test** (`test_incremental_dataframe.py`): embedded session, register `src` with 3 rows, `iv = s.sql("SELECT k, SUM(v) AS total FROM src GROUP BY k").to_incremental()`, `iv.insert(batch); ` assert `iv.snapshot()` equals the batch `groupBy` oracle.
 - [ ] **Step 2: Run** `.venv/bin/python -m pytest python/tests/test_incremental_dataframe.py -q` → FAIL (import/attr error).
@@ -115,7 +115,7 @@
 
 - [ ] **Step 1: Write failing test** — assert `hasattr(krishiv, "IncrementalDataFrame")`, it's in `__all__`, and `from krishiv import *` exposes it.
 - [ ] **Step 2: Run** → FAIL.
-- [ ] **Step 3: Implement** exports + stubs (mirror the streaming pattern; `changes()`/`snapshot()` typed).
+- [ ] **Step 3: Implement** exports + stubs (mirror the streaming pattern; `next_change()`/`snapshot()` typed).
 - [ ] **Step 4: Run** → PASS.
 - [ ] **Step 5: Commit** (feat: export IncrementalDataFrame).
 
@@ -128,7 +128,7 @@
 - Modify: any examples referencing `live_table`
 
 **Interfaces:**
-- Migration mapping enforced by rewritten tests: `s.live_table(name,sql)`→`s.sql(sql).to_incremental()`; `ingest_row(id,"insert"/"delete"/"update")`→`insert/delete/upsert`; `refresh()`→auto-step; `change_feed()`→`changes()`; `drop()`→`drop()`.
+- Migration mapping enforced by rewritten tests: `s.live_table(name,sql)`→`s.sql(sql).to_incremental()`; `ingest_row(id,"insert"/"delete"/"update")`→`insert/delete/upsert`; `refresh()`→auto-step; `change_feed()`→`next_change()`; `drop()`→`drop()`.
 
 - [ ] **Step 1: Rewrite** `test_live_table.py` + `test_change_feed.py` using `IncrementalDataFrame` per the mapping (these are the no-functionality-lost proof).
 - [ ] **Step 2: Run** → FAIL (LiveTable still referenced / new API not wired in tests).

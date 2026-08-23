@@ -353,6 +353,20 @@ pub struct RegisterViewRequest {
     pub is_materialized: bool,
     #[serde(default)]
     pub is_recursive: bool,
+    /// IVM-AUD-DDL-B1. Absent before, and the handler hardcoded an empty
+    /// vector, so a view's LATENESS bound was silently dropped in Distributed
+    /// mode: the same SQL meant different retention semantics per mode.
+    /// `#[serde(default)]` keeps an older client (which omits the field)
+    /// working — it just gets the old no-lateness behaviour it already had.
+    #[serde(default)]
+    pub lateness: Vec<LatenessJson>,
+}
+
+/// Wire form of `krishiv_delta::LatenessSpec`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LatenessJson {
+    pub column: String,
+    pub lateness_ms: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -377,7 +391,11 @@ pub async fn api_ivm_register_view(
         output_schema,
         is_materialized: body.is_materialized,
         is_recursive: body.is_recursive,
-        lateness: vec![],
+        lateness: body
+            .lateness
+            .into_iter()
+            .map(|l| krishiv_ivm::LatenessSpec::new(l.column, l.lateness_ms))
+            .collect(),
     };
     registry.register_view(&job_id, spec).map_err(ivm_err)?;
     persist_ivm_job(&registry, &coordinator, &job_id).await?;
@@ -1421,6 +1439,7 @@ mod tests {
             },
             is_materialized: true,
             is_recursive: false,
+            lateness: Vec::new(),
         }
     }
 
@@ -1592,6 +1611,43 @@ mod tests {
         .await
         .expect("Utf8View output schema must be accepted");
         assert!(resp.0.success);
+    }
+
+    /// IVM-AUD-DDL-B1. The request struct had no `lateness` field and this
+    /// handler hardcoded `lateness: vec![]`, so `CREATE INCREMENTAL VIEW …
+    /// LATENESS ts INTERVAL '5' MINUTE` kept its late-record dropping and
+    /// join-trace GC in embedded mode and lost both in Distributed mode —
+    /// silently, with no error and no log. Same SQL, different retention.
+    #[tokio::test]
+    async fn register_view_carries_the_lateness_bound_into_the_flow() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        registry.create("j".into()).unwrap();
+        let mut req = revenue_view_request();
+        req.lateness = vec![LatenessJson {
+            column: "event_ts".into(),
+            lateness_ms: 300_000,
+        }];
+        api_ivm_register_view(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+            Json(req),
+        )
+        .await
+        .expect("register must succeed");
+
+        let declared = registry
+            .get("j")
+            .expect("job must exist")
+            .declared_lateness()
+            .expect("flow must expose its declared lateness");
+        assert_eq!(
+            declared.len(),
+            1,
+            "the LATENESS bound must reach the flow, not be dropped at the wire"
+        );
+        assert_eq!(declared[0].column, "event_ts");
+        assert_eq!(declared[0].lateness_ms, 300_000);
     }
 
     #[tokio::test]

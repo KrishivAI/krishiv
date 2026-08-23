@@ -47,6 +47,10 @@ impl IncrementalDistinctOp {
     /// pending schema work. A long-running incremental DISTINCT over a
     /// high-cardinality source should use `DISTINCT (event_time_col)` in the
     /// view body so the SQL engine can prune older partitions.
+    /// Watermark GC is **not applicable** here, for the same reason as the
+    /// aggregate operator: DISTINCT state is a per-row-key multiplicity map
+    /// with no retained event time, so no watermark can prove an entry is
+    /// evictable (IVM-AUD-CORE-6). Returning 0 is the honest answer.
     pub fn gc_watermark(&mut self, _watermark: i64) -> crate::DeltaResult<usize> {
         Ok(0)
     }

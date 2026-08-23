@@ -1017,7 +1017,6 @@ pub struct SqlEngine {
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     iceberg_catalogs: IcebergCatalogRegistry,
     /// Live-table DDL registry shared across SQL and session APIs.
-    live_table_registry: Arc<live_table::LiveTableRegistry>,
     /// Incremental-view DDL registry shared across SQL and session APIs.
     incremental_view_registry: Arc<incremental_view::IncrementalViewRegistry>,
     /// Pipeline DDL registry (CREATE SOURCE / CREATE SINK metadata).
@@ -1402,7 +1401,6 @@ impl SqlEngine {
             memory_limit_bytes,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
-            live_table_registry: Arc::new(live_table::LiveTableRegistry::new()),
             incremental_view_registry: Arc::new(incremental_view::IncrementalViewRegistry::new()),
             pipeline_registry: Arc::new(pipeline_ddl::PipelineRegistry::new()),
             operation_registry: Arc::new(OperationRegistry::new()),
@@ -1447,7 +1445,6 @@ impl SqlEngine {
             memory_limit_bytes: None,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
             iceberg_catalogs: Arc::new(std::sync::RwLock::new(Vec::new())),
-            live_table_registry: Arc::new(live_table::LiveTableRegistry::new()),
             incremental_view_registry: Arc::new(incremental_view::IncrementalViewRegistry::new()),
             pipeline_registry: Arc::new(pipeline_ddl::PipelineRegistry::new()),
             operation_registry: Arc::new(OperationRegistry::new()),
@@ -1788,11 +1785,6 @@ impl SqlEngine {
             self.invalidate_plan_cache();
         }
         Ok(())
-    }
-
-    /// Shared live-table registry for `CREATE LIVE TABLE` DDL.
-    pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry> {
-        &self.live_table_registry
     }
 
     /// Shared incremental-view registry for `CREATE INCREMENTAL VIEW` DDL.
@@ -2714,34 +2706,17 @@ impl SqlEngine {
             };
         }
 
-        // ── Intercept CREATE / REFRESH / DROP LIVE TABLE ─────────────────────
-        if live_table::execute_live_table_ddl(&self.live_table_registry, query)?.is_some() {
-            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-            return Ok(self.attach_query_metadata(self.make_sql_df("live-table-ddl", empty), query));
-        }
+        // ── Reject CREATE / REFRESH / DROP LIVE TABLE (never implemented) ────
+        live_table::reject_live_table_ddl(query)?;
 
         // ── Intercept CREATE/DECLARE/REFRESH/DROP INCREMENTAL VIEW ───────────
-        match incremental_view::execute_incremental_view_ddl(
-            &self.incremental_view_registry,
-            query,
-        )? {
-            Some(incremental_view::IncrementalViewResult::Refresh(_name)) => {
-                // REFRESH requires the caller (Session) to re-run the pipeline.
-                // Return a sentinel empty result so the caller knows to refresh.
-                let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-                return Ok(self.attach_query_metadata(
-                    self.make_sql_df("incremental-view-refresh", empty),
-                    query,
-                ));
-            }
-            Some(_) => {
-                let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
-                return Ok(self.attach_query_metadata(
-                    self.make_sql_df("incremental-view-ddl", empty),
-                    query,
-                ));
-            }
-            None => {}
+        if incremental_view::execute_incremental_view_ddl(&self.incremental_view_registry, query)?
+            .is_some()
+        {
+            let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
+            return Ok(
+                self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query)
+            );
         }
 
         // ── Intercept CREATE STREAMING TABLE … AS <streaming SELECT> ─────────

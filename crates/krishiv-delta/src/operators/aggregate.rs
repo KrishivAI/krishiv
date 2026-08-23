@@ -583,6 +583,19 @@ impl IncrementalAggOp {
     /// source should add a `TUMBLE/HOP/SESSION` window or filter on
     /// `event_time_col` in the view body so the SQL engine can prune older
     /// partitions.
+    /// Watermark GC is **not applicable** to this operator, and returning 0
+    /// is the honest answer rather than a stub (IVM-AUD-CORE-6).
+    ///
+    /// A `GROUP BY k` accumulator holds one entry per key with no event-time
+    /// dimension: a SUM does not retain the timestamps of the rows folded into
+    /// it, so no watermark can prove that a key's state is complete and
+    /// evictable. State here is bounded by key cardinality, not by time — the
+    /// same property a streaming aggregation without windows has.
+    ///
+    /// Only operators that retain the contributing ROWS (the join traces) can
+    /// be watermark-GC'd; the audit's finding was not that this returns 0, but
+    /// that the docs claimed LATENESS pruned "aggregate state" when it never
+    /// could.
     pub fn gc_watermark(&mut self, _watermark: i64) -> crate::DeltaResult<usize> {
         Ok(0)
     }

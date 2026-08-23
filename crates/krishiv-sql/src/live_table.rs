@@ -1,9 +1,25 @@
-//! `CREATE LIVE TABLE` SQL extensions (R14 S1.1).
-
-use std::collections::HashMap;
-use std::sync::RwLock;
-
-use krishiv_plan::{ExecutionKind, LogicalPlan, NodeOp, PlanNode};
+//! `CREATE LIVE TABLE` SQL extensions (R14 S1.1) — **parsed, then rejected.**
+//!
+//! Live tables were never implemented. The DDL parsed, wrote a name into a
+//! registry and produced a `LogicalPlan` carrying `NodeOp::CreateLiveTable` /
+//! `RefreshLiveTable` / `DropLiveTable` — plan ops that **no executor, planner
+//! or scheduler in this repository handles**. `SqlEngine::sql` then threw the
+//! plan away and answered with an empty result set, so
+//! `CREATE LIVE TABLE t AS …` reported success and `SELECT * FROM t` failed
+//! with "table not found".
+//!
+//! Rather than keep reporting success for a statement that does nothing,
+//! [`execute_live_table_ddl`] now rejects every live-table statement with an
+//! error that names the doors which do work:
+//!
+//! * `CREATE MATERIALIZED VIEW <name> AS <query>` (plus `CREATE SOURCE` /
+//!   `CREATE SINK` / `START PIPELINE`) for an incrementally-maintained table —
+//!   this is what `Session::create_live_table(.., Refresh::Incremental)` has
+//!   always routed to, going around this module entirely; or
+//! * `Session::create_live_table(name, query, Refresh::Batch)` for a one-shot
+//!   materialized snapshot.
+//!
+//! The parser is kept so the rejection can name the statement and the table.
 
 use crate::{SqlError, SqlResult};
 
@@ -13,71 +29,6 @@ pub enum LiveTableStatement {
     Create { name: String, query: String },
     Refresh { name: String },
     Drop { name: String },
-}
-
-/// Registry of active live tables and their backing queries.
-///
-/// Internally guarded by an `RwLock` so concurrent `query`/`contains`
-/// calls (the common case for `REFRESH LIVE TABLE` checks and executor
-/// query lookups) do not serialise against each other. Writes
-/// (`register`/`remove_table`) take the write lock. This avoids the
-/// `Mutex<LiveTableRegistry>` contention seen under fan-out of
-/// parallel `SELECT` against live tables in a shared
-/// `DataFusion` `SessionContext`.
-#[derive(Debug, Default)]
-pub struct LiveTableRegistry {
-    tables: RwLock<HashMap<String, String>>,
-}
-
-impl LiveTableRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Returns `true` if the write lock would succeed without blocking.
-    /// Callers using `RwLock` semantics may use this to diagnose stalls.
-    pub fn try_register(
-        &self,
-        name: impl Into<String>,
-        query: impl Into<String>,
-    ) -> Result<bool, SqlError> {
-        let mut tables = self.tables.write().map_err(|_| SqlError::DataFusion {
-            message: "live table registry lock poisoned".into(),
-        })?;
-        let name = name.into();
-        let is_new = !tables.contains_key(&name);
-        tables.insert(name, query.into());
-        Ok(is_new)
-    }
-
-    pub fn register(
-        &self,
-        name: impl Into<String>,
-        query: impl Into<String>,
-    ) -> Result<(), SqlError> {
-        self.try_register(name, query).map(|_| ())
-    }
-
-    pub fn remove_table(&self, name: &str) -> SqlResult<bool> {
-        let mut tables = self.tables.write().map_err(|_| SqlError::DataFusion {
-            message: "live table registry lock poisoned".into(),
-        })?;
-        Ok(tables.remove(name).is_some())
-    }
-
-    pub fn contains(&self, name: &str) -> SqlResult<bool> {
-        let tables = self.tables.read().map_err(|_| SqlError::DataFusion {
-            message: "live table registry lock poisoned".into(),
-        })?;
-        Ok(tables.contains_key(name))
-    }
-
-    pub fn query(&self, name: &str) -> SqlResult<Option<String>> {
-        let tables = self.tables.read().map_err(|_| SqlError::DataFusion {
-            message: "live table registry lock poisoned".into(),
-        })?;
-        Ok(tables.get(name).cloned())
-    }
 }
 
 /// Parse `CREATE|REFRESH|DROP LIVE TABLE` statements.
@@ -151,84 +102,37 @@ fn split_name_and_query(rest: &str) -> SqlResult<(String, String)> {
     Ok((name, query))
 }
 
-/// Build a Krishiv logical plan for a live-table DDL statement.
-pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan {
-    match stmt {
-        LiveTableStatement::Create { name, query } => LogicalPlan::new(
-            format!("create-live-table:{name}"),
-            ExecutionKind::Streaming,
-        )
-        .with_node(
-            PlanNode::new(
-                format!("create-live-{name}"),
-                format!("CREATE LIVE TABLE {name}"),
-                ExecutionKind::Streaming,
-            )
-            .with_op(NodeOp::CreateLiveTable { name, query }),
-        ),
-        LiveTableStatement::Refresh { name } => LogicalPlan::new(
-            format!("refresh-live-table:{name}"),
-            ExecutionKind::Streaming,
-        )
-        .with_node(
-            PlanNode::new(
-                format!("refresh-live-{name}"),
-                format!("REFRESH LIVE TABLE {name}"),
-                ExecutionKind::Streaming,
-            )
-            .with_op(NodeOp::RefreshLiveTable { name }),
-        ),
-        LiveTableStatement::Drop { name } => {
-            LogicalPlan::new(format!("drop-live-table:{name}"), ExecutionKind::Batch).with_node(
-                PlanNode::new(
-                    format!("drop-live-{name}"),
-                    format!("DROP LIVE TABLE {name}"),
-                    ExecutionKind::Batch,
-                )
-                .with_op(NodeOp::DropLiveTable { name }),
-            )
-        }
-    }
-}
-
-/// Apply a live-table statement to the registry and return its logical plan.
+/// Reject a live-table statement, naming the doors that do work.
 ///
-/// `REFRESH LIVE TABLE <name>` looks up the existing query in the
-/// registry and re-registers it (which is the registry-level half of
-/// "refresh" — the executor is expected to re-execute the plan to
-/// materialise the new result). If the named table is not registered,
-/// the refresh is rejected with `SqlError::Unsupported` so callers see a
-/// clear error rather than a silent no-op.
+/// IVM-AUD-DDL-F1. This used to write the name into a registry, build a
+/// `LogicalPlan` carrying `NodeOp::CreateLiveTable`, and return it — whereupon
+/// `SqlEngine::sql` discarded the plan and answered with an empty result set.
+/// No executor, planner or scheduler matched those plan ops, so the statement
+/// reported success and the table did not exist; the next `SELECT` failed with
+/// "table not found". Reporting success for a statement that does nothing is
+/// the one outcome worse than rejecting it.
 ///
-/// The registry is `&LiveTableRegistry` (not `&Mutex<...>`); internal
-/// synchronisation is the registry's responsibility. Callers that
-/// already hold a `Mutex<LiveTableRegistry>` can pass `&*guard`.
-pub fn execute_live_table_ddl(
-    registry: &LiveTableRegistry,
-    sql: &str,
-) -> SqlResult<Option<LogicalPlan>> {
+/// Returns `Ok(())` for anything that is not live-table DDL, so `SqlEngine`
+/// can call this as a pass-through interceptor.
+pub fn reject_live_table_ddl(sql: &str) -> SqlResult<()> {
     let Some(stmt) = parse_live_table_statement(sql)? else {
-        return Ok(None);
+        return Ok(());
     };
-    match &stmt {
-        LiveTableStatement::Create { name, query } => {
-            registry.register(name.clone(), query.clone())?;
-        }
-        LiveTableStatement::Drop { name } => {
-            registry.remove_table(name)?;
-        }
-        LiveTableStatement::Refresh { name } => {
-            let Some(query) = registry.query(name)? else {
-                return Err(SqlError::Unsupported {
-                    feature: format!("REFRESH LIVE TABLE {name}: table is not registered"),
-                });
-            };
-            // Re-register the same query to bump any "last refresh" bookkeeping
-            // and force the executor to re-materialise the result.
-            registry.register(name.clone(), query)?;
-        }
-    }
-    Ok(Some(plan_live_table(stmt)))
+    let (statement, name) = match &stmt {
+        LiveTableStatement::Create { name, .. } => ("CREATE", name),
+        LiveTableStatement::Refresh { name } => ("REFRESH", name),
+        LiveTableStatement::Drop { name } => ("DROP", name),
+    };
+    Err(SqlError::Unsupported {
+        feature: format!(
+            "{statement} LIVE TABLE {name}: live tables are not implemented. \
+             For an incrementally-maintained table use \
+             `CREATE MATERIALIZED VIEW {name} AS <query>` (with CREATE SOURCE / \
+             CREATE SINK / START PIPELINE to drive it); for a one-shot \
+             materialized snapshot use \
+             `Session::create_live_table(\"{name}\", <query>, Refresh::Batch)`"
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -302,94 +206,27 @@ mod tests {
         assert!(matches!(d, LiveTableStatement::Drop { .. }));
     }
 
+    // ── every live-table statement is rejected ───────────────────────────────
+
+    /// DDL-F1. `CREATE LIVE TABLE` used to return a plan and a `success`; the
+    /// plan op had no handler, so the table never existed and the next
+    /// `SELECT` failed with "table not found". It must fail at the statement.
     #[test]
-    fn registry_register_and_drop() {
-        let reg = LiveTableRegistry::new();
-        reg.register("v", "SELECT 1").unwrap();
-        assert!(reg.contains("v").unwrap());
-        reg.remove_table("v").unwrap();
-        assert!(!reg.contains("v").unwrap());
-    }
-
-    // ── execute_live_table_ddl integration ────────────────────────────────────
-
-    #[test]
-    fn execute_live_table_ddl_create_populates_registry_and_returns_streaming_plan() {
-        use krishiv_plan::ExecutionKind;
-
-        let registry = LiveTableRegistry::new();
-        let plan = execute_live_table_ddl(
-            &registry,
+    fn create_live_table_is_rejected_and_names_a_working_alternative() {
+        let err = reject_live_table_ddl(
             "CREATE LIVE TABLE summary AS SELECT id, SUM(val) FROM events GROUP BY id",
         )
-        .unwrap()
-        .unwrap();
+        .expect_err("CREATE LIVE TABLE must not report success for a no-op");
 
-        assert!(
-            registry.contains("summary").unwrap(),
-            "registry must contain the created live table"
-        );
-        assert_eq!(
-            registry.query("summary").unwrap(),
-            Some("SELECT id, SUM(val) FROM events GROUP BY id".to_string()),
-            "registry must store the backing query"
-        );
-        assert_eq!(
-            plan.kind(),
-            ExecutionKind::Streaming,
-            "CREATE LIVE TABLE must produce a Streaming logical plan"
-        );
-    }
-
-    #[test]
-    fn execute_live_table_ddl_drop_removes_from_registry() {
-        let registry = LiveTableRegistry::new();
-        execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_drop AS SELECT 1 AS n").unwrap();
-        assert!(registry.contains("to_drop").unwrap());
-
-        execute_live_table_ddl(&registry, "DROP LIVE TABLE to_drop").unwrap();
-        assert!(
-            !registry.contains("to_drop").unwrap(),
-            "dropped table must be removed from registry"
-        );
-    }
-
-    #[test]
-    fn execute_live_table_ddl_refresh_returns_plan_without_error() {
-        let registry = LiveTableRegistry::new();
-        execute_live_table_ddl(&registry, "CREATE LIVE TABLE to_refresh AS SELECT 1 AS x").unwrap();
-        let plan = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE to_refresh")
-            .unwrap()
-            .expect("REFRESH must return a plan");
-        assert!(
-            !plan.nodes().is_empty(),
-            "REFRESH plan must have at least one node"
-        );
-    }
-
-    #[test]
-    fn execute_live_table_ddl_non_live_table_sql_returns_none() {
-        let registry = LiveTableRegistry::new();
-        let result = execute_live_table_ddl(&registry, "SELECT 1 AS n").unwrap();
-        assert!(
-            result.is_none(),
-            "non-live-table SQL must return None from execute_live_table_ddl"
-        );
-    }
-
-    #[test]
-    fn execute_live_table_ddl_refresh_unregistered_table_errors() {
-        let registry = LiveTableRegistry::new();
-        // REFRESH on a table that has never been CREATEd must error, not
-        // silently no-op (the previous behaviour silently dropped the
-        // refresh and returned a plan).
-        let err = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE missing")
-            .expect_err("REFRESH on an unknown table must fail");
         match err {
-            crate::SqlError::Unsupported { feature } => {
+            SqlError::Unsupported { feature } => {
                 assert!(
-                    feature.contains("missing"),
-                    "error should name the missing table; got {feature}"
+                    feature.contains("summary"),
+                    "the error must name the table; got {feature}"
+                );
+                assert!(
+                    feature.contains("CREATE MATERIALIZED VIEW"),
+                    "the error must name the working alternative; got {feature}"
                 );
             }
             other => panic!("expected Unsupported, got {other:?}"),
@@ -397,13 +234,21 @@ mod tests {
     }
 
     #[test]
-    fn execute_live_table_ddl_refresh_registered_table_succeeds() {
-        let registry = LiveTableRegistry::new();
-        execute_live_table_ddl(&registry, "CREATE LIVE TABLE t AS SELECT 1").unwrap();
-        // REFRESH on a registered table must succeed and return a plan.
-        let plan = execute_live_table_ddl(&registry, "REFRESH LIVE TABLE t")
-            .unwrap()
-            .unwrap();
-        assert!(!plan.nodes().is_empty());
+    fn refresh_and_drop_live_table_are_rejected_too() {
+        for sql in ["REFRESH LIVE TABLE summary", "DROP LIVE TABLE summary"] {
+            let err = reject_live_table_ddl(sql).unwrap_err().to_string();
+            assert!(
+                err.contains("live tables are not implemented"),
+                "{sql} must be rejected; got {err}"
+            );
+        }
+    }
+
+    /// The fall-through contract the `SqlEngine::sql` interceptor relies on:
+    /// non-live-table SQL is not this module's business.
+    #[test]
+    fn non_live_table_sql_passes_through() {
+        reject_live_table_ddl("SELECT 1 AS n")
+            .expect("non-live-table SQL must pass through the interceptor untouched");
     }
 }

@@ -255,6 +255,15 @@ impl IvmJob {
         }
     }
 
+    /// The LATENESS bounds that actually reached the flow (first shard when
+    /// partitioned — every shard is registered from the same spec).
+    pub fn declared_lateness(&self) -> IvmResult<Vec<krishiv_ivm::LatenessSpec>> {
+        match self {
+            IvmJob::Single(f) => f.declared_lateness(),
+            IvmJob::Partitioned(p) => p.declared_lateness(),
+        }
+    }
+
     /// Full checkpoint (per-shard framed when partitioned).
     pub fn checkpoint(&self) -> IvmResult<Vec<u8>> {
         match self {
