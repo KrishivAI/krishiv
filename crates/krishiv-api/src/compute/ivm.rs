@@ -39,6 +39,50 @@ impl IvmJob {
         )?))
     }
 
+    /// The one place execution mode is turned into an `IvmJob`.
+    ///
+    /// `partitioned` is the whole difference between the two Session entry
+    /// points, and it is a **capability**, not a tuning knob: a partitioned
+    /// flow never cascades a base view's output into a downstream view, so a
+    /// job that will host a view-DAG must be pinned single. Both
+    /// `Session::ivm` / `Session::ivm_unpartitioned` and
+    /// `IncrementalDataFrame::from_view_sql` route through here, so the
+    /// mode-to-constructor mapping exists once instead of being written out
+    /// per call site and drifting (IVM-AUD-DUP-2).
+    pub(crate) async fn for_mode(
+        mode: crate::ExecutionMode,
+        coordinator_http: Option<&str>,
+        registry: Option<&SharedIvmJobRegistry>,
+        name: &str,
+        partitioned: bool,
+    ) -> Result<Self> {
+        match mode {
+            crate::ExecutionMode::Distributed => {
+                let url = coordinator_http.ok_or_else(|| {
+                    KrishivError::unsupported(
+                        "distributed IVM requires a coordinator URL; connect the session with \
+                         with_coordinator()/http_url",
+                    )
+                })?;
+                if partitioned {
+                    Self::remote(url, name).await
+                } else {
+                    Self::remote_unpartitioned(url, name).await
+                }
+            }
+            crate::ExecutionMode::Embedded | crate::ExecutionMode::SingleNode => {
+                let registry = registry.ok_or_else(|| {
+                    KrishivError::unsupported("embedded IVM requires the session's job registry")
+                })?;
+                if partitioned {
+                    Self::embedded(registry, name)
+                } else {
+                    Self::embedded_unpartitioned(registry, name)
+                }
+            }
+        }
+    }
+
     /// Create a remote IVM job on the coordinator at `coordinator_http`.
     pub async fn remote(coordinator_http: &str, name: &str) -> Result<Self> {
         Ok(Self::Remote(
@@ -638,6 +682,49 @@ mod tests {
         let job1 = IvmJob::embedded(&single, "agg").unwrap();
         job1.register_view(revenue_spec()).await.unwrap();
         assert_eq!(job1.is_partitioned().unwrap(), Some(false));
+    }
+
+    /// IVM-AUD-DUP-2. `Session::ivm` and `Session::ivm_unpartitioned` differ in
+    /// exactly one thing, and it is a capability rather than a tuning knob: a
+    /// partitioned flow never cascades a base view's output into a derived
+    /// view, so only the pinned-single job can host a view-DAG. Before this
+    /// pair existed there was no way to ask a `Session` for the pinned shape —
+    /// `to_incremental` reached past it into `IvmJob` — and an error message
+    /// already directed callers to `Session::ivm_unpartitioned`, which did not
+    /// exist.
+    #[tokio::test]
+    async fn the_session_pair_differs_only_in_shape_and_only_one_hosts_a_view_dag() {
+        let sharded: SharedIvmJobRegistry = Arc::new(IvmJobRegistry::with_default_shards(3));
+        let session_like = |partitioned: bool| {
+            let reg = sharded.clone();
+            async move {
+                IvmJob::for_mode(
+                    crate::ExecutionMode::Embedded,
+                    None,
+                    Some(&reg),
+                    if partitioned { "auto" } else { "pinned" },
+                    partitioned,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        let auto = session_like(true).await;
+        auto.register_view(revenue_spec()).await.unwrap();
+        assert_eq!(
+            auto.is_partitioned().unwrap(),
+            Some(true),
+            "ivm() must auto-partition a key-shardable view in a sharding registry"
+        );
+
+        let pinned = session_like(false).await;
+        pinned.register_view(revenue_spec()).await.unwrap();
+        assert_eq!(
+            pinned.is_partitioned().unwrap(),
+            Some(false),
+            "ivm_unpartitioned() must pin the same view single, in the same registry"
+        );
     }
 
     /// The embedded arm still enables both features for real (the fix above

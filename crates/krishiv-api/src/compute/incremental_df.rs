@@ -74,40 +74,27 @@ impl IncrementalDataFrame {
             is_recursive: false,
             lateness: Vec::new(),
         };
-        let job = match mode {
-            ExecutionMode::Distributed => {
-                let url = coordinator_http.ok_or_else(|| {
-                    KrishivError::unsupported(
-                        "distributed to_incremental requires a coordinator URL; \
-                         connect the session with with_coordinator()/http_url",
-                    )
-                })?;
-                // Non-partitioned so the coordinator job can host a view-DAG
-                // (a derived view reading the base view's full output).
-                IvmJob::remote_unpartitioned(&url, name).await?
-            }
-            ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-                // Pinned to a single (non-partitioned) flow: an
-                // IncrementalDataFrame job may gain derived views (the
-                // `Session::view` view-DAG), and a partitioned job does not
-                // cascade a base view's output to downstream views. Composition
-                // correctness outweighs single-view sharding here (in-process
-                // anyway) — and `Session::ivm` does NOT make the same choice,
-                // which is the divergence documented on `DataFrame::to_incremental`.
-                //
-                // IVM-AUD-API-A4: the pin is now the same mechanism the remote
-                // path uses — `create_unpartitioned`, which sets the registry's
-                // `pinned_single` marker — rather than a registry built with
-                // `with_default_shards(1)`. The old form worked only because
-                // *every* job in that private registry was single by accident of
-                // its shard count, and it could not survive sharing the
-                // session's registry (INT-F15) at all.
-                let registry = registry.unwrap_or_else(|| {
-                    Arc::new(IvmJobRegistry::with_default_shards(1)) as SharedIvmJobRegistry
-                });
-                IvmJob::embedded_unpartitioned(&registry, name)?
-            }
-        };
+        // Pinned to a single (non-partitioned) flow: this job may gain
+        // derived views (the `Session::view` view-DAG), and a partitioned flow
+        // does not cascade a base view's output to downstream views.
+        // Composition correctness outweighs single-view sharding here — and
+        // `Session::ivm` does NOT make the same choice, which is the
+        // divergence documented on `DataFrame::to_incremental` and now named
+        // by `Session::ivm_unpartitioned`.
+        //
+        // The mode-to-constructor mapping lives in `IvmJob::for_mode`, once
+        // (IVM-AUD-DUP-2); this used to be a second hand-written copy of it.
+        let registry = registry.unwrap_or_else(|| {
+            Arc::new(IvmJobRegistry::with_default_shards(1)) as SharedIvmJobRegistry
+        });
+        let job = IvmJob::for_mode(
+            mode,
+            coordinator_http.as_deref(),
+            Some(&registry),
+            name,
+            false,
+        )
+        .await?;
         job.register_view(spec).await?;
         Ok(Self {
             job,

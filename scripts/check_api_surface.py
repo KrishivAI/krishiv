@@ -596,6 +596,9 @@ CLASS_METHOD_SIGNATURES: dict[tuple[str, str], list[str]] = {
     ("Session", "read_json"): ["    def read_json(self, path: str) -> DataFrame: ..."],
     ("Session", "read_parquet_with_options"): ["    def read_parquet_with_options(self, path: str, *, batch_size: int | None = ...) -> DataFrame: ..."],
     ("Session", "read_csv_with_options"): ["    def read_csv_with_options(self, path: str, *, delimiter: str | None = ..., has_header: bool | None = ...) -> DataFrame: ..."],
+    ("Session", "ivm_unpartitioned"): [
+        "    def ivm_unpartitioned(self, name: str) -> IvmJob: ...",
+    ],
     ("Session", "register_record_batches"): [
         "    def register_record_batches(self, name: str, batches: Sequence[BatchLike] | Any) -> None: ...",
     ],

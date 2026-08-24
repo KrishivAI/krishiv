@@ -149,3 +149,15 @@ def test_ivm_checkpoint_restore():
     assert snap2.to_arrow().to_pydict() == snap1.to_arrow().to_pydict(), (
         "the rebuilt view must equal the pre-checkpoint view, not merely exist"
     )
+
+
+def test_ivm_and_ivm_unpartitioned_are_both_reachable_from_python():
+    """IVM-AUD-DUP-2: the partitioning choice is a capability, so both shapes
+    need a named Session entry point on every surface — not just Rust.
+
+    Only the pinned-single job can host a view-DAG, because a partitioned flow
+    never cascades a base view's output into a derived view.
+    """
+    s = krishiv.Session()
+    assert s.ivm("auto").job_id == "auto"
+    assert s.ivm_unpartitioned("pinned").job_id == "pinned"

@@ -3384,20 +3384,37 @@ impl Session {
     /// daemon is an open decision, recorded in
     /// `docs/implementation/ivm-audit-register.md`; until it is taken, this doc
     /// is the whole of the contract.
+    /// Auto-partitions: if the job's first view is key-shardable it is spread
+    /// across shards. Fast for a single view, and **cannot host a view-DAG** —
+    /// a partitioned flow never cascades a base view's output into a derived
+    /// view. Use [`ivm_unpartitioned`](Self::ivm_unpartitioned) when the job
+    /// will gain derived views; `DataFrame::to_incremental` picks that one for
+    /// exactly this reason.
     pub async fn ivm(&self, name: &str) -> Result<crate::IvmJob> {
-        match self.mode {
-            ExecutionMode::Distributed => {
-                let url = self.ivm_http_url().ok_or_else(|| {
-                    KrishivError::unsupported(
-                        "distributed IVM requires a coordinator URL; call with_coordinator()",
-                    )
-                })?;
-                crate::IvmJob::remote(url, name).await
-            }
-            ExecutionMode::Embedded | ExecutionMode::SingleNode => {
-                crate::IvmJob::embedded(&self.ivm_registry, name)
-            }
-        }
+        self.ivm_with_shape(name, true).await
+    }
+
+    /// Like [`ivm`](Self::ivm) but pinned to a single flow, so the job can host
+    /// a view-DAG (`Session::view` + `to_incremental`, where a derived view
+    /// reads the base view's full output).
+    ///
+    /// This is the same pin `DataFrame::to_incremental` uses. It exists as a
+    /// named `Session` entry point because the choice is a capability rather
+    /// than a tuning knob, and because an error message elsewhere directed
+    /// callers here before the method existed (IVM-AUD-DUP-2).
+    pub async fn ivm_unpartitioned(&self, name: &str) -> Result<crate::IvmJob> {
+        self.ivm_with_shape(name, false).await
+    }
+
+    async fn ivm_with_shape(&self, name: &str, partitioned: bool) -> Result<crate::IvmJob> {
+        crate::IvmJob::for_mode(
+            self.mode,
+            self.ivm_http_url(),
+            Some(&self.ivm_registry),
+            name,
+            partitioned,
+        )
+        .await
     }
 
     /// Read an incremental view as a [`DataFrame`] — the Rust view-DAG entry

@@ -1123,8 +1123,24 @@ impl PySession {
     /// connected to a coordinator returns a remote job. The returned
     /// :class:`IvmJob` exposes the same ``feed`` / ``step`` / ``snapshot`` /
     /// ``checkpoint`` surface in both modes.
+    ///
+    /// Auto-partitions a key-shardable first view, and therefore **cannot host
+    /// a view-DAG** — a partitioned flow never cascades a base view's output
+    /// into a derived view. Use :meth:`ivm_unpartitioned` when the job will
+    /// gain derived views; ``df.to_incremental()`` picks that shape already.
     pub fn ivm(&self, name: String) -> PyResult<crate::incremental::PyIvmJob> {
         let job = block_on_async(self.inner.ivm(&name)).map_err(map_krishiv_error)?;
+        Ok(crate::incremental::PyIvmJob { inner: job })
+    }
+
+    /// Like :meth:`ivm` but pinned to a single flow, so the job can host a
+    /// view-DAG (``Session.view(iv)`` + ``to_incremental``, where a derived
+    /// view reads the base view's full output).
+    ///
+    /// Same pin ``df.to_incremental()`` uses. The choice is a capability, not
+    /// a tuning knob, which is why it is a named method rather than a flag.
+    pub fn ivm_unpartitioned(&self, name: String) -> PyResult<crate::incremental::PyIvmJob> {
+        let job = block_on_async(self.inner.ivm_unpartitioned(&name)).map_err(map_krishiv_error)?;
         Ok(crate::incremental::PyIvmJob { inner: job })
     }
 
