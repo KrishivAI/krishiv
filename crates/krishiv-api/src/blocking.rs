@@ -96,17 +96,6 @@ impl BlockingSession {
         self.block(df.collect_async())
     }
 
-    /// Create a live table synchronously — the keystone surface through the
-    /// sync facade (delegates to [`Session::create_live_table`]).
-    pub fn create_live_table(
-        &self,
-        name: &str,
-        query: &str,
-        refresh: crate::Refresh,
-    ) -> Result<()> {
-        self.inner.create_live_table(name, query, refresh)
-    }
-
     /// Register record batches as a named table synchronously.
     pub fn register_record_batches(
         &self,
@@ -266,7 +255,10 @@ mod tests {
             "sql",
             "sql_as",
             "collect",
-            "create_live_table",
+            // `create_live_table` was here until it was removed as a
+            // duplicate router; the two modes it reached are covered by
+            // `register_record_batches` (Batch) and `sql` (Incremental, via
+            // CREATE MATERIALIZED VIEW).
             "register_record_batches",
             "register_parquet",
             "deregister_table",
@@ -292,17 +284,22 @@ mod tests {
     }
 
     #[test]
-    fn blocking_session_covers_live_table_facade() {
-        // The sync facade reaches the Phase 61 keystone without an async
-        // runtime: create a batch live table, query it, drop it — all blocking.
+    fn blocking_session_materializes_both_refresh_modes_without_a_runtime() {
+        // `create_live_table` is gone (it was a router under a name that
+        // described no distinct object). Both of the modes it routed to stay
+        // reachable through the sync facade, which is what this test exists to
+        // prove: no async runtime is needed for either.
         let bs = BlockingSession::embedded().unwrap();
-        bs.create_live_table(
-            "bt",
-            "SELECT 1 AS a UNION ALL SELECT 2 AS a",
-            crate::Refresh::Batch,
-        )
-        .unwrap();
+
+        // Batch: a snapshot table.
+        bs.sql("CREATE TABLE bt AS SELECT * FROM (VALUES (1), (2)) v(a)")
+            .unwrap();
         assert_eq!(bs.sql("SELECT a FROM bt").unwrap().row_count(), 2);
+
+        // Incremental: an IVM materialized view on the same session.
+        bs.sql("CREATE MATERIALIZED VIEW bmv AS SELECT SUM(a) AS s FROM bt")
+            .unwrap();
+
         bs.deregister_table("bt").unwrap();
     }
 

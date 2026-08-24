@@ -14,10 +14,10 @@
 //!
 //! * `CREATE MATERIALIZED VIEW <name> AS <query>` (plus `CREATE SOURCE` /
 //!   `CREATE SINK` / `START PIPELINE`) for an incrementally-maintained table —
-//!   this is what `Session::create_live_table(.., Refresh::Incremental)` has
-//!   always routed to, going around this module entirely; or
-//! * `Session::create_live_table(name, query, Refresh::Batch)` for a one-shot
-//!   materialized snapshot.
+//!   this is what the `Refresh::Incremental` route has always lowered to,
+//!   going around this module entirely; or
+//! * `df.write_stream().refresh(Refresh::Batch).to_table(session, name)` for a
+//!   one-shot materialized snapshot.
 //!
 //! The parser is kept so the rejection can name the statement and the table.
 
@@ -130,7 +130,7 @@ pub fn reject_live_table_ddl(sql: &str) -> SqlResult<()> {
              `CREATE MATERIALIZED VIEW {name} AS <query>` (with CREATE SOURCE / \
              CREATE SINK / START PIPELINE to drive it); for a one-shot \
              materialized snapshot use \
-             `Session::create_live_table(\"{name}\", <query>, Refresh::Batch)`"
+             `df.write_stream().refresh(Refresh::Batch).to_table(session, \"{name}\")`"
         ),
     })
 }

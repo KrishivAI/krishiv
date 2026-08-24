@@ -4248,39 +4248,6 @@ impl Session {
         Ok(dir)
     }
 
-    /// Create a **live table** `name` defined by `query`, choosing the compute
-    /// engine from `refresh` — the unified declarative surface over the three
-    /// engines (Phase 61 keystone). One query, one result; the refresh mode is
-    /// the only thing that selects Batch / Incremental (IVM) / Streaming:
-    ///
-    /// - [`Refresh::Batch`] materializes a snapshot now (registered as `name`).
-    /// - [`Refresh::Incremental`] registers a materialized view maintained by
-    ///   the IVM engine (via the `CREATE MATERIALIZED VIEW` engine primitive).
-    /// - [`Refresh::Continuous`] targets the streaming engine; an embedded
-    ///   session has no coordinator to run it and says so, loudly.
-    ///
-    /// The platform's live-tables pipelines remain the *governed* wrapper — this
-    /// is the raw engine primitive underneath, not a competing catalog of record.
-    pub fn create_live_table(&self, name: &str, query: &str, refresh: Refresh) -> Result<()> {
-        match refresh {
-            Refresh::Batch => {
-                let batches = self.sql(query)?.collect()?.into_batches();
-                self.register_record_batches(name, batches)
-            }
-            Refresh::Incremental => {
-                // Route through the engine's CREATE MATERIALIZED VIEW primitive
-                // so the IVM engine owns the maintenance.
-                self.sql(format!("CREATE MATERIALIZED VIEW {name} AS {query}"))?;
-                Ok(())
-            }
-            Refresh::Continuous => Err(KrishivError::unsupported(format!(
-                "create_live_table('{name}', refresh=Continuous) needs a streaming coordinator to \
-                 run the continuous job; submit it via the continuous-stream registration API or a \
-                 cluster-attached session"
-            ))),
-        }
-    }
-
     /// Deregister (drop) a named table from this session.
     pub fn deregister_table(&self, name: &str) -> Result<()> {
         self.sql_engine

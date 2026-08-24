@@ -11,8 +11,6 @@ pub mod avro;
 pub mod cassandra_sink;
 #[cfg(feature = "lakehouse")]
 pub mod cdc;
-#[cfg(all(feature = "lakehouse", feature = "kafka"))]
-pub mod cdc_router;
 pub mod csv_json;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch_sink;
@@ -116,26 +114,22 @@ pub use vector::{
 #[cfg(all(feature = "state", feature = "lakehouse"))]
 pub use cdc::CdcOffsetTracker;
 
-#[cfg(feature = "lakehouse")]
-pub use lakehouse::{
-    AsOfSpec, DeltaEntry, DeltaObjectStoreReader, DeltaOp, DeltaStore, DeltaTableHandle,
-    DeltaWriteMode, DistributedIcebergCommitCoordinator, HudiCowWriter, HudiObjectStoreReader,
-    HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader, HudiWriteResult, IcebergFsTable,
-    IcebergReference, IcebergReferenceKind, IcebergScanOptions, IcebergTableRef,
-    IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, LakehouseError, LakehouseResult,
-    LakehouseTable, MemoryDeltaStore, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable,
-    MergeDeltaResult, MultiWriterGuard, PartitionField, PartitionSpecResolver,
-    PartitionSpecVersion, RedbDeltaStore, SchemaField, SchemaVersion, StagedSnapshot,
-    ensure_hoodie_properties, kafka_offsets_json, merge_delta, parse_kafka_offsets_json,
-    read_hoodie_properties, read_table_at_timestamp, remove_merge_key_column, vacuum_hudi_table,
-    vacuum_table, write_delta, write_hudi_cow_append, write_hudi_cow_fixture,
-    write_hudi_cow_upsert,
-};
-#[cfg(all(feature = "lakehouse", feature = "kafka"))]
-pub use lakehouse::{KafkaDeltaStore, RdkafkaDeltaStore};
-
 pub use io_contract::{
     DatabaseIoOptions, FileFormat, FileLayout, IoCapabilities, IoConnectorKind, KafkaIoOptions,
     SchemaEvolutionMode, SortDirection as FileSortDirection, SortField, WriteDistribution,
     WriteMode,
+};
+#[cfg(feature = "lakehouse")]
+pub use lakehouse::{
+    AsOfSpec, DeltaObjectStoreReader, DeltaTableHandle, DeltaWriteMode,
+    DistributedIcebergCommitCoordinator, HudiCowWriter, HudiObjectStoreReader,
+    HudiObjectStoreWriter, HudiQueryType, HudiSnapshotReader, HudiWriteResult, IcebergFsTable,
+    IcebergReference, IcebergReferenceKind, IcebergScanOptions, IcebergTableRef,
+    IcebergTwoPhaseCommit, KAFKA_OFFSETS_SUMMARY_KEY, LakehouseError, LakehouseResult,
+    LakehouseTable, MemoryIcebergTwoPhaseCommit, MemoryLakehouseTable, MergeDeltaResult,
+    MultiWriterGuard, PartitionField, PartitionSpecResolver, PartitionSpecVersion, SchemaField,
+    SchemaVersion, StagedSnapshot, ensure_hoodie_properties, kafka_offsets_json, merge_delta,
+    parse_kafka_offsets_json, read_hoodie_properties, read_table_at_timestamp,
+    remove_merge_key_column, vacuum_hudi_table, vacuum_table, write_delta, write_hudi_cow_append,
+    write_hudi_cow_fixture, write_hudi_cow_upsert,
 };

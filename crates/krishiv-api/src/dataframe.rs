@@ -168,7 +168,14 @@ impl<'a> WriteStreamBuilder<'a> {
     /// transformations not expressible as a single query still work);
     /// `Incremental` registers an IVM materialized view from the DataFrame's
     /// defining query; `Continuous` targets the coordinator-gated streaming
-    /// engine. Mirrors [`Session::create_live_table`](crate::Session::create_live_table).
+    /// engine.
+    ///
+    /// This is the **one** materialize-by-refresh-mode entry point. It used to
+    /// delegate to `Session::create_live_table`, which was the same router
+    /// under a name that described no distinct object: a "live table" was
+    /// either this DataFrame collected once (`Batch`), an incremental view
+    /// (`Incremental`), or an error (`Continuous`). That method is gone and
+    /// the routing lives here.
     pub fn to_table(self, session: &crate::Session, name: &str) -> Result<()> {
         match self.refresh {
             crate::Refresh::Batch => {
@@ -182,13 +189,15 @@ impl<'a> WriteStreamBuilder<'a> {
                          DataFrame (its defining query drives the materialized view)",
                     )
                 })?;
-                session.create_live_table(name, query, crate::Refresh::Incremental)
+                // The IVM engine owns the maintenance from here.
+                session.sql(format!("CREATE MATERIALIZED VIEW {name} AS {query}"))?;
+                Ok(())
             }
-            crate::Refresh::Continuous => session.create_live_table(
-                name,
-                self.df.sql_query.as_deref().unwrap_or("<dataframe>"),
-                crate::Refresh::Continuous,
-            ),
+            crate::Refresh::Continuous => Err(KrishivError::unsupported(format!(
+                "write_stream().refresh(Continuous).to_table('{name}') needs a streaming \
+                 coordinator to run the continuous job; submit it via the continuous-stream \
+                 registration API or a cluster-attached session"
+            ))),
         }
     }
 }

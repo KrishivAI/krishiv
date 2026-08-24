@@ -65,3 +65,13 @@ replacement = "Session::sql_as(&self, api_key: &str, query: impl AsRef<str> + Se
 id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::sql_with_timeout::pub fn sql_with_timeout(&self, query: impl AsRef<str>, timeout_ms: u64) -> Result<DataFrame>"
 reason = "Sync/async audit: same block_on Send-bound fix as sql."
 replacement = "Session::sql_with_timeout(&self, query: impl AsRef<str> + Send, timeout_ms: u64)"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/session.rs::fn::create_live_table::pub fn create_live_table(&self, name: &str, query: &str, refresh: Refresh) -> Result<()>"
+reason = "Removed before 1.0 as a duplicate concept. A \"live table\" was never a distinct object: the method was a three-arm router where Batch collected the query once, Incremental issued CREATE MATERIALIZED VIEW, and Continuous returned an error. The rest of the R14 live-table stack (SQL statements, dataflow operators, delta log, CDC router) had no handlers at all and has been deleted; keeping the router preserved a name that described nothing and implied a second engine alongside the incremental view."
+replacement = "DataFrame::write_stream().refresh(..).to_table(session, name) — the same three-arm routing, and previously the caller of this method"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/blocking.rs::fn::create_live_table::pub fn create_live_table(&self, name: &str, query: &str, refresh: crate::Refresh) -> Result<()>"
+reason = "Sync-facade wrapper for the removed Session::create_live_table."
+replacement = "BlockingSession::register_record_batches (Batch) or BlockingSession::sql(\"CREATE MATERIALIZED VIEW ..\") (Incremental); both remain runtime-free"

@@ -271,7 +271,7 @@ pub const PARITY: &[ApiEntry] = &[
         Supported,
         "write_stream",
         "Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(\
-         session, name) selects the engine by refresh mode (also session.create_live_table); \
+         session, name) selects the engine by refresh mode; \
          Continuous execution + Interval/cron are the coordinator/scheduler-gated residual",
     ),
     entry(

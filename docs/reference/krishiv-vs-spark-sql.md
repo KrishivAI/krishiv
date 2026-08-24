@@ -142,5 +142,5 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `functions.json.schema_of_json` — schema_of_json(json) infer a DDL schema string _(planned)_
 - `functions.hof.zip_map` — zip_with, map_filter, transform_keys/values _(require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall)_
 - `functions.spark.hash_generators` — xxhash64, stack, posexplode, inline _(xxhash64 needs byte-exact replication of Spark's seed-42 typed hashing; stack/posexplode/inline need generator machinery — itemized shortfall)_
-- `ddl.live_table` — CREATE / REFRESH / DROP LIVE TABLE via session.sql() _(not implemented and rejected at the statement: the DDL parsed and produced plan ops no executor handled, so it reported success while the table did not exist. Use CREATE MATERIALIZED VIEW for an incrementally-maintained table, or Session::create_live_table(.., Refresh::Batch) for a one-shot snapshot)_
+- `ddl.live_table` — CREATE / REFRESH / DROP LIVE TABLE via session.sql() _(not implemented and rejected at the statement: the DDL parsed and produced plan ops no executor handled, so it reported success while the table did not exist. Use CREATE MATERIALIZED VIEW for an incrementally-maintained table, or df.write_stream().refresh(Refresh::Batch).to_table(..) for a one-shot snapshot)_
 

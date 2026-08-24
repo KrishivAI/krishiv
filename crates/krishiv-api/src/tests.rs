@@ -1814,29 +1814,40 @@ fn f_star_scalar_helpers_have_exact_semantics() {
 }
 
 #[test]
-fn create_live_table_selects_engine_by_refresh_mode() {
+fn write_stream_to_table_selects_engine_by_refresh_mode() {
     use crate::Refresh;
+    // Was `create_live_table_selects_engine_by_refresh_mode`. That method was
+    // the same router under a name describing no distinct object, and it is
+    // gone; `df.write_stream().refresh(..).to_table(..)` is the one entry
+    // point, so the coverage moves here rather than being deleted.
     let session = Session::builder().build().unwrap();
 
     // Batch: materialize a snapshot, queryable as `snap`.
     session
-        .create_live_table(
-            "snap",
-            "SELECT 1 AS a UNION ALL SELECT 2 AS a",
-            Refresh::Batch,
-        )
+        .sql("SELECT 1 AS a UNION ALL SELECT 2 AS a")
+        .unwrap()
+        .write_stream()
+        .refresh(Refresh::Batch)
+        .to_table(&session, "snap")
         .unwrap();
-    let rows = session
-        .sql("SELECT a FROM snap")
-        .unwrap()
-        .collect()
-        .unwrap()
-        .row_count();
-    assert_eq!(rows, 2, "batch snapshot holds both rows");
+    assert_eq!(
+        session
+            .sql("SELECT a FROM snap")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        2,
+        "batch snapshot holds both rows"
+    );
 
     // Incremental: register a materialized view on the IVM engine.
     session
-        .create_live_table("mv", "SELECT SUM(a) AS s FROM snap", Refresh::Incremental)
+        .sql("SELECT SUM(a) AS s FROM snap")
+        .unwrap()
+        .write_stream()
+        .refresh(Refresh::Incremental)
+        .to_table(&session, "mv")
         .unwrap();
     assert!(
         session
@@ -1850,7 +1861,11 @@ fn create_live_table_selects_engine_by_refresh_mode() {
     // Continuous: no coordinator in an embedded session — clear error, not a
     // silent degrade.
     let err = session
-        .create_live_table("c", "SELECT 1 AS a", Refresh::Continuous)
+        .sql("SELECT 1 AS a")
+        .unwrap()
+        .write_stream()
+        .refresh(Refresh::Continuous)
+        .to_table(&session, "c")
         .expect_err("continuous refresh needs a coordinator");
     assert!(
         err.to_string().to_lowercase().contains("coordinator"),

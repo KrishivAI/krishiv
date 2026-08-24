@@ -8,7 +8,6 @@ use arrow::record_batch::RecordBatch;
 
 mod as_of;
 pub mod connector_registry;
-mod delta;
 mod delta_lake;
 #[cfg(feature = "iceberg")]
 pub mod dml;
@@ -35,11 +34,6 @@ pub mod streaming_sink;
 mod two_phase;
 
 pub use as_of::AsOfSpec;
-#[cfg(feature = "kafka")]
-pub use delta::RdkafkaDeltaStore;
-pub use delta::{
-    DeltaEntry, DeltaOp, DeltaStore, KafkaDeltaStore, MemoryDeltaStore, RedbDeltaStore,
-};
 pub use delta_lake::DeltaObjectStoreReader;
 pub use delta_lake::{
     DeltaTableHandle, DeltaWriteMode, MergeDeltaResult, merge_delta, remove_merge_key_column,

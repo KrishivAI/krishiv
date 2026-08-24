@@ -66,7 +66,7 @@
 | `withColumnsRenamed` | supported | with_columns_renamed | bulk rename over (existing, new) pairs (Phase 61 variant-collapse) |
 | `toPandas` | planned | — | Phase 61 gap: zero-copy Arrow → pandas (Python surface) |
 | `write` | supported | write | DataFrameWriter |
-| `writeStream` | supported | write_stream | Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(session, name) selects the engine by refresh mode (also session.create_live_table); Continuous execution + Interval/cron are the coordinator/scheduler-gated residual |
+| `writeStream` | supported | write_stream | Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(session, name) selects the engine by refresh mode; Continuous execution + Interval/cron are the coordinator/scheduler-gated residual |
 | `foreachBatch` | partial | DataStreamWriter::foreach_batch | micro-batch sink callback on write_stream()/DataStreamWriter (PySpark hangs it off writeStream); reachable, placement differs |
 
 ## Column
