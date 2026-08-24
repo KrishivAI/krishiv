@@ -600,3 +600,46 @@ def test_dataframe_collect():
     result = rel.collect()
     assert result.row_count == 1
     assert "5" in result.pretty()
+
+
+# ── register_record_batches accepts Arrow ────────────────────────────────────
+#
+# It used to take `krishiv.Batch` only, which Python cannot construct: `Batch`
+# exposes `to_arrow`/`to_pandas` and no way in, so the only values satisfying
+# the signature came out of a previous query. Its doc said "in-memory Arrow
+# batches" while offering no route for Arrow data a caller already held — the
+# tests all wrote a parquet file to register memory.
+
+
+def test_register_record_batches_accepts_a_list_of_arrow_record_batches():
+    import pyarrow as pa
+
+    s = ks.Session()
+    rb = pa.RecordBatch.from_pydict({"region": ["us", "eu"], "amount": [10, 20]})
+    s.register_record_batches("orders", [rb])
+    got = s.sql("SELECT SUM(amount) AS total FROM orders").collect().to_arrow().to_pydict()
+    assert got["total"] == [30]
+
+
+def test_register_record_batches_accepts_a_pyarrow_table():
+    import pyarrow as pa
+
+    s = ks.Session()
+    s.register_record_batches("t", pa.table({"x": [1, 2, 3]}))
+    got = s.sql("SELECT SUM(x) AS s FROM t").collect().to_arrow().to_pydict()
+    assert got["s"] == [6]
+
+
+def test_register_record_batches_still_accepts_krishiv_batches():
+    """Back-compat guard: the old input type must keep working.
+
+    Not revert-proof — this asserts the pre-fix behaviour by construction.
+    """
+    import pyarrow as pa
+
+    s = ks.Session()
+    s.register_record_batches("a", [pa.RecordBatch.from_pydict({"x": [1, 2]})])
+    result = s.sql("SELECT * FROM a").collect()
+    s.register_record_batches("b", list(result))
+    got = s.sql("SELECT COUNT(*) AS c FROM b").collect().to_arrow().to_pydict()
+    assert got["c"] == [2]

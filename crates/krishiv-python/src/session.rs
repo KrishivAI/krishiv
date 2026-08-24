@@ -643,16 +643,43 @@ impl PySession {
     }
 
     /// Register in-memory Arrow batches as a named SQL table.
+    ///
+    /// Accepts PyArrow ``RecordBatch`` objects, a PyArrow ``Table`` (its
+    /// batches are taken in order), or Krishiv :class:`Batch` objects — the
+    /// same dual acceptance the ``DeltaBatch`` constructors already have.
+    ///
+    /// It used to take :class:`Batch` **only**, which is unconstructible from
+    /// Python: `Batch` exposes `to_arrow`/`to_pandas` and no way in, so the
+    /// only values that satisfied the signature came out of a previous query.
+    /// The doc said "in-memory Arrow batches"; there was no route for Arrow
+    /// data a caller already held, and the tests all went through
+    /// `register_parquet` instead — writing a file to register memory.
     pub fn register_record_batches(
         &self,
         py: Python<'_>,
         name: String,
-        batches: Vec<crate::batch::PyBatch>,
+        batches: &Bound<'_, PyAny>,
     ) -> PyResult<()> {
-        let record_batches: Vec<arrow::record_batch::RecordBatch> = batches
-            .into_iter()
-            .map(|b| b.record_batch().clone())
-            .collect();
+        // A single Table, or any iterable of RecordBatch / Table / Batch.
+        let items: Vec<pyo3::Bound<'_, PyAny>> = if batches.hasattr("to_batches")? {
+            batches
+                .call_method0("to_batches")?
+                .try_iter()?
+                .collect::<PyResult<Vec<_>>>()?
+        } else {
+            batches.try_iter()?.collect::<PyResult<Vec<_>>>()?
+        };
+        let mut record_batches: Vec<arrow::record_batch::RecordBatch> =
+            Vec::with_capacity(items.len());
+        for item in &items {
+            if item.hasattr("to_batches")? {
+                for rb in item.call_method0("to_batches")?.try_iter()? {
+                    record_batches.push(crate::incremental::record_batch_from_py(&rb?)?);
+                }
+            } else {
+                record_batches.push(crate::incremental::record_batch_from_py(item)?);
+            }
+        }
         let inner = self.inner.clone();
         py.detach(move || {
             inner

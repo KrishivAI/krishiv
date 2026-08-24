@@ -40,7 +40,7 @@ fn rt_err(e: impl std::fmt::Display) -> PyErr {
 /// Accept either a Krishiv [`PyBatch`] or a raw PyArrow ``RecordBatch`` so the
 /// `DeltaBatch` constructors work directly on the Arrow objects users already
 /// hold, without an explicit `krishiv.Batch(...)` wrap.
-fn record_batch_from_py(obj: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
+pub(crate) fn record_batch_from_py(obj: &Bound<'_, PyAny>) -> PyResult<RecordBatch> {
     if let Ok(batch) = obj.extract::<PyRef<'_, PyBatch>>() {
         return Ok(batch.record_batch().clone());
     }

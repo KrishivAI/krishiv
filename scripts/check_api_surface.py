@@ -596,7 +596,9 @@ CLASS_METHOD_SIGNATURES: dict[tuple[str, str], list[str]] = {
     ("Session", "read_json"): ["    def read_json(self, path: str) -> DataFrame: ..."],
     ("Session", "read_parquet_with_options"): ["    def read_parquet_with_options(self, path: str, *, batch_size: int | None = ...) -> DataFrame: ..."],
     ("Session", "read_csv_with_options"): ["    def read_csv_with_options(self, path: str, *, delimiter: str | None = ..., has_header: bool | None = ...) -> DataFrame: ..."],
-    ("Session", "register_record_batches"): ["    def register_record_batches(self, name: str, batches: Sequence[Batch]) -> None: ..."],
+    ("Session", "register_record_batches"): [
+        "    def register_record_batches(self, name: str, batches: Sequence[BatchLike] | Any) -> None: ...",
+    ],
     ("Session", "deregister_table"): ["    def deregister_table(self, name: str) -> None: ..."],
     ("Session", "drop_table"): ["    def drop_table(self, name: str) -> None: ..."],
     ("Session", "table_exists"): ["    def table_exists(self, name: str) -> bool: ..."],
