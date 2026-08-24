@@ -1202,10 +1202,17 @@ impl ExecutorTaskRunner {
                 }
             }
             crate::ExecutionModel::DeltaBatch => {
-                // Phase 57 (AUD-6): resident-protocol fragments run against the
-                // executor's persistent per-job flow (attach/tick/ckpt/detach).
-                // The legacy `delta:step:` stateless tick is kept for
-                // rolling-upgrade compatibility with older coordinators.
+                // Phase 57 (AUD-6): every IVM fragment runs against the
+                // executor's persistent per-job flow (attach/tick/detach).
+                //
+                // IVM-AUD-INT-F20: there used to be an `else` arm here running
+                // the stateless `delta:step:` tick, justified in this comment as
+                // "kept for rolling-upgrade compatibility with older
+                // coordinators". That was false — CHANGELOG's released sections
+                // contain no IVM at all, so no released coordinator has ever
+                // sent a `delta:step:`. Both the arm and the ~100-line executor
+                // half it called are gone, and such a fragment now fails loudly
+                // inside execute_resident_ivm_fragment.
                 //
                 // Unlike the Batch branch above, a tick is deliberately NOT
                 // raced against a cancel-watch (#224). A tick applies deltas
@@ -1223,18 +1230,10 @@ impl ExecutorTaskRunner {
                     .task_timeout_secs()
                     .unwrap_or_else(default_batch_task_timeout_secs);
                 let fragment_body = fragment_body.to_string();
-                let is_resident = crate::fragment::ivm::is_resident_ivm_fragment(&fragment_body);
-                let ivm_future = erased(async {
-                    if is_resident {
-                        crate::fragment::ivm::execute_resident_ivm_fragment(
-                            &self.ivm_flows,
-                            &fragment_body,
-                        )
-                        .await
-                    } else {
-                        crate::fragment::ivm::execute_ivm_fragment(&fragment_body).await
-                    }
-                });
+                let ivm_future = erased(crate::fragment::ivm::execute_resident_ivm_fragment(
+                    &self.ivm_flows,
+                    &fragment_body,
+                ));
                 match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), ivm_future)
                     .await
                 {
@@ -1242,7 +1241,7 @@ impl ExecutorTaskRunner {
                         tracing::debug!(
                             active_views = summary.active_views,
                             total_output_rows = summary.total_output_rows,
-                            "IVM delta:step tick completed on executor"
+                            "resident IVM fragment completed on executor"
                         );
                         Ok(crate::runner::task_output::ExecutorTaskOutput::ivm_step(
                             summary.active_views,

@@ -9,12 +9,18 @@
 //!
 //! The coordinator's flow is the **single source of truth for every mode**
 //! (embedded, single-node, distributed), which keeps executors replaceable.
-//! For distributed mode with live executors, single-flow ticks are offloaded to
-//! an executor: the coordinator drains pending locally, ships a full state
-//! snapshot (`checkpoint_full`), and applies the returned view outputs via
-//! `apply_computed_tick`; on any failure it re-feeds pending and computes
-//! centrally. Partitioned jobs always compute centrally (shards already run in
-//! parallel in-process).
+//! For distributed mode with live executors, single-flow ticks run on an
+//! executor-**resident** flow (Phase 57 / AUD-6): full state ships once at
+//! `delta:attach:`, each tick afterwards carries only that tick's input deltas
+//! plus a fence, and the coordinator mirrors the returned per-view output
+//! deltas onto its own flow via `apply_remote_tick`. On any failure it re-feeds
+//! pending and computes centrally. Partitioned jobs always compute centrally
+//! (shards already run in parallel in-process).
+//!
+//! The per-tick full-state round trip this doc used to describe
+//! (`checkpoint_full` out, full view outputs back, `apply_computed_tick`) has
+//! not been the distributed path since Phase 57, and its wire half was deleted
+//! under IVM-AUD-INT-F20.
 
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -567,6 +573,17 @@ pub struct IvmDispatchState {
     pub fence: u64,
     /// Most recent dispatch decision.
     pub last: Option<IvmDispatchRecord>,
+    /// Tick wire negotiated with the resident executor at attach
+    /// (IVM-AUD-INT-F19). Process-local for the same reason `attached` and
+    /// `fence` are, and correct for the same reason: a coordinator restart
+    /// clears it, which forces a re-attach, which re-negotiates.
+    ///
+    /// The `Default` is all-false — the wire every executor has always
+    /// understood. Defaulting the other way would make a coordinator that has
+    /// not yet attached send a payload an older executor cannot read, and the
+    /// price of that guess is a failed tick, a detach, and a full
+    /// `checkpoint_full` re-attach — per tick, for the length of a rollout.
+    pub wire: krishiv_ivm::WireCapabilities,
 }
 
 /// Registry of IVM jobs hosted on this coordinator process.
@@ -1215,6 +1232,37 @@ mod tests {
     use arrow::record_batch::RecordBatch;
 
     use super::*;
+
+    /// T13 (IVM-AUD-INT-F19). The negotiated tick wire is recorded per job and
+    /// its default is fail-CLOSED. Fail-open is the tempting default and it is
+    /// the one that costs a `checkpoint_full` re-attach per tick against an
+    /// executor that cannot read the binary payload.
+    #[test]
+    fn dispatch_state_records_the_negotiated_wire() {
+        let registry = IvmJobRegistry::new();
+        assert_eq!(
+            registry.dispatch_state("j").wire,
+            krishiv_ivm::WireCapabilities::default(),
+            "a job that has never attached must be assumed legacy"
+        );
+        assert!(!registry.dispatch_state("j").wire.binary_input_deltas);
+
+        // An old executor answers the attach with no blob at all.
+        let legacy = krishiv_ivm::decode_attach_echo(None);
+        registry.update_dispatch("j", |d| d.wire = legacy);
+        assert!(!registry.dispatch_state("j").wire.binary_input_deltas);
+        assert!(!registry.dispatch_state("j").wire.tick_health);
+
+        // A v2 executor echoes its capabilities.
+        let echo = krishiv_ivm::encode_attach_echo(krishiv_ivm::WireCapabilities {
+            binary_input_deltas: true,
+            tick_health: true,
+        });
+        let negotiated = krishiv_ivm::decode_attach_echo(Some(&echo));
+        registry.update_dispatch("j", |d| d.wire = negotiated);
+        assert!(registry.dispatch_state("j").wire.binary_input_deltas);
+        assert!(registry.dispatch_state("j").wire.tick_health);
+    }
 
     fn orders(regions: &[&str], amounts: &[i64]) -> RecordBatch {
         RecordBatch::try_new(

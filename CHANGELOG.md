@@ -36,7 +36,50 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   pruning proof (10 000-row fact scan emits 100 rows on a 3-key star
   join) and a dedicated runtime-filters-off corpus dual-run binary.
 
+### Removed
+
+- **`krishiv-delta`: the unwired `RecursiveOp` fixed-point operator**
+  (2026-08-24, IVM-AUD-REC-OP-1). `operators::recursive` is deleted, and
+  with it the public items `RecursiveOp`, `RecursiveStepFn`,
+  `DEFAULT_MAX_ITERATIONS` and `DeltaError::CycleLimitExceeded` (the
+  variant only `RecursiveOp` constructed). Nothing in the workspace
+  called any of them: recursive views are, and were, maintained by
+  `IncrementalFlow::run_recursive_fixpoint` in `krishiv-ivm`, never by
+  this operator. **No behaviour changes.** In particular the operator's
+  between-iteration DISTINCT was never reachable, so removing it takes
+  nothing away — `DECLARE RECURSIVE VIEW` still has no auto-DISTINCT, as
+  documented, and a non-converging recursion still errors at the
+  100-iteration cap with `FixpointNotConverged`. Breaking only for
+  out-of-tree code depending on `krishiv-delta` directly; the crate is
+  outside the tracked `api/` public-API baseline, so no gate entry
+  applies.
+
 ### Fixed
+
+- **IVM source state is now a faithful Z-set** (2026-08-24,
+  IVM-AUD-CORE-2). A retraction for a row that is not present used to be
+  discarded — a materialized `RecordBatch` cannot hold a row −1 times, so
+  `apply_delta` clamped the net weight at zero — which meant out-of-order
+  CDC (`DELETE 42` before `INSERT 42`) left no memory and the later
+  insertion made the row **present**. A Python `iv.delete(...)` of a
+  missing row, and an over-retraction (weight −2 against one copy), were
+  the same silent no-op. Each source now holds a `SourceState`: the same
+  materialized relation as before plus a `deficit` of rows whose net
+  weight is negative, so the later insertion settles the debt instead of
+  adding a row. The append-only fast path is unchanged and measured
+  unchanged (1.02 ms/tick over a 50 k-row source with 500-row appends,
+  zero consolidations); a source that owes rows pays O(|deficit| + Δ) per
+  tick, not O(state). Deficits survive `checkpoint`/`restore` (that
+  section always carried a `DeltaBatch`) and `checkpoint_full`/
+  `restore_full` (a new trailing `IVMZ1` section, framed and sniffed like
+  the `IVMF2` exact-state section, so **older checkpoints still load and
+  an older binary reading a new blob degrades to its previous
+  behaviour**). `restore_delta` keeps its deliberate set-collapse and now
+  applies it to both signs. New per-source retained state is reported by
+  `RetainedState::sources_with_deficits` / `deficit_rows_retained` and
+  reclaimed by `drop_source`. **Not fixed:** view snapshots still clamp
+  the same way (IVM-AUD-CORE-2b); the loss there is now counted by
+  `IncrementalView::clamped_retraction_rows()` rather than silent.
 
 - **`CREATE EXTERNAL TABLE … LOCATION 's3://…'` now registers its object
   store** (2026-07-22). The SQL DDL path executed the statement without first

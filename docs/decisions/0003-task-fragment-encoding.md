@@ -116,3 +116,25 @@ validation error, and the job falls back per §4 of the phase plan.
   physical-plan round-tripping.
 - Streaming and delta-batch fragments are unchanged today; their Phase 55/57
   reworks inherit this envelope decision instead of re-litigating it.
+
+## Amendment (2026-08-24, IVM-AUD-INT-F19 / INT-F20)
+
+The delta-batch row above named `delta:step:` as the canonical IVM kind. Phase
+57 replaced it with the resident protocol and this pass deleted the last of it,
+so the canonical delta verbs are now:
+
+| Verb | Payload | Result |
+| --- | --- | --- |
+| `delta:attach:{job}\|{specs_b64}\|{state_b64}\|{fence}` | full state, once | capability echo (`IVMW`) |
+| `delta:tick:{job}\|{deltas_b64}\|{fence}` | that tick's input deltas | `IVMD1` deltas, or `IVMD2` deltas + per-view health |
+| `delta:detach:{job}` | — | — |
+
+`delta:step:` and `delta:ckpt:` no longer execute anywhere; a fragment carrying
+either is refused by the executor. The envelope decision (§1) is unchanged —
+these are still prefix-typed bodies under `TypedTaskFragment` version 1 — but
+§3's "the `v1` payload tag plus the envelope version is the whole compatibility
+story" is no longer true for IVM: the tick result carries its own format magic
+and `IVM_TICK_WIRE_VERSION`, negotiated per attach, precisely so that the
+rolling-upgrade window §3 defers to the (still unwritten) Phase 59 wire ADR
+degrades to reduced reporting instead of failed ticks. See
+`docs/COMPATIBILITY.md`.

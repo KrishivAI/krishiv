@@ -37,7 +37,6 @@
 //! | join | `operators::join` | Bilinear (two Traces) |
 //! | aggregate | `operators::aggregate` | Nonlinear (running state) |
 //! | distinct | `operators::distinct` | Nonlinear (count map) |
-//! | recursive | `operators::recursive` | Fixed-point loop |
 
 pub mod behavior_version;
 pub mod coalesce;
@@ -45,6 +44,7 @@ pub mod delta_batch;
 pub mod error;
 pub mod lateness;
 pub mod operators;
+pub mod source_state;
 pub mod trace;
 pub mod view;
 
@@ -66,7 +66,7 @@ pub use operators::distinct::IncrementalDistinctOp;
 pub use operators::filter::{FilterOp, FilterValue, filter_batch};
 pub use operators::join::{IncrJoinType, IncrementalJoinOp};
 pub use operators::map::{ProjectOp, map_batch, project_batch};
-pub use operators::recursive::{DEFAULT_MAX_ITERATIONS, RecursiveOp};
 pub use operators::stream::{IntegrateOp, apply_delta, differentiate};
+pub use source_state::SourceState;
 pub use trace::Trace;
 pub use view::{IncrementalView, IncrementalViewRegistry, IncrementalViewSpec};

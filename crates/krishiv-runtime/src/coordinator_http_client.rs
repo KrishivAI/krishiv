@@ -2442,6 +2442,10 @@ struct IvmViewHealthJson {
     degraded_views: Vec<String>,
     #[serde(default)]
     errored_views: Vec<IvmViewErrorJson>,
+    #[serde(default)]
+    degraded_omitted: u32,
+    #[serde(default)]
+    errored_omitted: u32,
 }
 
 #[derive(serde::Deserialize)]
@@ -2459,8 +2463,10 @@ pub struct RemoteStepSummary {
     pub tick: u64,
     /// Per-view health for the tick, or `None` when this tick has no health
     /// signal at all — an older coordinator that does not send the field, or a
-    /// tick the coordinator dispatched to a resident executor whose result wire
-    /// carries output deltas only (IVM-AUD-API-A5).
+    /// tick the coordinator dispatched to a resident executor still on the v1
+    /// tick wire, whose result carries output deltas only (IVM-AUD-API-A5).
+    /// A resident tick on a v2 (`IVMD2`) executor does report health
+    /// (IVM-AUD-A5-RESIDENT), so `None` no longer means "resident".
     ///
     /// `Some(h)` with both vectors empty means "nothing failed". `None` means
     /// "nobody looked". Callers that flatten the two are back to the bug this
@@ -2475,6 +2481,20 @@ pub struct RemoteViewHealth {
     pub degraded_views: Vec<String>,
     /// Views that failed and were skipped; the tick itself still succeeded.
     pub errored_views: Vec<RemoteViewError>,
+    /// Entries the executor's health frame dropped to keep the resident tick
+    /// wire bounded (IVM-AUD-A5-RESIDENT). Non-zero means the vectors above are
+    /// prefixes, not the whole list — presenting a truncated list as complete is
+    /// the same defect this field's neighbours exist to close.
+    ///
+    /// Carried here so the field is not silently dropped on the way off the
+    /// wire. `krishiv_api::StepReport` does **not** carry it yet (that is a
+    /// public-type change across krishiv-api/python/mcp); until it does, a
+    /// caller that needs the distinction must read this struct rather than the
+    /// report built from it. Both are 0 unless a single tick failed more than
+    /// 256 views.
+    pub degraded_omitted: u32,
+    /// Errored views dropped by the same cap.
+    pub errored_omitted: u32,
 }
 
 /// One view's failure on a remote tick.
@@ -2542,6 +2562,8 @@ fn remote_step_summary(job_id: &str, parsed: IvmStepResponse) -> RemoteStepSumma
                     message: e.message,
                 })
                 .collect(),
+            degraded_omitted: h.degraded_omitted,
+            errored_omitted: h.errored_omitted,
         })
     });
     RemoteStepSummary {

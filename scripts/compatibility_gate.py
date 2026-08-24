@@ -163,11 +163,25 @@ def main() -> int:
                 )
         return f"wire protocol: R{version}"
 
+    # ── IVM resident tick wire (coordinator <-> executor tick result) ────────
+    def ivm_tick_wire() -> str:
+        rel = "crates/krishiv-ivm/src/flow.rs"
+        version = const_u32(rel, "IVM_TICK_WIRE_VERSION")
+        require_in_doc(
+            doc,
+            f"Readers reject unsupported tick-result versions (current v{version}) "
+            "instead of silently interpreting them.",
+            "IVM resident tick wire",
+        )
+        test_exists(rel, "decode_tick_result_rejects_unknown_magic")
+        return f"IVM resident tick wire: v{version}"
+
     checks = [
         ("checkpoint metadata", checkpoint),
         ("savepoint metadata", savepoint),
         ("task-fragment envelope", fragment),
         ("wire protocol", transport),
+        ("IVM resident tick wire", ivm_tick_wire),
     ]
 
     for name, check in checks:

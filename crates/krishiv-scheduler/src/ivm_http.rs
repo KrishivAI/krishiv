@@ -730,12 +730,15 @@ pub struct StepResponse {
 
 /// Per-view health for one tick. See [`StepResponse::view_health`].
 ///
-/// `reported` exists because one of the two dispatch routes genuinely has no
-/// health to give: a **resident** tick runs on an executor and its result wire
-/// carries per-view output deltas only, so the coordinator's mirror
-/// (`IncrementalFlow::apply_remote_tick`) constructs its summary with empty
-/// health vectors. Serializing those as if they were a report would replace one
-/// silent lie with another.
+/// `reported` exists because health is not always available. A central tick
+/// computes the views here and always has a real report. A **resident** tick is
+/// computed on an executor, and whether it has one depends on that executor's
+/// tick wire: since IVM-AUD-A5-RESIDENT the v2 result (`IVMD2`) carries the
+/// executor's real `degraded_views`/`errored_views`, but an executor still on
+/// v1 answers with output deltas only — and during a rolling upgrade that is
+/// exactly what a coordinator meets. `reported: false` means "nobody looked",
+/// never "nothing failed"; serializing empty vectors as a report would collapse
+/// the two.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ViewHealthJson {
     /// Whether the engine that ran this tick reported per-view health at all.
@@ -749,6 +752,15 @@ pub struct ViewHealthJson {
     pub degraded_views: Vec<String>,
     /// Views that failed and were skipped this tick.
     pub errored_views: Vec<ViewErrorJson>,
+    /// Degraded views the executor's health frame dropped to keep the tick wire
+    /// bounded (`krishiv_ivm::MAX_HEALTH_ENTRIES`). Non-zero means
+    /// `degraded_views` is a prefix, not the whole list. Always 0 on a tick this
+    /// coordinator computed itself.
+    #[serde(default)]
+    pub degraded_omitted: u32,
+    /// Errored views dropped by the same cap.
+    #[serde(default)]
+    pub errored_omitted: u32,
 }
 
 impl ViewHealthJson {
@@ -767,6 +779,43 @@ impl ViewHealthJson {
                     message: e.message.clone(),
                 })
                 .collect(),
+            degraded_omitted: 0,
+            errored_omitted: 0,
+        }
+    }
+
+    /// A real report — one that carries information, as opposed to an absence
+    /// of signal.
+    ///
+    /// Usually relayed from the executor that ran a resident tick. It is *not*
+    /// always a relay: `submit_resident_ivm_step`'s empty-input early return
+    /// also produces a (default, empty) report, because no view was evaluated
+    /// and "nothing failed" is then the coordinator's own knowledge rather
+    /// than something it heard. So `reported: true` can flip to `false` on the
+    /// next tick of the same job against a v1 executor — the difference is
+    /// whether the tick had input, not whether the peer got worse.
+    ///
+    /// The kinds arrive as snake-case strings from
+    /// [`krishiv_ivm::view_error_kind_name`] and are passed through verbatim —
+    /// an executor on a newer build may name a kind this coordinator has never
+    /// heard of, and mapping it onto a known one would relabel a new failure
+    /// mode as an old one.
+    fn from_tick_health(health: &krishiv_ivm::TickHealth) -> Self {
+        Self {
+            reported: true,
+            unreported_reason: String::new(),
+            degraded_views: health.degraded_views.clone(),
+            errored_views: health
+                .errored_views
+                .iter()
+                .map(|e| ViewErrorJson {
+                    view: e.view.clone(),
+                    kind: e.kind.clone(),
+                    message: e.message.clone(),
+                })
+                .collect(),
+            degraded_omitted: health.degraded_omitted,
+            errored_omitted: health.errored_omitted,
         }
     }
 
@@ -777,7 +826,38 @@ impl ViewHealthJson {
             unreported_reason: reason.to_owned(),
             degraded_views: Vec::new(),
             errored_views: Vec::new(),
+            degraded_omitted: 0,
+            errored_omitted: 0,
         }
+    }
+}
+
+/// Health for a tick that ran on a resident executor.
+///
+/// `Some` → a real report: either the executor's, over the v2 tick wire, or a
+/// locally-known empty one for a tick that evaluated no view (see
+/// [`ViewHealthJson::from_tick_health`]).
+/// `None` → it does not, and the honest answer names the wire version rather
+/// than blaming the protocol as a whole (it was the protocol's fault only until
+/// IVM-AUD-A5-RESIDENT).
+///
+/// A free function so the mapping can be unit-tested directly. It is NOT
+/// unreachable through the handler: an earlier version of this comment claimed
+/// `test_deps_with_shards` yields `executor_count == 0` so no test could reach
+/// the resident arm, and used that to justify unit-level proof only. That was
+/// false — `executor_count` comes from `coordinator.executor_snapshots()`, and
+/// `coordinator_with_one_executor` has driven this arm end to end since
+/// IVM-AUD-DIST-A3. See `a_v2_resident_tick_relays_real_health_through_the_handler`.
+///
+/// Note also that what selects `Some` vs `None` here is the *tick result's*
+/// magic (`IVMD2` carries health, `IVMD1` does not), not the attach-time
+/// capability echo — a fact established by revert-proving that test.
+fn health_for_resident(health: Option<&krishiv_ivm::TickHealth>) -> ViewHealthJson {
+    match health {
+        Some(h) => ViewHealthJson::from_tick_health(h),
+        None => ViewHealthJson::unreported(
+            "this tick ran on a resident executor whose tick wire predates per-view health (pre-IVMD2); its result carries output deltas only",
+        ),
     }
 }
 
@@ -794,18 +874,11 @@ pub struct ViewErrorJson {
 
 /// Wire name for a view-failure kind.
 ///
-/// Exhaustive on purpose: adding a `ViewErrorKind` variant must be a compile
-/// error here, because the alternative is a catch-all that silently relabels a
-/// new failure mode as an old one.
-fn view_error_kind_name(kind: &krishiv_ivm::ViewErrorKind) -> &'static str {
-    use krishiv_ivm::ViewErrorKind as K;
-    match kind {
-        K::OperatorApply => "operator_apply",
-        K::ViewSql => "view_sql",
-        K::Publish => "publish",
-        K::FixpointNotConverged => "fixpoint_not_converged",
-    }
-}
+/// One definition, in `krishiv-ivm`, shared with the resident tick encoder: a
+/// second exhaustive match here would be free to drift, and then the same
+/// failure would reach a caller under two different names depending on which
+/// route computed the tick.
+use krishiv_ivm::view_error_kind_name;
 
 pub async fn api_ivm_step(
     State(registry): State<SharedIvmJobRegistry>,
@@ -846,23 +919,20 @@ pub async fn api_ivm_step(
     // parallel in-process). Every route is recorded as a queryable dispatch
     // decision; nothing falls back silently.
     //
-    // The route also decides whether this tick has any per-view health to
-    // report (IVM-AUD-API-A5): a central tick computes the views here and its
-    // `StepSummary` is a real report; a resident tick is computed on an
-    // executor whose result wire carries view output deltas only, so the
-    // coordinator's mirror has nothing to say and must say exactly that.
+    // The route also decides where this tick's per-view health comes from
+    // (IVM-AUD-API-A5): a central tick computes the views here and its
+    // `StepSummary` is the report; a resident tick relays the executor's own
+    // health off the v2 tick wire (IVM-AUD-A5-RESIDENT), and says so when it
+    // met an executor still on v1.
     let (summary, health) = if executor_count > 0 && matches!(flow, crate::ivm::IvmJob::Single(_)) {
         let crate::ivm::IvmJob::Single(inner_flow) = &flow else {
             unreachable!("matched above")
         };
         match submit_resident_ivm_step(&coordinator, &registry, inner_flow, &job_id).await {
-            Ok(sum) => (
-                sum,
-                ViewHealthJson::unreported(
-                    "this tick ran on a resident executor; the resident tick result carries \
-                     per-view output deltas only, so no per-view health was reported",
-                ),
-            ),
+            Ok((sum, tick_health)) => {
+                let health = health_for_resident(tick_health.as_ref());
+                (sum, health)
+            }
             Err(step_err) => {
                 // Recorded central fallback: submit_resident_ivm_step re-feeds
                 // pending before failing, so this tick observes the same input.
@@ -1103,16 +1173,21 @@ async fn submit_resident_ivm_step(
     registry: &SharedIvmJobRegistry,
     flow: &std::sync::Arc<IncrementalFlow>,
     ivm_job_id: &str,
-) -> Result<krishiv_ivm::StepSummary, String> {
+) -> Result<(krishiv_ivm::StepSummary, Option<krishiv_ivm::TickHealth>), String> {
     // 1. Drain pending locally — never lost: re-fed on any failure below.
     let local_pending = flow.take_pending().map_err(|e| e.to_string())?;
     let dispatch_deltas = coalesce_pending(local_pending.clone()).map_err(|e| e.to_string())?;
 
-    // Nothing to compute: advance the tick structurally and return.
+    // Nothing to compute: advance the tick structurally and return. No view is
+    // evaluated, so "nothing failed" is a fact rather than an absence of signal
+    // — the same answer a central tick with no input gives.
     if dispatch_deltas.is_empty() {
         flow.step_with(|_| Ok(HashMap::new()))
             .map_err(|e| e.to_string())?;
-        return Ok(krishiv_ivm::StepSummary::default());
+        return Ok((
+            krishiv_ivm::StepSummary::default(),
+            Some(krishiv_ivm::TickHealth::default()),
+        ));
     }
 
     let refeed = |e: String| -> String {
@@ -1130,9 +1205,13 @@ async fn submit_resident_ivm_step(
         let attach =
             krishiv_ivm::encode_ivm_attach_fragment(ivm_job_id, &specs, &state_bytes, disp.fence)
                 .map_err(|e| refeed(e.to_string()))?;
-        run_ivm_fragment_job(coordinator, attach, "ivm-attach")
+        let echo = run_ivm_fragment_job(coordinator, attach, "ivm-attach")
             .await
             .map_err(refeed)?;
+        // IVM-AUD-INT-F19: the attach reply is the wire negotiation. No blob
+        // (an executor predating the echo) decodes fail-closed to the legacy
+        // JSON tick + v1 result, which every executor understands.
+        let negotiated = krishiv_ivm::decode_attach_echo(echo.as_deref());
         // The executor's flow owns the live accumulators from here on; the
         // coordinator's cached plans are stale and must never apply another
         // delta (a later central fallback rebuilds + reseeds from the mirror).
@@ -1141,26 +1220,54 @@ async fn submit_resident_ivm_step(
         // every delta this tick had taken custody of.
         flow.invalidate_view_plans()
             .map_err(|e| refeed(format!("invalidate_view_plans: {e}")))?;
-        registry.update_dispatch(ivm_job_id, |d| d.attached = true);
+        registry.update_dispatch(ivm_job_id, |d| {
+            d.attached = true;
+            d.wire = negotiated;
+        });
         disp.attached = true;
+        disp.wire = negotiated;
         tracing::info!(
             job_id = %ivm_job_id,
             state_bytes = state_bytes.len(),
             fence = disp.fence,
+            binary_deltas = negotiated.binary_input_deltas,
+            tick_health = negotiated.tick_health,
             "IVM job attached to resident executor flow"
         );
     }
 
     // 3. Tick: deltas + fence only (O(Δ) wire, both directions).
+    //
+    // The payload dialect is whatever the attach echo said this executor reads,
+    // unless an operator has forced the legacy wire. Sending binary to an
+    // executor that cannot read it fails the tick, detaches the job and costs a
+    // full `checkpoint_full` re-attach, so the default when we know nothing is
+    // the one every executor understands.
+    let binary_deltas = disp.wire.binary_input_deltas && !legacy_tick_wire_forced();
     let fence = disp.fence + 1;
-    let tick_fragment = krishiv_ivm::encode_ivm_tick_fragment(ivm_job_id, &dispatch_deltas, fence)
-        .map_err(|e| refeed(e.to_string()))?;
+    let tick_fragment =
+        krishiv_ivm::encode_ivm_tick_fragment(ivm_job_id, &dispatch_deltas, fence, binary_deltas)
+            .map_err(|e| refeed(e.to_string()))?;
     let blob = run_ivm_fragment_job(coordinator, tick_fragment, "ivm-tick")
         .await
         .map_err(refeed)?
         .ok_or_else(|| refeed("ivm-tick produced no inline result blob".to_owned()))?;
-    let view_deltas = krishiv_ivm::decode_delta_map(&blob)
-        .map_err(|e| refeed(format!("decode delta map: {e}")))?;
+    let result = krishiv_ivm::decode_tick_result(&blob)
+        .map_err(|e| refeed(format!("decode tick result: {e}")))?;
+    let view_deltas = result.view_deltas;
+    // A tick negotiated as health-reporting that answers without health means
+    // the pod behind this job was replaced between the attach and the tick
+    // (IVM-AUD-DIST-A2: there is no placement pin). Correct — the answer is
+    // still a valid v1 result — but worth saying out loud, because the symptom
+    // downstream is `reported: false` on a cluster the operator believes is
+    // fully upgraded.
+    if disp.wire.tick_health && binary_deltas && result.health.is_none() {
+        tracing::warn!(
+            job_id = %ivm_job_id,
+            "resident tick answered on the v1 wire though this job negotiated v2 at \
+             attach; the tick likely landed on a different executor than the attach"
+        );
+    }
 
     // 4. Mirror the tick on the coordinator's authoritative state.
     //
@@ -1173,6 +1280,10 @@ async fn submit_resident_ivm_step(
     let summary = flow
         .apply_remote_tick(local_pending.clone(), view_deltas)
         .map_err(|e| refeed(format!("apply_remote_tick: {e}")))?;
+    // `summary` is the coordinator MIRROR's view of the tick — it applied
+    // deltas, it did not evaluate any view SQL, so its health vectors are empty
+    // by construction and mean nothing. The health that means something is the
+    // executor's, and it rides in the tick result.
     let tick = flow.tick().unwrap_or(0);
     registry.update_dispatch(ivm_job_id, |d| {
         d.fence = fence;
@@ -1183,7 +1294,18 @@ async fn submit_resident_ivm_step(
             at_unix_ms: krishiv_common::async_util::unix_now_ms(),
         });
     });
-    Ok(summary)
+    Ok((summary, result.health))
+}
+
+/// `KRISHIV_IVM_LEGACY_TICK_WIRE=1` forces the pre-IVMD2 JSON tick payload even
+/// when the executor said it reads binary.
+///
+/// The operator escape hatch for a wire change: a coordinator can be put back
+/// on the dialect every executor has always understood without a rollback.
+/// Costs the 25% wire saving and the per-view health (a JSON tick is answered
+/// in v1), which is the point — it is the old behaviour, exactly.
+fn legacy_tick_wire_forced() -> bool {
+    krishiv_common::env_registry::truthy_env("KRISHIV_IVM_LEGACY_TICK_WIRE")
 }
 
 // ── GET /api/v1/ivm/jobs/{job_id}/dispatch ───────────────────────────────────
@@ -1896,6 +2018,49 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
 
 #[cfg(test)]
 mod tests {
+    /// T11 (IVM-AUD-A5-RESIDENT). A resident tick whose executor sent health
+    /// must be reported as a real report — the whole point of widening the
+    /// wire. Extracted as a pure function so the mapping can be tested
+    /// directly — not because the handler is unreachable, which an earlier
+    /// version of this comment wrongly asserted. The handler-level cover is
+    /// `a_v2_resident_tick_relays_real_health_through_the_handler`.
+    #[test]
+    fn health_for_resident_reports_when_the_executor_sent_health() {
+        let health = krishiv_ivm::TickHealth {
+            degraded_views: vec!["slow".into()],
+            errored_views: vec![krishiv_ivm::WireViewError {
+                view: "broken".into(),
+                kind: "view_sql".into(),
+                message: "column not found".into(),
+            }],
+            degraded_omitted: 0,
+            errored_omitted: 0,
+        };
+        let h = super::health_for_resident(Some(&health));
+        assert!(h.reported, "the executor did report; say so");
+        assert!(h.unreported_reason.is_empty());
+        assert_eq!(h.degraded_views, vec!["slow".to_string()]);
+        let e = h.errored_views.iter().find(|e| e.view == "broken").unwrap();
+        assert_eq!(e.kind, "view_sql");
+        assert_eq!(e.message, "column not found");
+    }
+
+    /// T12. The other direction, and the honesty half: an executor still on the
+    /// v1 tick wire produces `reported: false` with a reason that names the
+    /// wire version rather than blaming the protocol (which stopped being at
+    /// fault when A5-RESIDENT was fixed).
+    #[test]
+    fn health_for_resident_stays_unreported_on_a_v1_executor() {
+        let h = super::health_for_resident(None);
+        assert!(!h.reported);
+        assert!(h.degraded_views.is_empty() && h.errored_views.is_empty());
+        assert!(
+            h.unreported_reason.contains("IVMD2"),
+            "the reason must name the wire version the executor lacks: {}",
+            h.unreported_reason
+        );
+    }
+
     /// The console fetches per-view stats by name; the list must carry the
     /// names. Revert-proof: drop the `jobs` field mapping and this fails.
     #[tokio::test]
@@ -4101,6 +4266,124 @@ mod tests {
         let mut map = HashMap::new();
         map.insert("revenue".to_owned(), DeltaBatch::from_inserts(rb).unwrap());
         krishiv_ivm::encode_delta_map(&map).unwrap()
+    }
+
+    /// A v2 tick result carrying real per-view health, driven all the way
+    /// through `api_ivm_step`.
+    ///
+    /// IVM-AUD-A5-RESIDENT. The register, this module and the T11 test doc all
+    /// claimed "`test_deps_with_shards` yields `executor_count == 0`, so no
+    /// test can reach the resident arm of `api_ivm_step` through the handler",
+    /// and used that to justify closing a HIGH row on unit-level proof alone.
+    /// The premise was false: `executor_count` comes from
+    /// `coordinator.executor_snapshots()`, and `coordinator_with_one_executor`
+    /// has driven the resident arm through this handler since DIST-A3. What
+    /// was genuinely missing is the path this test covers — the executor
+    /// echoing v2 capability at attach, the coordinator then sending a binary
+    /// tick, and a real `TickHealth` arriving as `reported: true` with its
+    /// contents intact.
+    #[tokio::test]
+    async fn a_v2_resident_tick_relays_real_health_through_the_handler() {
+        use krishiv_ivm::{TickHealth, WireCapabilities, WireViewError};
+
+        let (registry, _) = test_deps_with_shards(1);
+        let (coordinator, executor_id, lease) = coordinator_with_one_executor().await;
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let fake = spawn_fake_ivm_executor(coordinator.clone(), executor_id, lease, |job_id| {
+            if job_id.starts_with("ivm-attach") {
+                // Speak v2 at attach — the half the old test left uncovered by
+                // answering `Ok(None)`, which fail-closes to the legacy wire.
+                Ok(Some(krishiv_ivm::encode_attach_echo(WireCapabilities {
+                    binary_input_deltas: true,
+                    tick_health: true,
+                })))
+            } else {
+                let rb = RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![
+                        Field::new("region", DataType::Utf8, true),
+                        Field::new("total", DataType::Float64, true),
+                    ])),
+                    vec![
+                        Arc::new(StringArray::from(vec!["US"])),
+                        Arc::new(Float64Array::from(vec![5.0])),
+                    ],
+                )
+                .unwrap();
+                let mut map = HashMap::new();
+                map.insert("revenue".to_owned(), DeltaBatch::from_inserts(rb).unwrap());
+                let health = TickHealth {
+                    degraded_views: vec!["slow_view".to_owned()],
+                    errored_views: vec![WireViewError {
+                        view: "broken_view".to_owned(),
+                        kind: "view_sql".to_owned(),
+                        message: "planning failed on the executor".to_owned(),
+                    }],
+                    degraded_omitted: 0,
+                    errored_omitted: 0,
+                };
+                Ok(Some(
+                    krishiv_ivm::encode_tick_result(&map, &health).unwrap(),
+                ))
+            }
+        });
+
+        let fed = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+            }),
+        )
+        .await
+        .expect("feed");
+        assert!(fed.0.success);
+        let step = tokio::time::timeout(
+            Duration::from_secs(20),
+            api_ivm_step(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path("j".into()),
+            ),
+        )
+        .await
+        .expect("step did not finish")
+        .expect("step");
+        fake.abort();
+
+        assert_eq!(
+            registry
+                .dispatch_state("j")
+                .last
+                .as_ref()
+                .map(|d| d.mode.as_str()),
+            Some("resident"),
+            "precondition: the tick must actually have gone to the resident executor"
+        );
+
+        let health = &step.0.view_health;
+        assert!(
+            health.reported,
+            "a v2 executor's health must arrive as reported, not as unreported: {health:?}"
+        );
+        assert_eq!(
+            health.degraded_views,
+            vec!["slow_view".to_owned()],
+            "the executor's degraded list must survive the wire"
+        );
+        assert_eq!(
+            health.errored_views.len(),
+            1,
+            "the executor's errored list must survive the wire: {health:?}"
+        );
+        assert_eq!(health.errored_views[0].view, "broken_view");
+        assert!(
+            health.errored_views[0]
+                .message
+                .contains("planning failed on the executor"),
+            "the message must cross verbatim: {health:?}"
+        );
     }
 
     /// IVM-AUD-DIST-A3: the first test to drive `submit_resident_ivm_step`

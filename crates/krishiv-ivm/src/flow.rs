@@ -6,7 +6,11 @@
 //!
 //! `step_datafusion` implements **diff-based IVM**:
 //!
-//! 1. Each source accumulates a running snapshot via `apply_delta`.
+//! 1. Each source accumulates a running Z-set in a [`SourceState`]: the
+//!    materialized relation plus any rows it *owes* — retractions that arrived
+//!    with nothing to cancel (IVM-AUD-CORE-2). View SQL reads the materialized
+//!    half; the owed half is what makes a later insertion of an already-deleted
+//!    row correctly a no-op.
 //! 2. Views execute in **topological order** (Kahn's algorithm on SQL tokens).
 //! 3. Each view's full SQL result is **differenced** against the previous
 //!    output (`diff_and_update`) to produce a true incremental `DeltaBatch`.
@@ -36,7 +40,7 @@ use tokio::sync::{broadcast, watch};
 
 use krishiv_delta::{
     DeltaBatch, DeltaError, IncrementalView, IncrementalViewRegistry, IncrementalViewSpec,
-    LatenessSpec, WatermarkTracker, apply_delta, consolidate_batch, deserialize_delta_batch,
+    LatenessSpec, SourceState, WatermarkTracker, consolidate_batch, deserialize_delta_batch,
     differentiate, serialize_delta_batch,
 };
 
@@ -103,6 +107,15 @@ pub struct ViewDeltaStats {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RetainedState {
     pub sources_with_snapshots: usize,
+    /// Sources holding a non-empty deficit — rows retracted that were never
+    /// inserted (IVM-AUD-CORE-2). This is the one per-source structure that a
+    /// misbehaving producer can grow without bound: a `DELETE` for a row that
+    /// never existed is free today and retained forever after CORE-2. It is
+    /// reclaimed by `drop_source` along with the rest of the source's state.
+    pub sources_with_deficits: usize,
+    /// Total deficit rows retained across all sources (distinct rows owed, not
+    /// owed multiplicity — one row owed a million times counts once).
+    pub deficit_rows_retained: usize,
     pub sources_with_pending: usize,
     pub sources_with_dedup_hashes: usize,
     pub dedup_hashes_retained: usize,
@@ -114,6 +127,30 @@ pub struct RetainedState {
     pub views_with_plans: usize,
     pub views_with_stats: usize,
     pub views_with_pending_plan_state: usize,
+}
+
+impl RetainedState {
+    /// Field-wise sum, for reporting a partitioned job's total retention.
+    ///
+    /// Every field is a count of retained entries, so summing across shards is
+    /// the right aggregation: shards partition the key space, so a source's
+    /// state really is split across them rather than replicated.
+    pub fn add(&mut self, other: Self) {
+        self.sources_with_snapshots += other.sources_with_snapshots;
+        self.sources_with_deficits += other.sources_with_deficits;
+        self.deficit_rows_retained += other.deficit_rows_retained;
+        self.sources_with_pending += other.sources_with_pending;
+        self.sources_with_dedup_hashes += other.sources_with_dedup_hashes;
+        self.dedup_hashes_retained += other.dedup_hashes_retained;
+        self.sources_with_checkpoint_deltas += other.sources_with_checkpoint_deltas;
+        self.sources_with_streaming_snapshots += other.sources_with_streaming_snapshots;
+        self.sources_with_ordinals += other.sources_with_ordinals;
+        self.sources_with_watermarks += other.sources_with_watermarks;
+        self.views_registered += other.views_registered;
+        self.views_with_plans += other.views_with_plans;
+        self.views_with_stats += other.views_with_stats;
+        self.views_with_pending_plan_state += other.views_with_pending_plan_state;
+    }
 }
 
 /// Count logical inserts/retracts in a delta (sum of positive weights,
@@ -293,7 +330,11 @@ struct IncrementalFlowInner {
     view_registry: IncrementalViewRegistry,
     pending: HashMap<String, Vec<DeltaBatch>>,
     tick: u64,
-    source_snapshots: HashMap<String, RecordBatch>,
+    /// Per-source accumulated Z-set. The materialized half of each entry is
+    /// what `source_snapshot()` returns and what Phase 3 registers as a
+    /// `MemTable`; the deficit half is invisible to SQL and exists so a
+    /// retraction with nothing to cancel is remembered (IVM-AUD-CORE-2).
+    source_snapshots: HashMap<String, SourceState>,
 
     // Content-addressed dedup: opt-in per-source insertion row dedup.
     // Each entry is (insertion-order FIFO queue, fast-lookup set).
@@ -327,9 +368,11 @@ struct IncrementalFlowInner {
     /// Rows dropped per source by a LATENESS bound, so the enforcement is
     /// observable rather than silent (IVM-AUD-CORE-7).
     late_dropped_rows: AHashMap<String, u64>,
-    /// Duplicate row copies per source discarded by `restore_delta`'s
-    /// set-materialization (IVM-AUD-CORE-29). Non-zero means the restored
-    /// source is not multiset-equal to the one that was checkpointed.
+    /// Row copies per source discarded by `restore_delta`'s set-collapse
+    /// (IVM-AUD-CORE-29). Counts both signs: `k - 1` duplicate copies of a row
+    /// present `k` times, and (since IVM-AUD-CORE-2) `|k| - 1` owed copies of a
+    /// row retracted `|k|` times. Non-zero means the restored source is not
+    /// multiset-equal to the one that was checkpointed.
     delta_restore_collapsed_rows: AHashMap<String, u64>,
     /// Union of every registered view's LATENESS declarations.
     ///
@@ -366,7 +409,9 @@ struct IncrementalFlowInner {
     /// `apply_computed_tick`, `apply_remote_tick`, `invalidate_view_plans`, and
     /// each committed `step_datafusion`.
     ///
-    /// IVM-AUD-CORE-19: a tick clones `source_snapshots` under the lock, runs
+    /// IVM-AUD-CORE-19: a tick clones `source_snapshots` under the lock (a
+    /// refcount bump per Arrow buffer — `SourceState` is Arc-backed on both
+    /// halves, so this stays cheap), runs
     /// view SQL for as long as it takes with the lock RELEASED, then reassigns
     /// `inner.source_snapshots = new_snapshots` wholesale. Anything that landed
     /// in that window — a restore, a mirrored remote tick, a second concurrent
@@ -654,7 +699,7 @@ impl IncrementalFlow {
     /// Take all pending input deltas (for external dispatch, e.g. executor fragments).
     ///
     /// Extracts and clears the current pending queue without running a tick.
-    /// Use this to encode a `delta:step:` fragment for executor-side execution.
+    /// Use this to encode a `delta:tick:` fragment for executor-side execution.
     pub fn take_pending(&self) -> IvmResult<HashMap<String, Vec<DeltaBatch>>> {
         let mut inner = self.inner.lock().map_err(lock_err)?;
         Ok(std::mem::take(&mut inner.pending))
@@ -843,6 +888,16 @@ impl IncrementalFlow {
         let inner = self.inner.lock().map_err(lock_err)?;
         Ok(RetainedState {
             sources_with_snapshots: inner.source_snapshots.len(),
+            sources_with_deficits: inner
+                .source_snapshots
+                .values()
+                .filter(|s| s.deficit().is_some())
+                .count(),
+            deficit_rows_retained: inner
+                .source_snapshots
+                .values()
+                .map(|s| s.deficit_rows())
+                .sum(),
             sources_with_pending: inner.pending.len(),
             sources_with_dedup_hashes: inner.seen_input_hashes.len(),
             dedup_hashes_retained: inner.seen_input_hashes.values().map(|(_, s)| s.len()).sum(),
@@ -1365,16 +1420,27 @@ impl IncrementalFlow {
         // empty). A freshly built operator is seeded from these so it holds the
         // restored state before this tick's delta is applied (G6/F4). In steady
         // state `views_needing_plans` is empty, so this clone never happens.
+        //
+        // Seeded from the MATERIALIZED half only: an operator's accumulator
+        // models the relation, and the relation does not contain owed rows
+        // (IVM-AUD-CORE-2).
         let pre_delta_snapshots: HashMap<String, RecordBatch> = if views_needing_plans.is_empty() {
             HashMap::new()
         } else {
-            current_snapshots.clone()
+            current_snapshots
+                .iter()
+                .map(|(k, v)| (k.clone(), v.positive().clone()))
+                .collect()
         };
 
         let mut new_snapshots = current_snapshots;
         for (name, delta) in &inputs {
             let current = new_snapshots.remove(name);
-            let updated = apply_delta(current, delta).map_err(delta_err)?;
+            // IVM-AUD-CORE-2: this is the line. It used to be `apply_delta`,
+            // which materializes and therefore clamps a net-negative row to
+            // zero copies — forgetting a retraction that had nothing to
+            // cancel. `SourceState::apply_to` keeps the remainder.
+            let updated = SourceState::apply_to(current, delta).map_err(delta_err)?;
             new_snapshots.insert(name.clone(), updated);
         }
 
@@ -1391,7 +1457,11 @@ impl IncrementalFlow {
                 .collect();
             tables.reconcile(&expected);
         }
-        for (name, snapshot) in &new_snapshots {
+        for (name, state) in &new_snapshots {
+            // The materialized half IS the relation, so there is nothing to
+            // expand here. A source holding only a deficit registers no table,
+            // which is correct: the relation it denotes is empty.
+            let snapshot = state.positive();
             if snapshot.num_rows() == 0 {
                 // A fresh context would have no table for an empty source.
                 tables.remove(name.as_str());
@@ -1409,8 +1479,8 @@ impl IncrementalFlow {
 
         // Schema map for plan construction: sources + upstream view schemas.
         let mut available_schemas: AHashMap<String, SchemaRef> = AHashMap::new();
-        for (name, snap) in &new_snapshots {
-            available_schemas.insert(name.clone(), snap.schema());
+        for (name, state) in &new_snapshots {
+            available_schemas.insert(name.clone(), state.positive().schema());
         }
         for spec in &view_specs {
             available_schemas.insert(spec.name.clone(), spec.output_schema.clone());
@@ -2186,9 +2256,82 @@ impl IncrementalFlow {
         Ok(inner.view_registry.get(name).ok().map(|v| v.spec.clone()))
     }
 
+    /// The source's **materialized relation** — what view SQL sees.
+    ///
+    /// A source can also owe rows it has never held (IVM-AUD-CORE-2); those are
+    /// not in this batch by construction, because a `RecordBatch` cannot hold a
+    /// row −1 times. Use [`Self::source_zset`] for the full Z-set and
+    /// [`Self::source_deficit_rows`] for how much is owed.
     pub fn source_snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {
         let inner = self.inner.lock().map_err(lock_err)?;
-        Ok(inner.source_snapshots.get(name).cloned())
+        Ok(inner
+            .source_snapshots
+            .get(name)
+            .map(|s| s.positive().clone()))
+    }
+
+    /// The source's full accumulated Z-set: the materialized rows at `+1` each
+    /// plus any owed rows at their negative weights (IVM-AUD-CORE-2).
+    ///
+    /// O(state) — this composes the two halves. It is what `checkpoint` writes.
+    pub fn source_zset(&self, name: &str) -> IvmResult<Option<DeltaBatch>> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        match inner.source_snapshots.get(name) {
+            None => Ok(None),
+            Some(state) => Ok(Some(state.zset().map_err(delta_err)?)),
+        }
+    }
+
+    /// How many distinct rows this source owes — retractions that arrived with
+    /// nothing to cancel and are being remembered (IVM-AUD-CORE-2).
+    ///
+    /// Zero for every append-only source and every source whose CDC stream is
+    /// per-key ordered. Non-zero and growing is the signal that a producer is
+    /// emitting deletes for rows that never existed; see
+    /// [`RetainedState::deficit_rows_retained`].
+    pub fn source_deficit_rows(&self, name: &str) -> IvmResult<usize> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .source_snapshots
+            .get(name)
+            .map_or(0, |s| s.deficit_rows()))
+    }
+
+    /// How many O(state) consolidations this source's state has performed in
+    /// `SourceState::apply` since it was created.
+    ///
+    /// The append-only concat fast path and the pay-off-the-deficit path do not
+    /// consolidate; only a delta carrying a retraction or a non-unit weight
+    /// does. All three compute the same Z-set, so this counter is the only way
+    /// a test can tell which path ran.
+    ///
+    /// It counts `apply` only. Building a state from scratch — the first
+    /// delta a source ever receives, and a restore — goes through
+    /// `SourceState::from_zset`, which consolidates once and deliberately does
+    /// not count it. So a source whose very first tick carries a retraction
+    /// reports 0 here having consolidated once. The distinction is "how many
+    /// ticks paid the O(state) branch", not "how many consolidations happened".
+    pub fn source_consolidations(&self, name: &str) -> IvmResult<u64> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .source_snapshots
+            .get(name)
+            .map_or(0, |s| s.consolidations()))
+    }
+
+    /// Retraction rows a view's integration clamped away (IVM-AUD-CORE-2b).
+    ///
+    /// See [`krishiv_delta::IncrementalView::clamped_retraction_rows`]: the
+    /// view level still materializes rather than holding a Z-set, so a
+    /// caller-supplied delta that retracts more than the view holds loses the
+    /// remainder. This reports the loss; it does not prevent it.
+    pub fn view_clamped_retractions(&self, name: &str) -> IvmResult<u64> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        Ok(inner
+            .view_registry
+            .get(name)
+            .ok()
+            .map_or(0, |v| v.clamped_retraction_rows()))
     }
 
     pub fn view_names(&self) -> IvmResult<Vec<String>> {
@@ -2224,10 +2367,16 @@ impl IncrementalFlow {
     pub fn checkpoint(&self) -> IvmResult<Vec<u8>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         let mut out: Vec<u8> = Vec::new();
-        let entries: Vec<(&String, &RecordBatch)> = inner.source_snapshots.iter().collect();
+        let entries: Vec<(&String, &SourceState)> = inner.source_snapshots.iter().collect();
         write_u32_len(&mut out, entries.len(), "source count")?;
-        for (name, snapshot) in entries {
-            let delta = DeltaBatch::from_inserts(snapshot.clone()).map_err(delta_err)?;
+        for (name, state) in entries {
+            // IVM-AUD-CORE-2: the whole Z-set, deficit included. The wire
+            // format is unchanged — this section always was a serialized
+            // `DeltaBatch`, it just never carried a negative weight before —
+            // so a binary predating CORE-2 reads this blob, calls
+            // `filter_positive_expanded` on it, and degrades to exactly the
+            // behaviour it has today.
+            let delta = state.zset().map_err(delta_err)?;
             let ipc = serialize_delta_batch(&delta).map_err(delta_err)?;
             let name_bytes = name.as_bytes();
             write_u32_len(&mut out, name_bytes.len(), "source name")?;
@@ -2242,7 +2391,7 @@ impl IncrementalFlow {
     pub fn restore(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
         let n = read_u32(bytes, &mut pos)? as usize;
-        let mut source_snapshots: HashMap<String, RecordBatch> =
+        let mut source_snapshots: HashMap<String, SourceState> =
             HashMap::with_capacity(bounded_capacity(n, bytes.len()));
         for _ in 0..n {
             let name_len = read_u32(bytes, &mut pos)? as usize;
@@ -2254,9 +2403,12 @@ impl IncrementalFlow {
             let data = bytes.get(pos..pos + data_len).ok_or_else(slice_err)?;
             pos += data_len;
             let delta = deserialize_delta_batch(data).map_err(delta_err)?;
-            // Multiset materialization (#160): keep duplicate-row copies.
-            let snapshot = delta.filter_positive_expanded().map_err(delta_err)?;
-            source_snapshots.insert(name, snapshot);
+            // Multiset materialization (#160) plus the deficit (CORE-2).
+            // `from_zset` consolidates when it has to: a blob may legitimately
+            // carry an unconsolidated mix of + and − for one row, and an
+            // all-`+1` blob (everything written before CORE-2) skips the
+            // consolidate entirely and costs exactly what it used to.
+            source_snapshots.insert(name, SourceState::from_zset(&delta).map_err(delta_err)?);
         }
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
@@ -2317,7 +2469,7 @@ impl IncrementalFlow {
         // Advance source snapshots deterministically (mirrors step_datafusion).
         for (name, delta) in &inputs {
             let current = inner.source_snapshots.remove(name);
-            let updated = apply_delta(current, delta).map_err(delta_err)?;
+            let updated = SourceState::apply_to(current, delta).map_err(delta_err)?;
             inner.source_snapshots.insert(name.clone(), updated);
         }
 
@@ -2391,10 +2543,10 @@ impl IncrementalFlow {
 
         // Phase 1 — compute the advanced source snapshots but do NOT commit
         // them (mirrors step_datafusion's arithmetic, not its commit point).
-        let mut advanced_sources: Vec<(String, RecordBatch)> = Vec::with_capacity(inputs.len());
+        let mut advanced_sources: Vec<(String, SourceState)> = Vec::with_capacity(inputs.len());
         for (name, delta) in &inputs {
             let current = inner.source_snapshots.get(name).cloned();
-            let updated = apply_delta(current, delta).map_err(delta_err)?;
+            let updated = SourceState::apply_to(current, delta).map_err(delta_err)?;
             advanced_sources.push((name.clone(), updated));
         }
 
@@ -2502,10 +2654,13 @@ impl IncrementalFlow {
     pub fn checkpoint_full(&self) -> IvmResult<Vec<u8>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         let mut out: Vec<u8> = Vec::new();
-        let sources: Vec<(&String, &RecordBatch)> = inner.source_snapshots.iter().collect();
+        let sources: Vec<(&String, &SourceState)> = inner.source_snapshots.iter().collect();
         write_u32_len(&mut out, sources.len(), "source count")?;
-        for (name, snap) in sources {
-            encode_named_batch(&mut out, name, snap)?;
+        for (name, state) in sources {
+            // Positives ONLY, byte-identical to what this section always held.
+            // The deficit rides in the trailing IVMZ1 section instead — see
+            // `encode_source_deficits` for why it must not be inlined here.
+            encode_named_batch(&mut out, name, state.positive())?;
         }
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         write_u32_len(&mut out, names.len(), "view count")?;
@@ -2534,6 +2689,7 @@ impl IncrementalFlow {
             out.extend_from_slice(&bytes);
         }
         encode_exact_state(&mut out, &inner)?;
+        encode_source_deficits(&mut out, &inner)?;
         Ok(out)
     }
 
@@ -2541,11 +2697,11 @@ impl IncrementalFlow {
     pub fn restore_full(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
         let n_sources = read_u32(bytes, &mut pos)? as usize;
-        let mut source_snapshots: HashMap<String, RecordBatch> =
+        let mut source_snapshots: HashMap<String, SourceState> =
             HashMap::with_capacity(bounded_capacity(n_sources, bytes.len()));
         for _ in 0..n_sources {
             let (name, batch) = decode_named_batch(bytes, &mut pos)?;
-            source_snapshots.insert(name, batch);
+            source_snapshots.insert(name, SourceState::from_positive(batch));
         }
         let n_views = read_u32(bytes, &mut pos)? as usize;
         // Pairs of (snapshot, full_output) per view name.
@@ -2591,6 +2747,24 @@ impl IncrementalFlow {
         // before it existed. Decoded before the lock is taken so a malformed
         // blob cannot leave the flow half-restored.
         let exact = decode_exact_state(bytes, &mut pos)?;
+        // Source-deficit section (IVM-AUD-CORE-2), likewise absent from older
+        // blobs. Merged into the states decoded above BEFORE the lock, for the
+        // same reason: a malformed blob must not leave the flow half-restored.
+        for (name, deficit) in decode_source_deficits(bytes, &mut pos)? {
+            match source_snapshots.get_mut(&name) {
+                Some(state) => state.set_deficit(Some(deficit)).map_err(delta_err)?,
+                None => {
+                    // A source that owes rows but holds none writes no entry in
+                    // the positives section (an empty batch is still written,
+                    // so this is defensive), so reconstruct it from the deficit.
+                    let mut state = SourceState::from_positive(RecordBatch::new_empty(
+                        deficit.data_schema().clone(),
+                    ));
+                    state.set_deficit(Some(deficit)).map_err(delta_err)?;
+                    source_snapshots.insert(name, state);
+                }
+            }
+        }
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
         // Drop any stale cached plans so the next step rebuilds them fresh and
@@ -2651,6 +2825,20 @@ impl IncrementalFlow {
     ///
     /// Consolidates each snapshot after applying so stacked restores do not
     /// accumulate paired ±1 rows that never cancel (G2 fix).
+    ///
+    /// # Set-collapse, on both signs (IVM-AUD-CORE-2 / DIST-C2)
+    ///
+    /// The collapse this path deliberately performs now applies to the deficit
+    /// too: a positive net weight is clamped to `+1` (one physical copy, as
+    /// before) and a negative one to `−1`. Keeping the exact negative magnitude
+    /// would destroy the very property the collapse exists to buy — applying
+    /// the same slice twice would owe `−2` and a later single insertion would
+    /// wrongly leave the row absent — and dropping the negatives entirely would
+    /// reintroduce CORE-2 on this path. Clamping is the only option that keeps
+    /// both: re-applying a slice N times converges on the same `−1`.
+    ///
+    /// Both halves of the collapse are counted into
+    /// `delta_restore_collapsed_rows`.
     pub fn restore_delta(&self, bytes: &[u8]) -> IvmResult<()> {
         let mut pos = 0usize;
         let n = read_u32(bytes, &mut pos)? as usize;
@@ -2666,12 +2854,17 @@ impl IncrementalFlow {
             pos += data_len;
             let delta = deserialize_delta_batch(data).map_err(delta_err)?;
             let current = inner.source_snapshots.remove(&name);
-            let updated = apply_delta(current, &delta).map_err(delta_err)?;
-            // Consolidate: turns the snapshot (all-positive) into a DeltaBatch,
-            // consolidates to cancel any residual paired rows, then strips weights.
-            let schema = updated.schema();
-            let as_delta = DeltaBatch::from_inserts(updated).map_err(delta_err)?;
-            let consolidated = consolidate_batch(as_delta, &[], &schema).map_err(delta_err)?;
+            // Compose the current Z-set (positives + deficit) with the slice,
+            // then consolidate to cancel residual paired rows.
+            let schema = delta.data_schema().clone();
+            let composed = match &current {
+                Some(state) => {
+                    let base = state.zset().map_err(delta_err)?;
+                    DeltaBatch::concat(&[base, delta]).map_err(delta_err)?
+                }
+                None => delta,
+            };
+            let consolidated = consolidate_batch(composed, &[], &schema).map_err(delta_err)?;
             // Deliberately SET-materialized (no #160 multiset expansion):
             // stacked restores are made idempotent by this collapse (G2) —
             // re-applying the same slice dedupes instead of doubling. The
@@ -2683,12 +2876,25 @@ impl IncrementalFlow {
             // row twice comes back holding it once — so count it and say so.
             // `filter_positive` keeps one copy per positive row; the weights
             // it is about to discard are exactly the lost copies.
+            //
+            // The negative half is collapsed the same way and for the same
+            // reason (see the method doc): `|w| - 1` owed copies are discarded
+            // per row so that stacking a slice stays idempotent. Both are
+            // counted here, because both mean the same thing — the restored
+            // source is not multiset-equal to the one that was checkpointed.
             let collapsed: u64 = consolidated
                 .weights()
                 .iter()
                 .flatten()
-                .filter(|w| *w > 1)
-                .map(|w| (w - 1) as u64)
+                .map(|w| {
+                    if w > 1 {
+                        (w - 1) as u64
+                    } else if w < -1 {
+                        (-w - 1) as u64
+                    } else {
+                        0
+                    }
+                })
                 .sum();
             if collapsed > 0 {
                 tracing::warn!(
@@ -2702,8 +2908,12 @@ impl IncrementalFlow {
                     .entry(name.clone())
                     .or_insert(0) += collapsed;
             }
-            let snapshot = consolidated.filter_positive().map_err(delta_err)?;
-            inner.source_snapshots.insert(name, snapshot);
+            // `normalize_weights` clamps every weight to its sign, so this is
+            // one `filter_positive` for the relation and a `−1`-per-row deficit
+            // for what is owed.
+            let collapsed_zset = consolidated.normalize_weights().map_err(delta_err)?;
+            let state = SourceState::from_zset(&collapsed_zset).map_err(delta_err)?;
+            inner.source_snapshots.insert(name, state);
         }
         // IVM-AUD-CORE-16: same treatment as `restore` — stale cached plans
         // must go, and the baseline and snapshot must be cleared together or
@@ -3674,6 +3884,78 @@ fn apply_exact_state(inner: &mut IncrementalFlowInner, exact: ExactState) {
         .collect();
 }
 
+// ── Source-deficit section of `checkpoint_full` (IVM-AUD-CORE-2) ─────────────
+//
+// CORE-2 made a source's state a Z-set: the materialized relation plus the rows
+// it *owes* (retractions that arrived with nothing to cancel). The relation is
+// still written by the source section at the top of the blob, unchanged and
+// byte-identical. What is owed goes here, in a tagged trailing section, for two
+// reasons that both rule out the obvious alternative of writing the weighted
+// batch into the source section directly:
+//
+//  1. An older `restore_full` reads the source section as a plain
+//     `RecordBatch`. Handed a weighted one it would install a source snapshot
+//     carrying a phantom `_weight` column — the source's schema silently
+//     corrupted, which is strictly worse than losing the deficit.
+//  2. Sniffing "does the last column look like `_weight`?" is ambiguous: a user
+//     source may legitimately end in an `Int64` column of that name, and
+//     `DeltaBatch::with_uniform_weight` would then just append a second one.
+//
+// So the framing mirrors CORE-27's `IVMF2` exactly: a magic tag, emitted
+// unconditionally (with `count = 0` when nothing is owed, which is 9 bytes and
+// matters because DIST-G3 writes a `checkpoint_full` per `/step`), and a
+// decoder that returns empty WITHOUT advancing `pos` when the tag is absent.
+// Both trailing decoders sniff that way, so they compose in either order and no
+// version bump is needed in either direction: an old blob has neither tag and
+// restores as it always did; a new blob read by an old binary stops after the
+// section it understands and degrades to today's clamping behaviour.
+//
+// Layout: `b"IVMZ1" || u32 count || (u32 name_len || name || u32 ipc_len ||
+// delta_ipc)*`, where each `delta_ipc` is a serialized all-negative
+// `DeltaBatch` — self-describing via its own trailing `_weight` column, inside
+// a section an old reader never looks at.
+const SOURCE_DEFICIT_MAGIC: &[u8; 5] = b"IVMZ1";
+
+fn encode_source_deficits(out: &mut Vec<u8>, inner: &IncrementalFlowInner) -> IvmResult<()> {
+    out.extend_from_slice(SOURCE_DEFICIT_MAGIC);
+    let owed: Vec<(&String, &DeltaBatch)> = inner
+        .source_snapshots
+        .iter()
+        .filter_map(|(name, state)| state.deficit().map(|d| (name, d)))
+        .collect();
+    write_u32_len(out, owed.len(), "source deficit count")?;
+    for (name, deficit) in owed {
+        write_name(out, name)?;
+        let ipc = serialize_delta_batch(deficit).map_err(delta_err)?;
+        write_u32_len(out, ipc.len(), "source deficit")?;
+        out.extend_from_slice(&ipc);
+    }
+    Ok(())
+}
+
+/// Read the source-deficit section if this blob has one.
+///
+/// Returns an empty vector *without advancing `pos`* for a blob written before
+/// the section existed, which is how restoring an old checkpoint keeps its old
+/// (deficit-free) behaviour instead of failing.
+fn decode_source_deficits(bytes: &[u8], pos: &mut usize) -> IvmResult<Vec<(String, DeltaBatch)>> {
+    match bytes.get(*pos..*pos + SOURCE_DEFICIT_MAGIC.len()) {
+        Some(tag) if tag == SOURCE_DEFICIT_MAGIC.as_slice() => {}
+        _ => return Ok(Vec::new()),
+    }
+    *pos += SOURCE_DEFICIT_MAGIC.len();
+    let n = read_u32(bytes, pos)? as usize;
+    let mut out = Vec::with_capacity(bounded_capacity(n, bytes.len()));
+    for _ in 0..n {
+        let name = decode_name(bytes, pos)?;
+        let len = read_u32(bytes, pos)? as usize;
+        let data = bytes.get(*pos..*pos + len).ok_or_else(slice_err)?;
+        *pos += len;
+        out.push((name, deserialize_delta_batch(data).map_err(delta_err)?));
+    }
+    Ok(out)
+}
+
 // ── RecordBatch framing helpers (for checkpoint_full / restore_full) ──────────
 
 /// Encode `name` + a required `RecordBatch` as Arrow IPC into `out`.
@@ -3776,169 +4058,336 @@ fn empty_batch_for_view(view: &krishiv_delta::IncrementalView) -> IvmResult<Reco
     RecordBatch::try_new(schema, cols).map_err(|e| IvmError::execution(e.to_string()))
 }
 
-// ── Batch-map framing (executor → coordinator result return) ──────────────────
-
-/// Encode a `name → RecordBatch` map as a length-framed binary blob.
-///
-/// Used to return per-view full outputs from a stateless executor tick back to
-/// the authoritative coordinator. Format:
-/// `u32 count || (u32 name_len || name || u32 ipc_len || arrow_ipc)*`
-pub fn encode_batch_map(map: &HashMap<String, RecordBatch>) -> IvmResult<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::new();
-    write_u32_len(&mut out, map.len(), "view count")?;
-    for (name, batch) in map {
-        encode_named_batch(&mut out, name, batch)?;
-    }
-    Ok(out)
-}
-
-/// Decode a blob produced by [`encode_batch_map`] back into a map.
-pub fn decode_batch_map(bytes: &[u8]) -> IvmResult<HashMap<String, RecordBatch>> {
-    let mut pos = 0usize;
-    let n = read_u32(bytes, &mut pos)? as usize;
-    let mut map = HashMap::with_capacity(bounded_capacity(n, bytes.len()));
-    for _ in 0..n {
-        let (name, batch) = decode_named_batch(bytes, &mut pos)?;
-        map.insert(name, batch);
-    }
-    Ok(map)
-}
-
 // ── Delta-map framing (resident executor → coordinator, AUD-6) ────────────────
 
-/// Magic prefix distinguishing a per-view **output-delta** map from the legacy
-/// full-output batch map returned by the stateless `delta:step:` path.
+/// Magic prefix of a **v1** resident tick payload: a per-view output-delta map
+/// and nothing else.
+///
+/// Used in BOTH directions since IVM-AUD-INT-F19: the coordinator's
+/// `delta:tick:` input deltas are framed with it (base64 of these bytes), and a
+/// pre-IVMD2 executor answers with it.
 const DELTA_MAP_MAGIC: &[u8; 5] = b"IVMD1";
 
-/// Encode a `view → output DeltaBatch` map as a length-framed binary blob.
+/// Magic prefix of a **v2** resident tick result: the same delta-map body
+/// followed by the executor's per-view health for that tick.
 ///
-/// AUD-6: a resident executor tick returns **deltas, not snapshots** — this is
-/// the O(Δ) wire format for the `delta:tick:` result. Format:
-/// `b"IVMD1" || u32 count || (u32 name_len || name || u32 ipc_len || delta_ipc)*`
-pub fn encode_delta_map(map: &HashMap<String, DeltaBatch>) -> IvmResult<Vec<u8>> {
-    let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(DELTA_MAP_MAGIC);
-    write_u32_len(&mut out, map.len(), "view count")?;
-    for (name, delta) in map {
-        let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
-        write_u32_len(&mut out, name.len(), "view name")?;
-        out.extend_from_slice(name.as_bytes());
-        write_u32_len(&mut out, ipc.len(), "output delta")?;
-        out.extend_from_slice(&ipc);
-    }
-    Ok(out)
+/// IVM-AUD-A5-RESIDENT: v1 had no room for health, so the coordinator's mirror
+/// built its `StepSummary` with empty health vectors and every resident tick
+/// had to be reported as `reported: false`. v2 carries the real thing.
+const TICK_RESULT_MAGIC: &[u8; 5] = b"IVMD2";
+
+/// Version of the resident IVM tick wire this build writes.
+///
+/// v1 = `IVMD1` (per-view output deltas only). v2 = `IVMD2` (deltas + per-view
+/// health). [`decode_tick_result`] accepts v1 and v2 and REJECTS anything else
+/// rather than guessing — see `docs/COMPATIBILITY.md` and the enforcing test
+/// `decode_tick_result_rejects_unknown_magic`.
+pub const IVM_TICK_WIRE_VERSION: u32 = 2;
+
+/// How much of a per-view error message the tick wire keeps.
+///
+/// A DataFusion diagnostic can run to several KB, and the whole point of this
+/// wire is that it is O(Δ) — an uncapped message per failing view would make
+/// the health section the dominant term on a tick that moved three rows.
+/// Truncation is marked in the message itself, never silent.
+///
+/// This is the size of the retained PREFIX, not the size of what goes on the
+/// wire: `truncate_health_message` appends a
+/// "… [truncated at N bytes; M total]" suffix, so a truncated message crosses
+/// at roughly 550 bytes. The doc used to call this "longest message the wire
+/// carries", which the suffix made false.
+const MAX_HEALTH_MESSAGE_BYTES: usize = 512;
+
+/// Most entries either health vector carries. Both are bounded by the job's
+/// view count in practice; this is the backstop, and what it drops is counted
+/// in `degraded_omitted` / `errored_omitted` so a reader is never told that a
+/// truncated list is the whole list.
+const MAX_HEALTH_ENTRIES: usize = 256;
+
+/// One view failure as it crosses the resident tick wire.
+///
+/// `kind` is the snake-case name from [`view_error_kind_name`] and stays a
+/// `String` on the way back in on purpose: an executor running a newer build
+/// may name a `ViewErrorKind` this coordinator has never heard of, and mapping
+/// the unknown name onto a known variant would relabel a new failure mode as an
+/// old one. An unrecognised kind is passed through verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireViewError {
+    pub view: String,
+    pub kind: String,
+    pub message: String,
 }
 
-/// Decode a blob produced by [`encode_delta_map`].
-pub fn decode_delta_map(bytes: &[u8]) -> IvmResult<HashMap<String, DeltaBatch>> {
-    let rest = bytes
-        .strip_prefix(DELTA_MAP_MAGIC.as_slice())
-        .ok_or_else(|| IvmError::execution("blob is not an IVM delta map (missing magic)"))?;
-    let mut pos = 0usize;
-    let n = read_u32(rest, &mut pos)? as usize;
+/// Per-view health for one remote tick (the v2 tick-result section).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickHealth {
+    /// Views that ran on the O(state) DiffBased path this tick.
+    pub degraded_views: Vec<String>,
+    /// Views that failed and were skipped this tick.
+    pub errored_views: Vec<WireViewError>,
+    /// Degraded views dropped by [`MAX_HEALTH_ENTRIES`]. Non-zero means the
+    /// list above is a prefix, not the whole truth.
+    pub degraded_omitted: u32,
+    /// Errored views dropped by [`MAX_HEALTH_ENTRIES`].
+    pub errored_omitted: u32,
+}
+
+impl TickHealth {
+    /// Build the wire form from the `StepSummary` the tick actually produced,
+    /// applying the wire caps.
+    ///
+    /// This is the whole of IVM-AUD-A5-RESIDENT's fix on the executor side: the
+    /// summary already held real health, and the wire simply had nowhere to put
+    /// it.
+    pub fn from_summary(summary: &StepSummary) -> Self {
+        let degraded_omitted = summary
+            .degraded_views
+            .len()
+            .saturating_sub(MAX_HEALTH_ENTRIES) as u32;
+        let errored_omitted = summary
+            .errored_views
+            .len()
+            .saturating_sub(MAX_HEALTH_ENTRIES) as u32;
+        Self {
+            degraded_views: summary
+                .degraded_views
+                .iter()
+                .take(MAX_HEALTH_ENTRIES)
+                .cloned()
+                .collect(),
+            errored_views: summary
+                .errored_views
+                .iter()
+                .take(MAX_HEALTH_ENTRIES)
+                .map(|e| WireViewError {
+                    view: e.view.clone(),
+                    kind: view_error_kind_name(&e.kind).to_owned(),
+                    message: truncate_health_message(&e.message),
+                })
+                .collect(),
+            degraded_omitted,
+            errored_omitted,
+        }
+    }
+}
+
+/// A decoded resident tick result: the per-view output deltas, plus health when
+/// the executor was new enough to send it.
+///
+/// `health: None` means "this executor does not report per-view health", NOT
+/// "nothing failed" — collapsing those two is the defect A5 exists to prevent.
+#[derive(Debug, Clone)]
+pub struct TickResult {
+    pub view_deltas: HashMap<String, DeltaBatch>,
+    pub health: Option<TickHealth>,
+}
+
+/// Wire name for a view-failure kind.
+///
+/// Exhaustive on purpose: adding a [`ViewErrorKind`] variant must be a compile
+/// error here, because the alternative is a catch-all that silently relabels a
+/// new failure mode as an old one. Lives here rather than in the coordinator's
+/// HTTP layer so the tick encoder and the HTTP serializer cannot drift into
+/// two different names for one kind.
+pub fn view_error_kind_name(kind: &ViewErrorKind) -> &'static str {
+    match kind {
+        ViewErrorKind::OperatorApply => "operator_apply",
+        ViewErrorKind::ViewSql => "view_sql",
+        ViewErrorKind::Publish => "publish",
+        ViewErrorKind::FixpointNotConverged => "fixpoint_not_converged",
+    }
+}
+
+/// Cap one health message, saying so in the message when it bites.
+fn truncate_health_message(message: &str) -> String {
+    if message.len() <= MAX_HEALTH_MESSAGE_BYTES {
+        return message.to_owned();
+    }
+    let mut end = MAX_HEALTH_MESSAGE_BYTES;
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "{}… [truncated at {MAX_HEALTH_MESSAGE_BYTES} bytes; {} total]",
+        &message[..end],
+        message.len()
+    )
+}
+
+/// `u32 count || (u32 name_len || name || u32 ipc_len || delta_ipc)*`
+fn encode_delta_map_body(out: &mut Vec<u8>, map: &HashMap<String, DeltaBatch>) -> IvmResult<()> {
+    write_u32_len(out, map.len(), "view count")?;
+    for (name, delta) in map {
+        let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
+        write_u32_len(out, name.len(), "view name")?;
+        out.extend_from_slice(name.as_bytes());
+        write_u32_len(out, ipc.len(), "output delta")?;
+        out.extend_from_slice(&ipc);
+    }
+    Ok(())
+}
+
+fn decode_delta_map_body(rest: &[u8], pos: &mut usize) -> IvmResult<HashMap<String, DeltaBatch>> {
+    let n = read_u32(rest, pos)? as usize;
     let mut map = HashMap::with_capacity(bounded_capacity(n, rest.len()));
     for _ in 0..n {
-        let name = decode_name(rest, &mut pos)?;
-        let len = read_u32(rest, &mut pos)? as usize;
-        let data = rest.get(pos..pos + len).ok_or_else(slice_err)?;
-        pos += len;
+        let name = decode_name(rest, pos)?;
+        let len = read_u32(rest, pos)? as usize;
+        let data = rest.get(*pos..*pos + len).ok_or_else(slice_err)?;
+        *pos += len;
         map.insert(name, deserialize_delta_batch(data).map_err(delta_err)?);
     }
     Ok(map)
 }
 
-// ── Fragment encoding helpers (coordinator-authoritative executor dispatch) ───
-
-/// Encode a coordinator-authoritative IVM dispatch fragment.
+/// Encode a `view → output DeltaBatch` map as a length-framed binary blob (v1).
 ///
-/// **No production caller** (IVM-AUD-INT-F20). The coordinator's resident
-/// dispatch encodes [`encode_ivm_attach_fragment`] + [`encode_ivm_tick_fragment`]
-/// instead; the only callers of this function, of
-/// [`encode_ivm_ckpt_fragment`], and of the executor's `execute_ivm_fragment`
-/// that decodes them are tests. The receiving half is still wired into the
-/// executor's task runner, so a `delta:step:` fragment WOULD execute if one were
-/// ever sent — nothing sends one. Kept, unremoved, only because deleting it
-/// means deleting the executor half too; do not read its existence as evidence
-/// that the stateless dispatch path is in use.
+/// AUD-6: a resident executor tick returns **deltas, not snapshots** — this is
+/// the O(Δ) framing. Format:
+/// `b"IVMD1" || u32 count || (u32 name_len || name || u32 ipc_len || delta_ipc)*`
 ///
-/// Format: `delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}`
+/// Since IVM-AUD-INT-F19 the same framing carries the tick's INPUT deltas
+/// (coordinator → executor, base64'd into the `delta:tick:` fragment), so this
+/// is the shared body format for both directions rather than a return-only one.
+/// Still emitted as a RESULT by an executor answering a v1 (JSON-payload) tick
+/// — see `encode_tick_result` for the v2 result.
+pub fn encode_delta_map(map: &HashMap<String, DeltaBatch>) -> IvmResult<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(DELTA_MAP_MAGIC);
+    encode_delta_map_body(&mut out, map)?;
+    Ok(out)
+}
+
+/// Decode a blob produced by [`encode_delta_map`].
 ///
-/// Each `|`-separated payload part is **base64-encoded**, so a `|` inside a
-/// SQL string literal in `body_sql` cannot corrupt the framing. `state_b64`
-/// is the base64 of [`IncrementalFlow::checkpoint_full`]; the executor restores
-/// it into a transient flow so the remote tick sees correct source snapshots
-/// and view baselines.
-pub fn encode_ivm_step_fragment(
-    job_id: &str,
-    pending: &HashMap<String, DeltaBatch>,
-    specs: &[IncrementalViewSpec],
-    state_bytes: &[u8],
-) -> IvmResult<String> {
-    use base64::Engine;
-    let b64 = base64::engine::general_purpose::STANDARD;
+/// Rejects a v2 (`IVMD2`) blob: its trailing health section would be silently
+/// ignored here. Use [`decode_tick_result`] to read either version.
+pub fn decode_delta_map(bytes: &[u8]) -> IvmResult<HashMap<String, DeltaBatch>> {
+    let rest = bytes
+        .strip_prefix(DELTA_MAP_MAGIC.as_slice())
+        .ok_or_else(|| IvmError::execution("blob is not an IVM delta map (missing magic)"))?;
+    let mut pos = 0usize;
+    decode_delta_map_body(rest, &mut pos)
+}
 
-    let delta_entries: Vec<serde_json::Value> = pending
-        .iter()
-        .map(|(source, delta)| {
-            let ipc = serialize_delta_batch(delta).map_err(delta_err)?;
-            let enc = b64.encode(&ipc);
-            Ok(serde_json::json!({ "source": source, "delta_b64": enc }))
-        })
-        .collect::<IvmResult<_>>()?;
-    let deltas_json =
-        serde_json::to_string(&delta_entries).map_err(|e| IvmError::execution(e.to_string()))?;
-    let deltas_b64 = b64.encode(deltas_json);
+/// `u32 degraded_count || (u32 len || name)* || u32 degraded_omitted ||
+///  u32 errored_count || (u32 len||view || u32 len||kind || u32 len||msg)* ||
+///  u32 errored_omitted`
+fn encode_tick_health(out: &mut Vec<u8>, health: &TickHealth) -> IvmResult<()> {
+    write_u32_len(out, health.degraded_views.len(), "degraded view count")?;
+    for name in &health.degraded_views {
+        write_name(out, name)?;
+    }
+    out.extend_from_slice(&health.degraded_omitted.to_le_bytes());
+    write_u32_len(out, health.errored_views.len(), "errored view count")?;
+    for e in &health.errored_views {
+        write_name(out, &e.view)?;
+        write_name(out, &e.kind)?;
+        write_name(out, &e.message)?;
+    }
+    out.extend_from_slice(&health.errored_omitted.to_le_bytes());
+    Ok(())
+}
 
-    let spec_entries: Vec<serde_json::Value> = specs
-        .iter()
-        .map(|s| {
-            let fields: Vec<serde_json::Value> = s
-                .output_schema
-                .fields()
-                .iter()
-                .map(|f| {
-                    serde_json::json!({
-                        "name": f.name(),
-                        "data_type": format!("{:?}", f.data_type()),
-                        "nullable": f.is_nullable()
-                    })
-                })
-                .collect();
-            serde_json::json!({
-                "name": s.name,
-                "body_sql": s.body_sql,
-                "output_schema_fields": fields,
-                "is_materialized": s.is_materialized,
-                "is_recursive": s.is_recursive,
-                // AUD-4: carry lateness so an offloaded tick applies the same
-                // retention/GC semantics as a central tick of the same job.
-                "lateness": s.lateness,
-            })
-        })
-        .collect();
-    let specs_json =
-        serde_json::to_string(&spec_entries).map_err(|e| IvmError::execution(e.to_string()))?;
-    let specs_b64 = b64.encode(specs_json);
+fn decode_tick_health(rest: &[u8], pos: &mut usize) -> IvmResult<TickHealth> {
+    let n = read_u32(rest, pos)? as usize;
+    let mut degraded_views = Vec::with_capacity(bounded_capacity(n, rest.len()));
+    for _ in 0..n {
+        degraded_views.push(decode_name(rest, pos)?);
+    }
+    let degraded_omitted = read_u32(rest, pos)?;
+    let n = read_u32(rest, pos)? as usize;
+    let mut errored_views = Vec::with_capacity(bounded_capacity(n, rest.len()));
+    for _ in 0..n {
+        let view = decode_name(rest, pos)?;
+        let kind = decode_name(rest, pos)?;
+        let message = decode_name(rest, pos)?;
+        errored_views.push(WireViewError {
+            view,
+            kind,
+            message,
+        });
+    }
+    let errored_omitted = read_u32(rest, pos)?;
+    Ok(TickHealth {
+        degraded_views,
+        errored_views,
+        degraded_omitted,
+        errored_omitted,
+    })
+}
 
-    let state_b64 = b64.encode(state_bytes);
+/// Encode a **v2** resident tick result: per-view output deltas + the health
+/// the tick actually produced.
+///
+/// `b"IVMD2" || <delta-map body> || <health section>`
+pub fn encode_tick_result(
+    map: &HashMap<String, DeltaBatch>,
+    health: &TickHealth,
+) -> IvmResult<Vec<u8>> {
+    let mut out: Vec<u8> = Vec::new();
+    out.extend_from_slice(TICK_RESULT_MAGIC);
+    encode_delta_map_body(&mut out, map)?;
+    encode_tick_health(&mut out, health)?;
+    Ok(out)
+}
 
-    Ok(format!(
-        "delta:step:{job_id}|{deltas_b64}|{specs_b64}|{state_b64}"
-    ))
+/// Decode a resident tick result of either wire version.
+///
+/// `IVMD2` → `health: Some(..)`. `IVMD1` → `health: None`, which the caller
+/// must surface as "this executor does not report health", never as "nothing
+/// failed". Any other prefix is an error: interpreting an unknown version as
+/// the newest known one is the exact failure `docs/COMPATIBILITY.md` rule 2
+/// forbids.
+pub fn decode_tick_result(bytes: &[u8]) -> IvmResult<TickResult> {
+    if let Some(rest) = bytes.strip_prefix(TICK_RESULT_MAGIC.as_slice()) {
+        let mut pos = 0usize;
+        let view_deltas = decode_delta_map_body(rest, &mut pos)?;
+        let health = decode_tick_health(rest, &mut pos)?;
+        return Ok(TickResult {
+            view_deltas,
+            health: Some(health),
+        });
+    }
+    if let Some(rest) = bytes.strip_prefix(DELTA_MAP_MAGIC.as_slice()) {
+        let mut pos = 0usize;
+        let view_deltas = decode_delta_map_body(rest, &mut pos)?;
+        return Ok(TickResult {
+            view_deltas,
+            health: None,
+        });
+    }
+    Err(IvmError::execution(format!(
+        "unknown IVM tick result format: leading bytes {:?} are neither IVMD1 nor IVMD2 \
+         (this build writes v{IVM_TICK_WIRE_VERSION})",
+        String::from_utf8_lossy(bytes.get(..bytes.len().min(5)).unwrap_or(bytes))
+    )))
 }
 
 // ── Resident-executor fragment encoding (AUD-6) ───────────────────────────────
 //
-// The resident protocol replaces the per-tick full-state round trip with four
+// The resident protocol replaces the per-tick full-state round trip with three
 // ops. State ships ONCE at attach; every tick afterwards carries only deltas
 // plus a fence:
 //
 // ```text
 // delta:attach:{job}|{specs_b64}|{state_b64}|{fence}   create/replace resident flow
-// delta:tick:{job}|{deltas_b64}|{fence}                feed Δ, step, return Δ-map
-// delta:ckpt:{job}                                     checkpoint_full of resident flow
+//                                          → capability echo (see below)
+// delta:tick:{job}|{deltas_b64}|{fence}                feed Δ, step, return tick result
 // delta:detach:{job}                                   drop resident flow
 // ```
+//
+// `delta:ckpt:` was the fourth op and is gone (IVM-AUD-INT-F20): nothing ever
+// sent one — the coordinator's mirror is the authoritative state, so there was
+// never a reason to ask the executor for a checkpoint.
+//
+// IVM-AUD-INT-F19 / A5-RESIDENT: `deltas_b64` and the result blob are both
+// version-negotiated. The attach reply carries a capability echo
+// (`ATTACH_ECHO_MAGIC` below); a coordinator that sees it sends binary input
+// deltas and expects an `IVMD2` result, and one that does not (or an executor
+// that answers `None`) stays on the JSON payload and the `IVMD1` result. The
+// executor answers in the dialect the tick was written in, which makes the
+// input an unforgeable proof of the coordinator's version.
 //
 // The fence is a per-job monotonically increasing tick number. A resident
 // executor accepts a tick only when `fence == last_fence + 1`; anything else
@@ -3980,19 +4429,23 @@ fn encode_specs_b64(specs: &[IncrementalViewSpec]) -> IvmResult<String> {
     Ok(b64.encode(specs_json))
 }
 
-/// Base64 of JSON of base64 of Arrow IPC.
+/// **Legacy** `delta:tick:` payload: base64 of JSON of base64 of Arrow IPC.
 ///
-/// IVM-AUD-INT-F19: this is the `delta:tick:` payload — the wire whose stated
-/// purpose is "O(Δ)". Each delta is base64'd (×4/3), embedded in a JSON array
-/// (a per-entry string quote/escape pass plus the field names), and the whole
-/// array is base64'd again (×4/3): ≈1.78× the IPC bytes, plus one full buffer
-/// copy per layer. [`encode_delta_map`] already frames the same map in binary
-/// at ×1.0, and [`decode_delta_map`] already reads it — the `delta:tick:`
-/// fragment could carry `b64(encode_delta_map(..))` for ×1.33 and one copy.
-/// Not changed here because the decoder lives in `krishiv-executor` and both
-/// ends must move together, which also means a mixed-version cluster needs a
-/// negotiated cutover.
-fn encode_deltas_b64(pending: &HashMap<String, DeltaBatch>) -> IvmResult<String> {
+/// IVM-AUD-INT-F19: each delta is base64'd (×4/3), embedded in a JSON array (a
+/// per-entry quote/escape pass plus the field names), and the whole array is
+/// base64'd again (×4/3). Measured by `binary_tick_payload_is_smaller_than_json`
+/// on a 16 384-row Int32 delta (201 100 IPC bytes): this encoder emits 357 564
+/// bytes (**×1.7780**), [`encode_deltas_binary_b64`] emits 268 164
+/// (**×1.3335**) — a **25.00% cut** — and three full buffer copies per hop
+/// against two.
+///
+/// Still emitted, and still decoded by the executor, for exactly one reason:
+/// during a rolling upgrade a new coordinator can meet an old executor that
+/// only understands this. The attach capability echo
+/// ([`decode_attach_echo`]) is what selects between the two, and the executor
+/// answers in the dialect it was asked in. Once no supported release speaks
+/// v1 this function and the executor's JSON branch both go.
+fn encode_deltas_json_b64(pending: &HashMap<String, DeltaBatch>) -> IvmResult<String> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let delta_entries: Vec<serde_json::Value> = pending
@@ -4006,6 +4459,87 @@ fn encode_deltas_b64(pending: &HashMap<String, DeltaBatch>) -> IvmResult<String>
     let deltas_json =
         serde_json::to_string(&delta_entries).map_err(|e| IvmError::execution(e.to_string()))?;
     Ok(b64.encode(deltas_json))
+}
+
+/// Magic prefix of the `delta:attach:` capability echo an executor returns.
+///
+/// `b"IVMW" || u8 wire_version || u32 flags_le`. Read by
+/// [`decode_attach_echo`]; written by the executor's attach branch. An older
+/// executor returns no blob at all, which decodes as [`WireCapabilities`]
+/// all-false — fail-closed, because the failure mode of guessing "new" is a
+/// rejected tick per tick, which costs a full re-attach (`checkpoint_full`)
+/// each time.
+pub const ATTACH_ECHO_MAGIC: &[u8; 4] = b"IVMW";
+
+/// Bit 0: this executor accepts `IVMD1`-framed binary input deltas.
+pub const WIRE_FLAG_BINARY_INPUT_DELTAS: u32 = 1 << 0;
+/// Bit 1: this executor answers a binary tick with an `IVMD2` tick result
+/// (per-view health included).
+pub const WIRE_FLAG_TICK_HEALTH: u32 = 1 << 1;
+
+/// What the resident executor said it can do, at attach time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WireCapabilities {
+    pub binary_input_deltas: bool,
+    pub tick_health: bool,
+}
+
+/// Encode the attach capability echo.
+pub fn encode_attach_echo(caps: WireCapabilities) -> Vec<u8> {
+    let mut flags = 0u32;
+    if caps.binary_input_deltas {
+        flags |= WIRE_FLAG_BINARY_INPUT_DELTAS;
+    }
+    if caps.tick_health {
+        flags |= WIRE_FLAG_TICK_HEALTH;
+    }
+    let mut out = ATTACH_ECHO_MAGIC.to_vec();
+    out.push(IVM_TICK_WIRE_VERSION as u8);
+    out.extend_from_slice(&flags.to_le_bytes());
+    out
+}
+
+/// Decode an attach capability echo.
+///
+/// `None` (no blob) and a blob this build cannot parse both yield the
+/// all-false default: an unreadable echo is not evidence of a capability.
+pub fn decode_attach_echo(blob: Option<&[u8]>) -> WireCapabilities {
+    let Some(bytes) = blob else {
+        return WireCapabilities::default();
+    };
+    let Some(rest) = bytes.strip_prefix(ATTACH_ECHO_MAGIC.as_slice()) else {
+        return WireCapabilities::default();
+    };
+    if rest.len() < 5 {
+        return WireCapabilities::default();
+    }
+    // rest[0] is the executor's wire version. It is deliberately NOT read:
+    // capability is negotiated by the flag bits below, which say what the peer
+    // can do rather than what release it is on, and `WireCapabilities` has no
+    // field to put a version in. It is encoded so a future negotiation that
+    // needs the number has it already; until then nothing may claim to report
+    // the peer's version, because this is the only place it arrives.
+    let mut pos = 1usize;
+    let Ok(flags) = read_u32(rest, &mut pos) else {
+        return WireCapabilities::default();
+    };
+    WireCapabilities {
+        binary_input_deltas: flags & WIRE_FLAG_BINARY_INPUT_DELTAS != 0,
+        tick_health: flags & WIRE_FLAG_TICK_HEALTH != 0,
+    }
+}
+
+/// Binary `delta:tick:` payload: base64 of [`encode_delta_map`] (×4/3 and one
+/// base64 pass, against the ×1.78 and two passes of
+/// [`encode_deltas_json_b64`]).
+///
+/// Not zero-copy: `encode_delta_map` builds one contiguous buffer and base64
+/// then builds a second, so peak encode memory is ≈2.33× the IPC bytes (down
+/// from ≈3.11×, not to zero).
+fn encode_deltas_binary_b64(pending: &HashMap<String, DeltaBatch>) -> IvmResult<String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD;
+    Ok(b64.encode(encode_delta_map(pending)?))
 }
 
 /// Encode a `delta:attach:` fragment (ships full state ONCE at promotion).
@@ -4025,26 +4559,230 @@ pub fn encode_ivm_attach_fragment(
 }
 
 /// Encode a `delta:tick:` fragment (deltas + fence only — no state).
+///
+/// `binary_deltas` selects the payload dialect and nothing else: the prefix,
+/// the part count and the fence position are identical either way, so only the
+/// bytes inside `deltas_b64` change. Pass `true` only when the executor's
+/// attach echo said it accepts binary input
+/// ([`WireCapabilities::binary_input_deltas`]) — the payload dialect is also
+/// what tells the executor which result dialect to answer in.
 pub fn encode_ivm_tick_fragment(
     job_id: &str,
     pending: &HashMap<String, DeltaBatch>,
     fence: u64,
+    binary_deltas: bool,
 ) -> IvmResult<String> {
-    let deltas_b64 = encode_deltas_b64(pending)?;
+    let deltas_b64 = if binary_deltas {
+        encode_deltas_binary_b64(pending)?
+    } else {
+        encode_deltas_json_b64(pending)?
+    };
     Ok(format!("delta:tick:{job_id}|{deltas_b64}|{fence}"))
-}
-
-/// Encode a `delta:ckpt:` fragment (resident flow → `checkpoint_full` bytes).
-///
-/// **No production caller** (IVM-AUD-INT-F20) — see
-/// [`encode_ivm_step_fragment`].
-pub fn encode_ivm_ckpt_fragment(job_id: &str) -> String {
-    format!("delta:ckpt:{job_id}")
 }
 
 /// Encode a `delta:detach:` fragment (drop the resident flow).
 pub fn encode_ivm_detach_fragment(job_id: &str) -> String {
     format!("delta:detach:{job_id}")
+}
+
+// ── Resident tick-wire tests (IVM-AUD-INT-F19 / A5-RESIDENT) ─────────────────
+
+#[cfg(test)]
+mod tick_wire_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use krishiv_delta::DeltaBatch;
+
+    use super::{
+        MAX_HEALTH_ENTRIES, MAX_HEALTH_MESSAGE_BYTES, StepSummary, TickHealth, ViewError,
+        ViewErrorKind, WireCapabilities, WireViewError, decode_attach_echo, decode_delta_map,
+        decode_tick_result, encode_attach_echo, encode_delta_map, encode_deltas_binary_b64,
+        encode_deltas_json_b64, encode_tick_result,
+    };
+
+    fn delta(ids: &[i32]) -> DeltaBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids.to_vec()))]).unwrap();
+        DeltaBatch::from_inserts(batch).unwrap()
+    }
+
+    fn one_view_map() -> HashMap<String, DeltaBatch> {
+        let mut m = HashMap::new();
+        m.insert("rev".to_string(), delta(&[1, 2, 3]));
+        m
+    }
+
+    /// T1. The v2 result carries the health the tick produced, not a placeholder.
+    #[test]
+    fn tick_result_v2_round_trips_health() {
+        let health = TickHealth {
+            degraded_views: vec!["slow".to_string()],
+            errored_views: vec![WireViewError {
+                view: "broken".to_string(),
+                kind: "view_sql".to_string(),
+                message: "column not found".to_string(),
+            }],
+            degraded_omitted: 0,
+            errored_omitted: 0,
+        };
+        let blob = encode_tick_result(&one_view_map(), &health).unwrap();
+        assert!(blob.starts_with(b"IVMD2"));
+        let decoded = decode_tick_result(&blob).unwrap();
+        assert_eq!(decoded.view_deltas.len(), 1);
+        let got = decoded.health.expect("v2 result carries health");
+        assert_eq!(got, health);
+    }
+
+    /// T2. A v1 blob decodes as *unreported*, never as "nothing failed".
+    #[test]
+    fn decode_tick_result_accepts_v1_as_unreported() {
+        let map = one_view_map();
+        let v1 = encode_delta_map(&map).unwrap();
+        let decoded = decode_tick_result(&v1).unwrap();
+        assert_eq!(decoded.view_deltas.len(), map.len());
+        assert!(
+            decoded.health.is_none(),
+            "a v1 executor said nothing about health; Some(empty) would claim it \
+             reported and found nothing wrong"
+        );
+    }
+
+    /// T3. An unknown version is refused, not read as the newest known one
+    /// (`docs/COMPATIBILITY.md` rule 2). Named by `scripts/compatibility_gate.py`.
+    #[test]
+    fn decode_tick_result_rejects_unknown_magic() {
+        let mut future = b"IVMD9".to_vec();
+        // A body that would decode perfectly well as v1 if the magic were ignored.
+        future.extend_from_slice(&encode_delta_map(&one_view_map()).unwrap()[5..]);
+        let err = decode_tick_result(&future).unwrap_err().to_string();
+        assert!(
+            err.contains("IVMD1") && err.contains("IVMD2"),
+            "the rejection must name what it does accept; got {err}"
+        );
+        assert!(decode_tick_result(b"").is_err());
+        assert!(decode_tick_result(b"IVM").is_err());
+    }
+
+    /// T4. A kind this build has never heard of survives verbatim rather than
+    /// being mapped onto a variant that happens to exist here.
+    #[test]
+    fn unknown_error_kind_name_survives_decode() {
+        let health = TickHealth {
+            degraded_views: vec![],
+            errored_views: vec![WireViewError {
+                view: "v".to_string(),
+                kind: "some_future_kind".to_string(),
+                message: "m".to_string(),
+            }],
+            degraded_omitted: 0,
+            errored_omitted: 0,
+        };
+        let blob = encode_tick_result(&HashMap::new(), &health).unwrap();
+        let got = decode_tick_result(&blob).unwrap().health.unwrap();
+        assert_eq!(got.errored_views[0].kind, "some_future_kind");
+    }
+
+    /// T5. The binary payload really is smaller (IVM-AUD-INT-F19). The bound is
+    /// 0.80 against a measured 0.75, so a silent revert to the JSON encoder
+    /// fails here even though both encoders produce a decodable payload.
+    #[test]
+    fn binary_tick_payload_is_smaller_than_json() {
+        let ids: Vec<i32> = (0..16_384).collect(); // 64 KiB of Int32 data
+        let mut m = HashMap::new();
+        m.insert("orders".to_string(), delta(&ids));
+        let json = encode_deltas_json_b64(&m).unwrap();
+        let binary = encode_deltas_binary_b64(&m).unwrap();
+        let ratio = binary.len() as f64 / json.len() as f64;
+        assert!(
+            ratio <= 0.80,
+            "binary payload must be materially smaller: binary {} bytes, json {} bytes, \
+             ratio {ratio:.4}",
+            binary.len(),
+            json.len()
+        );
+    }
+
+    /// The `IVMD1` sniff the executor does on the INPUT payload is only safe
+    /// because a legacy payload is a JSON array — it can never begin with the
+    /// binary magic. Asserted rather than asserted-in-a-comment.
+    #[test]
+    fn legacy_json_payload_never_looks_like_binary() {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let raw = b64
+            .decode(encode_deltas_json_b64(&one_view_map()).unwrap())
+            .unwrap();
+        assert_eq!(raw[0], b'[', "the legacy payload is a bare JSON array");
+        assert!(!raw.starts_with(b"IVMD1"));
+        let raw_bin = b64
+            .decode(encode_deltas_binary_b64(&one_view_map()).unwrap())
+            .unwrap();
+        assert!(raw_bin.starts_with(b"IVMD1"));
+        // Both payloads carry the same map.
+        assert_eq!(decode_delta_map(&raw_bin).unwrap().len(), 1);
+    }
+
+    /// Health is capped so it cannot become the dominant term on an O(Δ) wire —
+    /// and every cap says so instead of quietly shortening the truth.
+    #[test]
+    fn health_caps_are_marked_not_silent() {
+        let long = "x".repeat(MAX_HEALTH_MESSAGE_BYTES * 4);
+        let summary = StepSummary {
+            degraded_views: (0..MAX_HEALTH_ENTRIES + 7)
+                .map(|i| format!("d{i}"))
+                .collect(),
+            errored_views: (0..MAX_HEALTH_ENTRIES + 3)
+                .map(|i| ViewError {
+                    view: format!("e{i}"),
+                    kind: ViewErrorKind::ViewSql,
+                    message: long.clone(),
+                })
+                .collect(),
+            ..StepSummary::default()
+        };
+        let health = TickHealth::from_summary(&summary);
+        assert_eq!(health.degraded_views.len(), MAX_HEALTH_ENTRIES);
+        assert_eq!(health.degraded_omitted, 7);
+        assert_eq!(health.errored_views.len(), MAX_HEALTH_ENTRIES);
+        assert_eq!(health.errored_omitted, 3);
+        let msg = &health.errored_views[0].message;
+        assert!(msg.len() < long.len());
+        assert!(
+            msg.contains("truncated"),
+            "a truncated message must say it was truncated; got {msg}"
+        );
+        // And the caps survive the wire.
+        let blob = encode_tick_result(&HashMap::new(), &health).unwrap();
+        assert_eq!(decode_tick_result(&blob).unwrap().health.unwrap(), health);
+    }
+
+    /// The attach echo is the negotiation, and it fails CLOSED: no blob, a
+    /// foreign blob, or a truncated one all read as "legacy".
+    #[test]
+    fn attach_echo_round_trips_and_fails_closed() {
+        let caps = WireCapabilities {
+            binary_input_deltas: true,
+            tick_health: true,
+        };
+        let echo = encode_attach_echo(caps);
+        assert!(echo.starts_with(b"IVMW"));
+        assert_eq!(decode_attach_echo(Some(&echo)), caps);
+
+        assert_eq!(decode_attach_echo(None), WireCapabilities::default());
+        assert_eq!(
+            decode_attach_echo(Some(b"not an echo")),
+            WireCapabilities::default()
+        );
+        assert_eq!(
+            decode_attach_echo(Some(b"IVMW\x02")),
+            WireCapabilities::default(),
+            "a truncated echo is not evidence of a capability"
+        );
+    }
 }
 
 // ── Integration tests (3d) ────────────────────────────────────────────────────
@@ -4089,14 +4827,30 @@ mod integration_tests {
     }
 
     #[test]
-    fn corrupt_delta_map_bytes_error_instead_of_aborting() {
-        // decode_delta_map is the resident-executor → coordinator wire decoder;
-        // a corrupt tick result must not OOM the coordinator.
-        let mut blob = b"IVMD1".to_vec();
-        blob.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]); // u32::MAX views
-        assert!(super::decode_delta_map(&blob).is_err());
-        // decode_batch_map (attach state) shares the bug class.
-        assert!(super::decode_batch_map(&[0xFFu8, 0xFF, 0xFF, 0xFF]).is_err());
+    fn corrupt_tick_result_bytes_error_instead_of_aborting() {
+        // decode_delta_map / decode_tick_result are the resident-executor →
+        // coordinator wire decoders; a corrupt tick result must not OOM the
+        // coordinator.
+        let mut v1 = b"IVMD1".to_vec();
+        v1.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]); // u32::MAX views
+        assert!(super::decode_delta_map(&v1).is_err());
+        assert!(super::decode_tick_result(&v1).is_err());
+
+        // v2's health section has three more attackable counts. A well-formed
+        // (empty) delta map followed by 0xFFFFFFFF degraded views must error,
+        // not preallocate — bounded_capacity is what keeps that from being a
+        // multi-gigabyte allocation, and it has to be applied per section.
+        let mut v2 = b"IVMD2".to_vec();
+        v2.extend_from_slice(&0u32.to_le_bytes()); // 0 views
+        v2.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]); // u32::MAX degraded
+        assert!(super::decode_tick_result(&v2).is_err());
+
+        let mut v2e = b"IVMD2".to_vec();
+        v2e.extend_from_slice(&0u32.to_le_bytes()); // 0 views
+        v2e.extend_from_slice(&0u32.to_le_bytes()); // 0 degraded
+        v2e.extend_from_slice(&0u32.to_le_bytes()); // 0 degraded omitted
+        v2e.extend_from_slice(&[0xFFu8, 0xFF, 0xFF, 0xFF]); // u32::MAX errored
+        assert!(super::decode_tick_result(&v2e).is_err());
     }
 
     // ── G2: restore_delta idempotency ─────────────────────────────────────────
@@ -5813,6 +6567,346 @@ mod integration_tests {
 
     // ── IVM-AUD-CORE-18 / 19 / 25 / 26 ───────────────────────────────────────
 
+    // ── IVM-AUD-CORE-2: source state is a faithful Z-set ─────────────────────
+
+    mod core2_source_zset {
+        use super::*;
+        use arrow::array::Int64Array;
+        use krishiv_delta::IncrementalViewSpec;
+
+        fn ids_schema() -> Arc<Schema> {
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]))
+        }
+
+        fn ids(vals: &[i64]) -> RecordBatch {
+            RecordBatch::try_new(
+                ids_schema(),
+                vec![Arc::new(Int64Array::from(vals.to_vec()))],
+            )
+            .unwrap()
+        }
+
+        fn inserts(vals: &[i64]) -> DeltaBatch {
+            DeltaBatch::from_inserts(ids(vals)).unwrap()
+        }
+
+        fn deletes(vals: &[i64]) -> DeltaBatch {
+            DeltaBatch::from_deletes(ids(vals)).unwrap()
+        }
+
+        fn fresh_with_view() -> IncrementalFlow {
+            let flow = IncrementalFlow::new();
+            flow.register_view(IncrementalViewSpec {
+                name: "v".into(),
+                body_sql: "SELECT id FROM src".into(),
+                output_schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                is_materialized: true,
+                is_recursive: false,
+                lateness: vec![],
+            })
+            .unwrap();
+            flow
+        }
+
+        fn source_rows(flow: &IncrementalFlow) -> usize {
+            flow.source_snapshot("src")
+                .unwrap()
+                .map_or(0, |b| b.num_rows())
+        }
+
+        fn view_rows(flow: &IncrementalFlow) -> usize {
+            flow.snapshot("v").unwrap().map_or(0, |b| b.num_rows())
+        }
+
+        /// The headline reproduction. A `DELETE 42` that arrives before its
+        /// `INSERT 42` used to be forgotten entirely (`apply_delta` materializes,
+        /// and a relation cannot hold a row −1 times), so the later insertion
+        /// made row 42 present. The Z-set answer is weight 0 — absent.
+        ///
+        /// Everything here goes through `step_datafusion`: `step()` drains
+        /// `pending` and never advances source state at all, so a test written
+        /// against it would pass before and after and prove nothing.
+        #[tokio::test]
+        async fn a_retraction_of_a_never_inserted_row_is_remembered() {
+            let flow = fresh_with_view();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(source_rows(&flow), 0, "a retraction adds no rows");
+
+            flow.feed("src", inserts(&[42])).unwrap();
+            let summary = flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                source_rows(&flow),
+                0,
+                "the insertion must cancel against the remembered retraction"
+            );
+            // NOT `assert_eq!(view_rows(&flow), 0)`. That assertion was here
+            // and it was trivially true: a zero-row source registers no
+            // MemTable (Phase 3 calls `tables.remove`), so the view's SQL
+            // fails to plan and reads 0 rows whether or not the deficit works
+            // — trap #3 in the register preamble. The source assertions above
+            // are what prove CORE-2. What the view does is a *consequence*
+            // worth pinning explicitly (IVM-AUD-CORE-2c): the source is now
+            // correctly empty forever, so the view over it fails to plan on
+            // every tick that carries input, permanently.
+            assert!(
+                summary
+                    .errored_views
+                    .iter()
+                    .any(|e| e.view == "v" && e.message.contains("not found")),
+                "the view over a correctly-empty source must report its failure, \
+                 not read as healthy: {:?}",
+                summary.errored_views
+            );
+        }
+
+        /// The second reachability the register names: a `iv.delete(...)` of a
+        /// row that is there, twice. Net −2 against one copy is weight −1, not
+        /// weight 0, so the next insertion pays the debt instead of adding a row.
+        #[tokio::test]
+        async fn an_over_retraction_is_remembered_not_clamped() {
+            let flow = fresh_with_view();
+            flow.feed("src", inserts(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(source_rows(&flow), 1);
+
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(source_rows(&flow), 0);
+
+            flow.feed("src", inserts(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                source_rows(&flow),
+                0,
+                "one copy is still owed, so this insertion only settles it"
+            );
+        }
+
+        /// The fast path is a **cost** claim, and every branch of
+        /// `SourceState::apply` computes the same Z-set — so a test that asserts
+        /// only row counts passes whichever branch ran (the fallback-mask trap
+        /// CORE-23 fell into). Assert the branch instead, through the
+        /// consolidation counter.
+        #[tokio::test]
+        async fn an_append_only_source_still_takes_the_concat_fast_path() {
+            let flow = fresh_with_view();
+            for i in 0..50i64 {
+                flow.feed("src", inserts(&[i])).unwrap();
+                flow.step_datafusion().await.unwrap();
+            }
+            assert_eq!(source_rows(&flow), 50);
+            assert_eq!(
+                flow.source_consolidations("src").unwrap(),
+                0,
+                "an append-only source must never pay an O(state) consolidate"
+            );
+
+            flow.feed("src", deletes(&[0])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                flow.source_consolidations("src").unwrap(),
+                1,
+                "and a retraction must pay exactly one"
+            );
+        }
+
+        /// Changing the in-memory state without carrying the deficit through
+        /// `checkpoint_full` would make deficits vanish on restart — silent, and
+        /// only visible after a restore. This is the test that says they do not.
+        #[tokio::test]
+        async fn checkpoint_full_carries_the_deficit() {
+            let flow = fresh_with_view();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(flow.source_deficit_rows("src").unwrap(), 1);
+
+            let blob = flow.checkpoint_full().unwrap();
+            let restored = fresh_with_view();
+            restored.restore_full(&blob).unwrap();
+            assert_eq!(
+                restored.source_deficit_rows("src").unwrap(),
+                1,
+                "the deficit must survive the round trip"
+            );
+
+            restored.feed("src", inserts(&[42])).unwrap();
+            restored.step_datafusion().await.unwrap();
+            assert_eq!(source_rows(&restored), 0);
+            assert_eq!(view_rows(&restored), 0);
+        }
+
+        /// A blob written before the deficit section existed carries no `IVMZ1`
+        /// tag; it must restore with the old (deficit-free) behaviour rather
+        /// than erroring — the same contract CORE-27's `IVMF2` section has.
+        #[tokio::test]
+        async fn a_checkpoint_without_the_deficit_section_still_restores() {
+            let flow = fresh_with_view();
+            flow.feed("src", inserts(&[1, 2, 3])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+
+            let blob = flow.checkpoint_full().unwrap();
+            let cut = blob
+                .windows(super::super::SOURCE_DEFICIT_MAGIC.len())
+                .position(|w| w == super::super::SOURCE_DEFICIT_MAGIC.as_slice())
+                .expect("a fresh checkpoint always carries the deficit section");
+            let legacy = &blob[..cut];
+
+            let restored = fresh_with_view();
+            restored.restore_full(legacy).unwrap();
+            assert_eq!(source_rows(&restored), 3, "the positives still restore");
+            assert_eq!(
+                restored.retained_state().unwrap().deficit_rows_retained,
+                0,
+                "an old blob owes nothing, which is exactly its old behaviour"
+            );
+        }
+
+        /// The design decision this pins: the deficit rides in its own trailing
+        /// section, NOT as a `_weight` column smuggled into the source section.
+        /// An older `restore_full` reading a weighted source batch would install
+        /// a source snapshot with a phantom `_weight` column — schema corruption,
+        /// which is strictly worse than dropping the deficit.
+        #[tokio::test]
+        async fn the_source_section_stays_free_of_the_weight_column() {
+            let flow = fresh_with_view();
+            flow.feed("src", inserts(&[1, 2, 3])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(flow.source_deficit_rows("src").unwrap(), 1);
+
+            // Read the blob the way a binary predating this change would.
+            let blob = flow.checkpoint_full().unwrap();
+            let cut = blob
+                .windows(super::super::SOURCE_DEFICIT_MAGIC.len())
+                .position(|w| w == super::super::SOURCE_DEFICIT_MAGIC.as_slice())
+                .expect("a fresh checkpoint always carries the deficit section");
+            let restored = fresh_with_view();
+            restored.restore_full(&blob[..cut]).unwrap();
+
+            let snap = restored.source_snapshot("src").unwrap().unwrap();
+            // Asserted FIRST: this is the assertion that pins the design
+            // decision, and it must be the one that fails if the weighted
+            // batch is ever inlined into the source section.
+            assert!(
+                snap.schema().field_with_name("_weight").is_err(),
+                "the source section must stay a plain RecordBatch; got schema {:?}",
+                snap.schema()
+            );
+            assert_eq!(snap.num_rows(), 3);
+        }
+
+        /// `restore_delta` keeps its deliberate set-collapse (G2) and stops
+        /// dropping deficits. The collapse now runs on both signs: a net `+k`
+        /// becomes one copy and a net `−k` becomes one owed copy, which is the
+        /// only shape that keeps stacked restores idempotent AND does not
+        /// reintroduce CORE-2 on this path.
+        #[test]
+        fn restore_delta_keeps_the_collapse_and_stops_dropping_deficits() {
+            let flow = IncrementalFlow::new();
+            flow.enable_delta_checkpoints().unwrap();
+            flow.feed("src", inserts(&[1, 2, 3])).unwrap();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step().unwrap();
+
+            let full_ck = flow.checkpoint().unwrap();
+            let delta_ck = flow.checkpoint_delta().unwrap();
+            flow.restore(&full_ck).unwrap();
+            flow.restore_delta(&delta_ck).unwrap();
+            flow.restore_delta(&delta_ck).unwrap();
+
+            // (a) the G2 property, unchanged.
+            assert_eq!(
+                source_rows(&flow),
+                3,
+                "stacked restore must not duplicate rows"
+            );
+            // (b) the deficit survived, and is exactly one copy — not zero
+            //     (CORE-2 reintroduced) and not two (idempotence broken).
+            assert_eq!(flow.source_deficit_rows("src").unwrap(), 1);
+            let owed: i64 = flow
+                .source_zset("src")
+                .unwrap()
+                .unwrap()
+                .weights()
+                .iter()
+                .flatten()
+                .filter(|w| *w < 0)
+                .sum();
+            assert_eq!(owed, -1, "two stacked restores must still owe exactly one");
+        }
+
+        /// The behavioural half of the row above, stated in rows rather than
+        /// weights: after two stacked restores the FIRST insertion of 42 settles
+        /// the debt and the SECOND makes the row present. Dropping the negatives
+        /// breaks the first assertion; keeping exact magnitudes breaks the second.
+        #[tokio::test]
+        async fn a_stacked_delta_restore_owes_exactly_one_copy() {
+            let flow = fresh_with_view();
+            flow.enable_delta_checkpoints().unwrap();
+            flow.feed("src", inserts(&[1, 2, 3])).unwrap();
+            flow.feed("src", deletes(&[42])).unwrap();
+            flow.step().unwrap();
+
+            let full_ck = flow.checkpoint().unwrap();
+            let delta_ck = flow.checkpoint_delta().unwrap();
+            flow.restore(&full_ck).unwrap();
+            flow.restore_delta(&delta_ck).unwrap();
+            flow.restore_delta(&delta_ck).unwrap();
+
+            flow.feed("src", inserts(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                source_rows(&flow),
+                3,
+                "the first insertion of 42 only settles what is owed"
+            );
+
+            flow.feed("src", inserts(&[42])).unwrap();
+            flow.step_datafusion().await.unwrap();
+            assert_eq!(
+                source_rows(&flow),
+                4,
+                "the second insertion must actually add the row"
+            );
+        }
+
+        /// IVM-AUD-CORE-2b. The view level still materializes rather than
+        /// holding a Z-set, so a caller-supplied retraction for a row the view
+        /// never emitted is still clamped away. This test does NOT claim that is
+        /// fixed — it asserts the loss is now counted instead of silent, exactly
+        /// as CORE-29 did for `restore_delta`'s collapse.
+        #[test]
+        fn a_view_counts_the_retractions_it_had_to_clamp() {
+            let flow = fresh_with_view();
+            let retraction = DeltaBatch::from_deletes(
+                RecordBatch::try_new(
+                    Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, true)])),
+                    vec![Arc::new(Int64Array::from(vec![99i64]))],
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            flow.step_with(|_| Ok(HashMap::from([("v".to_string(), retraction.clone())])))
+                .unwrap();
+
+            assert_eq!(
+                view_rows(&flow),
+                0,
+                "the view cannot hold a row minus one times, so it still clamps"
+            );
+            assert_eq!(
+                flow.view_clamped_retractions("v").unwrap(),
+                1,
+                "but the clamped row must be counted, not lost silently"
+            );
+        }
+    }
+
     mod state_discipline {
         use super::*;
         use arrow::array::{Int64Array, StringArray};
@@ -6022,6 +7116,34 @@ mod integration_tests {
                 super::super::RetainedState::default(),
                 "dropping the only view and the only source must leave nothing behind"
             );
+        }
+
+        /// IVM-AUD-CORE-2 is new unbounded per-source state: a delete for a
+        /// row that never existed used to cost nothing and is now retained
+        /// forever. CORE-25's rule is that the first question about a flow that
+        /// will not stop growing is which map is growing — so the deficit has to
+        /// be visible in `retained_state`, and it has to come back on
+        /// `drop_source`. It lives inside `SourceState` rather than in a tenth
+        /// sibling map precisely so `drop_source` reclaims it for free.
+        #[tokio::test]
+        async fn deficits_are_visible_and_reclaimable() {
+            let flow = IncrementalFlow::new();
+            flow.register_view(totals_spec(true)).unwrap();
+            flow.feed(
+                "orders",
+                DeltaBatch::from_deletes(orders(&["ghost"], &[1])).unwrap(),
+            )
+            .unwrap();
+            flow.step_datafusion().await.unwrap();
+
+            let before = flow.retained_state().unwrap();
+            assert_eq!(before.sources_with_deficits, 1);
+            assert_eq!(before.deficit_rows_retained, 1);
+
+            assert!(flow.drop_source("orders").unwrap());
+            let after = flow.retained_state().unwrap();
+            assert_eq!(after.sources_with_deficits, 0);
+            assert_eq!(after.deficit_rows_retained, 0);
         }
 
         /// IVM-AUD-CORE-26: the dedup set's capacity check ran once per `feed`,

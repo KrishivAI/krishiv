@@ -211,6 +211,12 @@ impl DeltaBatch {
     /// a join output carrying weight 2 must show 2 rows, exactly as the
     /// equivalent SQL would (#160). Snapshot maintenance (`apply_delta`, view
     /// publication, trace snapshots) uses this variant.
+    ///
+    /// The `.max(0)` below is a **materialization** decision, not a bug: a row
+    /// with net weight −1 appears in the relation zero times, and there is no
+    /// `RecordBatch` that says otherwise. Do not "fix" it here — the negative
+    /// remainder has to be held somewhere that can represent it, which is what
+    /// [`SourceState`](crate::SourceState) is for (IVM-AUD-CORE-2).
     pub fn filter_positive_expanded(&self) -> DeltaResult<RecordBatch> {
         let weights = self.weights();
         // Fast path: every weight exactly +1 — the data batch is the answer.

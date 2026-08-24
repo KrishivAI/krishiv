@@ -685,6 +685,32 @@ impl PartitionedIncrementalFlow {
     // not start with the magic is therefore read with the old framing (shard
     // count only), which is exactly the guarantee it shipped with.
 
+    /// Total rows owed across every shard's sources — the Z-set deficits
+    /// CORE-2 introduced.
+    ///
+    /// Forwarded because a partitioned job was otherwise **blind** to them:
+    /// the deficit is per-source state that grows one entry per unmatched
+    /// retraction with no cap, and `PartitionedIncrementalFlow` exposed
+    /// neither this nor `retained_state`, so for a sharded job the only
+    /// signal was a tracing WARN.
+    pub fn source_deficit_rows(&self, name: &str) -> IvmResult<usize> {
+        let mut total = 0usize;
+        for shard in &self.shards {
+            total = total.saturating_add(shard.source_deficit_rows(name)?);
+        }
+        Ok(total)
+    }
+
+    /// Per-map retained-state counts summed across shards (CORE-25's rule:
+    /// the first question about a growing flow is which map is growing).
+    pub fn retained_state(&self) -> IvmResult<crate::RetainedState> {
+        let mut total = crate::RetainedState::default();
+        for shard in &self.shards {
+            total.add(shard.retained_state()?);
+        }
+        Ok(total)
+    }
+
     /// The LATENESS bounds that reached the shards. Every shard is registered
     /// from the same spec, so the first shard's answer is the job's.
     pub fn declared_lateness(&self) -> IvmResult<Vec<krishiv_delta::LatenessSpec>> {

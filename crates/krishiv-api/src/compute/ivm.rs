@@ -456,6 +456,8 @@ mod tests {
                         kind: "view_sql".into(),
                         message: "column 'nope' not found".into(),
                     }],
+                    degraded_omitted: 0,
+                    errored_omitted: 0,
                 }),
             },
         );
@@ -520,6 +522,8 @@ mod tests {
                         kind: "some_future_kind".into(),
                         message: "boom".into(),
                     }],
+                    degraded_omitted: 0,
+                    errored_omitted: 0,
                 }),
             },
         );

@@ -133,6 +133,22 @@ pub fn differentiate(
 /// batches via `arrow::compute::concat_batches` instead of the full consolidate-
 /// based merge, making source snapshot maintenance truly O(delta) for
 /// append-only workloads.
+///
+/// # This is materialization, not state (IVM-AUD-CORE-2)
+///
+/// The result is a `RecordBatch`, so a row whose net weight is **negative**
+/// has nowhere to go: `filter_positive_expanded` clamps it at zero copies and
+/// the remainder is forgotten. That is the right answer for a materialized
+/// relation and the wrong one for accumulated state — a retraction that
+/// arrives before its insertion must be remembered, or the later insertion
+/// wrongly makes the row present. Anything that *accumulates* a source Z-set
+/// must use [`SourceState`](crate::SourceState), which keeps the negative
+/// remainder alongside this same materialization. `IncrementalFlow` does.
+///
+/// View snapshots (`IncrementalView::apply_output_delta`,
+/// `IncrementalView::publish_output`) still integrate through this function
+/// and therefore still clamp; the rows they lose are counted and reported by
+/// `IncrementalView::clamped_retraction_rows` (IVM-AUD-CORE-2b).
 pub fn apply_delta(current: Option<RecordBatch>, delta: &DeltaBatch) -> DeltaResult<RecordBatch> {
     match current {
         None => delta.filter_positive_expanded(),

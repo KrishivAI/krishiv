@@ -15,7 +15,7 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use krishiv_delta::{
-    DeltaBatch, Trace, WEIGHT_COLUMN, consolidate_batch, deserialize_delta_batch,
+    DeltaBatch, SourceState, Trace, WEIGHT_COLUMN, consolidate_batch, deserialize_delta_batch,
     serialize_delta_batch,
 };
 use proptest::prelude::*;
@@ -187,6 +187,52 @@ proptest! {
         let expected: Vec<i64> = a.iter().map(|(_, w)| w.signum()).filter(|s| *s != 0).collect();
         let got: Vec<i64> = out.weights().iter().map(|w| w.unwrap_or(0)).collect();
         prop_assert_eq!(got, expected);
+    }
+
+    /// IVM-AUD-CORE-2: `SourceState` folded over an arbitrary sequence of
+    /// deltas equals the Z-set model of their concatenation — including the
+    /// keys whose running net weight goes negative, which is exactly what
+    /// `apply_delta` used to clamp away.
+    ///
+    /// Both invariants are asserted too: every deficit weight is strictly
+    /// negative, and no key is both present and owed. The invariant half is
+    /// what exercises the pay-off-the-deficit branch, which the behavioural
+    /// tests in `krishiv-ivm` only touch incidentally.
+    #[test]
+    fn source_state_apply_matches_the_zset_model(
+        chunks in proptest::collection::vec(rows_strategy(), 1..6),
+    ) {
+        let mut state: Option<SourceState> = None;
+        for chunk in &chunks {
+            state = Some(SourceState::apply_to(state, &zbatch(chunk)).expect("apply"));
+        }
+        let state = state.expect("at least one chunk");
+
+        let all: Rows = chunks.iter().flatten().copied().collect();
+        let expected = model(&all);
+
+        // positive (as a multiset) + deficit == the model Z-set.
+        let mut got: BTreeMap<i64, i64> = multiset(state.positive());
+        if let Some(deficit) = state.deficit() {
+            for (k, w) in batch_model(deficit) {
+                *got.entry(k).or_insert(0) += w;
+            }
+        }
+        got.retain(|_, w| *w != 0);
+        prop_assert_eq!(got, expected);
+
+        // Invariant 1: every deficit weight is strictly negative.
+        if let Some(deficit) = state.deficit() {
+            prop_assert!(deficit.num_rows() > 0, "an empty deficit must be None");
+            for w in deficit.weights().iter().flatten() {
+                prop_assert!(w < 0, "deficit weight {} is not negative", w);
+            }
+            // Invariant 2: no key is both present and owed.
+            let present = multiset(state.positive());
+            for k in batch_model(deficit).keys() {
+                prop_assert!(!present.contains_key(k), "key {} is both present and owed", k);
+            }
+        }
     }
 
     /// A `Trace` fed the same rows in arbitrary chunkings always snapshots to

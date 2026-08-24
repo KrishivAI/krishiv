@@ -1181,6 +1181,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Per-IVM-job cap on queued input bytes across all sources. A /feed that would push the backlog past it is refused with HTTP 429 instead of growing an unbounded in-memory queue (audit INT-F11). 0 restores the old unbounded behaviour; a value that does not parse falls back to the default.",
     ),
     rt(
+        "KRISHIV_IVM_LEGACY_TICK_WIRE",
+        FlagKind::Bool,
+        "false",
+        "Forces the coordinator to send the pre-IVMD2 JSON payload on every resident IVM tick, even to an executor whose attach echo said it reads the binary one (audit INT-F19). The operator escape hatch for the tick-wire change: it gives back the old behaviour exactly, which means giving up the 25% wire saving AND per-view health on resident ticks (a JSON tick is answered on the v1 result wire, so /step reports view_health.reported=false).",
+    ),
+    rt(
         "KRISHIV_IVM_DISPATCH_TIMEOUT_SECS",
         FlagKind::UInt,
         "300",

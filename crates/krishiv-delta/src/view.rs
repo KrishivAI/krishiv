@@ -6,6 +6,7 @@
 //! view, its current pending output `DeltaBatch`, and its registered sinks.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use arrow::array::RecordBatch;
@@ -57,6 +58,9 @@ pub struct IncrementalView {
     /// Previous full materialized output used for diff-based IVM.
     /// `differentiate(full_output_prev, new_full)` produces the true delta.
     full_output: Arc<Mutex<Option<RecordBatch>>>,
+    /// Retraction rows this view's integration had to clamp away
+    /// (IVM-AUD-CORE-2b). See [`Self::clamped_retraction_rows`].
+    clamped_retractions: Arc<AtomicU64>,
 }
 
 impl IncrementalView {
@@ -70,8 +74,62 @@ impl IncrementalView {
             delta_tx,
             snapshot: Arc::new(Mutex::new(None)),
             full_output: Arc::new(Mutex::new(None)),
+            clamped_retractions: Arc::new(AtomicU64::new(0)),
         };
         (view, receiver)
+    }
+
+    /// Retraction rows this view's integration clamped away, cumulative
+    /// (IVM-AUD-CORE-2b).
+    ///
+    /// **This is a measurement, not a fix.** A view's materialized state is a
+    /// `RecordBatch`, so a delta that retracts a row the view does not hold
+    /// has nowhere to record the debt — `apply_delta` clamps it at zero copies
+    /// and the remainder is dropped. CORE-2 fixed that for *source* state (see
+    /// [`SourceState`](crate::SourceState)); the view level still clamps, and
+    /// this counter is what makes the loss visible instead of silent, exactly
+    /// as `delta_restore_collapsed_rows` did for `restore_delta`'s collapse.
+    ///
+    /// Non-zero means this view's snapshot and diff baseline are **not** the
+    /// Z-set the deltas describe.
+    ///
+    /// It stays zero on the DiffBased path in normal operation, whose delta
+    /// comes from `differentiate` against the view's own baseline and so
+    /// cannot retract more than that baseline holds. It can go non-zero
+    /// through a caller-supplied delta
+    /// (`IncrementalFlow::step_with`) or a remote tick mirrored onto a drifted
+    /// baseline (`IncrementalFlow::apply_remote_tick`).
+    pub fn clamped_retraction_rows(&self) -> u64 {
+        self.clamped_retractions.load(Ordering::Relaxed)
+    }
+
+    /// Count what a materialization of `delta` on top of `prev` had to clamp.
+    ///
+    /// The Z-set answer has `prev.num_rows() + Σweights` rows; the materialized
+    /// answer has `Σ max(0, net)` rows. The difference is exactly the owed
+    /// multiplicity that was clamped away, and computing it costs one pass over
+    /// the delta's weights — no second consolidate.
+    fn record_clamped(
+        &self,
+        prev: Option<&RecordBatch>,
+        delta: &DeltaBatch,
+        updated: &RecordBatch,
+    ) {
+        let mut expected: i64 = prev.map_or(0, |p| p.num_rows() as i64);
+        for w in delta.weights().iter().flatten() {
+            expected = expected.saturating_add(w);
+        }
+        let clamped = (updated.num_rows() as i64).saturating_sub(expected).max(0);
+        if clamped > 0 {
+            tracing::warn!(
+                view = %self.spec.name,
+                clamped_rows = clamped,
+                "view integration clamped a retraction with nothing to cancel; the view's \
+                 state is not the Z-set the delta describes (IVM-AUD-CORE-2b)"
+            );
+            self.clamped_retractions
+                .fetch_add(clamped as u64, Ordering::Relaxed);
+        }
     }
 
     /// Publish an output delta whose diff baseline has **already** been
@@ -111,8 +169,11 @@ impl IncrementalView {
                 // losing all history. `RecordBatch` clones share Arc'd
                 // buffers, so this costs a refcount bump.
                 let current = snap.clone();
-                match crate::operators::stream::apply_delta(current, &output) {
-                    Ok(rb) => rb,
+                match crate::operators::stream::apply_delta(current.clone(), &output) {
+                    Ok(rb) => {
+                        self.record_clamped(current.as_ref(), &output, &rb);
+                        rb
+                    }
                     Err(e) => {
                         tracing::warn!(
                             view = %self.spec.name,
@@ -328,7 +389,13 @@ impl IncrementalView {
                 .full_output
                 .lock()
                 .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            crate::operators::stream::apply_delta(fo.clone(), delta)?
+            let prev = fo.clone();
+            let updated = crate::operators::stream::apply_delta(prev.clone(), delta)?;
+            // Counted on the baseline only, not again on the snapshot: for a
+            // materialized view the two integrate the same delta, so counting
+            // both would double every loss.
+            self.record_clamped(prev.as_ref(), delta, &updated);
+            updated
         };
         let updated_snapshot = if self.spec.is_materialized {
             let snap = self

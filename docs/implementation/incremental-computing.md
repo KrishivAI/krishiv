@@ -183,6 +183,30 @@ Weight semantics:
 - `+2` = row present twice (multiset; rare in practice)
 - `0` = row absent (eliminated by consolidate)
 
+### `SourceState`
+
+What an `IncrementalFlow` holds per source. A materialized `RecordBatch`
+cannot represent a row whose net weight is negative, so accumulated source
+state is split in two (IVM-AUD-CORE-2):
+
+```
+SourceState {
+    positive: RecordBatch,        // the relation; weight k → k physical rows
+    deficit: Option<ChangeBatch>, // rows whose net weight is < 0
+}
+```
+
+`positive` is what view SQL reads (registered as a `MemTable` each tick) and
+what `source_snapshot()` returns. `deficit` is what makes a retraction that
+arrives before its insertion — out-of-order CDC, or a `delete` of a row that
+is not there — cancel correctly instead of being forgotten. Invariants: every
+deficit weight is strictly negative, and no row is both present and owed.
+
+Applying a delta costs O(Δ) for an append-only source (a plain
+`concat_batches`), O(|deficit| + Δ) for an append onto a source that owes
+rows, and O(state) only when the delta itself carries a retraction or a
+non-unit weight — the same case that already cost O(state).
+
 ### `Trace`
 
 ```
@@ -257,7 +281,6 @@ crates/krishiv-delta/
       join.rs               — bilinear incremental join (two Traces)
       aggregate.rs          — stateful aggregate (sum, count, avg; retraction-aware)
       distinct.rs           — nonlinear distinct (threshold tracking via HashMap)
-      recursive.rs          — fixed-point iteration for recursive views
 ```
 
 ---
@@ -290,7 +313,6 @@ crates/krishiv-delta/
 | `Distinct` | `operators/distinct.rs` | `count: AHashMap<RowKey, i64>` | O(|ΔA| · hash) |
 | `Aggregate(SUM,COUNT,AVG)` | `operators/aggregate.rs` | `running: AHashMap<GroupKey, AggState>` | O(|ΔA| · hash) |
 | `Aggregate(MAX,MIN)` | `operators/aggregate.rs` | `multiset: AHashMap<GroupKey, BTreeMap<Value, i64>>` | O(|ΔA| · log|group|) |
-| `Recursive` | `operators/recursive.rs` | inner view state | O(fixpoint_iters · |delta|) |
 
 ### Aggregate Retraction Protocol
 
@@ -502,7 +524,6 @@ async for change_batch in flow.change_stream("order_totals"):
 - [x] `operators/join.rs`: `IncrementalJoinOp` (two Traces, bilinear protocol)
 - [x] `operators/aggregate.rs`: `IncrementalAggOp` (SUM/COUNT/AVG + retraction; MAX/MIN via BTreeMap)
 - [x] `operators/distinct.rs`: `IncrementalDistinctOp` (threshold HashMap)
-- [x] `operators/recursive.rs`: `RecursiveOp` (fixed-point loop, cycle guard)
 - [x] `view.rs`: `IncrementalView`, `IncrementalViewRegistry`
 - [x] `plan.rs`: `IncrementalPlan`, `IncrementalOp` trait, DataFusion plan-walker
 
@@ -536,9 +557,13 @@ async for change_batch in flow.change_stream("order_totals"):
 
 ### Phase 7 — Recursive Views  [TODO]
 
-- [ ] `operators/recursive.rs` full fixed-point implementation with cycle guard
+- [x] Fixed-point loop with an iteration cap — implemented in the IVM tick
+      (`IncrementalFlow::run_recursive_fixpoint`), not as a delta operator.
+      `operators/recursive.rs` was deleted unwired (IVM-AUD-REC-OP-1).
 - [ ] `DECLARE RECURSIVE VIEW` SQL: forward-declare, parse body, detect self-reference
-- [ ] Auto-DISTINCT on recursive views
+- [ ] Auto-DISTINCT on recursive views — **deliberately not done** and
+      documented as a non-feature (IVM-AUD-DDL-E3); the body must be written
+      set-semantically by the user.
 - [ ] Integration test: transitive closure over 5-node graph
 
 ### Phase 8 — Integration + Validation  [TODO]
@@ -622,7 +647,14 @@ async for change_batch in flow.change_stream("order_totals"):
 
 3. **No distributed Trace sharding** (Phase 10): the `IncrementalJoinOp` Traces are local to one process. For datasets that exceed single-node memory, distributed sharding is required (planned, uses existing shuffle infrastructure).
 
-4. **Recursive views** are not yet implemented (Phase 7). The `RecursiveOp` stub exists but the fixed-point loop requires forward-declaration resolution.
+4. **Recursive views** are implemented, but by naive (not semi-naive) iteration.
+   `DECLARE RECURSIVE VIEW` is maintained by `IncrementalFlow::run_recursive_fixpoint`,
+   which re-runs the whole view body against the previous iterate until two
+   iterates are equal, capped at `MAX_FIXPOINT_ITERS` (100). A recursive view is
+   forced off the O(Δ) plan path, so it costs a full recompute per iteration per
+   tick. Nothing applies DISTINCT between iterations: a `UNION ALL` recursion over
+   a cyclic input does not converge and errors at the cap with
+   `FixpointNotConverged` (IVM-AUD-DDL-E3/CORE-12/CORE-13).
 
 5. **Source watermark scheduler integration** (Phase 9) is not yet wired. Skip-if-unchanged optimization is planned but not active; all scheduled ticks currently evaluate regardless of source advancement.
 

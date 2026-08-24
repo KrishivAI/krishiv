@@ -60,11 +60,16 @@ impl TypedTaskFragment {
         if fragment.starts_with("stream:") {
             return ExecutionKind::Streaming;
         }
-        // IVM fragments shipped by the coordinator's distributed dispatch:
-        // the legacy stateless `delta:step:` tick plus the Phase 57 resident
-        // protocol (`delta:attach:` / `delta:tick:` / `delta:ckpt:` /
+        // IVM fragments shipped by the coordinator's distributed dispatch: the
+        // Phase 57 resident protocol (`delta:attach:` / `delta:tick:` /
         // `delta:detach:`). Without this the executor infers Batch and the
         // batch dispatcher rejects the fragment, forcing central fallback.
+        //
+        // Deliberately the whole `delta:` namespace and not those three verbs:
+        // a retired verb (`delta:step:`, `delta:ckpt:` — deleted under
+        // IVM-AUD-INT-F20) must still route to the IVM handler, which names it
+        // and refuses it, rather than to the batch dispatcher, which would
+        // report something unrelated about a fragment it was never given.
         if fragment.starts_with("delta:") {
             return ExecutionKind::DeltaBatch;
         }
@@ -186,9 +191,21 @@ mod tests {
     }
 
     #[test]
-    fn legacy_delta_step_prefix_is_delta_batch() {
-        // Distributed IVM tick fragment must classify as DeltaBatch so the
-        // executor routes it to the IVM handler, not the batch dispatcher.
+    fn every_delta_prefix_is_delta_batch() {
+        // Distributed IVM fragments must classify as DeltaBatch so the executor
+        // routes them to the IVM handler, not the batch dispatcher.
+        for live in [
+            "delta:attach:orders|s|st|0",
+            "delta:tick:orders|d|1",
+            "delta:detach:orders",
+        ] {
+            assert_eq!(
+                execution_kind_from_fragment(live),
+                ExecutionKind::DeltaBatch
+            );
+        }
+        // And so must a retired one: it has to reach the handler that can say
+        // "delta:step: no longer executes" (IVM-AUD-INT-F20).
         assert_eq!(
             execution_kind_from_fragment("delta:step:orders|d|s|st"),
             ExecutionKind::DeltaBatch

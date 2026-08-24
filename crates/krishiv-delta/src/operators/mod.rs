@@ -7,5 +7,4 @@ pub mod filter;
 pub mod join;
 pub mod key_util;
 pub mod map;
-pub mod recursive;
 pub mod stream;

@@ -18,9 +18,6 @@ pub enum DeltaError {
     #[error("view not found: {0}")]
     ViewNotFound(String),
 
-    #[error("recursive view cycle limit exceeded after {0} iterations")]
-    CycleLimitExceeded(usize),
-
     #[error("serialization error: {0}")]
     Serialization(String),
 }
