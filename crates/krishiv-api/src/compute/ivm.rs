@@ -260,7 +260,10 @@ fn remote_step_report(job_id: &str, s: krishiv_runtime::RemoteStepSummary) -> St
                     },
                 })
                 .collect(),
-            view_health: super::job::ViewHealth::Reported,
+            view_health: super::job::ViewHealth::Reported {
+                degraded_omitted: h.degraded_omitted,
+                errored_omitted: h.errored_omitted,
+            },
         },
         None => StepReport {
             active_views: s.active_views,
@@ -357,7 +360,12 @@ impl FeedableJob for IvmJob {
                             message: e.message,
                         })
                         .collect(),
-                    view_health: super::job::ViewHealth::Reported,
+                    // Embedded: the summary is the engine's own, never
+                    // across a wire, so nothing can have been dropped.
+                    view_health: super::job::ViewHealth::Reported {
+                        degraded_omitted: 0,
+                        errored_omitted: 0,
+                    },
                 }
             }
             Self::Remote(j) => remote_step_report(j.job_id(), j.step().await?),
@@ -514,7 +522,7 @@ mod tests {
             report.errored_views[0].message, "column 'nope' not found",
             "a recognised kind must not have the kind name spliced into its message"
         );
-        assert_eq!(report.view_health, crate::ViewHealth::Reported);
+        assert!(report.view_health.is_reported() && report.view_health.is_complete());
     }
 
     /// IVM-AUD-API-A5, the other half: a tick with no health signal — an older
@@ -536,7 +544,7 @@ mod tests {
         );
         assert!(report.errored_views.is_empty());
         match &report.view_health {
-            crate::ViewHealth::Reported => {
+            crate::ViewHealth::Reported { .. } => {
                 panic!("a tick nobody reported health for must not claim to be a health report")
             }
             crate::ViewHealth::Unreported(why) => {
@@ -682,6 +690,59 @@ mod tests {
         let job1 = IvmJob::embedded(&single, "agg").unwrap();
         job1.register_view(revenue_spec()).await.unwrap();
         assert_eq!(job1.is_partitioned().unwrap(), Some(false));
+    }
+
+    /// IVM-AUD-A5-RESIDENT-b. The resident tick frame caps each health vector
+    /// at 256 entries and reports what it dropped, but those counts stopped at
+    /// the HTTP layer — a Rust caller saw a truncated list and had no way to
+    /// know. They now ride on `ViewHealth::Reported` itself, so "did anything
+    /// report" and "was the report complete" cannot be answered separately.
+    #[test]
+    fn a_truncated_health_report_cannot_be_read_as_a_whole_one() {
+        use krishiv_runtime::{RemoteStepSummary, RemoteViewHealth};
+
+        let truncated = remote_step_report(
+            "j",
+            RemoteStepSummary {
+                active_views: 1,
+                total_output_rows: 0,
+                tick: 7,
+                view_health: Some(RemoteViewHealth {
+                    degraded_views: vec!["a".into()],
+                    errored_views: Vec::new(),
+                    degraded_omitted: 300,
+                    errored_omitted: 0,
+                }),
+            },
+        );
+        assert!(
+            truncated.view_health.is_reported(),
+            "a truncated report is still a report"
+        );
+        assert!(
+            !truncated.view_health.is_complete(),
+            "but it must not read as complete: {:?}",
+            truncated.view_health
+        );
+
+        let whole = remote_step_report(
+            "j",
+            RemoteStepSummary {
+                active_views: 1,
+                total_output_rows: 0,
+                tick: 7,
+                view_health: Some(RemoteViewHealth {
+                    degraded_views: vec!["a".into()],
+                    errored_views: Vec::new(),
+                    degraded_omitted: 0,
+                    errored_omitted: 0,
+                }),
+            },
+        );
+        assert!(
+            whole.view_health.is_complete(),
+            "an untruncated report is complete"
+        );
     }
 
     /// IVM-AUD-DUP-2. `Session::ivm` and `Session::ivm_unpartitioned` differ in

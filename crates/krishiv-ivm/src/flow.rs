@@ -406,7 +406,7 @@ struct IncrementalFlowInner {
     rebuild_all_views: bool,
     /// Bumped by every operation that replaces state a tick in flight has
     /// already read: `restore`, `restore_full`, `restore_delta`,
-    /// `apply_computed_tick`, `apply_remote_tick`, `invalidate_view_plans`, and
+    /// `apply_remote_tick`, `invalidate_view_plans`, and
     /// each committed `step_datafusion`.
     ///
     /// IVM-AUD-CORE-19: a tick clones `source_snapshots` under the lock (a
@@ -1459,14 +1459,20 @@ impl IncrementalFlow {
         }
         for (name, state) in &new_snapshots {
             // The materialized half IS the relation, so there is nothing to
-            // expand here. A source holding only a deficit registers no table,
-            // which is correct: the relation it denotes is empty.
+            // expand here. A source holding only a deficit denotes an empty
+            // relation — and an empty relation is still a relation.
+            //
+            // IVM-AUD-CORE-2c: this used to `tables.remove` a zero-row source,
+            // reasoning that "a fresh context would have no table for an empty
+            // source". That parity argument does not hold: the source IS
+            // declared, it just has no rows, so a view reading it failed to
+            // plan with "table not found" and was reported as errored on every
+            // tick — for as long as the source stayed empty. CORE-2 made that
+            // permanent for a source whose rows are all owed back, which is
+            // how it surfaced. Registering the zero-row batch (which carries
+            // the schema) makes such a view plan and return no rows, which is
+            // the right answer to "what is the sum over an empty table".
             let snapshot = state.positive();
-            if snapshot.num_rows() == 0 {
-                // A fresh context would have no table for an empty source.
-                tables.remove(name.as_str());
-                continue;
-            }
             tables
                 .register(name.as_str(), snapshot)
                 .map_err(|e| IvmError::execution(e.to_string()))?;
@@ -2446,69 +2452,9 @@ impl IncrementalFlow {
         Ok(())
     }
 
-    /// Apply a tick that was computed remotely.
-    ///
-    /// `local_pending` is the pending queue the coordinator drained before
-    /// dispatch (it is *not* re-read from `self`). `view_full_outputs` is the
-    /// full materialized output per view, as computed by the executor. This
-    /// method coalesces the pending deltas, advances `source_snapshots`
-    /// deterministically (matching what `step_datafusion` does), replaces each
-    /// view's full state wholesale (so the diff baseline cannot drift), and
-    /// advances the tick.
-    ///
-    /// The coordinator's flow ends this call in exactly the same state the
-    /// executor's transient flow was in after its `step_datafusion`.
-    pub fn apply_computed_tick(
-        &self,
-        local_pending: HashMap<String, Vec<DeltaBatch>>,
-        view_full_outputs: HashMap<String, RecordBatch>,
-    ) -> IvmResult<StepSummary> {
-        let inputs = coalesce_pending(local_pending)?;
-        let mut inner = self.inner.lock().map_err(lock_err)?;
-
-        // Advance source snapshots deterministically (mirrors step_datafusion).
-        for (name, delta) in &inputs {
-            let current = inner.source_snapshots.remove(name);
-            let updated = SourceState::apply_to(current, delta).map_err(delta_err)?;
-            inner.source_snapshots.insert(name.clone(), updated);
-        }
-
-        inner.tick += 1;
-        inner.state_epoch = inner.state_epoch.wrapping_add(1);
-        let mut total_output_rows = 0usize;
-        let mut total_inserted_rows = 0u64;
-        let mut total_retracted_rows = 0u64;
-        let mut active_views = 0usize;
-        for (name, full) in view_full_outputs {
-            if let Ok(view) = inner.view_registry.get(&name) {
-                let delta = view.replace_full(full).map_err(delta_err)?;
-                if !delta.is_empty() {
-                    total_output_rows += delta.num_rows();
-                    active_views += 1;
-                    let (inserts, retracts) = delta_insert_retract_counts(&delta);
-                    total_inserted_rows += inserts;
-                    total_retracted_rows += retracts;
-                    let stats = inner.view_delta_stats.entry(name.clone()).or_default();
-                    stats.rows_inserted_total += inserts;
-                    stats.rows_retracted_total += retracts;
-                    stats.last_tick_inserts = inserts;
-                    stats.last_tick_retracts = retracts;
-                }
-            }
-        }
-        Ok(StepSummary {
-            total_output_rows,
-            total_inserted_rows,
-            total_retracted_rows,
-            active_views,
-            degraded_views: Vec::new(),
-            errored_views: Vec::new(),
-        })
-    }
-
     /// Apply a tick computed on a **resident** executor (AUD-6).
     ///
-    /// Unlike [`apply_computed_tick`], the executor returns per-view **output
+    /// The executor returns per-view **output
     /// deltas** (O(Δ)), not full outputs. The coordinator mirrors the tick:
     /// source snapshots advance by the input deltas, each view's snapshot and
     /// diff baseline advance by its output delta, and the tick counter bumps.
@@ -5529,15 +5475,6 @@ mod integration_tests {
             .value(0)
     }
 
-    fn empty_view_batch(schema: &arrow::datatypes::SchemaRef) -> RecordBatch {
-        let cols: Vec<_> = schema
-            .fields()
-            .iter()
-            .map(|f| arrow::array::new_empty_array(f.data_type()))
-            .collect();
-        RecordBatch::try_new(schema.clone(), cols).unwrap()
-    }
-
     /// IVM-AUD-CORE-23. The aggregate planner zipped `aggr_expr` (SELECT
     /// order) against the declared schema's non-group columns (schema order),
     /// so a view whose declared schema lists its aggregates in the other order
@@ -5816,106 +5753,6 @@ mod integration_tests {
         restored.step_datafusion().await.unwrap();
         assert_eq!(view_rows(&flow), 0);
         assert_eq!(view_rows(&restored), 0);
-    }
-
-    /// The coordinator-authoritative offload protocol (drain → checkpoint_full →
-    /// remote compute → apply_computed_tick) must leave the authoritative flow
-    /// identical to a plain central `step_datafusion`. This is the core
-    /// correctness guarantee for distributed delta batch: no divergence, no
-    /// baseline drift, real `StepSummary`, correct snapshot.
-    #[tokio::test]
-    async fn apply_computed_tick_matches_central_step() {
-        let setup = |flow: &IncrementalFlow| {
-            flow.register_view(sum_view_spec()).unwrap();
-            flow.feed(
-                "sales",
-                DeltaBatch::from_inserts(sales_batch(&[100.0, 200.0, 50.0])).unwrap(),
-            )
-            .unwrap();
-        };
-
-        // Baseline tick 1 (identical on both flows).
-        let central = IncrementalFlow::new();
-        let auth = IncrementalFlow::new();
-        setup(&central);
-        setup(&auth);
-        central.step_datafusion().await.unwrap();
-        auth.step_datafusion().await.unwrap();
-        assert!((sum_total(&central) - 350.0).abs() < 1e-9);
-        assert!((sum_total(&auth) - 350.0).abs() < 1e-9);
-        let baseline_tick = auth.tick().unwrap();
-
-        // Tick 2: feed the same delta on both.
-        let delta = DeltaBatch::from_inserts(sales_batch(&[25.0, 10.0])).unwrap();
-        central.feed("sales", delta.clone()).unwrap();
-        auth.feed("sales", delta).unwrap();
-
-        // Central computes tick 2 directly.
-        let central_summary = central.step_datafusion().await.unwrap();
-
-        // Authoritative offload: drain pending, snapshot state, run a transient
-        // remote tick, then apply the returned outputs.
-        let local_pending = auth.take_pending().unwrap();
-        let state = auth.checkpoint_full().unwrap();
-        let specs = auth.view_specs().unwrap();
-
-        // Simulate the stateless executor: fresh flow, restore, feed, step.
-        let remote = IncrementalFlow::new();
-        for spec in &specs {
-            remote.register_view(spec.clone()).unwrap();
-        }
-        remote.restore_full(&state).unwrap();
-        // Mirror the executor: force DiffBased (no incremental-plan accumulators).
-        remote.force_diff_based().unwrap();
-        for (src, batches) in &local_pending {
-            for b in batches {
-                remote.feed(src, b.clone()).unwrap();
-            }
-        }
-        let remote_summary = remote.step_datafusion().await.unwrap();
-        let mut view_outputs: HashMap<String, RecordBatch> = HashMap::new();
-        for spec in &specs {
-            let snap = remote
-                .snapshot(&spec.name)
-                .unwrap()
-                .unwrap_or_else(|| empty_view_batch(&spec.output_schema));
-            view_outputs.insert(spec.name.clone(), snap);
-        }
-
-        // Apply the remote result to the authoritative flow.
-        let applied_summary = auth
-            .apply_computed_tick(local_pending, view_outputs)
-            .unwrap();
-
-        // The authoritative flow now matches the central flow exactly.
-        assert!(
-            (sum_total(&auth) - 385.0).abs() < 1e-9,
-            "authoritative total {} != 385",
-            sum_total(&auth)
-        );
-        assert!(
-            (sum_total(&auth) - sum_total(&central)).abs() < 1e-9,
-            "authoritative total must equal central total"
-        );
-        assert_eq!(
-            auth.tick().unwrap(),
-            baseline_tick + 1,
-            "apply_computed_tick must advance the tick exactly once"
-        );
-        assert_eq!(
-            auth.tick().unwrap(),
-            central.tick().unwrap(),
-            "tick counts must match"
-        );
-        // Real summaries (not fabricated zeros): the remote tick produced output.
-        assert_eq!(
-            remote_summary.total_output_rows, applied_summary.total_output_rows,
-            "applied summary must reflect the real remote output row count"
-        );
-        assert_eq!(
-            central_summary.total_output_rows, applied_summary.total_output_rows,
-            "offloaded tick summary must match the central tick summary"
-        );
     }
 
     /// Phase 57 (AUD-6): `apply_remote_tick` — mirroring a RESIDENT executor
@@ -6640,23 +6477,20 @@ mod integration_tests {
                 0,
                 "the insertion must cancel against the remembered retraction"
             );
-            // NOT `assert_eq!(view_rows(&flow), 0)`. That assertion was here
-            // and it was trivially true: a zero-row source registers no
-            // MemTable (Phase 3 calls `tables.remove`), so the view's SQL
-            // fails to plan and reads 0 rows whether or not the deficit works
-            // — trap #3 in the register preamble. The source assertions above
-            // are what prove CORE-2. What the view does is a *consequence*
-            // worth pinning explicitly (IVM-AUD-CORE-2c): the source is now
-            // correctly empty forever, so the view over it fails to plan on
-            // every tick that carries input, permanently.
+            // The source assertions above are what prove CORE-2; a bare
+            // `view_rows == 0` would not, because it was trivially true while
+            // a zero-row source registered no table at all (trap #3).
+            // IVM-AUD-CORE-2c fixed that, so the view now plans against an
+            // empty relation and answers honestly instead of erroring:
             assert!(
-                summary
-                    .errored_views
-                    .iter()
-                    .any(|e| e.view == "v" && e.message.contains("not found")),
-                "the view over a correctly-empty source must report its failure, \
-                 not read as healthy: {:?}",
+                summary.errored_views.is_empty(),
+                "a view over an empty-but-declared source must plan, not fail: {:?}",
                 summary.errored_views
+            );
+            assert_eq!(
+                view_rows(&flow),
+                0,
+                "and it must report no rows — the right answer over an empty table"
             );
         }
 

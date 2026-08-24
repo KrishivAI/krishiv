@@ -1308,6 +1308,50 @@ fn legacy_tick_wire_forced() -> bool {
     krishiv_common::env_registry::truthy_env("KRISHIV_IVM_LEGACY_TICK_WIRE")
 }
 
+// ── GET /api/v1/ivm/jobs/{job_id}/retained-state ────────────────────────────
+
+/// Per-map retained-entry counts for a job's flow.
+///
+/// IVM-AUD-CORE-2d. CORE-2 introduced per-source **deficits** — rows retracted
+/// that were never inserted, which a Z-set must remember — and that is the one
+/// per-source structure a misbehaving producer can grow without bound: a
+/// `DELETE` for a row that never existed is free and retained forever. The
+/// accessors existed but stopped at Rust: no HTTP field, no metric, no console
+/// column, so in production the only signal was a tracing WARN nobody polls.
+/// CORE-25's rule is that state which can grow must be observable, so it is
+/// served here.
+#[derive(Debug, Serialize)]
+pub struct RetainedStateResponse {
+    pub sources_with_snapshots: usize,
+    /// Sources currently owing rows back. Non-zero and rising is the shape of
+    /// a producer sending retractions for rows it never sent.
+    pub sources_with_deficits: usize,
+    /// Distinct rows owed across all sources (a row owed twice counts once).
+    pub deficit_rows_retained: usize,
+    pub sources_with_pending: usize,
+    pub dedup_hashes_retained: usize,
+    pub views_registered: usize,
+    pub views_with_plans: usize,
+}
+
+pub async fn api_ivm_retained_state(
+    State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
+    Path(job_id): Path<String>,
+) -> Result<Json<RetainedStateResponse>, StatusCode> {
+    let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
+    let r = job.retained_state().map_err(ivm_err)?;
+    Ok(Json(RetainedStateResponse {
+        sources_with_snapshots: r.sources_with_snapshots,
+        sources_with_deficits: r.sources_with_deficits,
+        deficit_rows_retained: r.deficit_rows_retained,
+        sources_with_pending: r.sources_with_pending,
+        dedup_hashes_retained: r.dedup_hashes_retained,
+        views_registered: r.views_registered,
+        views_with_plans: r.views_with_plans,
+    }))
+}
+
 // ── GET /api/v1/ivm/jobs/{job_id}/dispatch ───────────────────────────────────
 
 /// Queryable dispatch decision for a job (Phase 57 quality gate: no silent
@@ -1968,6 +2012,10 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
             get(api_ivm_dispatch_state),
         )
         .route(
+            "/api/v1/ivm/jobs/{job_id}/retained-state",
+            get(api_ivm_retained_state),
+        )
+        .route(
             "/api/v1/ivm/jobs/{job_id}/views/{view_name}/snap",
             get(api_ivm_snapshot),
         )
@@ -2159,6 +2207,12 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn delta_b64_deletes(rb: RecordBatch) -> String {
+        let delta = DeltaBatch::from_deletes(rb).unwrap();
+        let ipc = serialize_delta_batch(&delta).unwrap();
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, ipc)
     }
 
     fn delta_b64(rb: RecordBatch) -> String {
@@ -2615,6 +2669,64 @@ mod tests {
         );
         assert_eq!(declared[0].column, "event_ts");
         assert_eq!(declared[0].lateness_ms, 300_000);
+    }
+
+    /// IVM-AUD-CORE-2d. The Z-set deficit is unbounded per-source state — a
+    /// `DELETE` for a row that never existed is free and remembered forever —
+    /// and it was reachable only from Rust: no HTTP field, no metric, no
+    /// console column, so in production the sole signal was a tracing WARN.
+    #[tokio::test]
+    async fn retained_state_reports_the_unbounded_deficit_over_http() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let before = api_ivm_retained_state(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("retained-state")
+        .0;
+        assert_eq!(before.sources_with_deficits, 0);
+
+        // Retract rows that were never inserted: the Z-set must remember them.
+        let fed = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64_deletes(orders(&["US", "EU"], &[5, 7])),
+            }),
+        )
+        .await
+        .expect("feed");
+        assert!(fed.0.success);
+        let stepped = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("step");
+        assert_eq!(stepped.0.tick, 1);
+
+        let after = api_ivm_retained_state(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("retained-state")
+        .0;
+        assert_eq!(
+            after.sources_with_deficits, 1,
+            "the owing source must be visible over HTTP"
+        );
+        assert_eq!(
+            after.deficit_rows_retained, 2,
+            "and so must how much it owes: {after:?}"
+        );
     }
 
     /// IVM-AUD-DIST-E1. No IVM endpoint had a leader check, so a demoted

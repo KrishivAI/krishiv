@@ -75,3 +75,8 @@ replacement = "DataFrame::write_stream().refresh(..).to_table(session, name) —
 id = "rust-public.json:items/crates/krishiv-api/src/blocking.rs::fn::create_live_table::pub fn create_live_table(&self, name: &str, query: &str, refresh: crate::Refresh) -> Result<()>"
 reason = "Sync-facade wrapper for the removed Session::create_live_table."
 replacement = "BlockingSession::register_record_batches (Batch) or BlockingSession::sql(\"CREATE MATERIALIZED VIEW ..\") (Incremental); both remain runtime-free"
+
+[[breaking]]
+id = "rust-public.json:items/crates/krishiv-api/src/compute/job.rs::enum::ViewHealth::Reported"
+reason = "IVM-AUD-A5-RESIDENT-b: the resident tick wire caps each health vector at 256 entries and reports what it dropped, but those counts stopped at the HTTP layer, so a Rust caller read a truncated list as a whole one. Reported became a struct variant carrying degraded_omitted/errored_omitted so completeness cannot be assessed separately from provenance."
+replacement = "ViewHealth::is_reported() for the previous check (unchanged meaning), ViewHealth::is_complete() for the new one; match ViewHealth::Reported { .. } where the variant is matched directly"

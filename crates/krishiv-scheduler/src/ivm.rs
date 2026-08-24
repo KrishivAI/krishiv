@@ -393,6 +393,18 @@ impl IvmJob {
         }
     }
 
+    /// Per-map retained-entry counts, summed across shards when partitioned.
+    ///
+    /// Serves `/retained-state` (IVM-AUD-CORE-2d): the Z-set deficit CORE-2
+    /// introduced is unbounded per-source state, and CORE-25's rule is that
+    /// such state must be observable from outside the process.
+    pub fn retained_state(&self) -> IvmResult<krishiv_ivm::RetainedState> {
+        match self {
+            IvmJob::Single(f) => f.retained_state(),
+            IvmJob::Partitioned(p) => p.retained_state(),
+        }
+    }
+
     /// The LATENESS bounds that actually reached the flow (first shard when
     /// partitioned — every shard is registered from the same spec).
     pub fn declared_lateness(&self) -> IvmResult<Vec<krishiv_ivm::LatenessSpec>> {

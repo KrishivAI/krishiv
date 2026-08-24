@@ -45,11 +45,25 @@ pub struct StepReport {
 }
 
 /// Provenance of [`StepReport::degraded_views`] / [`StepReport::errored_views`].
+///
+/// Use [`ViewHealth::is_reported`] for the common "did anything report" check;
+/// match on the variant when you need to know whether the lists are complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewHealth {
     /// The engine that ran the tick reported per-view health. Empty vectors
     /// mean "no view degraded / failed".
-    Reported,
+    ///
+    /// The counts say how many entries the wire dropped: the resident tick
+    /// frame caps each vector at 256, and before IVM-AUD-A5-RESIDENT-b those
+    /// counts stopped at the HTTP layer, so a Rust caller read a truncated
+    /// list as a whole one. They are carried here rather than as loose fields
+    /// on `StepReport` so that "is this a report" and "is it complete" cannot
+    /// be answered separately. Both are 0 unless a single tick failed or
+    /// degraded more than 256 views.
+    Reported {
+        degraded_omitted: u32,
+        errored_omitted: u32,
+    },
     /// Nothing reported per-view health for this tick, so the vectors are empty
     /// for lack of a signal — **not** because every view is healthy. The string
     /// says which link in the chain has no signal to give.
@@ -58,9 +72,22 @@ pub enum ViewHealth {
 
 impl ViewHealth {
     /// Whether the report's health vectors can be trusted as a statement about
-    /// the views.
+    /// the views. True even if the lists were truncated — see
+    /// [`is_complete`](Self::is_complete).
     pub fn is_reported(&self) -> bool {
-        matches!(self, Self::Reported)
+        matches!(self, Self::Reported { .. })
+    }
+
+    /// Whether a report arrived **and** carried every entry. False when the
+    /// resident tick wire dropped entries past its 256-per-vector cap.
+    pub fn is_complete(&self) -> bool {
+        matches!(
+            self,
+            Self::Reported {
+                degraded_omitted: 0,
+                errored_omitted: 0
+            }
+        )
     }
 }
 

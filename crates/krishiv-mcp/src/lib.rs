@@ -1519,7 +1519,7 @@ impl KrishivMcpServer {
         // resident executor). Emitting the two arrays alone would tell an agent
         // "nothing failed" when the truth is "nobody looked".
         let (health_reported, health_note) = match &report.view_health {
-            krishiv_api::ViewHealth::Reported => (true, String::new()),
+            krishiv_api::ViewHealth::Reported { .. } => (true, String::new()),
             krishiv_api::ViewHealth::Unreported(why) => (false, why.clone()),
         };
         Ok(json!({
