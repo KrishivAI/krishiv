@@ -16,9 +16,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ahash::AHashMap;
-use arrow::array::{Array, ArrayRef, Float64Array, Int64Array, RecordBatch};
+use arrow::array::{Array, ArrayRef, Decimal128Array, Float64Array, Int64Array, RecordBatch};
 use arrow::compute;
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::datatypes::{
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, Schema, SchemaRef,
+};
 use arrow::row::{RowConverter, SortField};
 
 use crate::delta_batch::{DeltaBatch, WEIGHT_COLUMN};
@@ -88,6 +90,17 @@ impl Aggregation {
 enum NumKind {
     Int,
     Float,
+    /// Fixed-point input (`Decimal128(precision, scale)`) accumulated exactly in
+    /// `i128` at the column's own scale — never routed through `f64`.
+    ///
+    /// IVM-AUD-DEC-1: money is the reason. TPC-H's reference answers are exact
+    /// decimal, and an engine that maintains a view perfectly but accumulates
+    /// its totals in binary floating point still returns a wrong number. There
+    /// is no incremental-maintenance fix for a lossy accumulator.
+    Decimal {
+        precision: u8,
+        scale: i8,
+    },
 }
 
 /// Map an Arrow type to its numeric accumulation kind, or `None` for a type
@@ -99,8 +112,53 @@ fn num_kind(dt: &DataType) -> Option<NumKind> {
     match dt {
         Int8 | Int16 | Int32 | Int64 | UInt8 | UInt16 | UInt32 | UInt64 => Some(NumKind::Int),
         Float16 | Float32 | Float64 => Some(NumKind::Float),
+        // DEC-1. `Decimal256` is deliberately absent: its accumulator would be
+        // `i256`, a different arithmetic, and claiming support by narrowing it
+        // to `i128` is the exact class of silent truncation this exists to
+        // remove. It reads as `None` and the view falls back to DiffBased.
+        Decimal128(p, s) => Some(NumKind::Decimal {
+            precision: *p,
+            scale: *s,
+        }),
         _ => None,
     }
+}
+
+/// SQL result type of `SUM(Decimal128(p, s))`: DataFusion widens the precision
+/// by 10 and keeps the scale. Mirrored here rather than inferred, because the
+/// operator's emitted type has to equal the planner's declared type exactly —
+/// IVM-AUD-SCHEMA-1's guard compares `Decimal128` precision and scale, and a
+/// near-miss fails the view closed instead of publishing a mistyped relation.
+fn decimal_sum_type(precision: u8, scale: i8) -> DataType {
+    DataType::Decimal128(
+        precision.saturating_add(10).min(DECIMAL128_MAX_PRECISION),
+        scale,
+    )
+}
+
+/// SQL result type of `AVG(Decimal128(p, s))`: precision and scale both +4,
+/// each capped at the `Decimal128` maximum.
+fn decimal_avg_type(precision: u8, scale: i8) -> DataType {
+    DataType::Decimal128(
+        precision.saturating_add(4).min(DECIMAL128_MAX_PRECISION),
+        scale.saturating_add(4).min(DECIMAL128_MAX_SCALE),
+    )
+}
+
+/// `acc + v * weight`, or `None` on overflow.
+///
+/// DEC-1: the old SUM used `saturating_add(saturating_mul(..))`, which clamps
+/// at `i64::MAX` and publishes the clamp as if it were the total — a wrong
+/// answer with no error attached. Every exact accumulator now reports
+/// overflow to its caller, which fails the tick.
+fn accumulate_i64(acc: i64, v: i64, weight: i64) -> Option<i64> {
+    v.checked_mul(weight).and_then(|d| acc.checked_add(d))
+}
+
+/// `acc + v * weight` in `i128` (DEC-1), or `None` on overflow.
+fn accumulate_i128(acc: i128, v: i128, weight: i64) -> Option<i128> {
+    v.checked_mul(weight as i128)
+        .and_then(|d| acc.checked_add(d))
 }
 
 /// A typed aggregate output value, so integer aggregates stay exact (no f64
@@ -109,6 +167,9 @@ fn num_kind(dt: &DataType) -> Option<NumKind> {
 enum AggScalar {
     I64(i64),
     F64(f64),
+    /// DEC-1: an exact fixed-point value as its **unscaled** `i128`, carrying
+    /// the scale of the field it will be written into — never a scaled `f64`.
+    Dec(i128),
 }
 
 // ── Per-aggregation state ──────────────────────────────────────────────────────
@@ -140,6 +201,25 @@ impl Default for OrdF64 {
     }
 }
 
+/// Multiset key for MIN/MAX.
+///
+/// DEC-1: the old key was `OrdF64` for **every** input type, so an `Int64` or
+/// decimal value was rounded to `f64` before being used as a map key. Past
+/// 2^53 that is not a rounding error, it is a *collision*: two distinct values
+/// land on one entry, their weights merge, and retracting one of them deletes
+/// both — MIN then returns a value that is still in the relation's true
+/// multiset only by luck. Integer-valued inputs now key on `i128` and keep
+/// their identity.
+///
+/// A given aggregation's `NumKind` is fixed at construction, so the two
+/// variants never coexist in one map; the derived `Ord` (which would compare
+/// variant tags first) is therefore never asked to order across them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MinMaxKey {
+    Int(i128),
+    Float(OrdF64),
+}
+
 /// Separate running state for ONE aggregation expression.
 /// A group's full state is `Vec<AggState>` indexed by position in `aggregations`.
 ///
@@ -154,19 +234,31 @@ struct AggState {
     /// Weighted sum for SUM over **integer** inputs (exact i64 accumulation,
     /// AUD-3 — avoids the >2^53 precision loss of the old f64-only path).
     sum_i64: i64,
+    /// DEC-1: weighted sum for SUM over **`Decimal128`** inputs, held as an
+    /// unscaled `i128` at the input column's own scale. Exact, and the scale is
+    /// invariant under addition, so no rescaling happens on the tick path.
+    sum_i128: i128,
     /// Row count for COUNT / empty-group detection. Also used as the non-null
     /// input count for AVG when inputs are float (avg_is_integer == false).
     count: i64,
     /// Integer-precision weighted sum for AVG over integer-typed inputs.
     avg_sum_i64: i64,
+    /// DEC-1: exact weighted sum for AVG over `Decimal128` inputs. Separate
+    /// from `sum_i128` so `[SUM(x), AVG(x)]` in one spec cannot cross-feed.
+    avg_sum_i128: i128,
     /// Non-null input count for AVG (separately tracked from `count` so
     /// COUNT and AVG can coexist in a multi-aggregation spec).
     avg_count_i64: i64,
     /// True when the AVG input is an integer column — use i64 accumulation.
     avg_is_integer: bool,
-    /// For MIN/MAX: multiset of (value → cumulative weight).
-    /// Uses OrdF64 keys so float columns (e.g. Float64) are ordered correctly.
-    min_max_set: BTreeMap<OrdF64, i64>,
+    /// DEC-1: set when an exact accumulator overflowed. Sticky — once a group's
+    /// running total cannot be represented, every later delta for it errors too,
+    /// so the view stays visibly broken rather than quietly resuming from a
+    /// number that was never the sum.
+    overflow: bool,
+    /// For MIN/MAX: multiset of (value → cumulative weight), keyed exactly for
+    /// the column's kind (DEC-1) rather than through `f64` for all of them.
+    min_max_set: BTreeMap<MinMaxKey, i64>,
 }
 
 /// One row's typed aggregate input value (AUD-7 / audit §5c): read directly
@@ -180,6 +272,8 @@ enum AggInput {
     Null,
     I64(i64),
     F64(f64),
+    /// DEC-1: the unscaled `i128` of a `Decimal128` cell, at the column's scale.
+    I128(i128),
 }
 
 impl AggState {
@@ -194,14 +288,30 @@ impl AggState {
         kind: Option<NumKind>,
         value: AggInput,
         weight: i64,
-    ) {
+    ) -> DeltaResult<()> {
+        // DEC-1: a poisoned accumulator never silently resumes.
+        if self.overflow {
+            return Err(DeltaError::Operator(format!(
+                "aggregate '{}' overflowed its exact accumulator on an earlier delta; the \
+                 running total is unrepresentable and the view will not publish one",
+                agg.output_col()
+            )));
+        }
         match agg {
             Aggregation::Sum { .. } => {
                 match value {
                     // SQL: null inputs are excluded from SUM.
-                    AggInput::Null | AggInput::None => return,
+                    AggInput::Null | AggInput::None => return Ok(()),
                     AggInput::I64(v) => {
-                        self.sum_i64 = self.sum_i64.saturating_add(v.saturating_mul(weight));
+                        self.sum_i64 =
+                            self.overflowing(accumulate_i64(self.sum_i64, v, weight), agg, "SUM")?;
+                    }
+                    AggInput::I128(v) => {
+                        self.sum_i128 = self.overflowing(
+                            accumulate_i128(self.sum_i128, v, weight),
+                            agg,
+                            "SUM",
+                        )?;
                     }
                     AggInput::F64(v) => self.sum += v * weight as f64,
                 }
@@ -210,7 +320,7 @@ impl AggState {
             Aggregation::Count { input_col, .. } => {
                 // IVM-6: COUNT(col) excludes nulls; COUNT(*) counts all rows.
                 if input_col.is_some() && matches!(value, AggInput::Null) {
-                    return;
+                    return Ok(());
                 }
                 self.count += weight;
             }
@@ -219,11 +329,23 @@ impl AggState {
                 // Integer inputs accumulate exactly in i64; float in f64.
                 match value {
                     // SQL: null inputs are excluded from AVG.
-                    AggInput::Null | AggInput::None => return,
+                    AggInput::Null | AggInput::None => return Ok(()),
                     AggInput::I64(v) => {
                         self.avg_is_integer = true;
-                        self.avg_sum_i64 =
-                            self.avg_sum_i64.saturating_add(v.saturating_mul(weight));
+                        self.avg_sum_i64 = self.overflowing(
+                            accumulate_i64(self.avg_sum_i64, v, weight),
+                            agg,
+                            "AVG",
+                        )?;
+                    }
+                    AggInput::I128(v) => {
+                        // DEC-1: the decimal path is selected by `kind` at
+                        // output time, so no `avg_is_integer` flag is set here.
+                        self.avg_sum_i128 = self.overflowing(
+                            accumulate_i128(self.avg_sum_i128, v, weight),
+                            agg,
+                            "AVG",
+                        )?;
                     }
                     AggInput::F64(v) => {
                         self.avg_is_integer = false;
@@ -234,16 +356,16 @@ impl AggState {
                 self.count += weight;
             }
             Aggregation::Min { .. } | Aggregation::Max { .. } => {
-                let v = match value {
+                let key = match value {
                     // SQL: null inputs do not affect MIN/MAX.
-                    AggInput::Null | AggInput::None => return,
-                    // `kind == Int` values are exact up to 2^53 as f64 keys;
-                    // that is fine for ordering.
-                    AggInput::I64(v) => v as f64,
-                    AggInput::F64(v) => v,
+                    AggInput::Null | AggInput::None => return Ok(()),
+                    // DEC-1: integer-valued inputs key exactly. The old code
+                    // widened them to f64 here, which collided above 2^53.
+                    AggInput::I64(v) => MinMaxKey::Int(v as i128),
+                    AggInput::I128(v) => MinMaxKey::Int(v),
+                    AggInput::F64(v) => MinMaxKey::Float(OrdF64(v)),
                 };
                 let _ = kind; // ordering strategy is value-driven now
-                let key = OrdF64(v);
                 let entry = self.min_max_set.entry(key).or_insert(0);
                 *entry += weight;
                 if *entry == 0 {
@@ -252,19 +374,52 @@ impl AggState {
                 self.count += weight;
             }
         }
+        Ok(())
+    }
+
+    /// Unwrap an exact accumulation, poisoning this state and failing the tick
+    /// if it overflowed (DEC-1).
+    fn overflowing<T>(&mut self, v: Option<T>, agg: &Aggregation, what: &str) -> DeltaResult<T> {
+        match v {
+            Some(v) => Ok(v),
+            None => {
+                self.overflow = true;
+                Err(DeltaError::Operator(format!(
+                    "{what} for '{}' overflowed its exact accumulator; the incremental view \
+                     fails closed rather than publishing a saturated total",
+                    agg.output_col()
+                )))
+            }
+        }
     }
 
     fn current_value(&self, agg: &Aggregation, kind: Option<NumKind>) -> Option<AggScalar> {
         match agg {
             Aggregation::Sum { .. } => match kind {
                 Some(NumKind::Int) => Some(AggScalar::I64(self.sum_i64)),
+                // DEC-1: SUM keeps the input's scale, so the running `i128` is
+                // already the output's unscaled value — no conversion at all.
+                Some(NumKind::Decimal { .. }) => Some(AggScalar::Dec(self.sum_i128)),
                 _ => Some(AggScalar::F64(self.sum)),
             },
             Aggregation::Count { .. } => Some(AggScalar::I64(self.count)),
             Aggregation::Avg { .. } => {
-                // AVG always yields a floating-point result (SQL semantics).
                 if self.avg_count_i64 == 0 {
                     None
+                } else if let Some(NumKind::Decimal { precision, scale }) = kind {
+                    // DEC-1: AVG over a decimal stays decimal. DataFusion
+                    // rescales the sum to the result scale and then divides,
+                    // truncating toward zero — reproduced exactly here, because
+                    // "the same answer to within a cent" is not the same answer.
+                    let DataType::Decimal128(_, out_scale) = decimal_avg_type(precision, scale)
+                    else {
+                        return None;
+                    };
+                    let lift = (out_scale - scale).max(0) as u32;
+                    10i128
+                        .checked_pow(lift)
+                        .and_then(|mul| self.avg_sum_i128.checked_mul(mul))
+                        .map(|scaled| AggScalar::Dec(scaled / self.avg_count_i64 as i128))
                 } else if self.avg_is_integer {
                     Some(AggScalar::F64(
                         self.avg_sum_i64 as f64 / self.avg_count_i64 as f64,
@@ -273,21 +428,28 @@ impl AggState {
                     Some(AggScalar::F64(self.sum / self.avg_count_i64 as f64))
                 }
             }
-            Aggregation::Min { .. } => self.min_max_set.keys().next().map(|k| scalar_of(k.0, kind)),
+            Aggregation::Min { .. } => self.min_max_set.keys().next().map(|k| scalar_of(*k, kind)),
             Aggregation::Max { .. } => self
                 .min_max_set
                 .keys()
                 .next_back()
-                .map(|k| scalar_of(k.0, kind)),
+                .map(|k| scalar_of(*k, kind)),
         }
     }
 }
 
-/// Wrap an f64 min/max key in the correct typed scalar for its column kind.
-fn scalar_of(v: f64, kind: Option<NumKind>) -> AggScalar {
-    match kind {
-        Some(NumKind::Int) => AggScalar::I64(v as i64),
-        _ => AggScalar::F64(v),
+/// Wrap a min/max key in the correct typed scalar for its column kind.
+///
+/// The key variant and the kind always agree (both are decided by the column's
+/// Arrow type); the cross cases are written out anyway so a future kind cannot
+/// reach a `_ =>` arm and silently emit the wrong representation.
+fn scalar_of(key: MinMaxKey, kind: Option<NumKind>) -> AggScalar {
+    match (kind, key) {
+        (Some(NumKind::Decimal { .. }), MinMaxKey::Int(v)) => AggScalar::Dec(v),
+        (Some(NumKind::Int), MinMaxKey::Int(v)) => AggScalar::I64(v as i64),
+        (Some(NumKind::Int), MinMaxKey::Float(v)) => AggScalar::I64(v.0 as i64),
+        (_, MinMaxKey::Int(v)) => AggScalar::F64(v as f64),
+        (_, MinMaxKey::Float(v)) => AggScalar::F64(v.0),
     }
 }
 
@@ -319,6 +481,10 @@ enum ValueReader {
     Int(Int64Array),
     /// Numeric input accumulated as f64 (float-typed column).
     Float(Float64Array),
+    /// DEC-1: fixed-point input read as its unscaled `i128` at the declared
+    /// scale — the delta is cast to that scale once per batch, so every row
+    /// contributes at one common scale and addition stays exact.
+    Decimal(Decimal128Array),
 }
 
 impl ValueReader {
@@ -355,6 +521,22 @@ impl ValueReader {
                     .clone();
                 Ok(ValueReader::Float(arr))
             }
+            Some(NumKind::Decimal { precision, scale }) => {
+                let want = DataType::Decimal128(precision, scale);
+                let arr = if col.data_type() == &want {
+                    col.clone()
+                } else {
+                    compute::cast(col, &want)?
+                };
+                let arr = arr
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .ok_or_else(|| {
+                        DeltaError::Operator("decimal128 cast produced wrong type".into())
+                    })?
+                    .clone();
+                Ok(ValueReader::Decimal(arr))
+            }
         }
     }
 
@@ -384,6 +566,13 @@ impl ValueReader {
                     AggInput::F64(a.value(row))
                 }
             }
+            ValueReader::Decimal(a) => {
+                if a.is_null(row) {
+                    AggInput::Null
+                } else {
+                    AggInput::I128(a.value(row))
+                }
+            }
         }
     }
 }
@@ -397,6 +586,12 @@ pub struct IncrementalAggOp {
     /// AUD-3: per-aggregation numeric kind, decided once from the input schema.
     /// `None` for COUNT (no numeric input to accumulate).
     input_kinds: Vec<Option<NumKind>>,
+    /// DEC-1: the SQL result type of each aggregate column *before* the view's
+    /// declared schema is applied. `build_output_batch` needs it to know what
+    /// an `AggScalar::Dec` is scaled by when the declared column is some other
+    /// type, and `new_with_output_schema` needs it to refuse a decimal
+    /// declaration that disagrees with the one the values actually carry.
+    agg_natural_types: Vec<DataType>,
     output_schema: SchemaRef,
     /// AUD-7: shared row-format encoder for group-by keys, built once from the
     /// group columns' declared types and reused across every tick. Reuse is what
@@ -474,19 +669,37 @@ impl IncrementalAggOp {
             })
             .collect::<DeltaResult<Vec<_>>>()?;
 
+        let mut agg_natural_types: Vec<DataType> = Vec::with_capacity(aggregations.len());
         for (agg, kind) in aggregations.iter().zip(input_kinds.iter()) {
-            // AUD-3: match SQL output types. COUNT → Int64; AVG → Float64 always;
-            // SUM/MIN/MAX preserve integer vs float (SUM(Int)→Int64, etc.).
+            // AUD-3: match SQL output types. COUNT → Int64; AVG → Float64 except
+            // over decimals; SUM/MIN/MAX preserve the input's family
+            // (SUM(Int)→Int64, SUM(Decimal(p,s))→Decimal(p+10,s), …).
             let output_type = match agg {
                 Aggregation::Count { .. } => DataType::Int64,
-                Aggregation::Avg { .. } => DataType::Float64,
-                Aggregation::Sum { .. } | Aggregation::Min { .. } | Aggregation::Max { .. } => {
-                    match kind {
-                        Some(NumKind::Int) => DataType::Int64,
-                        _ => DataType::Float64,
+                Aggregation::Avg { .. } => match kind {
+                    Some(NumKind::Decimal { precision, scale }) => {
+                        decimal_avg_type(*precision, *scale)
                     }
-                }
+                    _ => DataType::Float64,
+                },
+                Aggregation::Sum { .. } => match kind {
+                    Some(NumKind::Int) => DataType::Int64,
+                    Some(NumKind::Decimal { precision, scale }) => {
+                        decimal_sum_type(*precision, *scale)
+                    }
+                    _ => DataType::Float64,
+                },
+                // MIN/MAX return a value drawn from the column, so the type is
+                // the column's own — no widening.
+                Aggregation::Min { .. } | Aggregation::Max { .. } => match kind {
+                    Some(NumKind::Int) => DataType::Int64,
+                    Some(NumKind::Decimal { precision, scale }) => {
+                        DataType::Decimal128(*precision, *scale)
+                    }
+                    _ => DataType::Float64,
+                },
             };
+            agg_natural_types.push(output_type.clone());
             out_fields.push(Arc::new(Field::new(agg.output_col(), output_type, true)));
         }
 
@@ -515,6 +728,7 @@ impl IncrementalAggOp {
             group_by,
             aggregations,
             input_kinds,
+            agg_natural_types,
             output_schema,
             group_converter,
             group_field_types,
@@ -531,8 +745,12 @@ impl IncrementalAggOp {
     /// honors that declaration so the materialized snapshot matches the
     /// registered contract that downstream plans and the DiffBased baseline
     /// diff against — instead of the old behavior of always emitting `Float64`.
-    /// Declared aggregate columns must be `Int64`/`Float64`; anything else
-    /// errors so the planner falls back to DiffBased.
+    /// Declared aggregate columns must be `Int64`/`Float64`, or the *exact*
+    /// `Decimal128(p, s)` the aggregate naturally produces; anything else errors
+    /// so the planner falls back to DiffBased. DEC-1: a decimal declaration that
+    /// differs in scale is refused rather than rescaled, because rescaling an
+    /// already-accumulated total is where fixed-point silently loses digits —
+    /// and a wrong scale is a wrong number by a factor of ten, not a rounding.
     pub fn new_with_output_schema(
         input_schema: &SchemaRef,
         group_by: Vec<String>,
@@ -544,23 +762,24 @@ impl IncrementalAggOp {
         let mut fields: Vec<Arc<Field>> = op.output_schema.fields().iter().cloned().collect();
         for (i, agg) in op.aggregations.iter().enumerate() {
             if let Ok(df) = declared.field_with_name(agg.output_col()) {
-                match df.data_type() {
-                    DataType::Int64 | DataType::Float64 => {
-                        if let Some(slot) = fields.get_mut(n_group + i) {
-                            *slot = Arc::new(Field::new(
-                                agg.output_col(),
-                                df.data_type().clone(),
-                                true,
-                            ));
-                        }
-                    }
-                    other => {
-                        return Err(DeltaError::Operator(format!(
-                            "declared output column '{}' has type {other:?}; the incremental \
-                             aggregate emits only Int64/Float64 — view falls back to DiffBased",
-                            agg.output_col()
-                        )));
-                    }
+                let natural = op.agg_natural_types.get(i);
+                let accept = match df.data_type() {
+                    DataType::Int64 | DataType::Float64 => true,
+                    dec @ DataType::Decimal128(_, _) => natural == Some(dec),
+                    _ => false,
+                };
+                if !accept {
+                    return Err(DeltaError::Operator(format!(
+                        "declared output column '{}' has type {:?} but the incremental \
+                         aggregate produces {:?}; it emits Int64/Float64 or that exact \
+                         Decimal128 — view falls back to DiffBased",
+                        agg.output_col(),
+                        df.data_type(),
+                        natural
+                    )));
+                }
+                if let Some(slot) = fields.get_mut(n_group + i) {
+                    *slot = Arc::new(Field::new(agg.output_col(), df.data_type().clone(), true));
                 }
             }
         }
@@ -688,7 +907,7 @@ impl IncrementalAggOp {
                 .zip(self.input_kinds.iter())
                 .zip(value_readers.iter())
             {
-                state.apply_delta_for_agg(agg, *kind, reader.value(row), w);
+                state.apply_delta_for_agg(agg, *kind, reader.value(row), w)?;
             }
 
             // GC empty groups: a group is empty when ALL its per-agg states are.
@@ -772,7 +991,7 @@ impl IncrementalAggOp {
                 Ok(ipc) => Some(ipc),
                 Err(_) => {
                     let mut out = Vec::new();
-                    out.extend_from_slice(AGG_STATE_MAGIC_V2);
+                    out.extend_from_slice(AGG_STATE_MAGIC_V3);
                     out.push(1u8);
                     out.extend_from_slice(&0u32.to_le_bytes());
                     return out;
@@ -783,7 +1002,7 @@ impl IncrementalAggOp {
         };
 
         let mut out = Vec::new();
-        out.extend_from_slice(AGG_STATE_MAGIC_V2);
+        out.extend_from_slice(AGG_STATE_MAGIC_V3);
         out.push(has_group_cols as u8);
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         if let Some(ipc) = &group_ipc {
@@ -802,17 +1021,17 @@ impl IncrementalAggOp {
     /// Replace the accumulator state with one previously produced by
     /// [`state_bytes`](Self::state_bytes). The group-by / aggregation shape is
     /// taken from `self` (rebuilt from the view SQL), so only the running
-    /// values are transferred. An unrecognized (non-v2) blob errors so the
+    /// values are transferred. An unrecognized (non-v3) blob errors so the
     /// caller can fall back to seed-from-snapshots.
     pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
-        if !bytes.starts_with(AGG_STATE_MAGIC_V2) {
+        if !bytes.starts_with(AGG_STATE_MAGIC_V3) {
             return Err(DeltaError::Operator(
-                "aggregate state blob is not format v2 (AUD-7); restore falls back to \
+                "aggregate state blob is not format v3 (AUD-7, DEC-1); restore falls back to \
                  seed-from-snapshots"
                     .into(),
             ));
         }
-        let mut pos = AGG_STATE_MAGIC_V2.len();
+        let mut pos = AGG_STATE_MAGIC_V3.len();
         let has_group_cols = read_u8(bytes, &mut pos)? == 1;
         let n_groups = read_u32(bytes, &mut pos)? as usize;
 
@@ -914,10 +1133,17 @@ impl IncrementalAggOp {
         };
 
         // Aggregate columns, typed to the declared output schema (AUD-3):
-        // integer SUM/MIN/MAX/COUNT emit Int64 exactly; AVG and float aggregates
-        // emit Float64.
+        // integer SUM/MIN/MAX/COUNT emit Int64 exactly; decimal aggregates emit
+        // Decimal128 at their own scale (DEC-1); everything else emits Float64.
         for ai in 0..self.aggregations.len() {
             let target = self.output_schema.field(n_group + ai).data_type();
+            // The scale the running `i128` is expressed in — the natural output
+            // type's, which is what `current_value` produced regardless of what
+            // the view declared.
+            let scale = match self.agg_natural_types.get(ai) {
+                Some(DataType::Decimal128(_, s)) => *s,
+                _ => 0,
+            };
             let col: ArrayRef = match target {
                 DataType::Int64 => {
                     let vals: Int64Array = agg_values
@@ -926,10 +1152,29 @@ impl IncrementalAggOp {
                             row.get(ai).copied().flatten().map(|s| match s {
                                 AggScalar::I64(v) => v,
                                 AggScalar::F64(v) => v as i64,
+                                AggScalar::Dec(v) => descale_to_i64(v, scale),
                             })
                         })
                         .collect();
                     Arc::new(vals)
+                }
+                DataType::Decimal128(p, s) => {
+                    // `with_precision_and_scale` validates every value against
+                    // the declared precision and errors if one does not fit —
+                    // the last fail-closed gate before a truncated total could
+                    // reach a snapshot.
+                    let vals: Vec<Option<i128>> = agg_values
+                        .iter()
+                        .map(|row| {
+                            row.get(ai).copied().flatten().map(|sc| match sc {
+                                AggScalar::Dec(v) => v,
+                                AggScalar::I64(v) => v as i128,
+                                AggScalar::F64(v) => (v * 10f64.powi(*s as i32)) as i128,
+                            })
+                        })
+                        .collect();
+                    let arr = Decimal128Array::from(vals).with_precision_and_scale(*p, *s)?;
+                    Arc::new(arr)
                 }
                 _ => {
                     let vals: Float64Array = agg_values
@@ -938,6 +1183,7 @@ impl IncrementalAggOp {
                             row.get(ai).copied().flatten().map(|s| match s {
                                 AggScalar::I64(v) => v as f64,
                                 AggScalar::F64(v) => v,
+                                AggScalar::Dec(v) => descale_to_f64(v, scale),
                             })
                         })
                         .collect();
@@ -960,10 +1206,40 @@ impl IncrementalAggOp {
 }
 
 /// Magic prefix for the version-2 aggregate-state blob (AUD-7).
-const AGG_STATE_MAGIC_V2: &[u8; 5] = b"AGGS2";
+/// DEC-1: bumped from `AGGS2` because the per-aggregation state gained exact
+/// `i128` accumulators and a typed min/max key. A v2 blob is *parseable* as v3
+/// byte-wise garbage, so the magic is the only thing standing between an old
+/// checkpoint and a plausible-looking wrong total — restore rejects it and the
+/// view reseeds from snapshots, which is slower and correct.
+const AGG_STATE_MAGIC_V3: &[u8; 5] = b"AGGS3";
 
 /// Serialize a `RecordBatch` to a bare Arrow IPC stream (no magic — this is an
 /// internal, length-framed payload inside the aggregate-state blob).
+/// Truncate an unscaled fixed-point value to a whole number (DEC-1). Only
+/// reached when a view declares an integer column for a decimal aggregate,
+/// which is the view's own stated contract — SQL's own `CAST(dec AS BIGINT)`
+/// truncates toward zero, and so does this.
+fn descale_to_i64(unscaled: i128, scale: i8) -> i64 {
+    let v = match scale.cmp(&0) {
+        std::cmp::Ordering::Greater => 10i128
+            .checked_pow(scale as u32)
+            .map(|d| unscaled / d)
+            .unwrap_or(0),
+        std::cmp::Ordering::Less => 10i128
+            .checked_pow(scale.unsigned_abs() as u32)
+            .and_then(|m| unscaled.checked_mul(m))
+            .unwrap_or(unscaled),
+        std::cmp::Ordering::Equal => unscaled,
+    };
+    v.clamp(i64::MIN as i128, i64::MAX as i128) as i64
+}
+
+/// Render an unscaled fixed-point value as `f64` (DEC-1). Lossy by nature —
+/// only reached when the view itself declares a float column.
+fn descale_to_f64(unscaled: i128, scale: i8) -> f64 {
+    unscaled as f64 / 10f64.powi(scale as i32)
+}
+
 fn encode_batch_ipc(batch: &RecordBatch) -> DeltaResult<Vec<u8>> {
     use arrow::ipc::writer::StreamWriter;
     let mut buf = Vec::new();
@@ -1018,17 +1294,40 @@ fn read_f64(bytes: &[u8], pos: &mut usize) -> DeltaResult<f64> {
     Ok(f64::from_le_bytes(raw.try_into().unwrap_or([0; 8])))
 }
 
+fn read_i128(bytes: &[u8], pos: &mut usize) -> DeltaResult<i128> {
+    let raw = bytes
+        .get(*pos..*pos + 16)
+        .ok_or_else(|| DeltaError::Operator("agg state truncated".into()))?;
+    *pos += 16;
+    Ok(i128::from_le_bytes(raw.try_into().unwrap_or([0; 16])))
+}
+
 impl AggState {
     fn write_bytes(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.sum.to_le_bytes());
         out.extend_from_slice(&self.sum_i64.to_le_bytes());
+        out.extend_from_slice(&self.sum_i128.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
         out.extend_from_slice(&self.avg_sum_i64.to_le_bytes());
+        out.extend_from_slice(&self.avg_sum_i128.to_le_bytes());
         out.extend_from_slice(&self.avg_count_i64.to_le_bytes());
         out.push(self.avg_is_integer as u8);
+        out.push(self.overflow as u8);
         out.extend_from_slice(&(self.min_max_set.len() as u32).to_le_bytes());
         for (k, w) in &self.min_max_set {
-            out.extend_from_slice(&k.0.to_le_bytes());
+            // DEC-1: the key is tagged, so an exact i128 key round-trips as an
+            // i128 instead of being flattened back through f64 on restore —
+            // which would reintroduce the collision the typed key removed.
+            match k {
+                MinMaxKey::Int(v) => {
+                    out.push(0u8);
+                    out.extend_from_slice(&v.to_le_bytes());
+                }
+                MinMaxKey::Float(v) => {
+                    out.push(1u8);
+                    out.extend_from_slice(&v.0.to_le_bytes());
+                }
+            }
             out.extend_from_slice(&w.to_le_bytes());
         }
     }
@@ -1036,24 +1335,38 @@ impl AggState {
     fn read_bytes(bytes: &[u8], pos: &mut usize) -> DeltaResult<Self> {
         let sum = read_f64(bytes, pos)?;
         let sum_i64 = read_i64(bytes, pos)?;
+        let sum_i128 = read_i128(bytes, pos)?;
         let count = read_i64(bytes, pos)?;
         let avg_sum_i64 = read_i64(bytes, pos)?;
+        let avg_sum_i128 = read_i128(bytes, pos)?;
         let avg_count_i64 = read_i64(bytes, pos)?;
         let avg_is_integer = read_u8(bytes, pos)? == 1;
+        let overflow = read_u8(bytes, pos)? == 1;
         let n_minmax = read_u32(bytes, pos)? as usize;
-        let mut min_max_set: BTreeMap<OrdF64, i64> = BTreeMap::new();
+        let mut min_max_set: BTreeMap<MinMaxKey, i64> = BTreeMap::new();
         for _ in 0..n_minmax {
-            let k = read_f64(bytes, pos)?;
+            let key = match read_u8(bytes, pos)? {
+                0 => MinMaxKey::Int(read_i128(bytes, pos)?),
+                1 => MinMaxKey::Float(OrdF64(read_f64(bytes, pos)?)),
+                other => {
+                    return Err(DeltaError::Operator(format!(
+                        "agg state has unknown min/max key tag {other}"
+                    )));
+                }
+            };
             let w = read_i64(bytes, pos)?;
-            min_max_set.insert(OrdF64(k), w);
+            min_max_set.insert(key, w);
         }
         Ok(Self {
             sum,
             sum_i64,
+            sum_i128,
             count,
             avg_sum_i64,
+            avg_sum_i128,
             avg_count_i64,
             avg_is_integer,
+            overflow,
             min_max_set,
         })
     }

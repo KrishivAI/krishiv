@@ -121,6 +121,11 @@ pub enum ViewErrorKind {
     /// iteration cap, so the tick has no value for it and its previous value
     /// stands (IVM-AUD-CORE-12).
     FixpointNotConverged,
+    /// The tick produced a delta that is not the relation the view declared, so
+    /// the engine refused to publish it and the view's previous value stands
+    /// (IVM-AUD-SCHEMA-1). Fail-closed: a view that stops updating is
+    /// recoverable, a view publishing the wrong relation is not.
+    OutputSchemaMismatch,
     /// The engine that ran the tick named a failure kind this binary does not
     /// know — a coordinator newer than this client. The view really did fail;
     /// only its category is unknown, and the reported name is preserved at the

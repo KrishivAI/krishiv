@@ -322,6 +322,10 @@ pub enum ViewErrorKind {
     /// `MAX_FIXPOINT_ITERS` iterations, so this tick has no value for it
     /// (IVM-AUD-CORE-12). The view keeps its previous value.
     FixpointNotConverged,
+    /// The delta about to be published is not the relation the view declared
+    /// (IVM-AUD-SCHEMA-1). Fail-closed: the view keeps its previous value and
+    /// is reported errored rather than publishing a wrong answer.
+    OutputSchemaMismatch,
 }
 
 // ── IncrementalFlowInner ──────────────────────────────────────────────────────
@@ -357,6 +361,12 @@ struct IncrementalFlowInner {
 
     // Gap 1: cached incremental execution plans per view.
     view_plans: AHashMap<String, ViewPlan>,
+    /// How each view's output is presented (IVM-ORDER-1). Kept beside the plan
+    /// rather than inside it: ordering is a read-time property of a Z-set and
+    /// does not participate in delta propagation, so putting it in `ViewPlan`
+    /// would add a delegating arm to every match for something no operator
+    /// consults.
+    view_order: AHashMap<String, crate::plan::OutputOrder>,
     // SQL text that was used to build each cached plan (for Gap 7 invalidation).
     view_plan_sqls: AHashMap<String, String>,
 
@@ -511,7 +521,23 @@ impl TickTables<'_> {
     /// output hit the duplicate error (swallowed by `let _ =`) and kept
     /// reading the upstream's previous-tick snapshot.
     fn register(&mut self, name: &str, batch: &RecordBatch) -> datafusion::error::Result<()> {
-        let table = MemTable::try_new(batch.schema(), vec![vec![batch.clone()]])?;
+        self.register_chunks(name, batch.schema(), std::slice::from_ref(batch))
+    }
+
+    /// Replace-register a relation held as several batches.
+    ///
+    /// `MemTable` takes a batch list natively, so a chunked `SourceState`
+    /// registers without being concatenated first — which is the point of
+    /// IVM-AUD-PERF-1. The chunks go in as one partition, preserving the
+    /// single-sequence semantics the one-batch registration had; DataFusion
+    /// repartitions for parallelism exactly as it did before.
+    fn register_chunks(
+        &mut self,
+        name: &str,
+        schema: SchemaRef,
+        chunks: &[RecordBatch],
+    ) -> datafusion::error::Result<()> {
+        let table = MemTable::try_new(schema, vec![chunks.to_vec()])?;
         let _ = self.ctx.deregister_table(name);
         self.ctx.register_table(name, Arc::new(table))?;
         if let Some(reg) = self.tracked.as_deref_mut() {
@@ -585,6 +611,7 @@ impl IncrementalFlow {
                 streaming_prev_snapshots: HashMap::new(),
                 provenance: None,
                 view_plans: AHashMap::new(),
+                view_order: AHashMap::new(),
                 view_plan_sqls: AHashMap::new(),
                 source_ordinals: AHashMap::new(),
                 watermark_trackers: AHashMap::new(),
@@ -1427,11 +1454,27 @@ impl IncrementalFlow {
         let pre_delta_snapshots: HashMap<String, RecordBatch> = if views_needing_plans.is_empty() {
             HashMap::new()
         } else {
+            // O(state) per source, but this arm only runs on the first tick
+            // after a view is registered or a checkpoint is restored — the
+            // operator being seeded needs one contiguous batch.
             current_snapshots
                 .iter()
-                .map(|(k, v)| (k.clone(), v.positive().clone()))
-                .collect()
+                .map(|(k, v)| v.positive_batch().map(|b| (k.clone(), b)))
+                .collect::<Result<HashMap<_, _>, _>>()
+                .map_err(delta_err)?
         };
+
+        // IVM-MAP-1: a *stateless* operator must be fed the change to the
+        // source's materialized relation, not the raw input delta. Those differ
+        // exactly by movement in the CORE-2 deficit: a retraction with nothing
+        // to cancel never reaches the relation, so forwarding it would publish a
+        // row the relation never held. A stateful operator's accumulator nets
+        // that out internally; a map has no accumulator, which is why this was
+        // latent until one existed.
+        let old_deficits: HashMap<String, Option<DeltaBatch>> = current_snapshots
+            .iter()
+            .map(|(k, v)| (k.clone(), v.deficit().cloned()))
+            .collect();
 
         let mut new_snapshots = current_snapshots;
         for (name, delta) in &inputs {
@@ -1442,6 +1485,34 @@ impl IncrementalFlow {
             // cancel. `SourceState::apply_to` keeps the remainder.
             let updated = SourceState::apply_to(current, delta).map_err(delta_err)?;
             new_snapshots.insert(name.clone(), updated);
+        }
+
+        // zset' = zset + raw, and zset = positive + deficit, so
+        //   positive' - positive = raw + deficit - deficit'
+        // With no deficit on either side (every append-only and in-order-CDC
+        // source, i.e. the overwhelming majority) this is just `raw`, and the
+        // clone below is the only cost.
+        let mut source_relation_deltas: HashMap<String, DeltaBatch> = HashMap::new();
+        for (name, raw) in &inputs {
+            let before = old_deficits.get(name).and_then(|d| d.clone());
+            let after = new_snapshots.get(name).and_then(|s| s.deficit().cloned());
+            if before.is_none() && after.is_none() {
+                source_relation_deltas.insert(name.clone(), raw.clone());
+                continue;
+            }
+            let mut parts: Vec<DeltaBatch> = vec![raw.clone()];
+            if let Some(b) = before {
+                parts.push(b);
+            }
+            if let Some(a) = after {
+                parts.push(a.negate().map_err(delta_err)?);
+            }
+            let combined = DeltaBatch::concat(&parts).map_err(delta_err)?;
+            let schema = combined.data_schema().clone();
+            let settled =
+                krishiv_delta::operators::consolidate::consolidate_batch(combined, &[], &schema)
+                    .map_err(delta_err)?;
+            source_relation_deltas.insert(name.clone(), settled.drop_zeros().map_err(delta_err)?);
         }
 
         // ── Phase 3 (no lock): register source MemTables ─────────────────────
@@ -1472,9 +1543,16 @@ impl IncrementalFlow {
             // how it surfaced. Registering the zero-row batch (which carries
             // the schema) makes such a view plan and return no rows, which is
             // the right answer to "what is the sum over an empty table".
-            let snapshot = state.positive();
+            //
+            // IVM-AUD-PERF-1: registered as chunks. Concatenating them here to
+            // recover the single batch this used to pass would reintroduce the
+            // O(accumulated rows) copy per tick that chunking removed.
             tables
-                .register(name.as_str(), snapshot)
+                .register_chunks(
+                    name.as_str(),
+                    state.schema().clone(),
+                    state.positive_chunks(),
+                )
                 .map_err(|e| IvmError::execution(e.to_string()))?;
         }
 
@@ -1486,7 +1564,7 @@ impl IncrementalFlow {
         // Schema map for plan construction: sources + upstream view schemas.
         let mut available_schemas: AHashMap<String, SchemaRef> = AHashMap::new();
         for (name, state) in &new_snapshots {
-            available_schemas.insert(name.clone(), state.positive().schema());
+            available_schemas.insert(name.clone(), state.schema().clone());
         }
         for spec in &view_specs {
             available_schemas.insert(spec.name.clone(), spec.output_schema.clone());
@@ -1507,6 +1585,7 @@ impl IncrementalFlow {
         let mut dirty_views: HashSet<String> = HashSet::new();
         // Newly built plans to insert in Phase 5: (name, plan, body_sql)
         let mut new_plans: Vec<(String, ViewPlan, String)> = Vec::new();
+        let mut new_orders: Vec<(String, Option<crate::plan::OutputOrder>)> = Vec::new();
 
         // Pass A — resolve, in topo order, which views this tick touches and
         // which of them get an O(Δ) incremental plan. This is separated from
@@ -1560,15 +1639,16 @@ impl IncrementalFlow {
             {
                 false
             } else if views_needing_plans.contains(view_name) {
-                let plan = crate::plan::build_view_plan(
+                let planned = crate::plan::build_planned_view(
                     &spec.body_sql,
                     &spec.output_schema,
                     &available_schemas,
                     &spec.lateness,
                 )
                 .await;
-                let is_incr = matches!(plan.kind(), ViewPlanKind::Incremental);
-                new_plans.push((view_name.clone(), plan, spec.body_sql.clone()));
+                let is_incr = matches!(planned.plan.kind(), ViewPlanKind::Incremental);
+                new_orders.push((view_name.clone(), planned.order));
+                new_plans.push((view_name.clone(), planned.plan, spec.body_sql.clone()));
                 is_incr
             } else {
                 view_plan_kinds
@@ -1779,6 +1859,16 @@ impl IncrementalFlow {
         // Without either, the first post-restore delta emits a non-retracting
         // insertion and corrupts the materialized view on the next restore
         // cycle (G6/F4).
+        for (name, order) in new_orders {
+            match order {
+                Some(o) => {
+                    inner.view_order.insert(name, o);
+                }
+                None => {
+                    inner.view_order.remove(name.as_str());
+                }
+            }
+        }
         for (name, mut plan, sql) in new_plans {
             let restored = match inner.pending_plan_state.remove(&name) {
                 Some(state_bytes) => plan.restore_state_bytes(&state_bytes).unwrap_or_else(|e| {
@@ -1937,6 +2027,75 @@ impl IncrementalFlow {
                             }
                         }
                     }
+                    // IVM-TOPN-1: ordered index over the relation. Like the
+                    // map it reads the *relation* delta, not the raw input —
+                    // an un-cancellable retraction never entered the relation
+                    // and must not enter the window's index either.
+                    Some(ViewPlan::TopN { source, op }) => {
+                        let src = source.clone();
+                        let delta = match source_relation_deltas
+                            .get(&src)
+                            .or_else(|| available_deltas.get(&src))
+                            .cloned()
+                        {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        match op.apply(delta) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view top-N apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    // IVM-MAP-1: stateless projection / derived columns /
+                    // filter. No trace to update and no accumulator to advance
+                    // — the mapped delta IS the output delta, because map is
+                    // linear over Z-sets.
+                    Some(ViewPlan::Map { source, op }) => {
+                        let src = source.clone();
+                        // Relation delta, not raw input delta — see the
+                        // IVM-MAP-1 note where `source_relation_deltas` is
+                        // built. Upstream *views* are not sources and carry no
+                        // deficit, so they fall through to `available_deltas`.
+                        let delta = match source_relation_deltas
+                            .get(&src)
+                            .or_else(|| available_deltas.get(&src))
+                            .cloned()
+                        {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        if delta.is_empty() {
+                            continue;
+                        }
+                        match op.apply(delta) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view map apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     Some(ViewPlan::Distinct { source, op, filter }) => {
                         let src = source.clone();
                         let delta = match available_deltas.get(&src).cloned() {
@@ -2004,6 +2163,47 @@ impl IncrementalFlow {
                     }
                 }
             };
+
+            // ── IVM-AUD-SCHEMA-1 tripwire ────────────────────────────────
+            // No operator may publish a relation other than the one the view
+            // declared. Two shapes reached here silently — a projected
+            // `DISTINCT` and a projected join, each emitting the operator's
+            // own wider relation because `source_of_plan` peels `Projection`
+            // nodes — and both reported `Incremental` with an empty
+            // `degraded_views` while the snapshot held the wrong columns.
+            // Those two are now refused at plan time (see `plan.rs`), which is
+            // the better outcome: DiffBased computes the projection correctly.
+            // This check exists for the shapes nobody has enumerated yet. It
+            // fails closed, because a view that stops updating is recoverable
+            // and a view that quietly publishes the wrong relation is not.
+            if !crate::plan::emits_declared_relation(
+                &output_delta.data_schema().clone(),
+                &view.spec.output_schema,
+            ) {
+                // Name AND type in the message: the first version printed names
+                // only, and a type-only mismatch then read as
+                // `["region","total"] but the view declares ["region","total"]`
+                // — a message that makes a real failure look like a bug in the
+                // check itself.
+                let describe = |s: &arrow::datatypes::SchemaRef| -> Vec<String> {
+                    s.fields()
+                        .iter()
+                        .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+                        .collect()
+                };
+                let emitted = describe(&output_delta.data_schema().clone());
+                let declared = describe(&view.spec.output_schema);
+                let message = format!(
+                    "operator emitted columns {emitted:?} but the view declares                      {declared:?}; refusing to publish a relation the view did                      not declare (IVM-AUD-SCHEMA-1)"
+                );
+                tracing::error!(view = %view_name, %message, "output schema mismatch");
+                errored_views.push(ViewError {
+                    view: view_name.clone(),
+                    kind: ViewErrorKind::OutputSchemaMismatch,
+                    message,
+                });
+                continue;
+            }
 
             if output_delta.is_empty() {
                 continue;
@@ -2241,7 +2441,14 @@ impl IncrementalFlow {
     pub fn snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {
         let inner = self.inner.lock().map_err(lock_err)?;
         let view = inner.view_registry.get(name).map_err(delta_err)?;
-        view.snapshot().map_err(delta_err)
+        let snap = view.snapshot().map_err(delta_err)?;
+        // IVM-ORDER-1: the relation is maintained unordered (it is a Z-set);
+        // the view's `ORDER BY` is applied here, on read, so maintenance pays
+        // nothing for it.
+        match (snap, inner.view_order.get(name)) {
+            (Some(batch), Some(order)) => Ok(Some(sort_batch(&batch, order)?)),
+            (snap, _) => Ok(snap),
+        }
     }
 
     /// Take this view's output delta from the most recent `step` — the
@@ -2270,10 +2477,12 @@ impl IncrementalFlow {
     /// [`Self::source_deficit_rows`] for how much is owed.
     pub fn source_snapshot(&self, name: &str) -> IvmResult<Option<RecordBatch>> {
         let inner = self.inner.lock().map_err(lock_err)?;
-        Ok(inner
+        inner
             .source_snapshots
             .get(name)
-            .map(|s| s.positive().clone()))
+            .map(|s| s.positive_batch())
+            .transpose()
+            .map_err(delta_err)
     }
 
     /// The source's full accumulated Z-set: the materialized rows at `+1` each
@@ -2606,7 +2815,7 @@ impl IncrementalFlow {
             // Positives ONLY, byte-identical to what this section always held.
             // The deficit rides in the trailing IVMZ1 section instead — see
             // `encode_source_deficits` for why it must not be inlined here.
-            encode_named_batch(&mut out, name, state.positive())?;
+            encode_named_batch(&mut out, name, &state.positive_batch().map_err(delta_err)?)?;
         }
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         write_u32_len(&mut out, names.len(), "view count")?;
@@ -3518,6 +3727,46 @@ fn write_u32_len(out: &mut Vec<u8>, len: usize, what: &str) -> IvmResult<()> {
     Ok(())
 }
 
+/// Apply a view's `ORDER BY` to its materialized snapshot (IVM-ORDER-1).
+///
+/// A column named in the order that is absent from the snapshot is skipped
+/// rather than raising: the order is derived from the view SQL and the snapshot
+/// from its declared schema, and a disagreement there is IVM-AUD-SCHEMA-1's
+/// business, not this function's. Skipping keeps a read working; failing here
+/// would turn a schema drift into an unreadable view.
+fn sort_batch(batch: &RecordBatch, order: &crate::plan::OutputOrder) -> IvmResult<RecordBatch> {
+    use arrow::compute::{SortColumn, SortOptions, lexsort_to_indices, take};
+    if batch.num_rows() <= 1 {
+        return Ok(batch.clone());
+    }
+    let mut cols: Vec<SortColumn> = Vec::with_capacity(order.columns.len());
+    for c in &order.columns {
+        let Some(values) = batch.column_by_name(&c.name) else {
+            continue;
+        };
+        cols.push(SortColumn {
+            values: values.clone(),
+            options: Some(SortOptions {
+                descending: c.descending,
+                nulls_first: c.nulls_first,
+            }),
+        });
+    }
+    if cols.is_empty() {
+        return Ok(batch.clone());
+    }
+    let indices = lexsort_to_indices(&cols, None)
+        .map_err(|e| IvmError::execution(format!("view order sort failed: {e}")))?;
+    let columns = batch
+        .columns()
+        .iter()
+        .map(|c| take(c.as_ref(), &indices, None))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| IvmError::execution(format!("view order take failed: {e}")))?;
+    RecordBatch::try_new(batch.schema(), columns)
+        .map_err(|e| IvmError::execution(format!("view order rebuild failed: {e}")))
+}
+
 fn delta_err(e: DeltaError) -> IvmError {
     IvmError::execution(e.to_string())
 }
@@ -4141,6 +4390,7 @@ pub fn view_error_kind_name(kind: &ViewErrorKind) -> &'static str {
         ViewErrorKind::ViewSql => "view_sql",
         ViewErrorKind::Publish => "publish",
         ViewErrorKind::FixpointNotConverged => "fixpoint_not_converged",
+        ViewErrorKind::OutputSchemaMismatch => "output_schema_mismatch",
     }
 }
 

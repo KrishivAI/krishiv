@@ -212,7 +212,7 @@ proptest! {
         let expected = model(&all);
 
         // positive (as a multiset) + deficit == the model Z-set.
-        let mut got: BTreeMap<i64, i64> = multiset(state.positive());
+        let mut got: BTreeMap<i64, i64> = multiset(&state.positive_batch().expect("positive"));
         if let Some(deficit) = state.deficit() {
             for (k, w) in batch_model(deficit) {
                 *got.entry(k).or_insert(0) += w;
@@ -228,7 +228,7 @@ proptest! {
                 prop_assert!(w < 0, "deficit weight {} is not negative", w);
             }
             // Invariant 2: no key is both present and owed.
-            let present = multiset(state.positive());
+            let present = multiset(&state.positive_batch().expect("positive"));
             for k in batch_model(deficit).keys() {
                 prop_assert!(!present.contains_key(k), "key {} is both present and owed", k);
             }

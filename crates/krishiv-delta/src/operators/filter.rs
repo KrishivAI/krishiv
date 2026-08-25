@@ -6,7 +6,10 @@
 //! yields exactly the same result as computing the full filtered view and
 //! differencing — so no state is needed, just apply the predicate.
 
-use arrow::array::BooleanArray;
+use std::sync::Arc;
+
+use arrow::array::{ArrayRef, BooleanArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use crate::delta_batch::DeltaBatch;
@@ -33,6 +36,52 @@ where
     }
 
     batch.filter_mask(&mask)
+}
+
+/// Replace a delta's data columns, keeping every row's weight untouched.
+///
+/// This is the kernel behind the O(Δ) map/projection plan (IVM-MAP-1). It is
+/// sound for exactly one reason, and the reason is worth stating because it is
+/// what makes the operator stateless: **projection is linear over Z-sets.**
+/// `map` distributes over multiset addition — `map(A + B) = map(A) + map(B)` —
+/// so mapping a delta gives precisely the delta of the mapped relation, with no
+/// accumulator and nothing to checkpoint. Aggregation and DISTINCT are *not*
+/// linear, which is why those operators must carry state and this one must not.
+///
+/// `f` must return a batch with the same row count and in the same row order —
+/// row `i` of the result is row `i` of the input, so it keeps row `i`'s weight.
+/// A row-count change is rejected rather than allowed to misalign weights,
+/// which would silently mislabel insertions as retractions.
+///
+/// Note the mapped rows are deliberately **not** consolidated: a projection may
+/// be non-injective (two source rows collapsing to one output row), and SQL
+/// projection does not deduplicate. Their weights are summed downstream by
+/// whatever consumes the Z-set, which is where `SELECT DISTINCT` would apply.
+pub fn map_batch<F>(batch: DeltaBatch, f: F) -> DeltaResult<DeltaBatch>
+where
+    F: FnOnce(&RecordBatch) -> DeltaResult<RecordBatch>,
+{
+    let data = batch.data_batch();
+    let rows_in = data.num_rows();
+    let mapped = f(&data)?;
+    if mapped.num_rows() != rows_in {
+        return Err(DeltaError::Operator(format!(
+            "map produced {} rows from {rows_in} input rows; a map must be \
+             row-preserving or the weights it carries no longer line up",
+            mapped.num_rows()
+        )));
+    }
+    let mut columns: Vec<ArrayRef> = mapped.columns().to_vec();
+    columns.push(Arc::new(batch.weights().clone()));
+    let mut fields: Vec<Arc<Field>> = mapped.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(
+        crate::delta_batch::WEIGHT_COLUMN,
+        DataType::Int64,
+        false,
+    )));
+    let inner = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|e| DeltaError::Operator(format!("map rebuild failed: {e}")))?;
+    DeltaBatch::from_weighted(inner)
 }
 
 /// `FilterOp` holds a static column predicate: keep rows where `column == value`.

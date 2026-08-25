@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc b5146c006db2d18b1f098154dee11edf5e952ad9291588082c20662b7e127de5 # shrinks to epoch_snapshots = [[[], []]], file_pick = Index(78743), byte_pick = Index(11081972770095317421), flip = 112

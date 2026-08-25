@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use ahash::AHashMap;
 use arrow::array::BooleanArray;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::execution::context::ExecutionProps;
@@ -33,6 +33,9 @@ use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
 use datafusion::prelude::SessionContext;
 
 use arrow::record_batch::RecordBatch;
+#[allow(unused_imports)]
+use krishiv_delta::operators::consolidate::{};
+use krishiv_delta::operators::topn::{IncrementalTopNOp, TopNSortKey};
 use krishiv_delta::{
     Aggregation, DeltaBatch, DeltaError, DeltaResult, IncrJoinType, IncrementalAggOp,
     IncrementalDistinctOp, IncrementalJoinOp,
@@ -70,8 +73,113 @@ pub enum ViewPlan {
         /// `WHERE` predicate applied to the source delta before de-duplication.
         filter: Option<SourceFilter>,
     },
+    /// Stateless projection / derived columns / filter over one source
+    /// (IVM-MAP-1). `map` is **linear** over Z-sets — `map(A + B) = map(A) +
+    /// map(B)` — so mapping the delta yields exactly the delta of the mapped
+    /// relation. That is why this variant carries no operator state: there is
+    /// nothing to accumulate, checkpoint, restore, seed or garbage-collect.
+    Map { source: String, op: MapOp },
+    /// Incremental `ORDER BY … LIMIT k` (IVM-TOPN-1). Unlike a bare `ORDER BY`,
+    /// a LIMIT changes *which rows are in the relation*, so this is a real
+    /// stateful operator — it holds the whole relation in sort order because a
+    /// retraction inside the cut promotes a row from outside it.
+    TopN {
+        source: String,
+        op: IncrementalTopNOp,
+    },
     /// Fallback: full SQL re-execution + diff against previous output (O(state)).
     DiffBased,
+}
+
+/// Compiled projection for a [`ViewPlan::Map`].
+///
+/// Holds one physical expression per output column plus an optional predicate,
+/// compiled once at plan time against the source schema. Applying it to a delta
+/// evaluates the expressions over the delta's rows and keeps each row's weight.
+#[derive(Clone)]
+pub struct MapOp {
+    exprs: Vec<(String, Arc<dyn PhysicalExpr>)>,
+    output_schema: SchemaRef,
+    predicate: Option<Arc<dyn PhysicalExpr>>,
+}
+
+impl MapOp {
+    /// Project (and optionally filter) one delta.
+    pub fn apply(&self, delta: DeltaBatch) -> DeltaResult<DeltaBatch> {
+        // Filter first: fewer rows to evaluate the projection over, and it
+        // matches SQL semantics (WHERE is applied before SELECT).
+        let delta = match &self.predicate {
+            Some(pred) => {
+                let pred = pred.clone();
+                krishiv_delta::operators::filter::filter_batch(delta, move |batch| {
+                    evaluate_predicate(&pred, batch)
+                })?
+            }
+            None => delta,
+        };
+        let exprs = self.exprs.clone();
+        let schema = self.output_schema.clone();
+        krishiv_delta::operators::filter::map_batch(delta, move |batch| {
+            let rows = batch.num_rows();
+            let mut columns: Vec<arrow::array::ArrayRef> = Vec::with_capacity(exprs.len());
+            for (name, expr) in &exprs {
+                let value = expr.evaluate(batch).map_err(|e| {
+                    krishiv_delta::DeltaError::Operator(format!(
+                        "map expression for column '{name}' failed: {e}"
+                    ))
+                })?;
+                let array = value.into_array(rows).map_err(|e| {
+                    krishiv_delta::DeltaError::Operator(format!(
+                        "map expression for column '{name}' produced no array: {e}"
+                    ))
+                })?;
+                // Conform to the planner's type (MAP-TYPE-1). Arrow's own
+                // arithmetic can land on a wider type than DataFusion's planner
+                // assigned the projection; the planner's answer is what every
+                // reader was told to expect, so the column is cast to it rather
+                // than the schema being bent to match the kernel.
+                let want = schema
+                    .field_with_name(name)
+                    .map_err(|e| {
+                        krishiv_delta::DeltaError::Operator(format!(
+                            "map output schema has no column '{name}': {e}"
+                        ))
+                    })?
+                    .data_type();
+                let array = if array.data_type() == want {
+                    array
+                } else {
+                    arrow::compute::cast(&array, want).map_err(|e| {
+                        krishiv_delta::DeltaError::Operator(format!(
+                            "map column '{name}': cannot represent {:?} as the planned {want:?}: {e}",
+                            array.data_type()
+                        ))
+                    })?
+                };
+                columns.push(array);
+            }
+            RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+                krishiv_delta::DeltaError::Operator(format!("map projection rebuild failed: {e}"))
+            })
+        })
+    }
+
+    /// The relation this operator emits — used by the IVM-AUD-SCHEMA-1 guard.
+    pub fn output_schema(&self) -> &SchemaRef {
+        &self.output_schema
+    }
+}
+
+impl std::fmt::Debug for MapOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MapOp")
+            .field(
+                "columns",
+                &self.exprs.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            )
+            .field("filtered", &self.predicate.is_some())
+            .finish()
+    }
 }
 
 /// A compiled `WHERE` predicate applied to a source's delta before it reaches
@@ -91,26 +199,43 @@ pub struct SourceFilter {
 }
 
 impl SourceFilter {
+    /// The compiled predicate, for a caller that applies it itself
+    /// (`MapOp` filters before projecting rather than in a separate pass).
+    fn into_predicate(self) -> Arc<dyn PhysicalExpr> {
+        self.predicate
+    }
+
     /// Keep only the delta rows for which the predicate evaluates to `true`.
     pub fn apply(&self, delta: DeltaBatch) -> DeltaResult<DeltaBatch> {
         let predicate = self.predicate.clone();
         krishiv_delta::operators::filter::filter_batch(delta, move |batch| {
-            let n = batch.num_rows();
-            let value = predicate
-                .evaluate(batch)
-                .map_err(|e| DeltaError::Operator(format!("filter predicate eval: {e}")))?;
-            let array = value
-                .into_array(n)
-                .map_err(|e| DeltaError::Operator(format!("filter predicate to_array: {e}")))?;
-            let mask = array
-                .as_any()
-                .downcast_ref::<BooleanArray>()
-                .ok_or_else(|| {
-                    DeltaError::Operator("filter predicate did not evaluate to Boolean".into())
-                })?;
-            Ok(mask.clone())
+            evaluate_predicate(&predicate, batch)
         })
     }
+}
+
+/// Evaluate a compiled predicate over a batch and return its boolean mask.
+///
+/// Shared by [`SourceFilter`] and [`MapOp`] so the two cannot drift into
+/// different ideas of what a predicate evaluating to non-Boolean means.
+fn evaluate_predicate(
+    predicate: &Arc<dyn PhysicalExpr>,
+    batch: &RecordBatch,
+) -> DeltaResult<BooleanArray> {
+    let n = batch.num_rows();
+    let value = predicate
+        .evaluate(batch)
+        .map_err(|e| DeltaError::Operator(format!("filter predicate eval: {e}")))?;
+    let array = value
+        .into_array(n)
+        .map_err(|e| DeltaError::Operator(format!("filter predicate to_array: {e}")))?;
+    let mask = array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| {
+            DeltaError::Operator("filter predicate did not evaluate to Boolean".into())
+        })?;
+    Ok(mask.clone())
 }
 
 /// Apply an optional source filter to an optional delta (helper for both the
@@ -150,13 +275,20 @@ impl ViewPlan {
                 "incremental aggregate — retract/insert only the changed groups per delta"
             }
             ViewPlan::Distinct { .. } => "incremental DISTINCT — multiset add/remove per delta",
+            ViewPlan::Map { .. } => {
+                "incremental map — projection/derived columns applied per delta row, stateless"
+            }
+            ViewPlan::TopN { .. } => {
+                "incremental top-N — ordered index over the relation, emits only the change to the window"
+            }
             ViewPlan::Join { .. } => {
                 "incremental equi-join — symmetric hash trace; probes only the delta rows"
             }
             ViewPlan::DiffBased => {
                 "full recompute (DiffBased) — no O(Δ) plan matched this view shape (needs a \
-                 single-source GROUP BY aggregate, DISTINCT, or equi-join with supported \
-                 per-side filters); the tick re-runs the whole view SQL and diffs the result"
+                 single-source GROUP BY aggregate, a projection/derived-column/filter map, \
+                 DISTINCT over the whole source, or an equi-join with supported per-side \
+                 filters); the tick re-runs the whole view SQL and diffs the result"
             }
         }
     }
@@ -190,6 +322,14 @@ impl ViewPlan {
                     None
                 }
             },
+            // Stateless by construction (map is linear), so there is nothing to
+            // checkpoint. Returning None is correct, not a gap: restore has
+            // nothing to rebuild and `seed_from_snapshots` is a no-op too.
+            ViewPlan::Map { .. } => None,
+            // The ordered index is rebuildable from the source relation, so
+            // restore seeds it rather than carrying a second encoding of the
+            // same rows through the checkpoint.
+            ViewPlan::TopN { .. } => None,
             ViewPlan::DiffBased => None,
         }
     }
@@ -211,6 +351,8 @@ impl ViewPlan {
                 op.restore_state_bytes(bytes)?;
                 Ok(true)
             }
+            ViewPlan::Map { .. } => Ok(false),
+            ViewPlan::TopN { .. } => Ok(false),
             ViewPlan::DiffBased => Ok(false),
         }
     }
@@ -257,6 +399,18 @@ impl ViewPlan {
             }
             ViewPlan::Distinct { source, op, filter } => {
                 if let Some(delta) = apply_side_filter(filter, seed_delta(source)?)? {
+                    let _ = op.apply(delta)?;
+                }
+            }
+            // Stateless: there is no accumulator to seed. Replaying the
+            // snapshot through it would emit the whole relation as a spurious
+            // insert delta, so doing nothing is the correct action, not a gap.
+            ViewPlan::Map { .. } => {}
+            ViewPlan::TopN { source, op } => {
+                // Replaying the snapshot rebuilds the ordered index; the emitted
+                // delta is discarded because the view's own snapshot already
+                // holds the window it describes.
+                if let Some(delta) = seed_delta(source)? {
                     let _ = op.apply(delta)?;
                 }
             }
@@ -325,9 +479,93 @@ impl ViewPlan {
                     Ok(0)
                 }
             }
+            // No retained state, so nothing can be reclaimed.
+            ViewPlan::Map { .. } => Ok(0),
+            // The index holds exactly the relation; nothing in it is reclaimable
+            // without changing the answer.
+            ViewPlan::TopN { .. } => Ok(0),
             ViewPlan::DiffBased => Ok(0),
         }
     }
+}
+
+/// One `ORDER BY` term of a view's output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderColumn {
+    pub name: String,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+/// How a view's materialized output should be presented.
+///
+/// **Ordering is deliberately NOT part of [`ViewPlan`]** (IVM-ORDER-1). An
+/// incremental operator maintains a Z-set, and a Z-set is an unordered
+/// multiset — `ORDER BY` says nothing about how the relation changes, only how
+/// it is read. Modelling it as a stateful sort operator would put per-tick cost
+/// on the maintenance path to serve a property that only matters at snapshot
+/// time, and would make every `ViewPlan` match arm carry a delegating case for
+/// something that does not affect delta propagation.
+///
+/// So a `Sort` node is peeled like a projection, the inner plan is maintained
+/// exactly as it would be without the clause, and the order is applied when the
+/// snapshot is read. Maintenance stays O(Δ) and unchanged; the sort is paid per
+/// *read*, which is the operation that actually asked for it.
+///
+/// `LIMIT` is a different thing entirely and is **not** peeled — see
+/// `try_build_from_logical`'s `Sort` arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputOrder {
+    pub columns: Vec<OrderColumn>,
+}
+
+/// A view's compiled plan plus how its output is presented.
+pub struct PlannedView {
+    pub plan: ViewPlan,
+    pub order: Option<OutputOrder>,
+}
+
+/// Read the `ORDER BY` off the root of a view's logical plan.
+///
+/// Only the root: an inner sort (inside a subquery, under an aggregate) does not
+/// describe the view's output and must not be lifted out of it.
+fn extract_output_order(plan: &LogicalPlan) -> Option<OutputOrder> {
+    // `ORDER BY x` roots at `Sort`; `ORDER BY x LIMIT k` roots at `Limit` with
+    // the `Sort` beneath it.
+    //
+    // The first cut matched only the bare `Sort`, so a top-N view recorded no
+    // order and read back **unsorted** — the operator maintained the correct
+    // top-k *set* while the presentation order the query asked for was simply
+    // dropped. A top-N is ordered by definition; `LIMIT` decides which rows are
+    // in the relation and `ORDER BY` decides how they are read, and both apply.
+    //
+    // This survived its own test: the operator's `BTreeMap` iterates in sort
+    // order, so early snapshots looked sorted by accident. It took reading back
+    // after several maintenance ticks to expose it.
+    let sort = match plan {
+        LogicalPlan::Sort(sort) => sort,
+        LogicalPlan::Limit(limit) => match limit.input.as_ref() {
+            LogicalPlan::Sort(sort) => sort,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let mut columns = Vec::with_capacity(sort.expr.len());
+    for se in &sort.expr {
+        // Only a plain column can be applied at read time. An expression sort
+        // (`ORDER BY a + b`) would need the expression evaluated against the
+        // snapshot, which is a map's job — express it as a map hop instead.
+        let name = expr_col_name(&se.expr)?;
+        columns.push(OrderColumn {
+            name,
+            descending: !se.asc,
+            nulls_first: se.nulls_first,
+        });
+    }
+    if columns.is_empty() {
+        return None;
+    }
+    Some(OutputOrder { columns })
 }
 
 // ── Public entry point ────────────────────────────────────────────────────────
@@ -348,6 +586,18 @@ pub async fn build_view_plan(
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
 ) -> ViewPlan {
+    build_planned_view(body_sql, output_schema, available_schemas, lateness)
+        .await
+        .plan
+}
+
+/// [`build_view_plan`] plus the view's output ordering (IVM-ORDER-1).
+pub async fn build_planned_view(
+    body_sql: &str,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+    lateness: &[krishiv_delta::LatenessSpec],
+) -> PlannedView {
     use datafusion::datasource::MemTable;
     let ctx = SessionContext::new();
     for (name, schema) in available_schemas {
@@ -358,11 +608,18 @@ pub async fn build_view_plan(
     }
     let df = match ctx.sql(body_sql).await {
         Ok(d) => d,
-        Err(_) => return ViewPlan::DiffBased,
+        Err(_) => {
+            return PlannedView {
+                plan: ViewPlan::DiffBased,
+                order: None,
+            };
+        }
     };
     let plan = df.logical_plan().clone();
-    try_build_from_logical(&plan, output_schema, available_schemas, lateness)
-        .unwrap_or(ViewPlan::DiffBased)
+    let order = extract_output_order(&plan);
+    let built = try_build_from_logical(&plan, output_schema, available_schemas, lateness)
+        .unwrap_or(ViewPlan::DiffBased);
+    PlannedView { plan: built, order }
 }
 
 // ── Auto-partition key inference ──────────────────────────────────────────────
@@ -653,7 +910,12 @@ fn try_build_from_logical(
 ) -> Option<ViewPlan> {
     match plan {
         // Peel top-level projections transparently.
-        LogicalPlan::Projection(Projection { input, expr, .. }) => {
+        LogicalPlan::Projection(Projection {
+            input,
+            expr,
+            schema: proj_schema,
+            ..
+        }) => {
             // IVM-AUD-CORE-23: a SELECT's aggregate aliases live in this
             // projection, not in the Aggregate below it — the Aggregate's own
             // schema names them `sum(sales.amount)` / `count(*)`. Peeling the
@@ -664,7 +926,14 @@ fn try_build_from_logical(
                 let aliases = aggregate_output_aliases(expr);
                 return build_agg_plan(agg, output_schema, available_schemas, &aliases);
             }
-            try_build_from_logical(input, output_schema, available_schemas, lateness)
+            // IVM-MAP-1: a projection directly over a source (optionally with a
+            // WHERE between) is a stateless O(Δ) map. Tried only after the
+            // recursive peel fails, so an aggregate/join/distinct underneath
+            // still gets its own operator — `resolve_source_with_filters`
+            // refuses to peel those nodes, so this cannot claim them anyway.
+            try_build_from_logical(input, output_schema, available_schemas, lateness).or_else(
+                || build_map_plan(expr, proj_schema, input, output_schema, available_schemas),
+            )
         }
         LogicalPlan::Aggregate(agg) => {
             build_agg_plan(agg, output_schema, available_schemas, &AHashMap::new())
@@ -672,7 +941,7 @@ fn try_build_from_logical(
         LogicalPlan::Join(join) => {
             // Only 2-source joins (source_of_plan returns None for multi-way joins
             // where one side is itself a Join node with 2 inputs).
-            build_join_plan(join, None, available_schemas, lateness)
+            build_join_plan(join, None, output_schema, available_schemas, lateness)
         }
         // #160: `WHERE` above a join (`SELECT … FROM a JOIN b ON … WHERE …`)
         // plans as `Filter → Join`. Filter is linear, so conjuncts that touch
@@ -683,16 +952,37 @@ fn try_build_from_logical(
         // shapes are resolved inside the aggregate/distinct builders; a bare
         // filtered scan stays DiffBased).
         LogicalPlan::Filter(f) => match f.input.as_ref() {
-            LogicalPlan::Join(join) => {
-                build_join_plan(join, Some(&f.predicate), available_schemas, lateness)
-            }
-            _ => None,
+            LogicalPlan::Join(join) => build_join_plan(
+                join,
+                Some(&f.predicate),
+                output_schema,
+                available_schemas,
+                lateness,
+            ),
+            // IVM-MAP-1: a bare filtered scan is an identity map with a
+            // predicate. Documented as DiffBased before this — filter is
+            // linear, so there was never a reason it had to be.
+            _ => build_map_plan(&[], plan.schema(), plan, output_schema, available_schemas),
         },
         // DISTINCT — the inner plan is the first (and only) input.
         LogicalPlan::Distinct(_) => {
             let inputs = plan.inputs();
             let inner_plan = inputs.first().copied()?;
             let source = source_of_plan(inner_plan)?;
+            // IVM-AUD-SCHEMA-1: `IncrementalDistinctOp` dedups whole source
+            // rows and emits them unchanged, so it can only serve a view whose
+            // output IS the source relation. `SELECT DISTINCT col FROM t`
+            // resolved here through the peeled `Projection` and published every
+            // source column — a wrong relation, reported healthy.
+            if !emits_declared_relation(available_schemas.get(&source)?, output_schema) {
+                tracing::warn!(
+                    source = %source,
+                    "IVM plan degraded to O(state) DiffBased: DISTINCT emits the \
+                     whole source relation, which does not match this view's \
+                     declared output columns (a projected DISTINCT)"
+                );
+                return None;
+            }
             Some(ViewPlan::Distinct {
                 source,
                 op: IncrementalDistinctOp::new(),
@@ -702,6 +992,20 @@ fn try_build_from_logical(
                 filter: None,
             })
         }
+        // IVM-ORDER-1: `ORDER BY` is a read-time property of the output Z-set,
+        // so the sort is peeled and the inner plan maintained unchanged. A
+        // `Sort` with `fetch` is a top-N — its *answer* depends on the order, so
+        // it is deliberately left to DiffBased rather than silently dropping the
+        // LIMIT, which would publish more rows than the view promises.
+        LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+            try_build_from_logical(&sort.input, output_schema, available_schemas, lateness)
+        }
+        // IVM-TOPN-1: `ORDER BY … LIMIT k` plans as `Limit -> Sort -> …`, not
+        // as a `Sort` carrying `fetch` — verified against the planner rather
+        // than assumed. Scoped like the map: the input must resolve to a plain
+        // source, so a top-N over an aggregate or a narrowing projection is a
+        // two-hop DAG rather than a fused operator.
+        LogicalPlan::Limit(limit) => build_topn_plan(limit, output_schema, available_schemas),
         // Window functions (ROW_NUMBER, RANK, rolling aggregates) cannot be
         // computed O(Δ) in general. Fall through to DiffBased explicitly.
         LogicalPlan::Window(Window { .. }) => None,
@@ -709,6 +1013,181 @@ fn try_build_from_logical(
         // fall back to DiffBased full SQL re-execution.
         _ => None,
     }
+}
+
+/// Build a stateless O(Δ) map plan for a projection (and/or WHERE) over one
+/// source. Returns `None` — meaning DiffBased — for anything else.
+///
+/// `exprs` empty means "identity projection": every source column, unchanged,
+/// which is the bare-filtered-scan shape.
+fn build_map_plan(
+    exprs: &[Expr],
+    node_schema: &DFSchema,
+    input: &LogicalPlan,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<ViewPlan> {
+    // Only a plain source underneath, with optional WHEREs. This deliberately
+    // does NOT peel a Join, Aggregate or Distinct: those need their own
+    // stateful operator, and a map cannot read a relation that has not been
+    // materialized as a source or an upstream view.
+    let (source, preds) = resolve_source_with_filters(input)?;
+    let source_schema = available_schemas.get(&source)?;
+
+    let df_schema = DFSchema::try_from_qualified_schema(&source, source_schema.as_ref()).ok()?;
+    let props = ExecutionProps::new();
+
+    // Identity projection when the node carries no expressions.
+    let owned_identity: Vec<Expr>;
+    let exprs = if exprs.is_empty() {
+        owned_identity = source_schema
+            .fields()
+            .iter()
+            .map(|f| Expr::Column(datafusion::common::Column::new_unqualified(f.name())))
+            .collect();
+        &owned_identity[..]
+    } else {
+        exprs
+    };
+
+    // Output field names come from the plan node's own schema, which is where
+    // DataFusion already resolved aliases — re-deriving them here would be a
+    // second source of truth for the same fact (the CORE-23 defect's shape).
+    let names: Vec<String> = node_schema
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    if names.len() != exprs.len() {
+        return None;
+    }
+
+    let mut compiled: Vec<(String, Arc<dyn PhysicalExpr>)> = Vec::with_capacity(exprs.len());
+    let mut fields: Vec<Field> = Vec::with_capacity(exprs.len());
+    for ((expr, name), planned) in exprs
+        .iter()
+        .zip(names.iter())
+        .zip(node_schema.fields().iter())
+    {
+        // Coerce before lowering, for the same reason `compile_source_filter`
+        // does: an unoptimized logical expression carries no casts, so a mixed
+        // arithmetic expression would fail the Arrow kernel at evaluation.
+        let mut coercion = TypeCoercionRewriter::new(&df_schema);
+        let coerced = expr.clone().rewrite(&mut coercion).ok()?.data;
+        let physical = create_physical_expr(&coerced, &df_schema, &props).ok()?;
+        compiled.push((name.clone(), physical));
+        // MAP-TYPE-1: the type comes from the plan node's schema, NOT from
+        // re-deriving it here. The first cut derived it independently and the
+        // two disagreed — `auction % 1000` over a `UInt64` source degraded
+        // silently because this function's answer differed from the planner's.
+        // That is the same "second source of truth for one fact" mistake the
+        // comment above this loop warns about for *names*; it was applied to
+        // names and not to types. `MapOp::apply` casts the evaluated column to
+        // this type, so the planner's answer is authoritative end to end.
+        fields.push(Field::new(
+            name,
+            planned.data_type().clone(),
+            planned.is_nullable(),
+        ));
+    }
+    let emitted: SchemaRef = Arc::new(Schema::new(fields));
+
+    // IVM-AUD-SCHEMA-1: never claim a shape whose relation is not the declared
+    // one. A map CAN produce arbitrary projections, so unlike DISTINCT and the
+    // join this is a real check rather than a refusal — but it still has to
+    // hold, because the declared schema is what every reader trusts.
+    if !emits_declared_relation(&emitted, output_schema) {
+        // Loud, because this is the one place a map degrades for a reason the
+        // author of the view cannot see from the SQL. A silent `None` here is
+        // how MAP-TYPE-1 hid.
+        tracing::warn!(
+            source = %source,
+            emitted = ?emitted
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+                .collect::<Vec<_>>(),
+            declared = ?output_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+                .collect::<Vec<_>>(),
+            planner_said = ?node_schema
+                .fields()
+                .iter()
+                .map(|f| format!("{}:{:?}", f.name(), f.data_type()))
+                .collect::<Vec<_>>(),
+            "IVM map plan degraded to DiffBased: the compiled projection does \
+             not emit the relation the view declares"
+        );
+        return None;
+    }
+
+    let predicate = match compile_source_filter(&preds, &source, source_schema) {
+        Ok(Some(f)) => Some(f.into_predicate()),
+        Ok(None) => None,
+        // A WHERE that will not compile must never be silently dropped (AUD-1).
+        Err(()) => return None,
+    };
+
+    Some(ViewPlan::Map {
+        source,
+        op: MapOp {
+            exprs: compiled,
+            output_schema: emitted,
+            predicate,
+        },
+    })
+}
+
+/// Build an O(Δ) top-N plan for `ORDER BY … LIMIT k` over one source.
+fn build_topn_plan(
+    limit: &datafusion::logical_expr::Limit,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<ViewPlan> {
+    // `OFFSET` shifts the window; the operator emits the first k and has no
+    // notion of skipping, so anything but skip=0 bails rather than silently
+    // returning the wrong page.
+    match limit.skip.as_deref() {
+        None => {}
+        Some(Expr::Literal(datafusion::scalar::ScalarValue::Int64(Some(0)), _)) => {}
+        Some(_) => return None,
+    }
+    let fetch = match limit.fetch.as_deref()? {
+        Expr::Literal(datafusion::scalar::ScalarValue::Int64(Some(n)), _) if *n >= 0 => {
+            usize::try_from(*n).ok()?
+        }
+        // A non-literal LIMIT is not a fixed window and cannot be maintained.
+        _ => return None,
+    };
+    let LogicalPlan::Sort(sort) = limit.input.as_ref() else {
+        return None;
+    };
+    // `source_of_plan` peels the identity `Projection` the planner inserts, and
+    // refuses a `Filter` — a WHERE under the LIMIT changes which rows compete
+    // for the window, and the operator has no filter hook, so that must bail
+    // rather than limit the unfiltered relation.
+    let source = source_of_plan(&sort.input)?;
+    let source_schema = available_schemas.get(&source)?;
+    if !emits_declared_relation(source_schema, output_schema) {
+        return None;
+    }
+    let mut keys = Vec::with_capacity(sort.expr.len());
+    for se in &sort.expr {
+        let name = expr_col_name(&se.expr)?;
+        let column = source_schema.index_of(&name).ok()?;
+        keys.push(TopNSortKey {
+            column,
+            descending: !se.asc,
+            nulls_first: se.nulls_first,
+        });
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let op = IncrementalTopNOp::new(source_schema.clone(), keys, fetch).ok()?;
+    Some(ViewPlan::TopN { source, op })
 }
 
 // ── Aggregate plan builder ────────────────────────────────────────────────────
@@ -842,6 +1321,7 @@ fn build_agg_plan(
 fn build_join_plan(
     join: &Join,
     outer_filter: Option<&Expr>,
+    output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
 ) -> Option<ViewPlan> {
@@ -987,6 +1467,23 @@ fn build_join_plan(
     )
     .ok()?;
 
+    // IVM-AUD-SCHEMA-1: the operator emits all left columns plus the right's
+    // non-key columns. A `Projection` above the join is not part of the
+    // operator, and `source_of_plan` peels projections — so a projected join
+    // published that wider relation while reporting `Incremental` with an empty
+    // `degraded_views`. Ask the operator what it will emit and refuse the plan
+    // when that is not what the view declared; DiffBased computes it correctly.
+    if !emits_declared_relation(op.output_schema(), output_schema) {
+        tracing::warn!(
+            left = %left_source,
+            right = %right_source,
+            "IVM plan degraded to O(state) DiffBased: the incremental join emits \
+             left ++ right-non-key columns, which does not match this view's \
+             declared output columns (a projected join)"
+        );
+        return None;
+    }
+
     Some(ViewPlan::Join {
         left_source,
         right_source,
@@ -1039,6 +1536,82 @@ fn unqualify_columns(preds: &[Expr]) -> Option<Vec<Expr>> {
 /// silently discarded. The filter-aware `resolve_source_with_filters` handles
 /// the clean-chain case in O(Δ); anything that reaches a `Filter` here returns
 /// `None`, correctly degrading the view to DiffBased full recompute.
+/// Does the relation an operator will emit match what the view declared?
+///
+/// IVM-AUD-SCHEMA-1. Every incremental operator emits its own *natural*
+/// relation — `DISTINCT` emits whole source rows, the join emits left ++ right
+/// non-key columns — and a `Projection` sitting above it in the logical plan is
+/// not part of the operator at all. `source_of_plan`'s catch-all peels any
+/// single-input node, projections included, so a projected view resolved to a
+/// source and then published the operator's wider relation while reporting
+/// `Incremental` with an empty `degraded_views`. Refusing the plan here sends
+/// the view to DiffBased, which computes the projection correctly.
+///
+/// Nullability is deliberately not compared: a declared output schema routinely
+/// marks columns nullable where the source does not, and that difference does
+/// not change which rows or columns are emitted.
+///
+/// Nor is the *physical encoding* of a string or binary column. A view's
+/// declared schema comes from DataFusion's planned output — which since DF 54
+/// is `Utf8View` — while an operator emits whatever the source column
+/// physically holds, typically `Utf8`. Those are the same logical column, and
+/// requiring them to be byte-identical rejected a correct `GROUP BY` on the
+/// resident-executor path (caught by
+/// `resident_group_by_aggregate_first_tick_emits_delta`). What this must catch
+/// is the *wrong columns* — a different count, different names, or a
+/// numerically different type such as Int64 where Float64 was declared, which
+/// really would change the values. Encoding is not that.
+/// Column *order* is not compared either, and that is not laxness — it is the
+/// contract IVM-AUD-CORE-23 established. An aggregate view's operator emits in
+/// SELECT order while its declared schema may list the same columns in another
+/// order, and the pairing between them is **by name**; readers take the
+/// snapshot's columns with `column_by_name`. Comparing positionally rejected
+/// the very test that pins that contract
+/// (`aggregates_follow_their_names_not_their_positions`, whose entire point is
+/// that SELECT order `(total, cnt)` and declared order `(cnt, total)` both
+/// work). Matching by name still catches what this guard is for: a projected
+/// view emits a different *set* of columns, not the same set reordered.
+pub(crate) fn emits_declared_relation(emitted: &SchemaRef, declared: &SchemaRef) -> bool {
+    let emitted = emitted.fields();
+    if emitted.len() != declared.fields().len() {
+        return false;
+    }
+    // Greedy match against a used-mask rather than a name->type map, so a
+    // relation that repeats a column name (a join can) has to bring the same
+    // multiplicity on both sides instead of collapsing to one entry.
+    let mut used = vec![false; emitted.len()];
+    declared.fields().iter().all(|d| {
+        let hit = emitted.iter().enumerate().position(|(i, e)| {
+            used.get(i) == Some(&false)
+                && e.name() == d.name()
+                && same_logical_type(e.data_type(), d.data_type())
+        });
+        match hit {
+            Some(i) => {
+                if let Some(slot) = used.get_mut(i) {
+                    *slot = true;
+                }
+                true
+            }
+            None => false,
+        }
+    })
+}
+
+/// Equal, treating the interchangeable Arrow encodings of one logical type as
+/// one type. Deliberately narrow: only the string and binary view/large
+/// variants, which are representation choices. Numeric widths are NOT unified —
+/// Int64 where Float64 was declared is a real difference in the values a caller
+/// reads, and is exactly the kind of thing this guard exists to surface.
+fn same_logical_type(a: &DataType, b: &DataType) -> bool {
+    use DataType::{Binary, BinaryView, LargeBinary, LargeUtf8, Utf8, Utf8View};
+    match (a, b) {
+        (Utf8 | LargeUtf8 | Utf8View, Utf8 | LargeUtf8 | Utf8View) => true,
+        (Binary | LargeBinary | BinaryView, Binary | LargeBinary | BinaryView) => true,
+        _ => a == b,
+    }
+}
+
 fn source_of_plan(plan: &LogicalPlan) -> Option<String> {
     match plan {
         LogicalPlan::TableScan(ts) if ts.filters.is_empty() => {

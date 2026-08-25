@@ -51,6 +51,7 @@ krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
 krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
 krishiv-engines = { path = "../krishiv-engines", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+ahash = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 parquet = { workspace = true }

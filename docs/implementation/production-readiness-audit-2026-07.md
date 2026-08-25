@@ -1385,7 +1385,7 @@ setup on hot paths, while purpose-built faster machinery sits parked.**
 3. Key-group parallelism + credit-based exchange (§4) → Phase 55.
 4. Sink commits at epoch boundaries; batch/linger dial → Phase 55.
 
-**IVM** (yardstick: #102 crossover — recompute wins below ~23M rows
+**IVM** (yardstick: #102 crossover — recompute wins below ~23M rows — **superseded 2026-08-24 by IVM-AUD-PERF-1: the crossover is now ~4M rows and IVM is 8.0x faster at 100M**
 today; target ≤1M):
 1. Executor-resident state; deltas-not-snapshots; no per-tick
    ctx/plan rebuild (§5, §5c) → Phase 57 AUD-6.

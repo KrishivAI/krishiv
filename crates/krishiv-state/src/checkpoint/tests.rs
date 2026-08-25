@@ -740,6 +740,62 @@ fn validate_epoch_manifest_hash_mismatch() {
     assert!(!validate_epoch(&s, "j", 50).unwrap());
 }
 
+/// The manifest names the paths recovery will open, so it decides what the
+/// process reaches on disk. Before these tests the guard that vets those paths
+/// had **no test at all** — traversal, absolute paths and self-reference were
+/// rejected by code nobody exercised, and the NUL case was not rejected at all.
+#[test]
+fn manifest_paths_that_escape_the_epoch_directory_are_corruption() {
+    for bad in [
+        "../../etc/passwd",
+        "/etc/passwd",
+        "a/../../../b",
+        "wind\\ows\\style",
+        "",
+        "manifest.sha256",
+        "a//b",
+        "./a",
+    ] {
+        let s = make_storage();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", b"{}");
+        manifest.insert(bad, "abc123");
+        write_manifest(&s, "j", 60, &manifest).unwrap();
+        // Make the legitimate entry actually validate, so the verdict below is
+        // decided by the bad path and not by a missing file.
+        s.write_bytes(&format!("{}/metadata.json", epoch_dir("j", 60)), b"{}")
+            .unwrap();
+        assert!(
+            matches!(
+                validate_epoch(&s, "j", 60),
+                Err(CheckpointError::Corrupt { epoch: 60, .. })
+            ),
+            "manifest path {bad:?} must be rejected as corruption"
+        );
+    }
+}
+
+/// A single flipped bit turns printable ASCII into a control character — 0x70
+/// (`p` of `op-0`) XOR 0x70 is NUL. The OS then rejects the path at `open()`,
+/// and the failure used to escape as a storage error, so recovery reported I/O
+/// trouble instead of fencing the damaged epoch and falling back.
+#[test]
+fn a_control_character_in_a_manifest_path_is_corruption_not_an_io_error() {
+    for bad in ["o\0-0/t0/state.bin", "op-0/t0/state\n.bin", "op-\u{7f}/x"] {
+        let s = make_storage();
+        let mut manifest = IntegrityManifest::new();
+        manifest.insert_bytes("metadata.json", b"{}");
+        manifest.insert(bad, "abc123");
+        write_manifest(&s, "j", 61, &manifest).unwrap();
+        s.write_bytes(&format!("{}/metadata.json", epoch_dir("j", 61)), b"{}")
+            .unwrap();
+        match validate_epoch(&s, "j", 61) {
+            Err(CheckpointError::Corrupt { epoch: 61, .. }) => {}
+            other => panic!("manifest path {bad:?} must be Corrupt, got {other:?}"),
+        }
+    }
+}
+
 // ── latest_valid_epoch ────────────────────────────────────────────────
 
 #[test]

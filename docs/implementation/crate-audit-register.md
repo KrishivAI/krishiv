@@ -5925,3 +5925,44 @@ streaming for every query class (stateless/join/pipeline fragments,
 registration wire, coordinator routing), then NEXMark on the k3s rig. Join
 column projection (the CTE SELECT list is still ignored; collisions prefix
 left_/right_) remains a named cosmetic debt.
+
+## §61 — A checkpoint proptest found the guard that vets manifest paths, and it had never been tested
+
+`proptest_checkpoint_kill::corrupted_epoch_is_fenced_and_recovery_falls_back` flips one byte
+anywhere in the newest sealed epoch and asserts recovery fences the damaged epoch and falls back
+to the previous one. On a fresh seed it failed:
+
+```
+unexpected error: checkpoint storage error: read .../00000000000000000001/o -0/t0/state.bin:
+file name contained an unexpected NUL byte
+```
+
+The flipped bit landed in the integrity manifest, in a path component — `0x70` (`p` of `op-0`)
+XOR `0x70` is NUL. `validate_manifest_relative_path` waved it through, the OS rejected it at
+`open()`, and the failure escaped as `CheckpointError::Storage`. That is the wrong *class* of
+error, and the class is what recovery branches on: a storage error says "I/O is unwell, do not
+draw conclusions", so recovery reported trouble instead of fencing an epoch that was plainly
+damaged and falling back to the good one sitting right next to it. **A corrupt checkpoint that
+presents as an I/O fault is a checkpoint that blocks its own fallback.**
+
+Fixed by rejecting any control character in a manifest path as `Corrupt`. No path this engine
+writes contains one, and a single bad bit is the obvious way to produce one from printable ASCII.
+
+**What the fix exposed is worth more than the fix.** The guard around it — rejecting absolute
+paths, `..` traversal, empty components, and self-reference — is the code that decides *what
+recovery opens on disk*, from a file whose contents an attacker with write access to the
+checkpoint store controls. It had **zero tests**. Not weak ones; none. Both new tests were
+added: `a_control_character_in_a_manifest_path_is_corruption_not_an_io_error` (red against the
+pre-fix guard, green after) and `manifest_paths_that_escape_the_epoch_directory_are_corruption`
+(green both ways — it is coverage for behaviour that was already correct but unexercised, and it
+is labelled that way rather than counted as a fix).
+
+Both tests initially failed for a reason unrelated to what they were testing: a manifest that
+lists `metadata.json` without the file existing short-circuits to `Ok(false)` before any bad path
+is reached, so the assertion was decided by a missing file rather than the path. The fixture
+writes the real file so the verdict comes from the thing under test. Worth noting because it is
+the same shape as the false-greens in the IVM register: **the test ran, the assertion held, and
+it was measuring something else.**
+
+Proptest pinned the discovering seed to `proptest_checkpoint_kill.proptest-regressions`, so this
+input is now part of the deterministic suite rather than a lucky draw.

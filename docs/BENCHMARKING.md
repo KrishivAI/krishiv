@@ -4,6 +4,61 @@ Performance claims must be reproducible. A benchmark result without the source
 revision, command, hardware, dataset, and configuration is diagnostic data—not
 a published project claim.
 
+## Do not benchmark a standard suite against the IVM path without checking the plan
+
+**Measured, and gated: 5 of 44.** `cargo test -p krishiv-bench --test
+ivm_query_coverage -- --nocapture` classifies every query in the committed
+TPC-H and NEXMark corpora and prints the table. As of 2026-08-25:
+
+| suite | queries maintaining incrementally as a single view |
+|---|---|
+| TPC-H | **0 / 22** |
+| NEXMark | **5 / 22** (q0, q10, q14, q21, q22 — all stateless) |
+
+The test asserts those counts **exactly**, not as a floor. A `>=` floor hides
+the failure this repo keeps hitting: a change that fixes one query while
+breaking another nets to zero and reads as "no regression".
+
+### Why TPC-H is zero, and why that is not a decimal problem
+
+It was a decimal problem until IVM-AUD-DEC-1; it no longer is. `Decimal128`
+aggregates are now exact (`i128` accumulation, DataFusion's own result types,
+verified against the differential oracle). TPC-H is still zero for a structural
+reason: **the IVM planner builds one operator per view.** Every TPC-H query
+composes several — join, then aggregate, then order — and q21 nests seventeen
+deep. Handed such a query verbatim, the planner finds nothing it can match and
+falls to `DiffBased`, which re-runs the whole view SQL each tick and diffs it:
+strictly *slower* than simply running the query, and not incremental
+maintenance in any sense.
+
+### The number you may have seen quoted, and what it actually means
+
+A larger figure — 28 of 51 — has been quoted for this engine. It measures a
+different thing: what a person can reach by **hand-decomposing** each query
+into a chain of single-hop views. That capability is real; the flow maintains
+view-over-view chains and orders them by dependency. It also took **166
+hand-built views to cover 28 queries.**
+
+Both numbers are true. Only one is a statement about the engine:
+
+- *"5 of 44 standard queries maintain incrementally"* — what the engine does
+  when handed a query.
+- *"28 of 51 can be expressed as DAGs of incremental views"* — what a person
+  can build out of the engine's operators, at 166 views.
+
+Never quote the second without the first. The gap between them is a single
+missing capability: **automatic decomposition of a multi-operator query into a
+DAG of internal views.** That is the highest-value item on the IVM roadmap, and
+until it exists, "TPC-H on IVM" means a human wrote 166 views.
+
+**Rule: any benchmark that claims to measure incremental maintenance must assert
+its views are actually executing incrementally, and fail if they are not.**
+`ivm_vs_full_recompute` does this in `require_incremental_plan()` — call
+`view_plan_classification` and panic on `incremental == false`. A benchmark
+without that assertion is not evidence about IVM. This is not hypothetical: the
+`ivm_vs_full_recompute` header asserted a wrong mechanism and a wrong magnitude
+for over a year (IVM-AUD-PERF-1).
+
 ## Benchmark suites
 
 - Criterion microbenchmarks: `cargo bench -p krishiv-bench`

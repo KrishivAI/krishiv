@@ -1064,14 +1064,27 @@ session's change). These are the **next tasks**, in priority order.
 
 ### Performance register (ranked by impact)
 
-- [ ] **AUD-5: G14 SessionContext-per-tick** (maintainer-ruled fix-first,
-  pre-registered): `step_datafusion` builds a fresh context per tick
-  (`flow.rs:586`), and every distributed tick builds a whole transient
-  flow (`fragment/ivm.rs`). Benchmarked at ~650-700 ms fixed cost/tick —
-  full recompute beats IVM ~100x below ~23M rows. Fix: one long-lived
-  ctx per flow; note flow Phase 3 re-registers source MemTables each tick
-  and only views are deregistered (`flow.rs:839`) — stale source tables
-  must be swapped, not leaked.
+- [x] **AUD-5: G14 SessionContext-per-tick** — DONE. `step_datafusion`
+  caches one context per flow in `self.tick_ctx` and replace-registers.
+  **The numbers in the original entry are long dead and were misleading
+  by 2026-08-24: measured then, the fixed cost was ~10 ms/tick, not
+  650-700 ms, and the gap to full recompute was 1-4x, not ~100x.**
+  Superseded by IVM-AUD-PERF-1 (below), which found the real remaining
+  slope was not this at all.
+- [x] **IVM-AUD-PERF-1: the tick was O(accumulated rows)** — DONE
+  2026-08-24, `ivm-tick-chunked`. `SourceState` held its relation as one
+  contiguous `RecordBatch` and rebuilt it with `concat_batches` on every
+  append, copying the whole relation per tick. This is the same
+  "Remaining tick slope = O(n) `apply_delta` snapshot concat" noted in the
+  2026-07-08 entry above and deferred as "next leg" — it is now done, not
+  rediscovered. The relation is chunked, with the open tail sealed into a
+  compacted run at 8192 rows, so each row is copied at most once.
+  Measured: tick 7.5M 81.25 -> 36.95 ms (-55%), 10M 65.23 -> 49.43 ms
+  (-24%). **IVM now beats full recompute above ~4M rows, and by 8.0x at
+  100M rows (70.87 ms vs 568.19 ms).** 10M -> 100M costs full recompute
+  7.9x (linear) and the tick 1.4x. Residual: the 3.5M-10M rise is real,
+  does not extrapolate past 10M, and is unexplained — needs a profile.
+  See `docs/implementation/ivm-audit-register.md` PERF-1.
 - [ ] **AUD-6: distributed IVM ships full state per tick, both
   directions.** Per dispatched tick: `checkpoint_full` O(state) + base64
   into a string fragment (`crates/krishiv-scheduler/src/ivm_http.rs:395-460`),
@@ -1383,6 +1396,9 @@ and is **not attempted here** — flagging it, not fixing it.
   the numbers above (criterion re-samples with fresh runs, so exact figures
   will vary run to run within noise, but the ~100x gap and the crossover
   order of magnitude are stable properties of the mechanism, not noise).
+  **Superseded 2026-08-24 — this claim did not survive.** The ~100x gap was
+  gone by then (measured 1-4x) and there was no crossover at all until
+  IVM-AUD-PERF-1 chunked the source state; see the performance register.
 - `cargo build -p krishiv-bench --bench ivm_vs_full_recompute` and the
   criterion `-- --test` smoke mode both clean.
 

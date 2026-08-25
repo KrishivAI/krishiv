@@ -356,6 +356,9 @@ impl FeedableJob for IvmJob {
                                 krishiv_ivm::ViewErrorKind::FixpointNotConverged => {
                                     super::job::ViewErrorKind::FixpointNotConverged
                                 }
+                                krishiv_ivm::ViewErrorKind::OutputSchemaMismatch => {
+                                    super::job::ViewErrorKind::OutputSchemaMismatch
+                                }
                             },
                             message: e.message,
                         })

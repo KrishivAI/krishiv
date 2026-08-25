@@ -441,6 +441,24 @@ fn validate_manifest_relative_path(path: &str, epoch: u64) -> CheckpointResult<(
             message: "manifest must not include itself".to_owned(),
         });
     }
+    // A control character — NUL above all — can never appear in a path this
+    // engine wrote, and no filesystem accepts one. Without this check a
+    // corrupted manifest byte turns a path component into something the OS
+    // rejects at `open()`, and the failure surfaces as a *storage* error:
+    // recovery then reports "I/O failed" for what is plainly a damaged epoch,
+    // and refuses to fall back to the previous good one. Found by
+    // `proptest_checkpoint_kill::corrupted_epoch_is_fenced_and_recovery_falls_back`
+    // flipping 0x70 out of `op-0`, which is exactly how a single bad bit
+    // produces a NUL from printable ASCII.
+    if let Some(bad) = path.chars().find(|c| c.is_control()) {
+        return Err(CheckpointError::Corrupt {
+            epoch,
+            message: format!(
+                "manifest path {path:?} contains control character {:?}; the manifest is damaged",
+                bad
+            ),
+        });
+    }
     for component in path.split('/') {
         if component.is_empty() || component == "." || component == ".." {
             return Err(CheckpointError::Corrupt {

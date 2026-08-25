@@ -19,17 +19,24 @@
 //! outside the timed region; only the operation actually being compared is
 //! measured.
 //!
-//! **Measured result (2026-07-05, see `docs/implementation/status.md` for
-//! full numbers/methodology) contradicts the naive expectation**:
-//! `full_recompute` is ~100x *faster* than `ivm_incremental_feed` at every
-//! size tested (up to 1M rows), because every production call site uses the
-//! `step_datafusion()` convenience method, which constructs a fresh
-//! `SessionContext` on every tick — that fixed setup cost dominates the true
-//! O(Δ) aggregate work at these scales. Extrapolating the measured
-//! `full_recompute` growth, the crossover (where a full recompute costs as
-//! much as one current IVM tick) is around 23M rows. Below that, this
-//! benchmark's workload is genuinely faster to recompute from scratch than
-//! to maintain incrementally, as currently implemented.
+//! **Measured 2026-08-24 (IVM-AUD-PERF-1), superseding the 2026-07-05 note
+//! that used to sit here.** That note claimed `full_recompute` was ~100x
+//! faster than `ivm_incremental_feed` and blamed a fresh `SessionContext` per
+//! tick, predicting a crossover near 23M rows. All three parts were wrong by
+//! the time it was read: `step_datafusion` caches its context, the measured
+//! gap was 1-4x rather than 100x, and there was no crossover because the tick
+//! was itself growing with accumulated rows — 7.6x the time for 7.5x the rows,
+//! for an identical `BATCH_SIZE` delta.
+//!
+//! That growth was the real finding, and it was a defect, not a property of
+//! IVM: `SourceState` held its relation as one contiguous `RecordBatch` and
+//! rebuilt it with `concat_batches` on every append, copying the whole
+//! accumulated relation per tick. See `SourceState`'s module doc. With the
+//! relation chunked, the tick no longer scales with accumulated rows.
+//!
+//! Keep this note honest against what the benchmark actually prints. Per
+//! `docs/BENCHMARKING.md` these are self-comparison numbers for regression
+//! detection, not figures to publish against unlike hardware.
 //! To run: `cargo bench -p krishiv-bench --bench ivm_vs_full_recompute`.
 //! Per `docs/BENCHMARKING.md`: record the commit, dirty-worktree state, and
 //! hardware alongside any published result — this file does not do that for
@@ -145,8 +152,31 @@ fn seeded_flow(rt: &tokio::runtime::Runtime, baseline_rows: i64) -> IncrementalF
     flow
 }
 
+/// Report — and require — that the benchmarked view actually executes O(Δ).
+///
+/// `ivm_incremental_feed` only measures incremental maintenance if `revenue`
+/// got an incremental plan. A view that degrades to `DiffBased` re-runs the
+/// whole SQL every tick, which is O(n) *by design*, and it would still produce
+/// a plausible number here — indistinguishable from real incremental
+/// maintenance except by being slow. That is exactly the confusion the
+/// 2026-07-05 note above fell into. Failing loudly means a future run cannot
+/// quietly benchmark the fallback and call it IVM.
+fn require_incremental_plan(rt: &tokio::runtime::Runtime) {
+    let flow = seeded_flow(rt, 10_000);
+    let (incremental, reason) = flow
+        .view_plan_classification("revenue")
+        .expect("classify revenue view")
+        .expect("revenue view is registered");
+    println!("ivm_vs_full_recompute: revenue incremental={incremental} ({reason})");
+    assert!(
+        incremental,
+        "the benchmarked view degraded to full recompute, so this run would not          be measuring incremental maintenance: {reason}"
+    );
+}
+
 fn bench_ivm_incremental_feed(c: &mut Criterion) {
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    require_incremental_plan(&rt);
     let mut group = c.benchmark_group("ivm_incremental_feed");
     for total in total_rows_ladder() {
         let baseline = total - BATCH_SIZE;
