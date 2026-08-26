@@ -46,7 +46,7 @@ use arrow::datatypes::SchemaRef;
 use datafusion::common::Column;
 use datafusion::common::tree_node::{Transformed, TreeNode};
 use datafusion::datasource::MemTable;
-use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion::logical_expr::{Expr, Filter as LogicalFilter, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 
 use crate::plan::{ViewPlan, ViewPlanKind, build_view_plan_single};
@@ -96,12 +96,22 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
                 chain.reverse();
                 return Some(chain);
             }
-            // DECOMP-4: a two-source Join ends the walk as the chain's leaf.
-            // Whether it is actually maintainable (equi keys, INNER, both
-            // sides plain sources) is the hop planner's decision, made when
-            // the leaf hop is verified like every other hop.
-            LogicalPlan::Join(_) => {
-                chain.push(node);
+            // DECOMP-4/MJOIN-1: a Join joins the chain. A LEFT-DEEP join
+            // tree — the shape every comma join plans to — descends along the
+            // left spine, each Join becoming one chain node whose RIGHT side
+            // must be a plain source (a bushy right side fails the hop
+            // planner and refuses the chain). The bottom-most Join, whose
+            // left side is also plain, is the leaf.
+            LogicalPlan::Join(join) => {
+                let left_is_join = matches!(join.left.as_ref(), LogicalPlan::Join(_));
+                chain.push(node.clone());
+                if left_is_join {
+                    let LogicalPlan::Join(join) = node else {
+                        return None;
+                    };
+                    node = join.left.as_ref().clone();
+                    continue;
+                }
                 chain.reverse();
                 return Some(chain);
             }
@@ -404,22 +414,30 @@ async fn decompose_core(
     // DECOMP-4: a join leaf emits a flat relation whose field names are the
     // bare column names of both sides. A collision would make every reference
     // above it ambiguous, so it is refused before any cutting happens.
-    if matches!(leaf, Leaf::Join)
-        && let Some(join_node) = chain.first()
-    {
-        // Both sides must be plain sources — the hop planner's own acceptance
-        // rule, checked HERE so a multi-way join (a side that is itself a
-        // join) refuses before the giant unparse + replan that would only be
-        // refused afterwards anyway (and whose planner recursion overflows a
-        // default thread stack on a five-way comma join).
-        if let LogicalPlan::Join(j) = join_node
-            && !(crate::plan::side_resolves_to_source(&j.left)
-                && crate::plan::side_resolves_to_source(&j.right))
-        {
-            return None;
+    if matches!(leaf, Leaf::Join) {
+        // MJOIN-1: the leaf join's LEFT side and every join level's RIGHT
+        // side must be plain sources (the walk already descended the left
+        // spine, so a non-source here means a bushy tree — refused before
+        // any unparse: replanning a doomed multi-way tree recurses
+        // DataFusion's planner deep enough to overflow a default thread
+        // stack, found on q2's five-way comma join).
+        let mut top_join: Option<&LogicalPlan> = None;
+        for n in &chain {
+            if let LogicalPlan::Join(j) = n {
+                if top_join.is_none() && !crate::plan::side_resolves_to_source(&j.left) {
+                    return None;
+                }
+                if !crate::plan::side_resolves_to_source(&j.right) {
+                    return None;
+                }
+                top_join = Some(n);
+            }
         }
+        // Every bare column name across the ACCUMULATED relation must be
+        // unique — hops above the joins reference them unqualified, and the
+        // topmost join's schema carries all of them.
         let mut seen = std::collections::HashSet::new();
-        for (_, f) in join_node.schema().iter() {
+        for (_, f) in top_join?.schema().iter() {
             if !seen.insert(f.name().clone()) {
                 return None;
             }
@@ -446,14 +464,54 @@ async fn decompose_core(
     let mut cuts: Vec<LogicalPlan> = Vec::new();
     let mut next = 0usize;
     if matches!(leaf, Leaf::Join) {
-        let join_node = *operator_nodes.first()?;
-        next = 1;
-        match operator_nodes.get(1) {
-            Some(LogicalPlan::Filter(_)) => {
-                cuts.push((*operator_nodes.get(1)?).clone());
-                next = 2;
+        // MJOIN-1: the run of join levels at the bottom of the chain, leaf
+        // first. A single WHERE above the run (the comma-join idiom) is
+        // DISTRIBUTED: each conjunct attaches to the LOWEST join level whose
+        // accumulated schema covers its columns, so `c_custkey = o_custkey`
+        // keys level one and `n_regionkey = r_regionkey` keys level five —
+        // handing the whole WHERE to any single level would leave the others
+        // keyless cross joins the planner refuses. Conjuncts no level covers
+        // become a filter hop above the run.
+        let mut join_run: Vec<&LogicalPlan> = Vec::new();
+        while let Some(n) = operator_nodes.get(next) {
+            if matches!(n, LogicalPlan::Join(_)) {
+                join_run.push(n);
+                next += 1;
+            } else {
+                break;
             }
-            _ => cuts.push(join_node.clone()),
+        }
+        let mut level_preds: Vec<Vec<Expr>> = vec![Vec::new(); join_run.len()];
+        let mut above_preds: Vec<Expr> = Vec::new();
+        if let Some(LogicalPlan::Filter(f)) = operator_nodes.get(next) {
+            for conjunct in datafusion::logical_expr::utils::split_conjunction(&f.predicate) {
+                let cols = conjunct.column_refs();
+                let level = join_run.iter().position(|jn| {
+                    !cols.is_empty() && cols.iter().all(|c| jn.schema().index_of_column(c).is_ok())
+                });
+                match level {
+                    Some(k) => level_preds.get_mut(k)?.push((*conjunct).clone()),
+                    None => above_preds.push((*conjunct).clone()),
+                }
+            }
+            next += 1; // the WHERE is consumed by the distribution
+        }
+        for (k, jn) in join_run.iter().enumerate() {
+            let preds = level_preds.get(k)?;
+            let cut = if preds.is_empty() {
+                (*jn).clone()
+            } else {
+                let combined = preds.iter().cloned().reduce(|a, b| a.and(b))?;
+                LogicalPlan::Filter(LogicalFilter::try_new(combined, Arc::new((*jn).clone())).ok()?)
+            };
+            cuts.push(cut);
+        }
+        if !above_preds.is_empty() {
+            let combined = above_preds.iter().cloned().reduce(|a, b| a.and(b))?;
+            let top = (*join_run.last()?).clone();
+            cuts.push(LogicalPlan::Filter(
+                LogicalFilter::try_new(combined, Arc::new(top)).ok()?,
+            ));
         }
     }
     for n in operator_nodes.iter().skip(next) {
@@ -519,12 +577,44 @@ async fn decompose_core(
                     node.with_new_exprs(node.expressions(), vec![scan]).ok()?
                 }
                 // The hop below carries flat bare names (collision-refused
-                // above), so references unqualify — one relation, so a bare
-                // name is unambiguous (the ALIAS-1 rule).
+                // above), so references unqualify — the accumulated relation
+                // plus the level's right table have pairwise-unique bare
+                // names, so an unqualified reference is unambiguous (the
+                // ALIAS-1 rule). A mid-chain JOIN cut (MJOIN-1) re-roots its
+                // LEFT input onto the hop below and keeps its right table; a
+                // Filter(Join) cut rebuilds both layers.
                 Leaf::Join => {
                     let scan = bare_hop_scan(&prev.name, &prev.schema)?;
-                    let exprs = unqualify_exprs(&node.expressions())?;
-                    node.with_new_exprs(exprs, vec![scan]).ok()?
+                    match node {
+                        LogicalPlan::Join(j) => {
+                            let exprs = unqualify_exprs(&node.expressions())?;
+                            node.with_new_exprs(exprs, vec![scan, j.right.as_ref().clone()])
+                                .ok()?
+                        }
+                        LogicalPlan::Filter(f)
+                            if matches!(f.input.as_ref(), LogicalPlan::Join(_)) =>
+                        {
+                            let LogicalPlan::Join(j) = f.input.as_ref() else {
+                                return None;
+                            };
+                            let join_exprs = unqualify_exprs(&f.input.expressions())?;
+                            let new_join = f
+                                .input
+                                .as_ref()
+                                .clone()
+                                .with_new_exprs(join_exprs, vec![scan, j.right.as_ref().clone()])
+                                .ok()?;
+                            let pred =
+                                unqualify_exprs(std::slice::from_ref(&f.predicate))?.pop()?;
+                            LogicalPlan::Filter(
+                                LogicalFilter::try_new(pred, Arc::new(new_join)).ok()?,
+                            )
+                        }
+                        _ => {
+                            let exprs = unqualify_exprs(&node.expressions())?;
+                            node.with_new_exprs(exprs, vec![scan]).ok()?
+                        }
+                    }
                 }
             }
         };

@@ -2263,7 +2263,19 @@ impl IncrementalFlow {
                         };
                         for hop in rest {
                             out = match out {
-                                Ok(d) => crate::plan::apply_chain_hop(hop, d),
+                                // MJOIN-1: a mid-chain join hop probes the
+                                // folded delta (its left) against its right
+                                // table's trace, and this tick's right delta
+                                // against the accumulated left trace.
+                                Ok(d) => {
+                                    if let ViewPlan::Join { right_source, .. } = hop {
+                                        let right =
+                                            available_deltas.get(right_source.as_str()).cloned();
+                                        crate::plan::apply_chain_join_hop(hop, Some(d), right)
+                                    } else {
+                                        crate::plan::apply_chain_hop(hop, d)
+                                    }
+                                }
                                 e => e,
                             };
                         }

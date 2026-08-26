@@ -361,3 +361,18 @@ async fn tpch_q12_registered_verbatim_maintains_incrementally() {
 async fn tpch_q14_registered_verbatim_maintains_incrementally() {
     verbatim_join_matches_recompute("q14", &["lineitem", "part"], &corpus_sql("q14")).await;
 }
+
+/// MJOIN-1: a LEFT-DEEP multi-way comma join — six tables, the WHERE's equi
+/// conjuncts distributed across five join levels, an aggregate with a
+/// computed argument on top, and an ORDER BY riding the final hop.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q5_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute(
+        "q5",
+        &[
+            "customer", "orders", "lineitem", "supplier", "nation", "region",
+        ],
+        &corpus_sql("q5"),
+    )
+    .await;
+}

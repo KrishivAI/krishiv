@@ -6,13 +6,13 @@ a published project claim.
 
 ## Do not benchmark a standard suite against the IVM path without checking the plan
 
-**Measured, and gated: 18 of 44 registered verbatim.** `cargo test -p
+**Measured, and gated: 19 of 44 registered verbatim.** `cargo test -p
 krishiv-bench --test ivm_query_coverage -- --nocapture` classifies every query
 in the committed TPC-H and NEXMark corpora. As of 2026-08-26:
 
 | suite | verbatim (engine) | how |
 |---|---|---|
-| TPC-H | **4 / 22** (q1, q6, q12, q14) | chains (DECOMP-3), incl. join-leaf chains — `aggregate over (A ⋈ B)`, the comma-join idiom (DECOMP-4 + JOIN-2) |
+| TPC-H | **5 / 22** (q1, q6, q12, q14, q5) | chains (DECOMP-3), join-leaf chains (DECOMP-4 + JOIN-2), and left-deep multi-way join runs with WHERE conjuncts distributed per level (MJOIN-1 — q5 is six tables, five join levels) |
 | NEXMark | **14 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20 + q1, q2, q7 + q15, q16, q17) | 5 single-operator maps + 3 band joins (BAND-1) + 3 TUMBLE windows (WINDOW-1 + UINT-1) + 3 statistics queries (CDIST-1: COUNT(DISTINCT col) via per-value multiplicity shared with MIN/MAX's multiset) |
 
 Since DECOMP-3 the planner cuts a linear single-table multi-operator query into

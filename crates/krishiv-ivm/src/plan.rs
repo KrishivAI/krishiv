@@ -604,7 +604,12 @@ impl ViewPlan {
                     };
                     if let Some(mut delta) = seeded {
                         for hop in rest {
-                            delta = apply_chain_hop(hop, delta)?;
+                            delta = if let ViewPlan::Join { right_source, .. } = hop {
+                                let right = seed_delta(&right_source.clone())?;
+                                apply_chain_join_hop(hop, Some(delta), right)?
+                            } else {
+                                apply_chain_hop(hop, delta)?
+                            };
                         }
                     }
                 }
@@ -693,22 +698,38 @@ impl ViewPlan {
             // leaf uses the minimum of its OWN two sources, like the
             // standalone join arm, and GCs its traces at it.
             ViewPlan::Chain { source, hops } => {
-                let wm = match hops.first() {
-                    Some(ViewPlan::Join {
+                // The minimum watermark across EVERY involved source bounds
+                // every hop's state: the leaf's side(s) plus each mid-chain
+                // join's right table (MJOIN-1).
+                // Only REAL sources carry trackers: the leaf join's two
+                // sides, and each later join's RIGHT table — a mid-chain
+                // join's left is an internal hop name, and treating its
+                // missing tracker as MIN would silently disable GC for every
+                // multi-join chain.
+                let mut wm: Option<i64> = None;
+                let mut take = |name: &str| {
+                    let w = watermarks.get(name).copied().unwrap_or(i64::MIN);
+                    wm = Some(match wm {
+                        Some(cur) => cur.min(w),
+                        None => w,
+                    });
+                };
+                for (i, hop) in hops.iter().enumerate() {
+                    if let ViewPlan::Join {
                         left_source,
                         right_source,
                         ..
-                    }) => watermarks
-                        .get(left_source.as_str())
-                        .copied()
-                        .unwrap_or(i64::MIN)
-                        .min(
-                            watermarks
-                                .get(right_source.as_str())
-                                .copied()
-                                .unwrap_or(i64::MIN),
-                        ),
-                    _ => watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN),
+                    } = hop
+                    {
+                        if i == 0 {
+                            take(left_source);
+                        }
+                        take(right_source);
+                    }
+                }
+                let wm = match wm {
+                    Some(w) => w,
+                    None => watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN),
                 };
                 if wm == i64::MIN {
                     return Ok(0);
