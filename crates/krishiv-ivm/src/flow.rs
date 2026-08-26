@@ -1939,6 +1939,20 @@ impl IncrementalFlow {
             inputs.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
         // Collect view Arcs (clone from registry) before any mutable borrows.
+        // IVM-AUD-EMPTY-2: a dirty view owes an output every tick, even when
+        // its input delta is empty or absent. Skipping the operator instead
+        // starves everything downstream: in a decomposed chain whose filter
+        // hop admits nothing, the global aggregate two hops down is never
+        // applied, so the one row it owes over empty input (GLOBAL-1) is never
+        // established and the whole chain answers nothing where SQL says one
+        // row. Substituting an explicitly empty delta keeps every operator's
+        // own empty-input semantics in charge — a map emits nothing, a global
+        // aggregate emits its initial row — at O(1) per dirty view.
+        let empty_input_delta = |src: &str| -> Option<DeltaBatch> {
+            let schema = available_schemas.get(src)?;
+            DeltaBatch::empty(schema.clone()).ok()
+        };
+
         let dirty_view_arcs: Vec<(String, Arc<IncrementalView>)> = topo
             .iter()
             .filter(|n| dirty_views.contains(&n.to_lowercase()))
@@ -1969,7 +1983,14 @@ impl IncrementalFlow {
                 match inner.view_plans.get_mut(view_name) {
                     Some(ViewPlan::Aggregate { source, op, filter }) => {
                         let src = source.clone();
-                        let delta = match available_deltas.get(&src).cloned() {
+                        // IVM-AUD-EMPTY-2: apply on an empty delta rather than
+                        // skip — a global aggregate's first output over empty
+                        // input is one row, not silence.
+                        let delta = match available_deltas
+                            .get(&src)
+                            .cloned()
+                            .or_else(|| empty_input_delta(&src))
+                        {
                             Some(d) => d,
                             None => continue,
                         };
@@ -2021,9 +2042,8 @@ impl IncrementalFlow {
                     }) => {
                         let left = available_deltas.get(left_source.as_str()).cloned();
                         let right = available_deltas.get(right_source.as_str()).cloned();
-                        if left.is_none() && right.is_none() {
-                            continue;
-                        }
+                        // IVM-AUD-EMPTY-2: two absent sides still owe an
+                        // (empty) output; `apply(None, None)` is O(1).
                         // AUD-1: apply per-side WHERE predicates before probing.
                         let (left, right) = match (
                             crate::plan::apply_side_filter(left_filter, left),
@@ -2071,6 +2091,7 @@ impl IncrementalFlow {
                             .get(&src)
                             .or_else(|| available_deltas.get(&src))
                             .cloned()
+                            .or_else(|| empty_input_delta(&src))
                         {
                             Some(d) => d,
                             None => continue,
@@ -2106,13 +2127,11 @@ impl IncrementalFlow {
                             .get(&src)
                             .or_else(|| available_deltas.get(&src))
                             .cloned()
+                            .or_else(|| empty_input_delta(&src))
                         {
                             Some(d) => d,
                             None => continue,
                         };
-                        if delta.is_empty() {
-                            continue;
-                        }
                         match op.apply(delta) {
                             Ok(d) => d,
                             Err(e) => {
@@ -2132,7 +2151,11 @@ impl IncrementalFlow {
                     }
                     Some(ViewPlan::Distinct { source, op, filter }) => {
                         let src = source.clone();
-                        let delta = match available_deltas.get(&src).cloned() {
+                        let delta = match available_deltas
+                            .get(&src)
+                            .cloned()
+                            .or_else(|| empty_input_delta(&src))
+                        {
                             Some(d) => d,
                             None => continue,
                         };
@@ -2240,6 +2263,40 @@ impl IncrementalFlow {
             }
 
             if output_delta.is_empty() {
+                // IVM-AUD-EMPTY-2, publish half: an empty output is still a
+                // value. A materialized view whose first ever output is empty
+                // must hold Some(empty relation) — leaving the snapshot absent
+                // reads as "not yet computed", the same absence-vs-value
+                // confusion as IVM-AUD-EMPTY-1 one layer down, and `SELECT *
+                // FROM t WHERE false` then answers None instead of zero rows.
+                // Later empty outputs change nothing and publish nothing.
+                if view.spec.is_materialized && matches!(view.snapshot(), Ok(None)) {
+                    let published = if plan_kind == ViewPlanKind::Incremental {
+                        view.apply_output_delta(&output_delta)
+                    } else {
+                        view.publish_output(output_delta)
+                    };
+                    match published {
+                        Ok(()) => {
+                            let published_at = inner.tick;
+                            inner
+                                .view_output_ticks
+                                .insert(view_name.clone(), published_at);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                view = %view_name,
+                                error = %e,
+                                "empty-relation establishment publish failed"
+                            );
+                            errored_views.push(ViewError {
+                                view: view_name.clone(),
+                                kind: ViewErrorKind::Publish,
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
                 continue;
             }
             total_output_rows += output_delta.num_rows();
