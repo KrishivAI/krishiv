@@ -1729,11 +1729,21 @@ impl IncrementalFlow {
                 //
                 // Register all upstream outputs, then execute SQL.
                 for (up_name, up_batch) in &view_full_outputs {
-                    if up_batch.num_rows() == 0 {
-                        // Keep parity with a fresh context: no table at all.
-                        tables.remove(up_name.as_str());
-                        continue;
-                    }
+                    // IVM-AUD-EMPTY-1: register an empty upstream view as an
+                    // EMPTY TABLE, never as an absent one. Removing it read as
+                    // "keep parity with a fresh context", but the identical
+                    // parity argument was examined and rejected for sources in
+                    // IVM-AUD-CORE-2c, and the consequence here is the same:
+                    // the downstream view's SQL fails to plan ("table ... not
+                    // found"), the tick substitutes an empty batch, and the
+                    // view retracts to zero rows.
+                    //
+                    // For a grouped aggregate that happens to be right. For a
+                    // GLOBAL aggregate it is wrong: `SELECT COUNT(*) FROM v`
+                    // over an empty `v` is ONE row containing 0, not zero
+                    // rows, so a consumer sees "no data" where the answer is
+                    // "the count is zero". An empty relation is a value, not
+                    // an absence.
                     let _ = tables.register(up_name.as_str(), up_batch);
                 }
 
