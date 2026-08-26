@@ -6,14 +6,14 @@ a published project claim.
 
 ## Do not benchmark a standard suite against the IVM path without checking the plan
 
-**Measured, and gated: 12 of 44 registered verbatim.** `cargo test -p
+**Measured, and gated: 15 of 44 registered verbatim.** `cargo test -p
 krishiv-bench --test ivm_query_coverage -- --nocapture` classifies every query
 in the committed TPC-H and NEXMark corpora. As of 2026-08-26:
 
 | suite | verbatim (engine) | how |
 |---|---|---|
 | TPC-H | **4 / 22** (q1, q6, q12, q14) | chains (DECOMP-3), incl. join-leaf chains — `aggregate over (A ⋈ B)`, the comma-join idiom (DECOMP-4 + JOIN-2) |
-| NEXMark | **8 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20) | 5 single-operator maps + 3 band joins (BAND-1: equi-keyed trace, `BETWEEN` as a residual, projection as a post-map) |
+| NEXMark | **11 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20 + q1, q2, q7) | 5 single-operator maps + 3 band joins (BAND-1) + 3 TUMBLE windows (WINDOW-1 rewrites the TVF to a `window_start` derived table at registration; UINT-1 admits DataFusion's unsigned aggregate output types) |
 
 Since DECOMP-3 the planner cuts a linear single-table multi-operator query into
 a `ViewPlan::Chain` at plan time: every hop must classify `Incremental` or the

@@ -513,11 +513,21 @@ impl ValueReader {
         match kind {
             // COUNT(col): keep the original array, we only probe its null mask.
             None => Ok(ValueReader::NullMask(col.clone())),
-            // Cast once per batch. arrow's default (safe) cast nulls out values
-            // that don't fit (e.g. UInt64 > i64::MAX), which then read as NULL —
-            // strictly better than the old parse path that coerced them to 0.
+            // Cast once per batch, ERRORING on overflow (UINT-1). arrow's
+            // default safe cast nulls out values that don't fit (a UInt64
+            // above i64::MAX), and a NULL is silently EXCLUDED from
+            // SUM/MIN/MAX — a wrong answer nobody sees. With unsigned
+            // declared outputs now accepted, that path is reachable, so it
+            // fails loudly instead (the sticky-overflow discipline of DEC-1).
             Some(NumKind::Int) => {
-                let arr = compute::cast(col, &DataType::Int64)?;
+                let arr = compute::cast_with_options(
+                    col,
+                    &DataType::Int64,
+                    &compute::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )?;
                 let arr = arr
                     .as_any()
                     .downcast_ref::<Int64Array>()
@@ -778,6 +788,11 @@ impl IncrementalAggOp {
                 let natural = op.agg_natural_types.get(i);
                 let accept = match df.data_type() {
                     DataType::Int64 | DataType::Float64 => true,
+                    // UINT-1: DataFusion types MAX/SUM over an unsigned column
+                    // as unsigned; the operator accumulates in i64 and emits a
+                    // checked cast back (negative or oversized totals error
+                    // loudly rather than wrapping).
+                    DataType::UInt64 => natural == Some(&DataType::Int64),
                     dec @ DataType::Decimal128(_, _) => natural == Some(dec),
                     _ => false,
                 };
@@ -1220,6 +1235,29 @@ impl IncrementalAggOp {
                         })
                         .collect();
                     Arc::new(vals)
+                }
+                // UINT-1: an unsigned declared output — accumulate in i64 as
+                // usual, then checked-cast back. `safe: false` makes a
+                // negative or oversized total an ERROR, never a wrap or NULL.
+                DataType::UInt64 => {
+                    let vals: Int64Array = agg_values
+                        .iter()
+                        .map(|row| {
+                            row.get(ai).copied().flatten().map(|s| match s {
+                                AggScalar::I64(v) => v,
+                                AggScalar::F64(v) => v as i64,
+                                AggScalar::Dec(v) => descale_to_i64(v, scale),
+                            })
+                        })
+                        .collect();
+                    compute::cast_with_options(
+                        &(Arc::new(vals) as ArrayRef),
+                        target,
+                        &compute::CastOptions {
+                            safe: false,
+                            ..Default::default()
+                        },
+                    )?
                 }
                 DataType::Decimal128(p, s) => {
                     // `with_precision_and_scale` validates every value against

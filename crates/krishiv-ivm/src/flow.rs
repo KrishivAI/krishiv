@@ -787,6 +787,20 @@ impl IncrementalFlow {
     /// the full SQL result as insertions) and the cached incremental plan is
     /// cleared so a fresh plan is built.
     pub fn register_view(&self, spec: IncrementalViewSpec) -> IvmResult<()> {
+        // WINDOW-1: `TUMBLE(TABLE t, DESCRIPTOR(col), n)` rewrites to a
+        // derived table computing `window_start`/`window_end` at REGISTRATION,
+        // so every downstream reader of `body_sql` — the plan builder, the
+        // DiffBased SQL path, the STALE-1 fingerprint, dependency extraction,
+        // the attach protocol — sees one consistent, plannable query. Without
+        // the rewrite the TVF syntax parses nowhere in the batch engine and
+        // the view is not merely DiffBased but unplannable outright.
+        let spec = match crate::window_rewrite::rewrite_tumble_tvfs(&spec.body_sql) {
+            Some(rewritten) => IncrementalViewSpec {
+                body_sql: rewritten,
+                ..spec
+            },
+            None => spec,
+        };
         let mut inner = self.inner.lock().map_err(lock_err)?;
         if let Ok(existing) = inner.view_registry.get(&spec.name) {
             // IVM-AUD-CORE-E4: `lateness` belongs in this comparison. Leaving

@@ -13,6 +13,7 @@ pub mod plan;
 pub mod provenance;
 pub mod spill;
 pub mod vector_sink;
+pub mod window_rewrite;
 
 pub use decompose::{Hop, decompose};
 pub use error::{IvmError, IvmResult};

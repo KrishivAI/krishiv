@@ -98,6 +98,12 @@ async fn classify(
     schemas: &AHashMap<String, SchemaRef>,
     sql: &str,
 ) -> Verdict {
+    // WINDOW-1: registration rewrites `TUMBLE(TABLE …)` into standard SQL, so
+    // this measurement applies the same rewrite — it measures what the engine
+    // does to a query handed over verbatim, and verbatim registration IS the
+    // engine's surface.
+    let rewritten = krishiv_ivm::window_rewrite::rewrite_tumble_tvfs(sql);
+    let sql = rewritten.as_deref().unwrap_or(sql);
     // DataFusion's own logical schema is the view's declared contract.
     let Ok(df) = ctx.sql(sql).await else {
         return Verdict::Unplannable;
@@ -148,12 +154,15 @@ async fn measure(
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
 const TPCH_INCREMENTAL: usize = 4;
-/// Five stateless queries (q0, q10, q14, q21, q22 — projection/filter, the
-/// IVM-MAP-1 operator) plus the three band joins (q3, q8, q20 — BAND-1: the
-/// trace keys on the equi conjunct, the `BETWEEN` compiles as a residual over
-/// the joined relation, and the projection as a post-map). The remaining 14
-/// die at the windowing-TVF parse.
-const NEXMARK_INCREMENTAL: usize = 8;
+/// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
+/// q8, q20 — BAND-1), and three TUMBLE windows (q1, q2, q7 — WINDOW-1
+/// rewrites the TVF into a window_start/window_end derived table at
+/// registration, the chain machinery maintains it, and UINT-1 admits the
+/// unsigned aggregate outputs DataFusion types for NEXMark's UInt64 price).
+/// q15/q16/q17 rewrite and RUN now but hold COUNT(DISTINCT), which has no
+/// incremental operator; HOP fans out 1:N, SESSION merges statefully, and
+/// PROCTIME has no delta-batch meaning — all deliberately not rewritten.
+const NEXMARK_INCREMENTAL: usize = 11;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
