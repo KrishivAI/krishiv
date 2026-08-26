@@ -66,6 +66,20 @@ const NUM_REGIONS: i64 = 100;
 /// Rows added per incremental step. Kept well under any of the `TOTAL_ROWS`
 /// scale points so the O(delta) vs O(n) gap is visible even at the smallest.
 const BATCH_SIZE: i64 = 5_000;
+/// **IVM-AUD-PERF-2: the largest ladder point is configuration-dependent.**
+/// Criterion runs every point of a group in ONE process, so a large point
+/// inherits the heap state of the points before it. Measured on a quiet box,
+/// nine runs: the 100M tick is **~432 ms** when it runs last in this ladder and
+/// **~84 ms** when it runs alone (`KRISHIV_BENCH_IVM_ROWS=100000000`). Same
+/// binary, 5.1x apart, both individually tight. The 10M point is unaffected
+/// (49-53 ms either way), which is why the tracked nightly budget reads 10M.
+///
+/// Neither number is wrong: one is the tick with a fresh heap, the other the
+/// tick after gigabytes of churn — which is what a long-lived coordinator looks
+/// like. **Quote which configuration you measured**, or the same code supports
+/// two opposite conclusions about whether the tick scales with accumulated
+/// rows. The cause is unidentified; huge pages are refuted (0% in both).
+///
 /// Accumulated-table sizes to benchmark at. The 10M point exists because the
 /// Phase 51 yardstick records IVM tick latency at 1M *and* 10M rows; it
 /// needs roughly 2 GB of headroom for its untimed per-iteration setup, so
