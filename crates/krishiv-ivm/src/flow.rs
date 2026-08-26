@@ -3858,6 +3858,21 @@ fn extract_sql_table_refs(sql: &str) -> Option<HashSet<String>> {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
 
+    // DEPS-1: this walk covers the top-level FROM only, so a subquery in the
+    // WHERE (`EXISTS (SELECT … FROM person …)`) — or a CTE — references
+    // tables it cannot see. The parse still SUCCEEDED and an INCOMPLETE dep
+    // set was recorded confidently: feeds of the subquery's table were
+    // rejected outright, and where another view legitimized the source, THIS
+    // view never went dirty on its changes — a subquery view silently served
+    // stale answers whenever only the inner table moved. Any second SELECT
+    // keyword forces the tokenizer fallback, which sees every identifier; a
+    // rare false positive (a column literally named "select…") only costs the
+    // safe fallback.
+    let upper = sql.to_uppercase();
+    if upper.match_indices("SELECT").count() > 1 {
+        return None;
+    }
+
     let stmts = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
     let stmt = stmts.into_iter().next()?;
     let Statement::Query(q) = stmt else {

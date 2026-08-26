@@ -227,3 +227,131 @@ async fn a_comma_join_with_a_where_band_agrees_with_recompute() {
         "only the in-band pair joins; the key-only match is excluded"
     );
 }
+
+/// DECORR-1 + SEMI-1: a correlated EXISTS decorrelates (via DataFusion's own
+/// rule) to a LeftSemi join the incremental operator maintains. The person
+/// arriving a tick late is the crossing: the auction must ENTER the relation
+/// when its first match appears, and LEAVE when the last one retracts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_exists_maintains_as_a_semi_join() {
+    let sql = "SELECT id, ts FROM auction a WHERE EXISTS \
+               (SELECT 1 FROM person p WHERE p.pid = a.seller)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("ts", DataType::Int64, true),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let p7 = persons(&[(7, 100, 0)]);
+    for (a, p, retract) in [
+        // Auctions for sellers 7 and 8; person 7 exists: auction 1 is in.
+        (
+            Some(auctions(&[(1, 7, 10), (2, 8, 20)])),
+            Some(p7.clone()),
+            false,
+        ),
+        // Person 7 leaves: auction 1 leaves (crossing down).
+        (None, Some(p7.clone()), true),
+        // Person 7 returns: auction 1 re-enters (crossing up).
+        (None, Some(p7), false),
+    ] {
+        let mk = |b: &RecordBatch| {
+            if retract {
+                DeltaBatch::from_deletes(b.clone()).unwrap()
+            } else {
+                DeltaBatch::from_inserts(b.clone()).unwrap()
+            }
+        };
+        if let Some(a) = a {
+            subject.feed("auction", mk(&a)).unwrap();
+            oracle.feed("auction", mk(&a)).unwrap();
+        }
+        if let Some(p) = p {
+            subject.feed("person", mk(&p)).unwrap();
+            oracle.feed("person", mk(&p)).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+
+        let got = subject.snapshot("v").unwrap().expect("published");
+        let want = oracle.snapshot("v").unwrap().expect("published");
+        assert_eq!(
+            canonical(&got),
+            canonical(&want),
+            "semi join disagreed with recompute"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "a decorrelated EXISTS must take the O(delta) path: {why}"
+    );
+    assert_eq!(
+        canonical(&subject.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(1), Some(10)]],
+        "auction 1 re-entered on the crossing up; auction 2 never matched"
+    );
+}
+
+/// The NOT EXISTS mirror: a LeftAnti join.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_correlated_not_exists_maintains_as_an_anti_join() {
+    let sql = "SELECT id, ts FROM auction a WHERE NOT EXISTS \
+               (SELECT 1 FROM person p WHERE p.pid = a.seller)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("ts", DataType::Int64, true),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    for (a, p) in [
+        (
+            Some(auctions(&[(1, 7, 10), (2, 8, 20)])),
+            Some(persons(&[(7, 100, 0)])),
+        ),
+        // Person 8 arrives later: auction 2 leaves the anti relation.
+        (None, Some(persons(&[(8, 200, 0)]))),
+    ] {
+        if let Some(a) = a {
+            let d = DeltaBatch::from_inserts(a).unwrap();
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        if let Some(p) = p {
+            let d = DeltaBatch::from_inserts(p).unwrap();
+            subject.feed("person", d.clone()).unwrap();
+            oracle.feed("person", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = subject.snapshot("v").unwrap().expect("published");
+        let want = oracle.snapshot("v").unwrap().expect("published");
+        assert_eq!(canonical(&got), canonical(&want));
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "a decorrelated NOT EXISTS must take the O(delta) path: {why}"
+    );
+    assert_eq!(
+        canonical(&subject.snapshot("v").unwrap().unwrap()),
+        Vec::<Vec<Option<i64>>>::new(),
+        "every auction gained a match; the anti relation is empty"
+    );
+}

@@ -857,6 +857,53 @@ pub async fn build_view_plan(
         .plan
 }
 
+/// DECORR-1: rewrite IN / EXISTS / scalar subqueries into joins using
+/// DataFusion's OWN optimizer rules — battle-tested unnesting, not hand-rolled
+/// rewrites. Correlated EXISTS becomes a LeftSemi join and NOT EXISTS a
+/// LeftAnti (both O(Δ) since SEMI-1); correlated scalar aggregates become
+/// joins whose side is an aggregate subplan (SIDE-1's territory). Applied only
+/// when a subquery is actually present, so every other view's plan is
+/// byte-identical to before; on any rule failure the original plan is kept and
+/// the view degrades exactly as it would have.
+pub fn maybe_decorrelate(plan: LogicalPlan) -> LogicalPlan {
+    fn expr_has_subquery(e: &Expr) -> bool {
+        let mut found = false;
+        let _ = e.apply(|node| {
+            if matches!(
+                node,
+                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+            ) {
+                found = true;
+                return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+            }
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        });
+        found
+    }
+    let mut has = false;
+    let _ = plan.apply(|node| {
+        if node.expressions().iter().any(expr_has_subquery) {
+            has = true;
+            return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+        }
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    if !has {
+        return plan;
+    }
+    use datafusion::optimizer::{Optimizer, OptimizerContext, OptimizerRule};
+    let rules: Vec<Arc<dyn OptimizerRule + Send + Sync>> = vec![
+        Arc::new(
+            datafusion::optimizer::decorrelate_predicate_subquery::DecorrelatePredicateSubquery::new(),
+        ),
+        Arc::new(datafusion::optimizer::scalar_subquery_to_join::ScalarSubqueryToJoin::new()),
+    ];
+    let optimizer = Optimizer::with_rules(rules);
+    optimizer
+        .optimize(plan.clone(), &OptimizerContext::new(), |_, _| {})
+        .unwrap_or(plan)
+}
+
 /// [`build_view_plan`] plus the view's output ordering (IVM-ORDER-1).
 pub async fn build_planned_view(
     body_sql: &str,
@@ -908,7 +955,7 @@ async fn build_planned_view_impl(
             };
         }
     };
-    let plan = df.logical_plan().clone();
+    let plan = maybe_decorrelate(df.logical_plan().clone());
     let order = extract_output_order(&plan);
     let mut built = try_build_from_logical(&plan, output_schema, available_schemas, lateness)
         .unwrap_or(ViewPlan::DiffBased);
@@ -1683,6 +1730,9 @@ fn build_join_plan(
     let incr_join_type = match join.join_type {
         JoinType::Inner => IncrJoinType::Inner,
         JoinType::Left => IncrJoinType::LeftOuter,
+        // DECORR-1: the shapes decorrelated IN/EXISTS produce (SEMI-1).
+        JoinType::LeftSemi => IncrJoinType::LeftSemi,
+        JoinType::LeftAnti => IncrJoinType::LeftAnti,
         other => {
             tracing::warn!(
                 join_type = ?other,
@@ -1700,8 +1750,23 @@ fn build_join_plan(
     // bails the whole join to DiffBased rather than dropping the filter.
     let (left_source, left_side_preds) = resolve_source_with_filters(&join.left)
         .or_else(|| source_of_plan(&join.left).map(|s| (s, Vec::new())))?;
+    let semi_side = matches!(join.join_type, JoinType::LeftSemi | JoinType::LeftAnti);
     let (right_source, right_side_preds) = resolve_source_with_filters(&join.right)
-        .or_else(|| source_of_plan(&join.right).map(|s| (s, Vec::new())))?;
+        .or_else(|| source_of_plan(&join.right).map(|s| (s, Vec::new())))
+        .or_else(|| {
+            // DECORR-1: DataFusion's decorrelator wraps the subquery side as
+            // `Projection(Int64(1), key_col, …)` — a LITERAL beside preserved
+            // columns. For a SEMI/ANTI side that is safely peelable: a literal
+            // cannot carry key meaning and nothing of this side is ever
+            // emitted, so the operator reading the RAW source is exact. Inner
+            // and outer joins keep the strict rule — their right side IS
+            // emitted.
+            if semi_side {
+                resolve_semi_side_with_filters(&join.right)
+            } else {
+                None
+            }
+        })?;
     let left_schema = available_schemas.get(&left_source)?;
     let right_schema = available_schemas.get(&right_source)?;
 
@@ -1879,9 +1944,17 @@ fn build_join_plan(
         for (q, f) in join.left.schema().iter() {
             qfields.push((q.cloned(), Arc::clone(f)));
         }
-        for (q, f) in join.right.schema().iter() {
-            if !right_key_cols.iter().any(|k| k == f.name()) {
-                qfields.push((q.cloned(), Arc::clone(f)));
+        // SEMI/ANTI emit the LEFT columns alone (SEMI-1): the right side is a
+        // membership test, so nothing of it exists post-join for a residual
+        // or a projection to reference — the compile schema says so.
+        if !matches!(
+            incr_join_type,
+            IncrJoinType::LeftSemi | IncrJoinType::LeftAnti
+        ) {
+            for (q, f) in join.right.schema().iter() {
+                if !right_key_cols.iter().any(|k| k == f.name()) {
+                    qfields.push((q.cloned(), Arc::clone(f)));
+                }
             }
         }
         DFSchema::new_with_metadata(qfields, std::collections::HashMap::new()).ok()?
@@ -2196,6 +2269,41 @@ fn resolve_source_with_filters(plan: &LogicalPlan) -> Option<(String, Vec<Expr>)
             let (src, mut preds) = resolve_source_with_filters(&f.input)?;
             preds.push(f.predicate.clone());
             Some((src, preds))
+        }
+        _ => None,
+    }
+}
+
+/// DECORR-1: side resolution for SEMI/ANTI membership sides only — like
+/// [`resolve_source_with_filters`], plus peeling projections whose every
+/// output is a preserved column or a LITERAL (the decorrelator's
+/// `Int64(1), key` wrapper). Sound because nothing of a membership side is
+/// emitted and a literal cannot be a join key, so the operator reading the
+/// raw source sees exactly the columns the keys and side filters name.
+fn resolve_semi_side_with_filters(plan: &LogicalPlan) -> Option<(String, Vec<Expr>)> {
+    match plan {
+        LogicalPlan::TableScan(ts) if ts.filters.is_empty() => {
+            Some((ts.table_name.table().to_string(), Vec::new()))
+        }
+        LogicalPlan::SubqueryAlias(sa) => resolve_semi_side_with_filters(&sa.input),
+        LogicalPlan::Filter(f) => {
+            let (src, mut preds) = resolve_semi_side_with_filters(&f.input)?;
+            preds.push(f.predicate.clone());
+            Some((src, preds))
+        }
+        LogicalPlan::Projection(p)
+            if p.expr.iter().all(|e| match e {
+                Expr::Column(_) | Expr::Literal(_, _) => true,
+                Expr::Alias(a) => {
+                    matches!(
+                        a.expr.as_ref(),
+                        Expr::Column(c) if c.name == a.name
+                    ) || matches!(a.expr.as_ref(), Expr::Literal(_, _))
+                }
+                _ => false,
+            }) =>
+        {
+            resolve_semi_side_with_filters(&p.input)
         }
         _ => None,
     }

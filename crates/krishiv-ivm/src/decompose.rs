@@ -488,7 +488,7 @@ async fn decompose_core(
             let _ = ctx.register_table(name.as_str(), Arc::new(t));
         }
     }
-    let plan = ctx.sql(body_sql).await.ok()?.logical_plan().clone();
+    let plan = crate::plan::maybe_decorrelate(ctx.sql(body_sql).await.ok()?.logical_plan().clone());
 
     let chain = linear_chain(&plan)?;
     let leaf = leaf_of(&chain)?;
