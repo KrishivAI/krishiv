@@ -293,6 +293,27 @@ honesty of the surfaces around it.
 
 ## Verified correct (do not "fix")
 
+**Delta-batch views stay incremental on an executor — the distributed path is not
+DiffBased.** A recon of the IVM seams reported that decomposition (and by extension
+any view) must be gated on `!force_diff_based`, because the flag is
+checkpoint-serialized and restored, so "on a distributed executor flow every hop runs
+DiffBased: N sub-query recomputes per tick instead of 1".
+
+**Measured, and it is false.** `krishiv-executor/src/fragment/ivm.rs` says so in a
+comment — "a resident flow uses cached incremental plans across ticks, this is the
+point of residency, so `force_diff_based` is deliberately NOT set" — and
+`distributed_stays_incremental.rs` now proves it: a grouped aggregate, a map and a
+global aggregate all classify `Incremental` **on the resident flow** after
+`delta:attach:` + `delta:tick:`, `is_force_diff_based()` is false there, and the
+coordinator's mirrored result matches a flow that computed the same ticks locally,
+row for row.
+
+The comment was right; nothing was checking it. That gap is what the test closes —
+and it is the same gap that let IVM-AUD-GLOBAL-1's first fix regress the mirror
+(`apply_remote_tick_mirrors_central_and_supports_fallback` caught that one, which is
+why the distributed path deserves assertions of its own rather than borrowed ones).
+
+
 **`build_agg_plan` has no `emits_declared_relation` call — and that is not a defect.**
 The structural observation is true: the guard is called in `try_build_from_logical`,
 `build_map_plan`, `build_topn_plan` and `build_join_plan`, and not in the aggregate
