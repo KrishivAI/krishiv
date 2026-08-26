@@ -30,6 +30,13 @@ pub enum IncrJoinType {
     Inner,
     /// LEFT OUTER JOIN: unmatched left rows emit null-padded output.
     LeftOuter,
+    /// SEMI-1: emit each left row ONCE while its key has at least one right
+    /// match — no pair multiplication, LEFT COLUMNS only. The right side is a
+    /// membership test, which is exactly what a decorrelated IN/EXISTS asks.
+    LeftSemi,
+    /// SEMI-1: the complement — each left row while its key has NO right
+    /// match (decorrelated NOT IN / NOT EXISTS).
+    LeftAnti,
 }
 
 /// Bilinear incremental join operator.
@@ -100,18 +107,22 @@ impl IncrementalJoinOp {
             right_trace = right_trace.with_lateness_column(col)?;
         }
 
-        // Output schema: all left columns + right non-key columns.
-        // For LEFT OUTER JOIN the right non-key columns must be nullable (they are
-        // NULL when the left row has no match on the right side).
+        // Output schema: all left columns + right non-key columns — except
+        // SEMI/ANTI (SEMI-1), whose relation is the LEFT columns alone: the
+        // right side is a membership test, not a data source.
+        // For LEFT OUTER JOIN the right non-key columns must be nullable (they
+        // are NULL when the left row has no match on the right side).
         let mut out_fields: Vec<_> = left_schema.fields().iter().cloned().collect();
-        for field in right_schema.fields().iter() {
-            if !right_key_cols.contains(field.name()) {
-                let f = if join_type == IncrJoinType::LeftOuter {
-                    Arc::new(Field::new(field.name(), field.data_type().clone(), true))
-                } else {
-                    field.clone()
-                };
-                out_fields.push(f);
+        if !matches!(join_type, IncrJoinType::LeftSemi | IncrJoinType::LeftAnti) {
+            for field in right_schema.fields().iter() {
+                if !right_key_cols.contains(field.name()) {
+                    let f = if join_type == IncrJoinType::LeftOuter {
+                        Arc::new(Field::new(field.name(), field.data_type().clone(), true))
+                    } else {
+                        field.clone()
+                    };
+                    out_fields.push(f);
+                }
             }
         }
         let output_schema = Arc::new(Schema::new(out_fields));
@@ -153,6 +164,12 @@ impl IncrementalJoinOp {
     ) -> DeltaResult<DeltaBatch> {
         if self.join_type == IncrJoinType::LeftOuter {
             return self.apply_left_outer(delta_left, delta_right);
+        }
+        if matches!(
+            self.join_type,
+            IncrJoinType::LeftSemi | IncrJoinType::LeftAnti
+        ) {
+            return self.apply_left_semi_anti(delta_left, delta_right);
         }
         // Inner join path.
         let mut output_parts: Vec<DeltaBatch> = Vec::new();
@@ -402,6 +419,128 @@ impl IncrementalJoinOp {
     /// Uses a precomputed "effective right count" (current + ΔB net) for ΔA
     /// so that same-tick ΔA+ΔB arrivals on the same key produce the correct
     /// joined output without spurious null rows.
+    /// SEMI-1: LEFT SEMI / LEFT ANTI. Rides the LEFT OUTER machinery's
+    /// per-key right-weight crossings: a left row belongs to the SEMI
+    /// relation while its key's right count is positive and to the ANTI
+    /// relation while it is zero, each with the row's own weight — never a
+    /// pair product. ΔA rows evaluate against EFFECTIVE counts (current +
+    /// this tick's ΔB net) and ΔB crossings probe the pre-tick left trace,
+    /// the same same-tick discipline `apply_left_outer` uses, so the two
+    /// halves never double-count one transition.
+    fn apply_left_semi_anti(
+        &mut self,
+        delta_left: Option<DeltaBatch>,
+        delta_right: Option<DeltaBatch>,
+    ) -> DeltaResult<DeltaBatch> {
+        let semi = self.join_type == IncrJoinType::LeftSemi;
+        // Net ΔB weight per key, for effective-count ΔA evaluation.
+        let rw_delta = if let Some(ref dr) = delta_right {
+            if !dr.is_empty() {
+                let rd = dr.data_batch();
+                let rw = dr.weights();
+                let rki = col_indices(&rd, &self.right_key_cols)?;
+                let mut m: AHashMap<Vec<Option<String>>, i64> = AHashMap::new();
+                for ri in 0..rd.num_rows() {
+                    *m.entry(extract_key(&rd, ri, &rki)?).or_insert(0) += rw.value(ri);
+                }
+                m
+            } else {
+                AHashMap::new()
+            }
+        } else {
+            AHashMap::new()
+        };
+
+        let mut parts: Vec<DeltaBatch> = Vec::new();
+
+        // ΔA: a left row enters the relation iff the mode's membership test
+        // holds under the effective right count.
+        if let Some(ref dl) = delta_left
+            && !dl.is_empty()
+        {
+            let left_data = dl.data_batch();
+            let lki = col_indices(&left_data, &self.left_key_cols)?;
+            let mut keep: Vec<usize> = Vec::new();
+            for li in 0..left_data.num_rows() {
+                let key = extract_key(&left_data, li, &lki)?;
+                let cur = self.right_key_group_weights.get(&key).copied().unwrap_or(0);
+                let eff = cur + rw_delta.get(&key).copied().unwrap_or(0);
+                let member = if semi { eff > 0 } else { eff == 0 };
+                if member {
+                    keep.push(li);
+                }
+            }
+            if !keep.is_empty() {
+                parts.push(select_rows(dl, &keep)?);
+            }
+        }
+
+        // ΔB: key crossings flip membership for every left-trace row of the
+        // crossed key. SEMI gains on 0→positive and loses on positive→0;
+        // ANTI is the mirror image.
+        if let Some(ref dr) = delta_right
+            && !dr.is_empty()
+        {
+            let right_data = dr.data_batch();
+            let right_weights = dr.weights();
+            let rki = col_indices(&right_data, &self.right_key_cols)?;
+            let mut delta_by_key: AHashMap<Vec<Option<String>>, i64> = AHashMap::new();
+            for ri in 0..right_data.num_rows() {
+                *delta_by_key
+                    .entry(extract_key(&right_data, ri, &rki)?)
+                    .or_insert(0) += right_weights.value(ri);
+            }
+            let mut gained: Vec<Vec<Option<String>>> = Vec::new();
+            let mut lost: Vec<Vec<Option<String>>> = Vec::new();
+            for (key, dw) in &delta_by_key {
+                let old_w = self.right_key_group_weights.get(key).copied().unwrap_or(0);
+                let new_w = old_w + dw;
+                if new_w == 0 {
+                    self.right_key_group_weights.remove(key);
+                } else {
+                    self.right_key_group_weights.insert(key.clone(), new_w);
+                }
+                let (crossed_up, crossed_down) = (old_w == 0 && new_w > 0, old_w > 0 && new_w == 0);
+                match (semi, crossed_up, crossed_down) {
+                    (true, true, _) | (false, _, true) => gained.push(key.clone()),
+                    (true, _, true) | (false, true, _) => lost.push(key.clone()),
+                    _ => {}
+                }
+            }
+            for (keys, sign) in [(&gained, 1i64), (&lost, -1i64)] {
+                if keys.is_empty() {
+                    continue;
+                }
+                let probe_batch =
+                    keys_to_probe_batch(keys, &self.left_key_cols, &self.left_schema)?;
+                let left_matches = self.left_trace.probe_by_keys(&probe_batch)?;
+                if left_matches.is_empty() {
+                    continue;
+                }
+                let lm = left_matches.data_batch();
+                let lmw = left_matches.weights();
+                let n = lm.num_rows();
+                let signed: Vec<i64> = (0..n).map(|i| sign * lmw.value(i)).collect();
+                let mut cols: Vec<arrow::array::ArrayRef> = lm.columns().to_vec();
+                cols.push(Arc::new(Int64Array::from(signed)));
+                let mut fields: Vec<_> = lm.schema().fields().iter().cloned().collect();
+                fields.push(Arc::new(Field::new(WEIGHT_COLUMN, DataType::Int64, false)));
+                let inner = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?;
+                parts.push(DeltaBatch::from_weighted(inner)?);
+            }
+        }
+
+        // Update traces AFTER all probes.
+        if let Some(dl) = delta_left {
+            self.left_trace.insert(dl);
+        }
+        if let Some(dr) = delta_right {
+            self.right_trace.insert(dr);
+        }
+
+        combine_parts(parts, &self.output_schema)
+    }
+
     fn apply_left_outer(
         &mut self,
         delta_left: Option<DeltaBatch>,
@@ -1386,5 +1525,127 @@ mod tests {
         let name_col = data.column_by_name("name").expect("name column");
         assert_eq!(data.num_rows(), 1);
         assert!(name_col.is_null(0), "fresh op state must be empty");
+    }
+
+    /// SEMI-1: a left row appears ONCE while its key has any right match —
+    /// two right matches must not double it — and the crossing directions
+    /// (first match arrives / last match leaves) flip membership for the
+    /// whole left trace of that key.
+    #[test]
+    fn left_semi_membership_without_pair_multiplication() {
+        let mut op = IncrementalJoinOp::new_with_lateness(
+            orders_schema(),
+            customers_schema(),
+            vec!["customer_id".into()],
+            vec!["customer_id".into()],
+            IncrJoinType::LeftSemi,
+            None,
+        )
+        .unwrap();
+        // Left columns only.
+        assert_eq!(
+            op.output_schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().clone())
+                .collect::<Vec<_>>(),
+            vec!["order_id".to_string(), "customer_id".to_string()],
+        );
+
+        // Tick 1: two orders for customer 1, no customers yet -> nothing.
+        let d = op
+            .apply(
+                Some(DeltaBatch::from_inserts(orders_batch(&[10, 11], &[1, 1])).unwrap()),
+                None,
+            )
+            .unwrap();
+        assert!(d.is_empty(), "no membership before any right match");
+
+        // Tick 2: customer 1 arrives TWICE (two copies) -> both orders enter
+        // ONCE each, not four pair rows.
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_inserts(customers_batch(&[1, 1], &["a", "a"])).unwrap()),
+            )
+            .unwrap();
+        let pos = d.filter_positive().unwrap();
+        assert_eq!(pos.num_rows(), 2, "one membership row per left row");
+
+        // Tick 3: retract ONE copy of customer 1 -> still a match, no change.
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_deletes(customers_batch(&[1], &["a"])).unwrap()),
+            )
+            .unwrap();
+        assert!(d.is_empty(), "one of two copies leaving crosses nothing");
+
+        // Tick 4: retract the LAST copy -> both orders leave the relation.
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_deletes(customers_batch(&[1], &["a"])).unwrap()),
+            )
+            .unwrap();
+        let (ins, ret): (i64, i64) = {
+            let w = d.weights();
+            let mut i = 0;
+            let mut r = 0;
+            for k in 0..w.len() {
+                if w.value(k) > 0 {
+                    i += w.value(k);
+                } else {
+                    r -= w.value(k);
+                }
+            }
+            (i, r)
+        };
+        assert_eq!((ins, ret), (0, 2), "last copy leaving retracts both orders");
+    }
+
+    /// SEMI-1: ANTI is the mirror — rows live in the relation while UNMATCHED.
+    #[test]
+    fn left_anti_is_the_mirror_image() {
+        let mut op = IncrementalJoinOp::new_with_lateness(
+            orders_schema(),
+            customers_schema(),
+            vec!["customer_id".into()],
+            vec!["customer_id".into()],
+            IncrJoinType::LeftAnti,
+            None,
+        )
+        .unwrap();
+        // Orders for customers 1 and 2; only customer 1 exists.
+        let d = op
+            .apply(
+                Some(DeltaBatch::from_inserts(orders_batch(&[10, 20], &[1, 2])).unwrap()),
+                Some(DeltaBatch::from_inserts(customers_batch(&[1], &["a"])).unwrap()),
+            )
+            .unwrap();
+        let pos = d.filter_positive().unwrap();
+        assert_eq!(pos.num_rows(), 1, "only the unmatched order is ANTI");
+
+        // Customer 2 arrives: order 20 LEAVES the anti relation.
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_inserts(customers_batch(&[2], &["b"])).unwrap()),
+            )
+            .unwrap();
+        let w = d.weights();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w.value(0), -1, "gaining a match retracts the anti row");
+
+        // Customer 1 leaves: order 10 ENTERS the anti relation.
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_deletes(customers_batch(&[1], &["a"])).unwrap()),
+            )
+            .unwrap();
+        let w = d.weights();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w.value(0), 1, "losing the last match admits the anti row");
     }
 }
