@@ -44,3 +44,6 @@ store_head.rs
 .stream_bench
 crates/krishiv-ui/console/node_modules/
 crates/krishiv-ui/console/tsconfig.tsbuildinfo
+
+# Scratch probes: research files, never part of the suite.
+crates/*/tests/zz_probe_*.rs
