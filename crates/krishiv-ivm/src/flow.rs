@@ -2039,6 +2039,8 @@ impl IncrementalFlow {
                         op,
                         left_filter,
                         right_filter,
+                        residual,
+                        post,
                     }) => {
                         let left = available_deltas.get(left_source.as_str()).cloned();
                         let right = available_deltas.get(right_source.as_str()).cloned();
@@ -2064,7 +2066,22 @@ impl IncrementalFlow {
                                 continue;
                             }
                         };
-                        match op.apply(left, right) {
+                        // BAND-1: the residual (non-equi ON conjuncts) and
+                        // the post-projection shape the emitted delta after
+                        // the probe; both are linear over Z-sets, so the
+                        // result is exactly the delta of the band-joined,
+                        // projected relation.
+                        let applied = op.apply(left, right).and_then(|d| {
+                            let d = match residual {
+                                Some(f) => f.apply(d)?,
+                                None => d,
+                            };
+                            match post {
+                                Some(m) => m.apply(d),
+                                None => Ok(d),
+                            }
+                        });
+                        match applied {
                             Ok(d) => d,
                             Err(e) => {
                                 tracing::warn!(

@@ -142,10 +142,21 @@ async fn a_projected_join_publishes_the_declared_columns_not_the_join_relation()
         vec!["amount".to_string(), "region".to_string()],
         "published the join's natural relation (incl. the key) instead of the declared columns"
     );
+    // Since BAND-1 this shape no longer degrades: the projection compiles as
+    // a post-map over the joined relation, and the assertions above prove the
+    // published relation is the DECLARED one — the contract this file guards.
     assert!(
-        summary.degraded_views.iter().any(|v| v == "j"),
-        "got {:?}",
-        summary.degraded_views
+        !summary.degraded_views.iter().any(|v| v == "j"),
+        "a projected join compiles a post-projection (BAND-1); reporting it \
+         degraded means that was lost"
+    );
+    let (inc, why) = flow
+        .view_plan_classification("j")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc && why.contains("join"),
+        "expected an incremental join: {why}"
     );
     assert!(summary.errored_views.is_empty());
 }

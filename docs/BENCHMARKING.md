@@ -6,14 +6,14 @@ a published project claim.
 
 ## Do not benchmark a standard suite against the IVM path without checking the plan
 
-**Measured, and gated: 7 of 44 registered verbatim.** `cargo test -p
+**Measured, and gated: 10 of 44 registered verbatim.** `cargo test -p
 krishiv-bench --test ivm_query_coverage -- --nocapture` classifies every query
 in the committed TPC-H and NEXMark corpora. As of 2026-08-26:
 
-| suite | verbatim (engine) | of which via a decomposed chain |
+| suite | verbatim (engine) | how |
 |---|---|---|
-| TPC-H | **2 / 22** (q1, q6) | 2 (both) |
-| NEXMark | **5 / 22** (q0, q10, q14, q21, q22) | 0 (all single-operator) |
+| TPC-H | **2 / 22** (q1, q6) | decomposed chains (DECOMP-3) |
+| NEXMark | **8 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20) | 5 single-operator maps + 3 band joins (BAND-1: equi-keyed trace, `BETWEEN` as a residual, projection as a post-map) |
 
 Since DECOMP-3 the planner cuts a linear single-table multi-operator query into
 a `ViewPlan::Chain` at plan time: every hop must classify `Incremental` or the

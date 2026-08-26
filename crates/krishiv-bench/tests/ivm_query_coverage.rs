@@ -147,10 +147,12 @@ async fn measure(
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
 const TPCH_INCREMENTAL: usize = 2;
-/// All five are NEXMark's stateless queries — projection and filter, the
-/// IVM-MAP-1 operator. They are single-operator queries, which is exactly why
-/// they are the ones that pass.
-const NEXMARK_INCREMENTAL: usize = 5;
+/// Five stateless queries (q0, q10, q14, q21, q22 — projection/filter, the
+/// IVM-MAP-1 operator) plus the three band joins (q3, q8, q20 — BAND-1: the
+/// trace keys on the equi conjunct, the `BETWEEN` compiles as a residual over
+/// the joined relation, and the projection as a post-map). The remaining 14
+/// die at the windowing-TVF parse.
+const NEXMARK_INCREMENTAL: usize = 8;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standard_benchmark_queries_that_maintain_on_delta_batch() {

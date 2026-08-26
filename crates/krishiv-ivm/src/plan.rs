@@ -65,6 +65,20 @@ pub enum ViewPlan {
         left_filter: Option<SourceFilter>,
         /// Predicate applied to the right source delta before probing.
         right_filter: Option<SourceFilter>,
+        /// BAND-1: non-equi ON conjuncts (`a.ts BETWEEN p.ts - 10000 AND
+        /// p.ts + 10000`), compiled against the joined relation and applied to
+        /// the emitted delta after the probe. Filter is linear over Z-sets, so
+        /// post-filtering the joined delta is exactly the delta of the
+        /// band-joined relation. INNER only: under LEFT OUTER an ON residual
+        /// decides *matching* (a band-failing pair still yields a null-padded
+        /// left row), which a post-filter cannot express.
+        residual: Option<SourceFilter>,
+        /// BAND-1: a `Projection` above the join, compiled against the joined
+        /// relation (per-side plan qualifiers, right keys dropped) and applied
+        /// after the residual — so a projected join emits the DECLARED
+        /// relation instead of being refused (the SCHEMA-1 guard then passes
+        /// for the right reason).
+        post: Option<MapOp>,
     },
     /// Threshold-tracking DISTINCT: emits ±1 only at crossing the 0-threshold.
     Distinct {
@@ -546,12 +560,17 @@ impl ViewPlan {
                     let _ = op.apply(delta)?;
                 }
             }
+            // Traces store raw rows keyed on the equi columns; the BAND-1
+            // residual and post-projection shape only the EMITTED delta, so
+            // seeding ignores them — the trace a residual-filtered join needs
+            // is the same trace an unfiltered one needs.
             ViewPlan::Join {
                 left_source,
                 right_source,
                 op,
                 left_filter,
                 right_filter,
+                ..
             } => {
                 let left = apply_side_filter(left_filter, seed_delta(left_source)?)?;
                 let right = apply_side_filter(right_filter, seed_delta(right_source)?)?;
@@ -1121,6 +1140,41 @@ fn try_build_from_logical(
                 let aliases = aggregate_output_aliases(expr);
                 return build_agg_plan(agg, output_schema, available_schemas, &aliases);
             }
+            // BAND-1: a projected join — `SELECT p.name, a.id FROM a JOIN p …`
+            // (optionally with a WHERE between) — compiles the projection as a
+            // post-map over the joined relation instead of being refused for
+            // emitting the wrong one. Tried before the recursive peel because
+            // the peel reaches the bare-join arm, which cannot see these
+            // projection expressions. On failure this FALLS THROUGH to the
+            // peel rather than refusing: a `SELECT *` join carries an identity
+            // projection wider than the operator's relation (it repeats the
+            // right key), and the peel-then-check path is what has always
+            // served that shape.
+            let projected_join = match input.as_ref() {
+                LogicalPlan::Join(join) => build_join_plan(
+                    join,
+                    None,
+                    output_schema,
+                    available_schemas,
+                    lateness,
+                    Some((expr, proj_schema)),
+                ),
+                LogicalPlan::Filter(f) => match f.input.as_ref() {
+                    LogicalPlan::Join(join) => build_join_plan(
+                        join,
+                        Some(&f.predicate),
+                        output_schema,
+                        available_schemas,
+                        lateness,
+                        Some((expr, proj_schema)),
+                    ),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if projected_join.is_some() {
+                return projected_join;
+            }
             // IVM-MAP-1: a projection directly over a source (optionally with a
             // WHERE between) is a stateless O(Δ) map. Tried only after the
             // recursive peel fails, so an aggregate/join/distinct underneath
@@ -1136,7 +1190,7 @@ fn try_build_from_logical(
         LogicalPlan::Join(join) => {
             // Only 2-source joins (source_of_plan returns None for multi-way joins
             // where one side is itself a Join node with 2 inputs).
-            build_join_plan(join, None, output_schema, available_schemas, lateness)
+            build_join_plan(join, None, output_schema, available_schemas, lateness, None)
         }
         // #160: `WHERE` above a join (`SELECT … FROM a JOIN b ON … WHERE …`)
         // plans as `Filter → Join`. Filter is linear, so conjuncts that touch
@@ -1153,6 +1207,7 @@ fn try_build_from_logical(
                 output_schema,
                 available_schemas,
                 lateness,
+                None,
             ),
             // IVM-MAP-1: a bare filtered scan is an identity map with a
             // predicate. Documented as DiffBased before this — filter is
@@ -1530,6 +1585,7 @@ fn build_join_plan(
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
+    projection: Option<(&[Expr], &DFSchema)>,
 ) -> Option<ViewPlan> {
     let incr_join_type = match join.join_type {
         JoinType::Inner => IncrJoinType::Inner,
@@ -1567,38 +1623,46 @@ fn build_join_plan(
     // #160: the SQL planner leaves the ON condition in `join.filter` (the
     // optimizer pass that lifts equi-pairs into `join.on` never runs on the
     // unoptimized plan inspected here) — so before this, every SQL-registered
-    // join silently degraded to DiffBased. Accept a conjunction of plain
-    // column equalities, classifying each side by the join input schemas; any
-    // other shape (non-equi residual, expressions over keys) bails.
+    // join silently degraded to DiffBased. Equi conjuncts become trace keys;
+    // BAND-1: anything else (a `BETWEEN` band, an expression comparison) is
+    // collected and compiled below as a residual over the joined relation —
+    // the trace stays keyed on the equi columns and the residual filters the
+    // probe's output, which is linear and therefore delta-correct.
+    let mut residual_conjuncts: Vec<Expr> = Vec::new();
     if let Some(filter) = &join.filter {
         for conjunct in datafusion::logical_expr::utils::split_conjunction(filter) {
-            let Expr::BinaryExpr(be) = strip_alias(conjunct) else {
-                return None;
-            };
-            if be.op != datafusion::logical_expr::Operator::Eq {
-                return None;
-            }
-            let (Expr::Column(a), Expr::Column(b)) =
-                (strip_alias(&be.left), strip_alias(&be.right))
-            else {
-                return None;
-            };
-            let a_left = join.left.schema().index_of_column(a).is_ok();
-            let b_left = join.left.schema().index_of_column(b).is_ok();
-            match (a_left, b_left) {
-                (true, false) => {
-                    left_key_cols.push(a.name.clone());
-                    right_key_cols.push(b.name.clone());
+            let equi = match strip_alias(conjunct) {
+                Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
+                    match (strip_alias(&be.left), strip_alias(&be.right)) {
+                        (Expr::Column(a), Expr::Column(b)) => {
+                            let a_left = join.left.schema().index_of_column(a).is_ok();
+                            let b_left = join.left.schema().index_of_column(b).is_ok();
+                            match (a_left, b_left) {
+                                (true, false) => Some((a.name.clone(), b.name.clone())),
+                                (false, true) => Some((b.name.clone(), a.name.clone())),
+                                // Same-side equality: a residual, not a key.
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    }
                 }
-                (false, true) => {
-                    left_key_cols.push(b.name.clone());
-                    right_key_cols.push(a.name.clone());
+                _ => None,
+            };
+            match equi {
+                Some((l, r)) => {
+                    left_key_cols.push(l);
+                    right_key_cols.push(r);
                 }
-                // Same-side equality or unresolvable column: not an equi-join
-                // pair this operator can key on.
-                _ => return None,
+                None => residual_conjuncts.push((*conjunct).clone()),
             }
         }
+    }
+    // An ON residual under LEFT OUTER decides *matching* — a band-failing
+    // pair still owes a null-padded left row — which a post-probe filter
+    // cannot express. Refuse rather than change the query's meaning.
+    if !residual_conjuncts.is_empty() && incr_join_type != IncrJoinType::Inner {
+        return None;
     }
 
     if left_key_cols.is_empty() {
@@ -1667,25 +1731,92 @@ fn build_join_plan(
         left_schema.clone(),
         right_schema.clone(),
         left_key_cols,
-        right_key_cols,
+        right_key_cols.clone(),
         incr_join_type,
         lateness_col,
     )
     .ok()?;
 
+    // BAND-1: the residual and any projection compile against the JOINED
+    // relation — the plan's own qualified fields (so `p."dateTime"` and
+    // `a."dateTime"` both resolve without rewriting a single expression),
+    // minus the right key columns the operator does not emit, so compiled
+    // column indices align with the emitted `left ++ right-non-key` batch
+    // exactly. A reference to a dropped right key fails the compile and the
+    // plan bails to DiffBased rather than guessing.
+    let joined_schema = {
+        let mut qfields: Vec<(Option<datafusion::common::TableReference>, Arc<Field>)> = Vec::new();
+        for (q, f) in join.left.schema().iter() {
+            qfields.push((q.cloned(), Arc::clone(f)));
+        }
+        for (q, f) in join.right.schema().iter() {
+            if !right_key_cols.iter().any(|k| k == f.name()) {
+                qfields.push((q.cloned(), Arc::clone(f)));
+            }
+        }
+        DFSchema::new_with_metadata(qfields, std::collections::HashMap::new()).ok()?
+    };
+    let props = ExecutionProps::new();
+    let residual = if residual_conjuncts.is_empty() {
+        None
+    } else {
+        let combined = residual_conjuncts.iter().cloned().reduce(|a, b| a.and(b))?;
+        let mut coercion = TypeCoercionRewriter::new(&joined_schema);
+        let coerced = combined.rewrite(&mut coercion).ok()?.data;
+        let predicate = create_physical_expr(&coerced, &joined_schema, &props).ok()?;
+        Some(SourceFilter { predicate })
+    };
+    let post = match projection {
+        None => None,
+        Some((exprs, proj_schema)) => {
+            if proj_schema.fields().len() != exprs.len() {
+                return None;
+            }
+            let mut compiled: Vec<(String, Arc<dyn PhysicalExpr>)> =
+                Vec::with_capacity(exprs.len());
+            let mut fields: Vec<Field> = Vec::with_capacity(exprs.len());
+            for (expr, planned) in exprs.iter().zip(proj_schema.fields().iter()) {
+                let mut coercion = TypeCoercionRewriter::new(&joined_schema);
+                let coerced = expr.clone().rewrite(&mut coercion).ok()?.data;
+                let physical = create_physical_expr(&coerced, &joined_schema, &props).ok()?;
+                compiled.push((planned.name().clone(), physical));
+                // Names and types from the planner's own projection schema —
+                // never re-derived (CORE-23 / MAP-TYPE-1).
+                fields.push(Field::new(
+                    planned.name(),
+                    planned.data_type().clone(),
+                    planned.is_nullable(),
+                ));
+            }
+            Some(MapOp {
+                exprs: compiled,
+                output_schema: Arc::new(Schema::new(fields)),
+                predicate: None,
+            })
+        }
+    };
+
     // IVM-AUD-SCHEMA-1: the operator emits all left columns plus the right's
-    // non-key columns. A `Projection` above the join is not part of the
-    // operator, and `source_of_plan` peels projections — so a projected join
-    // published that wider relation while reporting `Incremental` with an empty
-    // `degraded_views`. Ask the operator what it will emit and refuse the plan
-    // when that is not what the view declared; DiffBased computes it correctly.
-    if !emits_declared_relation(op.output_schema(), output_schema) {
+    // non-key columns; a post-projection (BAND-1) reshapes that to the
+    // projection's own relation. Whichever applies last is what readers see,
+    // so that is what must match the declaration — the guard now passes for a
+    // projected join because the post genuinely emits the declared relation,
+    // not because the check got weaker.
+    let emitted: SchemaRef = match &post {
+        Some(m) => m.output_schema.clone(),
+        None => op.output_schema().clone(),
+    };
+    if !emits_declared_relation(&emitted, output_schema) {
         tracing::warn!(
             left = %left_source,
             right = %right_source,
-            "IVM plan degraded to O(state) DiffBased: the incremental join emits \
-             left ++ right-non-key columns, which does not match this view's \
-             declared output columns (a projected join)"
+            "IVM plan degraded to O(state) DiffBased: the join emits {} which \
+             does not match this view's declared output columns",
+            if post.is_some() {
+                "the compiled post-projection's relation"
+            } else {
+                "left ++ right-non-key columns"
+            }
         );
         return None;
     }
@@ -1696,6 +1827,8 @@ fn build_join_plan(
         op,
         left_filter,
         right_filter,
+        residual,
+        post,
     })
 }
 
