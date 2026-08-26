@@ -224,3 +224,40 @@ async fn filtered_aggregate_agrees_with_full_recompute() {
     assert!(incremental, "a WHERE pushed onto the delta stays O(delta)");
     assert_eq!(canonical(&a), canonical(&b));
 }
+
+/// IVM-AUD-RESOLVE-1 — the defect this oracle exists for, caught by it at last.
+///
+/// The aggregate's input is a derived table that *rebinds* `amount` to
+/// `amount * 2`. `source_of_plan` used to peel that projection and resolve to
+/// `orders`, so the operator summed the **raw** column and published exactly
+/// half the right number — while `view_plan_classification` reported
+/// `Incremental`, no error was raised, and the view appeared in no health
+/// surface. Both existing guards passed: the emitted relation had the right
+/// *shape*, and only its *values* were wrong.
+///
+/// This test deliberately does **not** assert that the view is incremental.
+/// The correct outcome is a refusal — the shape has no O(delta) plan, so
+/// falling back to full recompute is right, and pinning "incremental" here
+/// would pin the bug. What it asserts is the answer.
+#[tokio::test]
+async fn an_aggregate_over_a_computed_derived_table_reads_the_computed_column() {
+    let (a, b, _) = both_ways(
+        "SELECT region, SUM(amount) AS total FROM \
+         (SELECT region, amount * 2 AS amount FROM orders) t GROUP BY region",
+        i64_schema(&["region", "total"]),
+        &two_batches(),
+    )
+    .await;
+    assert_eq!(
+        canonical(&a),
+        canonical(&b),
+        "the incremental path summed the raw column instead of the derived one"
+    );
+    // Pin the value independently of the oracle, so this cannot pass by both
+    // paths being broken the same way.
+    assert_eq!(
+        canonical(&a),
+        vec![vec![10, 750], vec![20, 1400]],
+        "amount doubled: region 10 = 2*(100+200+50+25), region 20 = 2*(300+400)"
+    );
+}

@@ -1620,16 +1620,42 @@ fn source_of_plan(plan: &LogicalPlan) -> Option<String> {
         // A scan with pushed-down predicates or a Filter node would mean a
         // dropped WHERE — never resolve through it.
         LogicalPlan::TableScan(_) | LogicalPlan::Filter(_) => None,
+        // A relation-level rename changes nothing about the columns.
         LogicalPlan::SubqueryAlias(sa) => source_of_plan(&sa.input),
-        _ => {
-            let inputs = plan.inputs();
-            if inputs.len() == 1 {
-                source_of_plan(inputs.first()?)
-            } else {
-                None
-            }
+        // IVM-AUD-RESOLVE-1: a projection may be peeled ONLY if every output
+        // name still means the same column underneath. The planner inserts
+        // identity projections that must be seen through (IVM-AUD-TOPN-1), but
+        // `SELECT amount * 2 AS amount` rebinds the name — and resolving
+        // through it makes the operator read the *raw* column while the view
+        // promises the computed one.
+        LogicalPlan::Projection(p) if projection_preserves_column_meaning(p) => {
+            source_of_plan(&p.input)
         }
+        // Everything else is refused rather than peeled. The old catch-all
+        // peeled ANY single-input node and recursed, which resolved a
+        // computing projection, a nested Aggregate and a Distinct alike
+        // straight to the base table: the operator then computed against the
+        // raw relation, the answer was wrong, and BOTH the plan-time
+        // `emits_declared_relation` check and the per-tick
+        // `OutputSchemaMismatch` tripwire passed, because the *shape* was
+        // right and only the *values* were wrong. Refusing costs a fallback to
+        // DiffBased, which is correct and slower.
+        _ => None,
     }
+}
+
+/// True when a projection re-exposes columns without rebinding any name — the
+/// only projection shape [`source_of_plan`] may resolve through.
+///
+/// Reordering and dropping columns are fine: a name that survives still refers
+/// to the same underlying column. Computing (`a * 2 AS a`) and cross-renaming
+/// (`other AS amount`) are not.
+fn projection_preserves_column_meaning(p: &datafusion::logical_expr::Projection) -> bool {
+    p.expr.iter().all(|e| match e {
+        Expr::Column(_) => true,
+        Expr::Alias(a) => matches!(a.expr.as_ref(), Expr::Column(c) if c.name == a.name),
+        _ => false,
+    })
 }
 
 /// Resolve the single base source under `plan`, collecting the `Filter`
