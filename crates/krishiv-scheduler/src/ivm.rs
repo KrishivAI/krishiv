@@ -277,7 +277,7 @@ impl IvmJob {
     /// first view was a key-group aggregate. That reasoning is about the shape
     /// of the SQL and is settled before any tick runs; whether a view got an
     /// O(Δ) plan is settled per shard on the first step and can come out
-    /// DiffBased (an aggregate the planner declines to lower — `COUNT(DISTINCT
+    /// DiffBased (an aggregate the planner declines to lower — `SUM(DISTINCT
     /// …)`, `SUM(…) FILTER (…)` — a `ctx.sql` failure, a restore that cleared
     /// the cached plans). So the one surface built to expose a silent
     /// full-recompute fallback reported "incremental" straight through it.
@@ -1836,7 +1836,8 @@ mod tests {
 
     /// IVM-AUD-PART-12: the "loud degradation" surface hardcoded `(true,
     /// "incremental — key-group partitioned aggregate")` for every partitioned
-    /// job without asking a shard. `COUNT(DISTINCT …)` is a legitimately
+    /// job without asking a shard. `SUM(DISTINCT …)` (re-blessed from
+    /// COUNT(DISTINCT) when CDIST-1 made that one incremental) is a legitimately
     /// shardable single-key aggregate that the planner will not lower, so every
     /// shard runs it as a full recompute — and the surface built to expose
     /// exactly that reported "incremental".
@@ -1848,7 +1849,7 @@ mod tests {
             "d",
             IncrementalViewSpec {
                 name: "distinct_amounts".into(),
-                body_sql: "SELECT region, COUNT(DISTINCT amount) AS n FROM orders GROUP BY region"
+                body_sql: "SELECT region, SUM(DISTINCT amount) AS n FROM orders GROUP BY region"
                     .into(),
                 output_schema: Arc::new(Schema::new(vec![
                     Field::new("region", DataType::Utf8, true),
