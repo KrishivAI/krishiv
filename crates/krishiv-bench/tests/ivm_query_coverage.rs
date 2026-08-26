@@ -155,14 +155,14 @@ async fn measure(
 /// though they were.
 const TPCH_INCREMENTAL: usize = 4;
 /// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
-/// q8, q20 — BAND-1), and three TUMBLE windows (q1, q2, q7 — WINDOW-1
-/// rewrites the TVF into a window_start/window_end derived table at
-/// registration, the chain machinery maintains it, and UINT-1 admits the
-/// unsigned aggregate outputs DataFusion types for NEXMark's UInt64 price).
-/// q15/q16/q17 rewrite and RUN now but hold COUNT(DISTINCT), which has no
-/// incremental operator; HOP fans out 1:N, SESSION merges statefully, and
-/// PROCTIME has no delta-batch meaning — all deliberately not rewritten.
-const NEXMARK_INCREMENTAL: usize = 11;
+/// q8, q20 — BAND-1), three TUMBLE windows (q1, q2, q7 — WINDOW-1 + UINT-1),
+/// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
+/// COUNT(DISTINCT col) per-value multiplicity by sharing MIN/MAX's value
+/// multiset). The remaining eight: HOP fans out 1:N, SESSION merges
+/// statefully, PROCTIME has no delta-batch meaning, q4/q9 window a derived
+/// join, q13 needs a side input, q18 needs row_number, q19 a per-window
+/// top-N.
+const NEXMARK_INCREMENTAL: usize = 14;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standard_benchmark_queries_that_maintain_on_delta_batch() {

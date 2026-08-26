@@ -400,3 +400,70 @@ async fn aliased_source_filtered_map_stays_incremental() {
         "an aliased WHERE must not cost the O(delta) path"
     );
 }
+
+/// CDIST-1: `COUNT(DISTINCT x)` maintains O(Δ) via per-value multiplicity.
+/// The load-bearing sequence is the retraction pair CORE-22 said a plain
+/// Z-set cannot answer: retracting ONE of two copies of a value must leave
+/// the distinct count unchanged, and retracting the LAST copy must drop it.
+#[tokio::test]
+async fn count_distinct_survives_partial_and_final_retraction() {
+    let sql = "SELECT region, COUNT(DISTINCT customer_id) AS uniques \
+               FROM orders GROUP BY region";
+    let out = i64_schema(&["region", "uniques"]);
+    let spec = |_: &str| IncrementalViewSpec {
+        name: "v".into(),
+        body_sql: sql.into(),
+        output_schema: out.clone(),
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    };
+    let incr = IncrementalFlow::new();
+    incr.register_view(spec("v")).unwrap();
+    let full = IncrementalFlow::new();
+    full.register_view(spec("v")).unwrap();
+    full.force_diff_based().unwrap();
+
+    // customer 1 appears TWICE in region 10; customer 2 once.
+    let base = orders(&[(1, 10, 100), (1, 10, 200), (2, 10, 300), (3, 20, 400)]);
+    for (batch, retract) in [
+        (base.clone(), false),
+        // Retract ONE copy of customer 1: uniques for region 10 stays 2.
+        (orders(&[(1, 10, 100)]), true),
+        // Retract the LAST copy: uniques drops to 1.
+        (orders(&[(1, 10, 200)]), true),
+    ] {
+        let d = if retract {
+            DeltaBatch::from_deletes(batch).unwrap()
+        } else {
+            DeltaBatch::from_inserts(batch).unwrap()
+        };
+        incr.feed("orders", d.clone()).unwrap();
+        full.feed("orders", d).unwrap();
+        incr.step_datafusion().await.unwrap();
+        full.step_datafusion().await.unwrap();
+
+        let a = incr.snapshot("v").unwrap().expect("published");
+        let b = full.snapshot("v").unwrap().expect("published");
+        assert_eq!(
+            canonical(&a),
+            canonical(&b),
+            "O(delta) COUNT(DISTINCT) disagreed with recompute"
+        );
+    }
+
+    let (inc, why) = incr
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "COUNT(DISTINCT col) must take the O(delta) path: {why}"
+    );
+    let final_snap = incr.snapshot("v").unwrap().unwrap();
+    assert_eq!(
+        canonical(&final_snap),
+        vec![vec![Some(10), Some(1)], vec![Some(20), Some(1)]],
+        "region 10 holds one distinct customer after both retractions"
+    );
+}

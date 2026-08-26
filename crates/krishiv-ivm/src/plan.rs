@@ -2242,12 +2242,31 @@ fn expr_to_aggregation(expr: &Expr, output_col: &str) -> Option<Aggregation> {
             // DiffBased (full recompute + diff), which is slower and CORRECT.
             // A wrong answer computed quickly is not a trade worth making.
             if agg_fn.params.distinct {
+                // CDIST-1: COUNT(DISTINCT col) over a plain column now HAS the
+                // per-value multiplicity a Z-set retraction needs — it shares
+                // MIN/MAX's value multiset and counts positive-weight entries.
+                // Every other DISTINCT aggregate (SUM/AVG DISTINCT, computed
+                // args) still refuses; the multiset holds values, not the
+                // arithmetic over them.
+                // The early return must not skip the FILTER/ORDER BY guards
+                // below — silently dropping a FILTER on a lowered aggregate is
+                // the exact CORE-22 shape this function exists to prevent.
+                if agg_fn.func.name().to_lowercase() == "count"
+                    && agg_fn.params.args.len() == 1
+                    && agg_fn.params.filter.is_none()
+                    && agg_fn.params.order_by.is_empty()
+                    && let Some(input_col) = agg_fn.params.args.first().and_then(expr_col_name)
+                {
+                    return Some(Aggregation::CountDistinct {
+                        input_col,
+                        output_col: output_col.to_string(),
+                    });
+                }
                 tracing::warn!(
                     output_col,
-                    "IVM plan degraded to O(state) DiffBased: DISTINCT inside an \
-                     aggregate has no incremental operator (a Z-set retraction \
-                     cannot tell whether the last copy of a value was removed \
-                     without holding per-value multiplicity)"
+                    "IVM plan degraded to O(state) DiffBased: DISTINCT inside a \
+                     non-COUNT aggregate has no incremental operator (the value \
+                     multiset holds values, not the arithmetic over them)"
                 );
                 return None;
             }

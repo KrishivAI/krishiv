@@ -53,6 +53,17 @@ pub enum Aggregation {
         input_col: String,
         output_col: String,
     },
+    /// CDIST-1: `COUNT(DISTINCT col)`. Shares MIN/MAX's per-group value
+    /// multiset (value → cumulative Z-weight), so the marginal state is one
+    /// counter: the number of values whose weight is positive, maintained on
+    /// zero-crossings. A retraction that removes the LAST copy of a value
+    /// decrements the count; removing one of several copies does not — which
+    /// is exactly the question CORE-22 said a plain retraction cannot answer
+    /// without per-value multiplicity. This is that multiplicity.
+    CountDistinct {
+        input_col: String,
+        output_col: String,
+    },
 }
 
 impl Aggregation {
@@ -60,6 +71,7 @@ impl Aggregation {
         match self {
             Self::Sum { output_col, .. }
             | Self::Count { output_col, .. }
+            | Self::CountDistinct { output_col, .. }
             | Self::Avg { output_col, .. }
             | Self::Min { output_col, .. }
             | Self::Max { output_col, .. } => output_col,
@@ -71,7 +83,8 @@ impl Aggregation {
             Self::Sum { input_col, .. }
             | Self::Avg { input_col, .. }
             | Self::Min { input_col, .. }
-            | Self::Max { input_col, .. } => Some(input_col),
+            | Self::Max { input_col, .. }
+            | Self::CountDistinct { input_col, .. } => Some(input_col),
             Self::Count { input_col, .. } => input_col.as_deref(),
         }
     }
@@ -259,6 +272,10 @@ struct AggState {
     /// For MIN/MAX: multiset of (value → cumulative weight), keyed exactly for
     /// the column's kind (DEC-1) rather than through `f64` for all of them.
     min_max_set: BTreeMap<MinMaxKey, i64>,
+    /// CDIST-1: how many `min_max_set` values currently have POSITIVE weight —
+    /// maintained on zero-crossings so `COUNT(DISTINCT)` emits in O(1).
+    /// Derived, not serialized: restore recomputes it from the multiset.
+    distinct_pos: i64,
 }
 
 /// One row's typed aggregate input value (AUD-7 / audit §5c): read directly
@@ -355,9 +372,11 @@ impl AggState {
                 self.avg_count_i64 += weight;
                 self.count += weight;
             }
-            Aggregation::Min { .. } | Aggregation::Max { .. } => {
+            Aggregation::Min { .. }
+            | Aggregation::Max { .. }
+            | Aggregation::CountDistinct { .. } => {
                 let key = match value {
-                    // SQL: null inputs do not affect MIN/MAX.
+                    // SQL: null inputs do not affect MIN/MAX or COUNT(DISTINCT).
                     AggInput::Null | AggInput::None => return Ok(()),
                     // DEC-1: integer-valued inputs key exactly. The old code
                     // widened them to f64 here, which collided above 2^53.
@@ -367,7 +386,16 @@ impl AggState {
                 };
                 let _ = kind; // ordering strategy is value-driven now
                 let entry = self.min_max_set.entry(key).or_insert(0);
+                let was_positive = *entry > 0;
                 *entry += weight;
+                let is_positive = *entry > 0;
+                // CDIST-1: count zero-crossings, not rows — retracting one of
+                // several copies of a value must not change the distinct count.
+                match (was_positive, is_positive) {
+                    (false, true) => self.distinct_pos += 1,
+                    (true, false) => self.distinct_pos -= 1,
+                    _ => {}
+                }
                 if *entry == 0 {
                     self.min_max_set.remove(&key);
                 }
@@ -412,6 +440,8 @@ impl AggState {
                 _ => Some(AggScalar::F64(self.sum)),
             },
             Aggregation::Count { .. } => Some(AggScalar::I64(self.count)),
+            // COUNT semantics: 0 over empty input, never NULL.
+            Aggregation::CountDistinct { .. } => Some(AggScalar::I64(self.distinct_pos)),
             Aggregation::Avg { .. } => {
                 if self.avg_count_i64 == 0 {
                     None
@@ -661,7 +691,8 @@ impl IncrementalAggOp {
                 Aggregation::Sum { input_col, .. }
                 | Aggregation::Avg { input_col, .. }
                 | Aggregation::Min { input_col, .. }
-                | Aggregation::Max { input_col, .. } => {
+                | Aggregation::Max { input_col, .. }
+                | Aggregation::CountDistinct { input_col, .. } => {
                     let field = input_schema
                         .field_with_name(input_col)
                         .map_err(|_| DeltaError::ColumnNotFound(input_col.clone()))?;
@@ -698,7 +729,7 @@ impl IncrementalAggOp {
             // over decimals; SUM/MIN/MAX preserve the input's family
             // (SUM(Int)→Int64, SUM(Decimal(p,s))→Decimal(p+10,s), …).
             let output_type = match agg {
-                Aggregation::Count { .. } => DataType::Int64,
+                Aggregation::Count { .. } | Aggregation::CountDistinct { .. } => DataType::Int64,
                 Aggregation::Avg { .. } => match kind {
                     Some(NumKind::Decimal { precision, scale }) => {
                         decimal_avg_type(*precision, *scale)
@@ -1458,6 +1489,9 @@ impl AggState {
             let w = read_i64(bytes, pos)?;
             min_max_set.insert(key, w);
         }
+        // CDIST-1: derived, so older AGGS3 blobs restore without a format
+        // bump — the multiset is the ground truth and this is its summary.
+        let distinct_pos = min_max_set.values().filter(|w| **w > 0).count() as i64;
         Ok(Self {
             sum,
             sum_i64,
@@ -1469,6 +1503,7 @@ impl AggState {
             avg_is_integer,
             overflow,
             min_max_set,
+            distinct_pos,
         })
     }
 }

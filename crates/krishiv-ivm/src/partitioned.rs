@@ -2071,15 +2071,15 @@ mod tests {
 
     /// IVM-AUD-PART-12: a partitioned view's execution strategy is decided per
     /// shard on the first step, not by the shape check that made the job
-    /// partitioned. `COUNT(DISTINCT …)` is a legitimately shardable
+    /// partitioned. `SUM(DISTINCT …)` (re-blessed from COUNT(DISTINCT) when
+    /// CDIST-1 made that one incremental) is a legitimately shardable
     /// single-key aggregate that the planner will not lower, so every shard
     /// runs it DiffBased — and the classification must say so.
     #[tokio::test]
     async fn a_view_that_lowers_to_diff_based_per_shard_is_not_called_incremental() {
         let spec = IncrementalViewSpec {
             name: "distinct_amounts".into(),
-            body_sql: "SELECT region, COUNT(DISTINCT amount) AS n FROM orders GROUP BY region"
-                .into(),
+            body_sql: "SELECT region, SUM(DISTINCT amount) AS n FROM orders GROUP BY region".into(),
             output_schema: Arc::new(Schema::new(vec![
                 Field::new("region", DataType::Utf8, true),
                 Field::new("n", DataType::Int64, true),
@@ -2186,12 +2186,12 @@ mod tests {
     // ── provenance forwarding (IVM-AUD-PART-25) ───────────────────────────────
 
     /// A view that lowers to the DiffBased path — provenance is recorded there
-    /// and nowhere else. `COUNT(DISTINCT ...)` degrades to DiffBased (CORE-22).
+    /// and nowhere else. `SUM(DISTINCT ...)` degrades to DiffBased (CORE-22;
+    /// COUNT(DISTINCT) no longer does since CDIST-1, hence the SUM form).
     fn diff_based_spec() -> IncrementalViewSpec {
         IncrementalViewSpec {
             name: "distinct_amounts".into(),
-            body_sql: "SELECT region, COUNT(DISTINCT amount) AS n FROM orders GROUP BY region"
-                .into(),
+            body_sql: "SELECT region, SUM(DISTINCT amount) AS n FROM orders GROUP BY region".into(),
             output_schema: Arc::new(Schema::new(vec![
                 Field::new("region", DataType::Utf8, true),
                 Field::new("n", DataType::Int64, true),
