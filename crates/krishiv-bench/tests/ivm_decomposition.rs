@@ -181,9 +181,15 @@ async fn tpch_q1_decomposes_and_agrees() {
     decomposed_matches_recompute("q1", "lineitem", &corpus_sql("q1")).await;
 }
 
-/// A join is a DAG, not a chain: refused wholesale rather than half-cut.
+/// The refusal rule is WHOLESALE-OR-NOTHING, and both sides of it are pinned.
+/// A joined aggregate — this file's original always-refused fixture — now
+/// cuts COMPLETELY (join hop, then aggregate; every hop verified Incremental
+/// by the decomposer's own gate), which honours the rule's intent: it forbade
+/// PARTIAL cuts, not successful ones. A join with no equality at all still
+/// refuses outright — there is nothing to key a trace on, and a half-cut
+/// chain would be slower than an uncut query.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_join_is_refused_rather_than_partly_cut() {
+async fn a_join_cuts_wholesale_or_not_at_all() {
     let ctx = fixture().await;
     let mut schemas: AHashMap<String, SchemaRef> = AHashMap::new();
     for t in ["lineitem", "orders"] {
@@ -195,9 +201,21 @@ async fn a_join_is_refused_rather_than_partly_cut() {
     let sql = "SELECT o_orderkey, sum(l_quantity) AS q FROM orders \
                JOIN lineitem ON o_orderkey = l_orderkey GROUP BY o_orderkey";
     let declared: SchemaRef = Arc::new(ctx.sql(sql).await.unwrap().schema().as_arrow().clone());
+    let hops = decompose("v", sql, &declared, &schemas)
+        .await
+        .expect("a joined aggregate cuts completely since MJOIN-1");
+    assert!(hops.len() >= 2, "join hop plus aggregate at minimum");
+
+    // No equality anywhere: nothing keys a trace; refused, not half-cut.
+    let non_equi = "SELECT o_orderkey, sum(l_quantity) AS q FROM orders \
+                    JOIN lineitem ON o_orderkey < l_orderkey GROUP BY o_orderkey";
+    let declared: SchemaRef =
+        Arc::new(ctx.sql(non_equi).await.unwrap().schema().as_arrow().clone());
     assert!(
-        decompose("v", sql, &declared, &schemas).await.is_none(),
-        "a partially-cut join is slower than an uncut one; it must be refused"
+        decompose("v", non_equi, &declared, &schemas)
+            .await
+            .is_none(),
+        "a join with no equi key must be refused wholesale"
     );
 }
 
@@ -392,6 +410,23 @@ async fn tpch_q10_registered_verbatim_maintains_incrementally() {
         "q10",
         &["customer", "orders", "lineitem", "nation"],
         &corpus_sql("q10"),
+    )
+    .await;
+}
+
+/// REORDER-1: q9's FROM lists `part, supplier` first, but they meet only
+/// THROUGH `lineitem` — the naive left-deep order puts a keyless cross join
+/// at the leaf. The join graph relinearizes to a connected order, every level
+/// gets its equi key, and the chain includes an EXTRACT(YEAR …) computed
+/// group key riding the derived-table map hop.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q9_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute(
+        "q9",
+        &[
+            "part", "supplier", "lineitem", "partsupp", "orders", "nation",
+        ],
+        &corpus_sql("q9"),
     )
     .await;
 }

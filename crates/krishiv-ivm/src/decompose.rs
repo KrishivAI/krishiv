@@ -148,6 +148,88 @@ enum Leaf {
     Join,
 }
 
+/// REORDER-1: rebuild a pure comma-join run in a CONNECTED order of its join
+/// graph, so predicate distribution keys every level. Returns `None` when the
+/// current order is already fine, when the graph is disconnected (a true
+/// cross join — the caller keeps the original run and the keyless level
+/// refuses downstream), or when anything fails to rebuild.
+fn relinearize_join_run(join_run: &[LogicalPlan], predicate: &Expr) -> Option<Vec<LogicalPlan>> {
+    // The sides, FROM order: leaf-left, then each level's right.
+    let mut sides: Vec<LogicalPlan> = Vec::new();
+    if let Some(LogicalPlan::Join(j0)) = join_run.first() {
+        sides.push(j0.left.as_ref().clone());
+    }
+    for jn in join_run {
+        let LogicalPlan::Join(j) = jn else {
+            return None;
+        };
+        sides.push(j.right.as_ref().clone());
+    }
+    // Adjacency from cross-side plain-column equalities.
+    let side_of = |c: &datafusion::common::Column| -> Option<usize> {
+        sides
+            .iter()
+            .position(|sp| sp.schema().index_of_column(c).is_ok())
+    };
+    let mut edges: Vec<(usize, usize)> = Vec::new();
+    for conjunct in datafusion::logical_expr::utils::split_conjunction(predicate) {
+        if let Expr::BinaryExpr(be) = conjunct
+            && be.op == datafusion::logical_expr::Operator::Eq
+            && let (Expr::Column(a), Expr::Column(b)) = (be.left.as_ref(), be.right.as_ref())
+            && let (Some(sa), Some(sb)) = (side_of(a), side_of(b))
+            && sa != sb
+        {
+            edges.push((sa, sb));
+        }
+    }
+    let connected_to = |set: &[usize], v: usize| {
+        edges
+            .iter()
+            .any(|(a, b)| (*a == v && set.contains(b)) || (*b == v && set.contains(a)))
+    };
+    // Already connected level by level? Keep the original order.
+    let mut prefix: Vec<usize> = vec![0];
+    let already_fine = (1..sides.len()).all(|k| {
+        let ok = connected_to(&prefix, k);
+        prefix.push(k);
+        ok
+    });
+    if already_fine {
+        return None;
+    }
+    // Greedy connected order from side 0.
+    let mut order: Vec<usize> = vec![0];
+    while order.len() < sides.len() {
+        let next = (0..sides.len()).find(|v| !order.contains(v) && connected_to(&order, *v))?;
+        order.push(next);
+    }
+    // Rebuild the left-deep run in that order.
+    let mut builder = LogicalPlanBuilder::from(sides.get(*order.first()?)?.clone());
+    for idx in order.iter().skip(1) {
+        builder = builder.cross_join(sides.get(*idx)?.clone()).ok()?;
+    }
+    let rebuilt = builder.build().ok()?;
+    // Collect the new run leaf-first, mirroring `linear_chain`.
+    let mut run_rev: Vec<LogicalPlan> = Vec::new();
+    let mut node = rebuilt;
+    loop {
+        match node {
+            LogicalPlan::Join(ref j) => {
+                let left = j.left.as_ref().clone();
+                run_rev.push(node);
+                if matches!(left, LogicalPlan::Join(_)) {
+                    node = left;
+                } else {
+                    break;
+                }
+            }
+            _ => return None,
+        }
+    }
+    run_rev.reverse();
+    Some(run_rev)
+}
+
 fn leaf_of(chain: &[LogicalPlan]) -> Option<Leaf> {
     match chain.first()? {
         LogicalPlan::TableScan(ts) => Some(Leaf::Table(ts.table_name.table().to_string())),
@@ -472,14 +554,33 @@ async fn decompose_core(
         // handing the whole WHERE to any single level would leave the others
         // keyless cross joins the planner refuses. Conjuncts no level covers
         // become a filter hop above the run.
-        let mut join_run: Vec<&LogicalPlan> = Vec::new();
+        let mut join_run: Vec<LogicalPlan> = Vec::new();
         while let Some(n) = operator_nodes.get(next) {
             if matches!(n, LogicalPlan::Join(_)) {
-                join_run.push(n);
+                join_run.push((*n).clone());
                 next += 1;
             } else {
                 break;
             }
+        }
+        // REORDER-1: the FROM order is arbitrary, and a level whose side
+        // relates to the accumulated set only THROUGH a later table is a
+        // keyless cross join the planner refuses — q9 lists `part, supplier`
+        // first, but they meet only via `lineitem`. When the run is a pure
+        // comma join (no per-level ON), linearize the JOIN GRAPH instead:
+        // adjacency from the WHERE's cross-side equalities, keep the original
+        // order if every level is already connected to its prefix, otherwise
+        // greedily append any side connected to the visited set — which keys
+        // every level, because ANY connected order of a connected graph does.
+        // A disconnected graph is a true cross join and refuses. Correctness
+        // does not depend on WHICH connected order is chosen; cost does, and
+        // choosing better than "first connected" is recorded future work.
+        if join_run
+            .iter()
+            .all(|n| matches!(n, LogicalPlan::Join(j) if j.on.is_empty() && j.filter.is_none()))
+            && let Some(LogicalPlan::Filter(f)) = operator_nodes.get(next)
+        {
+            join_run = relinearize_join_run(&join_run, &f.predicate).unwrap_or(join_run);
         }
         let mut level_preds: Vec<Vec<Expr>> = vec![Vec::new(); join_run.len()];
         let mut above_preds: Vec<Expr> = Vec::new();
@@ -499,7 +600,7 @@ async fn decompose_core(
         for (k, jn) in join_run.iter().enumerate() {
             let preds = level_preds.get(k)?;
             let cut = if preds.is_empty() {
-                (*jn).clone()
+                jn.clone()
             } else {
                 let combined = preds.iter().cloned().reduce(|a, b| a.and(b))?;
                 LogicalPlan::Filter(LogicalFilter::try_new(combined, Arc::new((*jn).clone())).ok()?)
@@ -508,7 +609,7 @@ async fn decompose_core(
         }
         if !above_preds.is_empty() {
             let combined = above_preds.iter().cloned().reduce(|a, b| a.and(b))?;
-            let top = (*join_run.last()?).clone();
+            let top = join_run.last()?.clone();
             cuts.push(LogicalPlan::Filter(
                 LogicalFilter::try_new(combined, Arc::new(top)).ok()?,
             ));
@@ -617,7 +718,28 @@ async fn decompose_core(
                             )
                         }
                         _ => {
-                            let exprs = unqualify_exprs(&node.expressions())?;
+                            let mut exprs = unqualify_exprs(&node.expressions())?;
+                            // Unqualifying changes DERIVED names — the
+                            // aggregate `sum(profit.amount)` re-roots as
+                            // `sum(amount)` — and the hop above references
+                            // the ORIGINAL. Alias every expression back to
+                            // the original node's schema name (the hoist's
+                            // alias-back rule, applied to re-rooting): output
+                            // names are part of a hop's contract. Projection
+                            // and Aggregate only — a Filter's expression is a
+                            // predicate and a Sort's is an ordering; neither
+                            // names an output column.
+                            if matches!(
+                                node,
+                                LogicalPlan::Projection(_) | LogicalPlan::Aggregate(_)
+                            ) && node.schema().fields().len() == exprs.len()
+                            {
+                                exprs = exprs
+                                    .into_iter()
+                                    .zip(node.schema().fields().iter())
+                                    .map(|(e, f)| e.alias(f.name().clone()))
+                                    .collect();
+                            }
                             node.with_new_exprs(exprs, vec![scan]).ok()?
                         }
                     }
@@ -626,10 +748,17 @@ async fn decompose_core(
         };
 
         let (name, target) = if i == last && !topn_final {
-            // Re-apply ORDER BY / LIMIT so the final view keeps them.
+            // Re-apply ORDER BY / LIMIT so the final view keeps them. Above a
+            // join leaf the relation is bare-named, so the read-time exprs
+            // unqualify like every other re-rooted reference (a Sort keyed on
+            // `profit.nation` reads plain `nation` from the hop relation).
             let mut top = rooted;
             for r in &above {
-                top = r.with_new_exprs(r.expressions(), vec![top]).ok()?;
+                let exprs = match &leaf {
+                    Leaf::Join => unqualify_exprs(&r.expressions())?,
+                    Leaf::Table(_) => r.expressions(),
+                };
+                top = r.with_new_exprs(exprs, vec![top]).ok()?;
             }
             (view_name.to_string(), top)
         } else {
