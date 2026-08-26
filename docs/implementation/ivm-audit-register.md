@@ -287,6 +287,30 @@ honesty of the surfaces around it.
 
 ## Verified correct (do not "fix")
 
+**`build_agg_plan` has no `emits_declared_relation` call — and that is not a defect.**
+The structural observation is true: the guard is called in `try_build_from_logical`,
+`build_map_plan`, `build_topn_plan` and `build_join_plan`, and not in the aggregate
+builder. It was reported (during the IVM-AUD-RESOLVE-1 recon) as a silent freeze: an
+aggregate emitting more columns than declared would plan `Incremental`, be rejected by
+the per-tick `OutputSchemaMismatch` tripwire forever, publish nothing, and appear in
+neither `degraded_views` nor `errored_views`.
+
+**Measured, and it does none of that.** A view declaring `(region, total)` over
+`SELECT region, SUM(amount) AS total, COUNT(*) AS n ... GROUP BY region` reports
+`degraded=["v"]` on *every* tick, classifies honestly as DiffBased with the full
+reason string, and publishes the correct 2-column relation. The missing plan-time
+guard is compensated downstream: the operator refuses to build, the view falls back,
+and the fallback is visible in the step summary.
+
+Do not add the guard call expecting to fix a freeze; there is no freeze. If it is
+added for symmetry, that is a readability change and the entry above is why it must
+not be described as a correctness fix.
+
+This is recorded because the claim came from the same recon that produced
+IVM-AUD-RESOLVE-1, which *was* real. Same source, same confidence, opposite outcome —
+which is the argument for running the probe rather than believing the report.
+
+
 Retraction atomicity (`from_update`/`from_cdc` emit `-1`/`+1` in one
 `DeltaBatch`, never splittable across ticks); Z-set consolidation
 order-independence; `differentiate`'s multiset matching via Arrow
