@@ -461,6 +461,10 @@ fn scalar_of(key: MinMaxKey, kind: Option<NumKind>) -> AggScalar {
 /// group column of every delta row. `Box<[u8]>` keeps the key heap-compact.
 type GroupStateMap = AHashMap<Box<[u8]>, Vec<AggState>>;
 
+/// The row-format key of the single implicit group a `GROUP BY`-less aggregate
+/// owns (IVM-AUD-GLOBAL-1). Empty, because there are no group columns to encode.
+const GLOBAL_KEY: &[u8] = &[];
+
 /// Before-snapshot map used within a single `apply` tick: `group_key → state as
 /// it was before the tick's deltas` (`None` = the group did not exist yet).
 type TouchedMap = AHashMap<Box<[u8]>, Option<Vec<AggState>>>;
@@ -828,6 +832,15 @@ impl IncrementalAggOp {
     /// 4. Emit insertion of new aggregate output (if group is now non-empty).
     pub fn apply(&mut self, delta: DeltaBatch) -> DeltaResult<DeltaBatch> {
         if delta.is_empty() {
+            // IVM-AUD-GLOBAL-1: an empty delta normally means nothing changed,
+            // and emitting nothing is right. The exception is a global
+            // aggregate that has not published yet: its row exists from the
+            // first tick regardless of whether any input row survived the
+            // view's WHERE clause, and a filter that admits nothing is exactly
+            // when the caller most needs to see the zero.
+            if self.group_by.is_empty() && !self.state.contains_key(GLOBAL_KEY) {
+                return self.emit_initial_global_row();
+            }
             return DeltaBatch::empty(self.output_schema.clone());
         }
 
@@ -911,12 +924,19 @@ impl IncrementalAggOp {
             }
 
             // GC empty groups: a group is empty when ALL its per-agg states are.
-            if let Some(states) = self.state.get(&key)
+            // IVM-AUD-GLOBAL-1: except the implicit group of a `GROUP BY`-less
+            // aggregate, which is not a group that happens to have no rows — it
+            // is the single row the query always returns. Dropping it published
+            // nothing where SQL says `count(*) = 0`.
+            if !self.group_by.is_empty()
+                && let Some(states) = self.state.get(&key)
                 && states.iter().all(|s| s.count == 0)
             {
                 self.state.remove(&key);
             }
         }
+
+        let global = self.group_by.is_empty();
 
         // Build output: retract old agg + insert new agg for each touched group.
         let mut out_keys: Vec<Box<[u8]>> = Vec::new();
@@ -924,15 +944,33 @@ impl IncrementalAggOp {
         let mut agg_values: Vec<Vec<Option<AggScalar>>> = Vec::new();
 
         for (key, before_states) in &touched {
-            let has_before = before_states
-                .as_ref()
-                .map(|s| s.iter().any(|a| a.count != 0))
-                .unwrap_or(false);
-            let has_after = self
-                .state
-                .get(key)
-                .map(|s| s.iter().any(|a| a.count != 0))
-                .unwrap_or(false);
+            // A keyed group exists exactly while some aggregation still counts
+            // rows for it. The implicit group of a `GROUP BY`-less aggregate is
+            // not like that (IVM-AUD-GLOBAL-1): it exists from the first tick
+            // to the last, and reads zero in between. Retracting it when its
+            // count hits zero — which is what "does any aggregation still have
+            // rows" answers — publishes no rows where SQL publishes `0`.
+            // Whether the implicit row was already out there is read from the
+            // STATE, not from a flag: a flag is not part of `state_bytes`, so a
+            // restored operator would call itself unpublished and emit the `+1`
+            // half of its update without the matching `-1` — the mirror then
+            // counts the group twice.
+            let has_before = if global {
+                before_states.is_some()
+            } else {
+                before_states
+                    .as_ref()
+                    .map(|s| s.iter().any(|a| a.count != 0))
+                    .unwrap_or(false)
+            };
+            let has_after = if global {
+                true
+            } else {
+                self.state
+                    .get(key)
+                    .map(|s| s.iter().any(|a| a.count != 0))
+                    .unwrap_or(false)
+            };
 
             if has_before && let Some(states) = before_states.as_ref() {
                 let vals = compute_agg_values(states, &self.aggregations, &self.input_kinds);
@@ -940,7 +978,13 @@ impl IncrementalAggOp {
                 out_weights.push(-1);
                 agg_values.push(vals);
             }
-            if has_after && let Some(after_states) = self.state.get(key) {
+            if has_after
+                && let Some(after_states) = self.state.get(key).or(if global {
+                    self.state.get(GLOBAL_KEY)
+                } else {
+                    None
+                })
+            {
                 let vals = compute_agg_values(after_states, &self.aggregations, &self.input_kinds);
                 out_keys.push(key.clone());
                 out_weights.push(1);
@@ -1102,6 +1146,16 @@ impl IncrementalAggOp {
     /// AUD-7: build the retract/insert output batch, rebuilding the group-by
     /// columns natively from row-format keys (no `String`→cast round trip) and
     /// emitting aggregate columns in the declared output types.
+    /// The `+1` row a `GROUP BY`-less aggregate owes from its very first tick
+    /// (IVM-AUD-GLOBAL-1): `COUNT` reads 0, every other aggregate reads NULL,
+    /// which is what SQL returns for an aggregate over no rows.
+    fn emit_initial_global_row(&mut self) -> DeltaResult<DeltaBatch> {
+        let states = vec![AggState::default(); self.aggregations.len()];
+        let values = compute_agg_values(&states, &self.aggregations, &self.input_kinds);
+        self.state.insert(GLOBAL_KEY.into(), states);
+        self.build_output_batch(&[GLOBAL_KEY.into()], &[1], &[values])
+    }
+
     fn build_output_batch(
         &self,
         group_keys: &[Box<[u8]>],

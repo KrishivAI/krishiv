@@ -261,3 +261,84 @@ async fn an_aggregate_over_a_computed_derived_table_reads_the_computed_column() 
         "amount doubled: region 10 = 2*(100+200+50+25), region 20 = 2*(300+400)"
     );
 }
+
+/// IVM-AUD-GLOBAL-1 — a `GROUP BY`-less aggregate owes exactly one row, always.
+///
+/// `SELECT count(*) FROM orders WHERE <nothing matches>` is one row containing
+/// zero, not zero rows. The incremental operator published nothing: it treated
+/// the implicit group like any other empty group and GC'd it, and on a tick
+/// where the WHERE clause admitted no rows the delta reaching the operator was
+/// empty, so `apply` returned early and the row was never established at all.
+/// A consumer read "no data" at exactly the moment the answer was "none
+/// matched" — the case where the zero matters most.
+///
+/// The values are compared against the recompute path rather than hardcoded,
+/// so this pins SQL's answer for an aggregate over no rows (`count` = 0, `sum`
+/// = NULL) rather than this engine's opinion of it.
+#[tokio::test]
+async fn a_global_aggregate_whose_filter_admits_nothing_still_publishes_its_row() {
+    let (a, b, incremental) = both_ways(
+        "SELECT COUNT(*) AS n, SUM(amount) AS total FROM orders WHERE amount > 100000",
+        i64_schema(&["n", "total"]),
+        &two_batches(),
+    )
+    .await;
+    assert_eq!(a.num_rows(), 1, "one row, even with no matching input");
+    assert_eq!(
+        canonical(&a),
+        canonical(&b),
+        "the O(delta) path disagreed with recompute on an empty global aggregate"
+    );
+    assert!(incremental, "and it must reach that answer incrementally");
+}
+
+/// The other half of IVM-AUD-GLOBAL-1, and it needed its own test: the first
+/// one is satisfied by the empty-delta path alone and stays green when the
+/// group-GC guard is reverted.
+///
+/// Here the aggregate *does* see rows, and then every one of them is retracted.
+/// The implicit group's count reaches zero and the GC — correct for a real
+/// `GROUP BY` key, which genuinely ceases to exist — would drop it, retracting
+/// the view to no rows. A global aggregate does not cease to exist; it goes
+/// back to reading zero.
+#[tokio::test]
+async fn a_global_aggregate_returns_to_zero_when_every_row_is_retracted() {
+    let sql = "SELECT COUNT(*) AS n, SUM(amount) AS total FROM orders";
+    let out = i64_schema(&["n", "total"]);
+    let spec = |name: &str| IncrementalViewSpec {
+        name: name.into(),
+        body_sql: sql.into(),
+        output_schema: out.clone(),
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    };
+    let incr = IncrementalFlow::new();
+    incr.register_view(spec("v")).unwrap();
+    let full = IncrementalFlow::new();
+    full.register_view(spec("v")).unwrap();
+    full.force_diff_based().unwrap();
+
+    let rows = vec![(1i64, 10i64, 100i64), (2, 10, 200)];
+    for d in [
+        DeltaBatch::from_inserts(orders(&rows)).unwrap(),
+        DeltaBatch::from_deletes(orders(&rows)).unwrap(),
+    ] {
+        incr.feed("orders", d.clone()).unwrap();
+        full.feed("orders", d).unwrap();
+        incr.step_datafusion().await.unwrap();
+        full.step_datafusion().await.unwrap();
+    }
+
+    let a = incr.snapshot("v").unwrap().expect("published");
+    let b = full.snapshot("v").unwrap().expect("published");
+    assert_eq!(a.num_rows(), 1, "the row survives losing all its input");
+    assert_eq!(canonical(&a), canonical(&b));
+    assert!(
+        incr.view_plan_classification("v")
+            .unwrap()
+            .expect("registered")
+            .0,
+        "and it stays incremental"
+    );
+}
