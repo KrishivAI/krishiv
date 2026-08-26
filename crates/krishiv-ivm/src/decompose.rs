@@ -564,6 +564,12 @@ async fn decompose_core(
     let mut plans: Vec<ViewPlan> = Vec::new();
     let mut visible = available_schemas.clone();
     let last = cuts.len() - 1;
+    // TOPN-2: a bare `Sort` is a read-time property (ORDER-1) and rides the
+    // final hop; a `Sort` under a `Limit` is a TOP-N — it changes which rows
+    // are in the relation — so the read-time run becomes its OWN final hop
+    // over the last cut, where a projection's renames (`sum(…) AS revenue`)
+    // are already plain columns the top-N matcher accepts.
+    let topn_final = above.iter().any(|n| matches!(n, LogicalPlan::Limit(_)));
 
     for (i, node) in cuts.iter().enumerate() {
         // Re-root onto the hop below, structurally.
@@ -619,7 +625,7 @@ async fn decompose_core(
             }
         };
 
-        let (name, target) = if i == last {
+        let (name, target) = if i == last && !topn_final {
             // Re-apply ORDER BY / LIMIT so the final view keeps them.
             let mut top = rooted;
             for r in &above {
@@ -638,7 +644,7 @@ async fn decompose_core(
         let sql = datafusion::sql::unparser::plan_to_sql(&target)
             .ok()?
             .to_string();
-        let schema: SchemaRef = if i == last {
+        let schema: SchemaRef = if i == last && !topn_final {
             declared.clone()
         } else {
             Arc::new(target.schema().as_arrow().clone())
@@ -658,6 +664,36 @@ async fn decompose_core(
             name,
             body_sql: sql,
             schema,
+        });
+    }
+
+    // TOPN-2: the synthesized final top-N hop over the last intermediate hop.
+    if topn_final {
+        let prev = hops.last()?;
+        let scan = match &leaf {
+            Leaf::Table(source) => aliased_hop_scan(&prev.name, &prev.schema, source)?,
+            Leaf::Join => bare_hop_scan(&prev.name, &prev.schema)?,
+        };
+        let mut top = scan;
+        for r in &above {
+            let exprs = match &leaf {
+                Leaf::Join => unqualify_exprs(&r.expressions())?,
+                Leaf::Table(_) => r.expressions(),
+            };
+            top = r.with_new_exprs(exprs, vec![top]).ok()?;
+        }
+        let sql = datafusion::sql::unparser::plan_to_sql(&top)
+            .ok()?
+            .to_string();
+        let plan = build_view_plan_single(&sql, declared, &visible, &[]).await;
+        if plan.kind() != ViewPlanKind::Incremental {
+            return None;
+        }
+        plans.push(plan);
+        hops.push(Hop {
+            name: view_name.to_string(),
+            body_sql: sql,
+            schema: declared.clone(),
         });
     }
 

@@ -376,3 +376,22 @@ async fn tpch_q5_registered_verbatim_maintains_incrementally() {
     )
     .await;
 }
+
+/// TOPN-2: `ORDER BY … LIMIT k` above a joined aggregate — the Sort+Limit
+/// becomes its own top-N hop over the projection hop, where the aggregate's
+/// rename (`sum(…) AS revenue`) is already a plain column.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q3_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q3", &["customer", "orders", "lineitem"], &corpus_sql("q3"))
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q10_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute(
+        "q10",
+        &["customer", "orders", "lineitem", "nation"],
+        &corpus_sql("q10"),
+    )
+    .await;
+}

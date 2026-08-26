@@ -138,16 +138,17 @@ async fn ordering_by_several_columns_works() {
     assert_eq!(col(&snap, "a"), vec![9, 7, 5]);
 }
 
-/// A top-N whose input is an **aggregate** falls back, because the operator
-/// reads a source or upstream view and `resolve_source_with_filters` refuses to
-/// peel an `Aggregate`. Express it as a two-hop DAG (aggregate view, then a
-/// top-N view over it), the same discipline the map follows.
+/// A top-N whose input is an **aggregate** maintains O(Δ) since TOPN-2 — as
+/// exactly the two-hop DAG this test's original text prescribed ("aggregate
+/// view, then a top-N view over it"), now cut automatically: the Sort+Limit
+/// becomes its own top-N hop over the aggregate's projection hop.
 ///
-/// The load-bearing half is the second assertion: the fallback must still
-/// honour the LIMIT. Peeling a `Sort` that carries `fetch` would drop it and
-/// publish every row — a wrong answer wearing a working view's clothes.
+/// The load-bearing half is unchanged: the LIMIT must be honoured. Peeling a
+/// `Sort` that carries `fetch` would drop it and publish every row — a wrong
+/// answer wearing a working view's clothes — so the row count and the VALUES
+/// are asserted, not just the classification.
 #[tokio::test]
-async fn a_top_n_over_an_aggregate_in_one_view_falls_back() {
+async fn a_top_n_over_an_aggregate_in_one_view_is_a_chain() {
     let flow = IncrementalFlow::new();
     flow.register_view(spec(
         "t",
@@ -158,18 +159,16 @@ async fn a_top_n_over_an_aggregate_in_one_view_falls_back() {
     feed(&flow, vec![1, 2, 3], vec![10, 30, 20]);
     let summary = flow.step_datafusion().await.unwrap();
 
-    let (incremental, _) = flow.view_plan_classification("t").unwrap().unwrap();
+    let (incremental, why) = flow.view_plan_classification("t").unwrap().unwrap();
     assert!(
-        !incremental,
-        "a top-N has no O(delta) plan; peeling its LIMIT would be a wrong answer"
+        incremental && why.contains("chain"),
+        "a top-N over an aggregate decomposes (TOPN-2): {why}"
     );
-    assert!(summary.degraded_views.iter().any(|v| v == "t"));
-    // And the fallback must honour the LIMIT.
-    assert_eq!(
-        flow.snapshot("t").unwrap().unwrap().num_rows(),
-        2,
-        "the DiffBased answer must still be the top 2"
-    );
+    assert!(!summary.degraded_views.iter().any(|v| v == "t"));
+    let snap = flow.snapshot("t").unwrap().unwrap();
+    assert_eq!(snap.num_rows(), 2, "the LIMIT must be honoured");
+    assert_eq!(col(&snap, "k"), vec![2, 3], "top 2 by total: 30 then 20");
+    assert_eq!(col(&snap, "total"), vec![30, 20]);
 }
 
 /// Top-N directly over a source is now O(Δ) (IVM-TOPN-1): an ordered index over
