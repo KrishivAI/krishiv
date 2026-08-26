@@ -199,3 +199,31 @@ async fn retracting_a_banded_row_retracts_the_join_pair() {
         "pair retracted"
     );
 }
+
+/// JOIN-2: a comma join is an equi-join spelled in the WHERE — the TPC-H
+/// idiom (`FROM orders, lineitem WHERE o_orderkey = l_orderkey`). The
+/// cross-side equality becomes the trace key and the cross-side band becomes
+/// the residual, exactly as if both were in an ON clause.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_comma_join_with_a_where_band_agrees_with_recompute() {
+    let (got, want) = band_both_ways(
+        "SELECT p.city, a.id FROM auction a, person p \
+         WHERE a.seller = p.pid AND a.ts BETWEEN p.pts - 100 AND p.pts + 100",
+        Arc::new(Schema::new(vec![
+            Field::new("city", DataType::Int64, true),
+            Field::new("id", DataType::Int64, true),
+        ])),
+        &[(
+            Some(auctions(&[(1, 7, 1000), (2, 8, 2000)])),
+            Some(persons(&[(7, 100, 1050), (8, 200, 2350)])),
+            false,
+        )],
+    )
+    .await;
+    assert_eq!(canonical(&got), canonical(&want));
+    assert_eq!(
+        canonical(&got),
+        vec![vec![Some(100), Some(1)]],
+        "only the in-band pair joins; the key-only match is excluded"
+    );
+}

@@ -2221,17 +2221,33 @@ impl IncrementalFlow {
                     // it owes over an empty input.
                     Some(ViewPlan::Chain { source, hops }) => {
                         let src = source.clone();
-                        let delta = match source_relation_deltas
-                            .get(&src)
-                            .or_else(|| available_deltas.get(&src))
-                            .cloned()
-                            .or_else(|| empty_input_delta(&src))
-                        {
-                            Some(d) => d,
-                            None => continue,
+                        let Some((first, rest)) = hops.split_first_mut() else {
+                            continue;
                         };
-                        let mut out = Ok(delta);
-                        for hop in hops.iter_mut() {
+                        // DECOMP-4: a join leaf reads its own two sources; a
+                        // scan leaf reads the chain's source like a map would.
+                        let mut out = if let ViewPlan::Join {
+                            left_source,
+                            right_source,
+                            ..
+                        } = first
+                        {
+                            let left = available_deltas.get(left_source.as_str()).cloned();
+                            let right = available_deltas.get(right_source.as_str()).cloned();
+                            crate::plan::apply_chain_join_hop(first, left, right)
+                        } else {
+                            let delta = match source_relation_deltas
+                                .get(&src)
+                                .or_else(|| available_deltas.get(&src))
+                                .cloned()
+                                .or_else(|| empty_input_delta(&src))
+                            {
+                                Some(d) => d,
+                                None => continue,
+                            };
+                            crate::plan::apply_chain_hop(first, delta)
+                        };
+                        for hop in rest {
                             out = match out {
                                 Ok(d) => crate::plan::apply_chain_hop(hop, d),
                                 e => e,

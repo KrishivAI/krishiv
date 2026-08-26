@@ -134,19 +134,20 @@ async fn measure(
 /// fixes one query while quietly breaking another nets to zero and reads as
 /// "no regression". Exact counts make any movement, in either direction, a
 /// test failure that has to be looked at and re-blessed on purpose.
-/// **q1 and q6 — via DECOMP-2 chains.** Since the decomposer was wired into
-/// the planner, a linear single-table multi-operator query handed over
-/// verbatim is cut into a `ViewPlan::Chain` whose every hop maintains O(Δ);
-/// q1 and q6 are the corpus's only such queries. The remaining 20 all join,
-/// which makes the plan a DAG the decomposer refuses wholesale — a partially
-/// cut query is slower than an uncut one.
+/// **q1, q6, q12, q14 — via chains.** DECOMP-3 wired linear single-table
+/// chains into the planner (q1, q6); DECOMP-4 admits a chain whose LEAF is a
+/// two-source join — `aggregate over (A ⋈ B)`, the comma-join idiom — which
+/// takes q12 and q14. The remaining 18 are multi-way joins (a join side that
+/// is itself a join is refused before any cutting) or carry subqueries (a cut
+/// holding EXISTS / IN / scalar subqueries can never plan as a hop and is
+/// refused wholesale).
 ///
 /// The larger coverage figures quoted elsewhere for TPC-H are a different
 /// measurement: what a *human* can build by hand-decomposing each query into
 /// single-hop views (166 views for 28 queries). That is a real capability and
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
-const TPCH_INCREMENTAL: usize = 2;
+const TPCH_INCREMENTAL: usize = 4;
 /// Five stateless queries (q0, q10, q14, q21, q22 — projection/filter, the
 /// IVM-MAP-1 operator) plus the three band joins (q3, q8, q20 — BAND-1: the
 /// trace keys on the equi conjunct, the `BETWEEN` compiles as a residual over
@@ -191,10 +192,12 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
     );
 }
 
-/// q1 and q6 — the corpus's only single-table multi-operator queries. Every
-/// other TPC-H query joins, which makes the plan a DAG the decomposer refuses
-/// wholesale (a partially cut query is slower than an uncut one).
-const TPCH_DECOMPOSED: usize = 2;
+/// q1 and q6 (single-table chains, DECOMP-3) plus q12 and q14 (join-leaf
+/// chains, DECOMP-4). NEXMark's three band joins do NOT decompose — their
+/// side tables share the bare column name `id`, which would make every
+/// reference above the join hop ambiguous — and they need no chain: BAND-1
+/// maintains them whole.
+const TPCH_DECOMPOSED: usize = 4;
 /// q14 — filter plus computed projection. The other single-table NEXMark
 /// queries are single-operator (already incremental whole, nothing to cut),
 /// windowed TVFs (unplannable), or joins.

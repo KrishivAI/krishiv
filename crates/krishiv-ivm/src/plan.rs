@@ -153,6 +153,40 @@ pub(crate) fn apply_chain_hop(
     }
 }
 
+/// Apply a chain's JOIN leaf hop (DECOMP-4): side filters, probe, residual,
+/// post — the same sequence as the flow's standalone join arm, shared with
+/// snapshot seeding so live and seed paths cannot diverge.
+pub(crate) fn apply_chain_join_hop(
+    hop: &mut ViewPlan,
+    left: Option<DeltaBatch>,
+    right: Option<DeltaBatch>,
+) -> Result<DeltaBatch, krishiv_delta::DeltaError> {
+    let ViewPlan::Join {
+        op,
+        left_filter,
+        right_filter,
+        residual,
+        post,
+        ..
+    } = hop
+    else {
+        return Err(krishiv_delta::DeltaError::Operator(
+            "chain leaf is not a join hop".into(),
+        ));
+    };
+    let left = apply_side_filter(left_filter, left)?;
+    let right = apply_side_filter(right_filter, right)?;
+    let d = op.apply(left, right)?;
+    let d = match residual {
+        Some(f) => f.apply(d)?,
+        None => d,
+    };
+    match post {
+        Some(m) => m.apply(d),
+        None => Ok(d),
+    }
+}
+
 /// Framing magic for a [`ViewPlan::Chain`]'s checkpointed state: per-hop
 /// length-prefixed blobs, so one view's checkpoint carries every stateful
 /// hop's accumulator.
@@ -544,11 +578,34 @@ impl ViewPlan {
             // one pass every stateful hop holds exactly the state it would
             // hold had the source arrived row by row. The final output is
             // discarded like every other seed (the view snapshot + baseline
-            // were restored separately, in lockstep).
+            // were restored separately, in lockstep). A join leaf (DECOMP-4)
+            // seeds both traces AND emits the joined relation as the seed
+            // delta for the hops above it — the same fold, two inputs.
             ViewPlan::Chain { source, hops } => {
-                if let Some(mut delta) = seed_delta(source)? {
-                    for hop in hops.iter_mut() {
-                        delta = apply_chain_hop(hop, delta)?;
+                if let Some((first, rest)) = hops.split_first_mut() {
+                    let seeded = if let ViewPlan::Join {
+                        left_source,
+                        right_source,
+                        ..
+                    } = first
+                    {
+                        let l = seed_delta(&left_source.clone())?;
+                        let r = seed_delta(&right_source.clone())?;
+                        if l.is_some() || r.is_some() {
+                            Some(apply_chain_join_hop(first, l, r)?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        match seed_delta(source)? {
+                            Some(d) => Some(apply_chain_hop(first, d)?),
+                            None => None,
+                        }
+                    };
+                    if let Some(mut delta) = seeded {
+                        for hop in rest {
+                            delta = apply_chain_hop(hop, delta)?;
+                        }
                     }
                 }
             }
@@ -631,10 +688,28 @@ impl ViewPlan {
                 }
             }
             // Hop sources are internal names with no watermark trackers of
-            // their own; the chain's base source watermark bounds every hop's
-            // state (event-time columns pass through map hops unchanged).
+            // their own; the chain's base watermark bounds every hop's state
+            // (event-time columns pass through map hops unchanged). A join
+            // leaf uses the minimum of its OWN two sources, like the
+            // standalone join arm, and GCs its traces at it.
             ViewPlan::Chain { source, hops } => {
-                let wm = watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN);
+                let wm = match hops.first() {
+                    Some(ViewPlan::Join {
+                        left_source,
+                        right_source,
+                        ..
+                    }) => watermarks
+                        .get(left_source.as_str())
+                        .copied()
+                        .unwrap_or(i64::MIN)
+                        .min(
+                            watermarks
+                                .get(right_source.as_str())
+                                .copied()
+                                .unwrap_or(i64::MIN),
+                        ),
+                    _ => watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN),
+                };
                 if wm == i64::MIN {
                     return Ok(0);
                 }
@@ -643,6 +718,7 @@ impl ViewPlan {
                     reclaimed += match hop {
                         ViewPlan::Aggregate { op, .. } => op.gc_watermark(wm)?,
                         ViewPlan::Distinct { op, .. } => op.gc_watermark(wm)?,
+                        ViewPlan::Join { op, .. } => op.gc_traces(wm)?,
                         _ => 0,
                     };
                 }
@@ -824,12 +900,8 @@ async fn build_planned_view_impl(
     if try_chain
         && matches!(built, ViewPlan::DiffBased)
         && lateness.is_empty()
-        && let Some(chain) = Box::pin(crate::decompose::decompose_into_chain(
-            body_sql,
-            output_schema,
-            available_schemas,
-        ))
-        .await
+        && let Some(chain) =
+            crate::decompose::decompose_into_chain(body_sql, output_schema, available_schemas).await
     {
         built = chain;
     }
@@ -1658,17 +1730,6 @@ fn build_join_plan(
             }
         }
     }
-    // An ON residual under LEFT OUTER decides *matching* — a band-failing
-    // pair still owes a null-padded left row — which a post-probe filter
-    // cannot express. Refuse rather than change the query's meaning.
-    if !residual_conjuncts.is_empty() && incr_join_type != IncrJoinType::Inner {
-        return None;
-    }
-
-    if left_key_cols.is_empty() {
-        return None;
-    }
-
     // #160: decompose a `WHERE` above the join by side. Filter is linear, so
     // a conjunct over one side's columns filters that side's delta before the
     // probe. Cross-side conjuncts cannot be pushed; under LEFT OUTER a
@@ -1692,11 +1753,59 @@ fn build_join_plan(
                 left_preds.push((*conjunct).clone());
             } else if all_right && incr_join_type == IncrJoinType::Inner {
                 right_preds.push((*conjunct).clone());
+            } else if incr_join_type == IncrJoinType::Inner {
+                // JOIN-2: cross-side conjuncts. For INNER, `WHERE` over the
+                // join is the same relation as the same condition in `ON` — a
+                // comma join (`FROM a, b WHERE a.k = b.k`) IS an equi-join
+                // spelled in the WHERE. A plain cross-side column equality
+                // becomes a trace key; anything else joins the BAND-1
+                // residual over the joined relation. LEFT OUTER keeps the
+                // refusal above: its WHERE is post-padding and neither
+                // classification preserves that.
+                let equi = match strip_alias(conjunct) {
+                    Expr::BinaryExpr(be) if be.op == datafusion::logical_expr::Operator::Eq => {
+                        match (strip_alias(&be.left), strip_alias(&be.right)) {
+                            (Expr::Column(a), Expr::Column(b)) => {
+                                let a_left = join.left.schema().index_of_column(a).is_ok();
+                                let b_left = join.left.schema().index_of_column(b).is_ok();
+                                match (a_left, b_left) {
+                                    (true, false) => Some((a.name.clone(), b.name.clone())),
+                                    (false, true) => Some((b.name.clone(), a.name.clone())),
+                                    _ => None,
+                                }
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                };
+                match equi {
+                    Some((l, r)) => {
+                        left_key_cols.push(l);
+                        right_key_cols.push(r);
+                    }
+                    None => residual_conjuncts.push((*conjunct).clone()),
+                }
             } else {
                 return None;
             }
         }
     }
+    // The guards run AFTER both the ON and the WHERE classification loops: a
+    // comma join carries its equi keys only in the WHERE, so checking
+    // `left_key_cols` before reading the outer filter refused every
+    // `FROM a, b WHERE a.k = b.k` outright (JOIN-2's original failure).
+    // An ON/WHERE residual under LEFT OUTER decides *matching* — a
+    // band-failing pair still owes a null-padded left row — which a
+    // post-probe filter cannot express. Refuse rather than change the
+    // query's meaning.
+    if !residual_conjuncts.is_empty() && incr_join_type != IncrJoinType::Inner {
+        return None;
+    }
+    if left_key_cols.is_empty() {
+        return None;
+    }
+
     // Outer-filter columns are qualified by the join-side relation (a table
     // alias, e.g. `t.dist`), which the source-schema compile below cannot
     // resolve — strip qualifiers so they bind by bare name.
@@ -1730,7 +1839,7 @@ fn build_join_plan(
     let op = IncrementalJoinOp::new_with_lateness(
         left_schema.clone(),
         right_schema.clone(),
-        left_key_cols,
+        left_key_cols.clone(),
         right_key_cols.clone(),
         incr_join_type,
         lateness_col,
@@ -1756,11 +1865,48 @@ fn build_join_plan(
         }
         DFSchema::new_with_metadata(qfields, std::collections::HashMap::new()).ok()?
     };
+    // JOIN-2: a reference to a dropped right KEY column rewrites to its
+    // paired left key — the two are equal on every inner-joined row, so the
+    // rewrite is exact (INNER is guaranteed here for residuals; for the post
+    // it also holds because a LEFT OUTER pads the right side with NULL only
+    // in non-key... no: a LEFT OUTER unmatched row has a NULL right key while
+    // the left key is not NULL, so the rewrite is INNER-only and the compile
+    // must refuse otherwise). Without it, `SELECT *` over a join — whose
+    // identity projection repeats the right key — could never compile a post.
+    let rewrite_right_keys = |e: Expr| -> Option<Expr> {
+        use datafusion::common::tree_node::{Transformed, TreeNode as _};
+        let rewritten = e
+            .transform(|node| {
+                if let Expr::Column(c) = &node
+                    && joined_schema.index_of_column(c).is_err()
+                    && join.right.schema().index_of_column(c).is_ok()
+                    && let Some(pos) = right_key_cols.iter().position(|k| k == &c.name)
+                    && let Some(col) = left_key_cols.get(pos).and_then(|left_name| {
+                        // Qualify by the left side's own qualifier.
+                        join.left
+                            .schema()
+                            .iter()
+                            .find(|(_, f)| f.name() == left_name)
+                            .map(|(q, f)| datafusion::common::Column::new(q.cloned(), f.name()))
+                    })
+                {
+                    return Ok(Transformed::yes(Expr::Column(col)));
+                }
+                Ok(Transformed::no(node))
+            })
+            .ok()?;
+        if rewritten.transformed && incr_join_type != IncrJoinType::Inner {
+            return None;
+        }
+        Some(rewritten.data)
+    };
+
     let props = ExecutionProps::new();
     let residual = if residual_conjuncts.is_empty() {
         None
     } else {
         let combined = residual_conjuncts.iter().cloned().reduce(|a, b| a.and(b))?;
+        let combined = rewrite_right_keys(combined)?;
         let mut coercion = TypeCoercionRewriter::new(&joined_schema);
         let coerced = combined.rewrite(&mut coercion).ok()?.data;
         let predicate = create_physical_expr(&coerced, &joined_schema, &props).ok()?;
@@ -1776,8 +1922,9 @@ fn build_join_plan(
                 Vec::with_capacity(exprs.len());
             let mut fields: Vec<Field> = Vec::with_capacity(exprs.len());
             for (expr, planned) in exprs.iter().zip(proj_schema.fields().iter()) {
+                let expr = rewrite_right_keys(expr.clone())?;
                 let mut coercion = TypeCoercionRewriter::new(&joined_schema);
-                let coerced = expr.clone().rewrite(&mut coercion).ok()?.data;
+                let coerced = expr.rewrite(&mut coercion).ok()?.data;
                 let physical = create_physical_expr(&coerced, &joined_schema, &props).ok()?;
                 compiled.push((planned.name().clone(), physical));
                 // Names and types from the planner's own projection schema —
@@ -1830,6 +1977,16 @@ fn build_join_plan(
         residual,
         post,
     })
+}
+
+/// True when a join side resolves to a plain source (optionally filtered or
+/// alias-wrapped) — the only sides [`build_join_plan`] accepts. The decomposer
+/// checks this BEFORE synthesising a join-leaf hop: a multi-way join's side is
+/// itself a join, and unparsing + replanning that whole tree just to have the
+/// hop refused recurses DataFusion's planner deep enough to overflow a
+/// default-size thread stack (found by q2's five-way comma join).
+pub(crate) fn side_resolves_to_source(plan: &LogicalPlan) -> bool {
+    resolve_source_with_filters(plan).is_some() || source_of_plan(plan).is_some()
 }
 
 /// Peel `Alias` wrappers off an expression (planners wrap freely).
@@ -2292,13 +2449,18 @@ mod tests {
         )
         .await;
         assert_eq!(non_equi.kind(), ViewPlanKind::DiffBased);
+        // JOIN-2 re-bless: an equi key plus a cross-side WHERE comparison now
+        // maintains O(Δ) — the equality keys the trace and the comparison
+        // compiles as a residual over the joined relation. The pure non-equi
+        // case above stays refused: with no equality there is nothing to key
+        // the trace on.
         let cross_side = plan_for(
             "SELECT orders.order_id, orders.customer_id, customers.name \
              FROM orders JOIN customers ON orders.customer_id = customers.customer_id \
              WHERE orders.order_id > customers.customer_id",
         )
         .await;
-        assert_eq!(cross_side.kind(), ViewPlanKind::DiffBased);
+        assert_eq!(cross_side.kind(), ViewPlanKind::Incremental);
     }
 
     /// Regression (crate-12 audit, A-class): MIN_BY/MAX_BY return the value of

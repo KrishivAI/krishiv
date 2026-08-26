@@ -268,3 +268,96 @@ async fn tpch_q6_registered_verbatim_maintains_incrementally() {
 async fn tpch_q1_registered_verbatim_maintains_incrementally() {
     verbatim_matches_recompute("q1", "lineitem", &corpus_sql("q1")).await;
 }
+
+/// DECOMP-4: a chain whose LEAF is a two-source join — `aggregate over
+/// (A ⋈ B)`, the TPC-H comma-join idiom. Tables feed on separate ticks so the
+/// join's trace must hold the first table's rows to meet the second's.
+async fn verbatim_join_matches_recompute(label: &str, tables: &[&str], sql: &str) {
+    let ctx = fixture().await;
+    let declared: SchemaRef = Arc::new(ctx.sql(sql).await.unwrap().schema().as_arrow().clone());
+
+    let subject = IncrementalFlow::new();
+    subject
+        .register_view(spec("v", sql, declared.clone()))
+        .unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec("v", sql, declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    // Tick 1: every table's rows — except the FIRST table, which holds back
+    // half of its rows for tick 2. The held-back half must meet the other
+    // table's rows in the join's trace, so maintenance (not just first-build)
+    // is exercised across the tick boundary.
+    let mut held_back: Option<(&str, RecordBatch)> = None;
+    for (i, table) in tables.iter().enumerate() {
+        let batches: Vec<RecordBatch> = ctx
+            .sql(&format!("SELECT * FROM {table}"))
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        for (bi, batch) in batches.iter().enumerate() {
+            let batch = if i == 0 && bi == 0 && batch.num_rows() >= 2 {
+                let half = batch.num_rows() / 2;
+                held_back = Some((table, batch.slice(half, batch.num_rows() - half)));
+                batch.slice(0, half)
+            } else {
+                batch.clone()
+            };
+            let d = DeltaBatch::from_inserts(batch).unwrap();
+            subject.feed(*table, d.clone()).unwrap();
+            oracle.feed(*table, d).unwrap();
+        }
+    }
+    let s = subject.step_datafusion().await.unwrap();
+    oracle.step_datafusion().await.unwrap();
+    assert!(
+        s.errored_views.is_empty(),
+        "{label}: view errored on tick 1: {:?}",
+        s.errored_views
+            .iter()
+            .map(|e| e.message.clone())
+            .collect::<Vec<_>>()
+    );
+    if let Some((table, rest)) = held_back {
+        let d = DeltaBatch::from_inserts(rest).unwrap();
+        subject.feed(table, d.clone()).unwrap();
+        oracle.feed(table, d).unwrap();
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(
+            s.errored_views.is_empty(),
+            "{label}: view errored on tick 2: {:?}",
+            s.errored_views
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "{label}: fell back to DiffBased: {why}");
+    assert!(why.contains("chain"), "{label}: not via the chain: {why}");
+
+    let got = subject.snapshot("v").unwrap().expect("subject published");
+    let want = oracle.snapshot("v").unwrap().expect("oracle published");
+    assert_eq!(
+        canonical(&got),
+        canonical(&want),
+        "{label}: the join-leaf chain disagreed with recomputing the whole query"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q12_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q12", &["orders", "lineitem"], &corpus_sql("q12")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q14_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q14", &["lineitem", "part"], &corpus_sql("q14")).await;
+}

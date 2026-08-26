@@ -96,6 +96,15 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
                 chain.reverse();
                 return Some(chain);
             }
+            // DECOMP-4: a two-source Join ends the walk as the chain's leaf.
+            // Whether it is actually maintainable (equi keys, INNER, both
+            // sides plain sources) is the hop planner's decision, made when
+            // the leaf hop is verified like every other hop.
+            LogicalPlan::Join(_) => {
+                chain.push(node);
+                chain.reverse();
+                return Some(chain);
+            }
             LogicalPlan::Projection(_)
             | LogicalPlan::Filter(_)
             | LogicalPlan::Aggregate(_)
@@ -117,10 +126,22 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
     }
 }
 
-/// The name of the single table a linear chain reads.
-fn leaf_table(chain: &[LogicalPlan]) -> Option<String> {
+/// What a linear chain reads at the bottom: one table, or one two-source join.
+enum Leaf {
+    /// Scan of a single table — hops above are re-rooted onto a scan of the
+    /// hop below WEARING this name, so their qualified references resolve.
+    Table(String),
+    /// A two-source join — its emitted relation carries flat bare names (the
+    /// decomposer refuses collisions), so hops above are re-rooted onto an
+    /// UNALIASED scan with their references unqualified, which is the sound
+    /// transform ALIAS-1 established for a single relation.
+    Join,
+}
+
+fn leaf_of(chain: &[LogicalPlan]) -> Option<Leaf> {
     match chain.first()? {
-        LogicalPlan::TableScan(ts) => Some(ts.table_name.table().to_string()),
+        LogicalPlan::TableScan(ts) => Some(Leaf::Table(ts.table_name.table().to_string())),
+        LogicalPlan::Join(_) => Some(Leaf::Join),
         _ => None,
     }
 }
@@ -131,7 +152,7 @@ fn leaf_table(chain: &[LogicalPlan]) -> Option<String> {
 /// again nests a derived table, and a projection over a projection is exactly
 /// the shape IVM-AUD-RESOLVE-1 taught the planner to refuse.
 fn needs_projection(node: &LogicalPlan) -> bool {
-    matches!(node, LogicalPlan::Filter(_))
+    matches!(node, LogicalPlan::Filter(_) | LogicalPlan::Join(_))
 }
 
 /// Project every column a node exposes, under its own name.
@@ -152,6 +173,43 @@ fn explicit_projection(node: &LogicalPlan) -> Option<LogicalPlan> {
         .ok()?
         .build()
         .ok()
+}
+
+/// A plain scan of `hop` — for hops above a join leaf, whose relation carries
+/// flat bare names that qualified references are unqualified against.
+fn bare_hop_scan(hop: &str, schema: &SchemaRef) -> Option<LogicalPlan> {
+    let empty = arrow::array::RecordBatch::new_empty(schema.clone());
+    let table = MemTable::try_new(schema.clone(), vec![vec![empty]]).ok()?;
+    LogicalPlanBuilder::scan(
+        hop,
+        datafusion::datasource::provider_as_source(Arc::new(table)),
+        None,
+    )
+    .ok()?
+    .build()
+    .ok()
+}
+
+/// Strip qualifiers from every column reference in `exprs` — sound over one
+/// relation with unique bare names (see `Leaf::Join`).
+fn unqualify_exprs(exprs: &[Expr]) -> Option<Vec<Expr>> {
+    use datafusion::common::Column;
+    exprs
+        .iter()
+        .map(|e| {
+            e.clone()
+                .transform(|node| {
+                    Ok(match node {
+                        Expr::Column(c) => {
+                            Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
+                        }
+                        other => Transformed::no(other),
+                    })
+                })
+                .map(|t| t.data)
+                .ok()
+        })
+        .collect()
 }
 
 /// A scan of `hop`, wearing `alias` so the caller's qualified column
@@ -303,15 +361,25 @@ pub async fn decompose(
 /// no generated view names, no separate checkpoint identities, no distributed
 /// attach questions — the chain checkpoints, restores and seeds through the
 /// view's own `ViewPlan` surface like every other plan.
-pub(crate) async fn decompose_into_chain(
-    body_sql: &str,
-    declared: &SchemaRef,
-    available_schemas: &AHashMap<String, SchemaRef>,
-) -> Option<ViewPlan> {
-    let (source, _, plans) = decompose_core("chain", body_sql, declared, available_schemas).await?;
-    Some(ViewPlan::Chain {
-        source,
-        hops: plans,
+/// Returns a boxed, type-erased `Send` future rather than being an `async fn`:
+/// the call graph is recursive (plan builder → decompose → per-hop plan
+/// builder), and with concrete future types the compiler's `Send` proof
+/// becomes self-referential — every async caller up to the HTTP handlers then
+/// fails with "implementation of `Send` is not general enough". Erasing at
+/// the signature keeps the concrete recursive type out of every caller's
+/// state.
+pub(crate) fn decompose_into_chain<'a>(
+    body_sql: &'a str,
+    declared: &'a SchemaRef,
+    available_schemas: &'a AHashMap<String, SchemaRef>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ViewPlan>> + Send + 'a>> {
+    Box::pin(async move {
+        let (source, _, plans) =
+            decompose_core("chain", body_sql, declared, available_schemas).await?;
+        Some(ViewPlan::Chain {
+            source,
+            hops: plans,
+        })
     })
 }
 
@@ -331,28 +399,99 @@ async fn decompose_core(
     let plan = ctx.sql(body_sql).await.ok()?.logical_plan().clone();
 
     let chain = linear_chain(&plan)?;
-    let source = leaf_table(&chain)?;
+    let leaf = leaf_of(&chain)?;
+
+    // DECOMP-4: a join leaf emits a flat relation whose field names are the
+    // bare column names of both sides. A collision would make every reference
+    // above it ambiguous, so it is refused before any cutting happens.
+    if matches!(leaf, Leaf::Join)
+        && let Some(join_node) = chain.first()
+    {
+        // Both sides must be plain sources — the hop planner's own acceptance
+        // rule, checked HERE so a multi-way join (a side that is itself a
+        // join) refuses before the giant unparse + replan that would only be
+        // refused afterwards anyway (and whose planner recursion overflows a
+        // default thread stack on a five-way comma join).
+        if let LogicalPlan::Join(j) = join_node
+            && !(crate::plan::side_resolves_to_source(&j.left)
+                && crate::plan::side_resolves_to_source(&j.right))
+        {
+            return None;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (_, f) in join_node.schema().iter() {
+            if !seen.insert(f.name().clone()) {
+                return None;
+            }
+        }
+    }
 
     // Operators to cut, bottom-up. Read-time nodes ride on the final hop.
     // An aggregate over computed inputs expands into two: the hop that
-    // materialises them, then the aggregate itself.
+    // materialises them, then the aggregate itself. A join leaf becomes cut 0
+    // — except when a Filter sits directly above it, which MERGES into the
+    // join cut instead of becoming its own hop: a comma join carries its equi
+    // keys in that WHERE, and a filter hop above a keyless join hop would
+    // leave the join a cross join the planner refuses. The Filter node's own
+    // input IS the join subtree, so using it unchanged as cut 0 is the merge.
+    // Plain indexed loops, no closure-based iterator: a `filter(..)` closure
+    // held in this future's state trips rustc's higher-ranked `FnOnce` proof
+    // once the future must be `Send` (the boxed recursive edge requires it).
+    let mut operator_nodes: Vec<&LogicalPlan> = Vec::new();
+    for n in &chain {
+        if !is_passthrough(n) && !is_read_time(n) {
+            operator_nodes.push(n);
+        }
+    }
     let mut cuts: Vec<LogicalPlan> = Vec::new();
-    for n in chain
-        .iter()
-        .filter(|n| !is_passthrough(n) && !is_read_time(n))
-    {
+    let mut next = 0usize;
+    if matches!(leaf, Leaf::Join) {
+        let join_node = *operator_nodes.first()?;
+        next = 1;
+        match operator_nodes.get(1) {
+            Some(LogicalPlan::Filter(_)) => {
+                cuts.push((*operator_nodes.get(1)?).clone());
+                next = 2;
+            }
+            _ => cuts.push(join_node.clone()),
+        }
+    }
+    for n in operator_nodes.iter().skip(next) {
         match hoist_computed_inputs(n) {
             Some((hoist, rewritten)) => {
                 let agg = n.with_new_exprs(rewritten, vec![hoist.clone()]).ok()?;
                 cuts.push(hoist);
                 cuts.push(agg);
             }
-            None => cuts.push(n.clone()),
+            None => cuts.push((*n).clone()),
         }
     }
     // One operator is what the planner already handles; cutting buys nothing.
     if cuts.len() < 2 {
         return None;
+    }
+    // A cut carrying a subquery can never plan as a hop — no operator compiles
+    // an EXISTS / IN / scalar subquery — so the chain is doomed and is refused
+    // BEFORE the unparse + replan round trip. This is not only economy: q20's
+    // two-level nested IN-subqueries recurse DataFusion's planner deep enough
+    // on the round trip to overflow a default-size thread stack.
+    for cut in &cuts {
+        for e in cut.expressions() {
+            let mut has_subquery = false;
+            let _ = e.apply(|node| {
+                if matches!(
+                    node,
+                    Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                ) {
+                    has_subquery = true;
+                    return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            });
+            if has_subquery {
+                return None;
+            }
+        }
     }
     // Whatever sits above the topmost operator (ORDER BY / LIMIT), in order.
     let root = chain.last()?;
@@ -374,8 +513,20 @@ async fn decompose_core(
             node.clone()
         } else {
             let prev = hops.last()?;
-            let scan = aliased_hop_scan(&prev.name, &prev.schema, &source)?;
-            node.with_new_exprs(node.expressions(), vec![scan]).ok()?
+            match &leaf {
+                Leaf::Table(source) => {
+                    let scan = aliased_hop_scan(&prev.name, &prev.schema, source)?;
+                    node.with_new_exprs(node.expressions(), vec![scan]).ok()?
+                }
+                // The hop below carries flat bare names (collision-refused
+                // above), so references unqualify — one relation, so a bare
+                // name is unambiguous (the ALIAS-1 rule).
+                Leaf::Join => {
+                    let scan = bare_hop_scan(&prev.name, &prev.schema)?;
+                    let exprs = unqualify_exprs(&node.expressions())?;
+                    node.with_new_exprs(exprs, vec![scan]).ok()?
+                }
+            }
         };
 
         let (name, target) = if i == last {
@@ -420,5 +571,13 @@ async fn decompose_core(
         });
     }
 
+    // The chain's nominal source: the scan-leaf table, or the join hop's own
+    // left source (used only as a fallback name — the flow reads a join hop's
+    // sources from the hop plan itself).
+    let source = match (&leaf, plans.first()) {
+        (Leaf::Table(t), _) => t.clone(),
+        (Leaf::Join, Some(ViewPlan::Join { left_source, .. })) => left_source.clone(),
+        (Leaf::Join, _) => return None,
+    };
     Some((source, hops, plans))
 }
