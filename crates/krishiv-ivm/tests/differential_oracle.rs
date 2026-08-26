@@ -187,9 +187,13 @@ async fn distinct_star_agrees_with_full_recompute() {
     assert_eq!(canonical(&a), canonical(&b));
 }
 
-/// The shape SCHEMA-1 was about. It is DiffBased now, so both flows take the
-/// same path and this cannot fail on a disagreement — its job is to pin that
-/// the *answer* is the projected one, which is what the defect got wrong.
+/// The shape SCHEMA-1 was about. Since DECOMP-2 it maintains O(Δ) again — as
+/// a chain (map hop projecting the column, then DISTINCT over the projected
+/// relation, which is exactly SQL's order: the plan is Distinct(Projection)).
+/// The assertions below are the extension SCHEMA-1's pin demanded before this
+/// was allowed to pass incrementally: the emitted relation is the projected
+/// one (column count and exact values), proven against full recompute over
+/// batches carrying duplicates.
 #[tokio::test]
 async fn projected_distinct_agrees_with_full_recompute() {
     let (a, b, incremental) = both_ways(
@@ -216,10 +220,9 @@ async fn projected_distinct_agrees_with_full_recompute() {
     );
     assert_eq!(canonical(&a), vec![vec![Some(10)], vec![Some(20)]]);
     assert!(
-        !incremental,
-        "a projected DISTINCT has no O(delta) plan (IVM-AUD-SCHEMA-1); if this \
-         starts passing incrementally, the oracle above must be extended to prove \
-         the new operator emits the projected relation"
+        incremental,
+        "a projected DISTINCT decomposes into a map + DISTINCT chain (DECOMP-2); \
+         losing that is a coverage regression"
     );
 }
 

@@ -6,25 +6,24 @@ a published project claim.
 
 ## Do not benchmark a standard suite against the IVM path without checking the plan
 
-**Measured, and gated: 5 of 44 as a single view, plus 3 of 44 by automatic
-decomposition.** `cargo test -p krishiv-bench --test ivm_query_coverage --
---nocapture` classifies every query in the committed TPC-H and NEXMark corpora
-and prints both tables. As of 2026-08-26:
+**Measured, and gated: 7 of 44 registered verbatim.** `cargo test -p
+krishiv-bench --test ivm_query_coverage -- --nocapture` classifies every query
+in the committed TPC-H and NEXMark corpora. As of 2026-08-26:
 
-| suite | single view | decomposed into an all-incremental chain |
+| suite | verbatim (engine) | of which via a decomposed chain |
 |---|---|---|
-| TPC-H | **0 / 22** | **2 / 22** (q1, q6) |
-| NEXMark | **5 / 22** (q0, q10, q14, q21, q22 — all stateless) | **1 / 22** (q14) |
+| TPC-H | **2 / 22** (q1, q6) | 2 (both) |
+| NEXMark | **5 / 22** (q0, q10, q14, q21, q22) | 0 (all single-operator) |
 
-The decomposed column is `krishiv_ivm::decompose`: it cuts a linear
-single-table query into hops, verifies **every** hop plans `Incremental`, and
-refuses wholesale otherwise (one DiffBased hop mid-chain forces its upstream to
+Since DECOMP-3 the planner cuts a linear single-table multi-operator query into
+a `ViewPlan::Chain` at plan time: every hop must classify `Incremental` or the
+whole chain is refused (one DiffBased hop mid-chain forces its upstream to
 full-recompute every tick, so a partially cut query is slower than an uncut
-one). `ivm_decomposition.rs` proves the q1/q6 chains answer exactly what the
-whole query answers, against `force_diff_based` recompute under text
-canonicalisation. **The decomposer is not yet wired into `register_view`** — a
-view registered verbatim still plans as a single view; the union of genuinely
-supported query shapes today is 5 single-view + q1 and q6 via the library call.
+one). The chain checkpoints, restores, seeds and attaches to executors through
+the one registered view — no generated hop views. `ivm_decomposition.rs`
+proves corpus q1 and q6 **registered verbatim** agree exactly with
+`force_diff_based` recompute under text canonicalisation, and
+`decomposed_chain.rs` pins lossless checkpoint/restore with duplicate rows.
 
 The test asserts those counts **exactly**, not as a floor. A `>=` floor hides
 the failure this repo keeps hitting: a change that fixes one query while

@@ -134,19 +134,19 @@ async fn measure(
 /// fixes one query while quietly breaking another nets to zero and reads as
 /// "no regression". Exact counts make any movement, in either direction, a
 /// test failure that has to be looked at and re-blessed on purpose.
-/// **TPC-H is zero, and that is not a bug — it is the shape of the engine.**
-/// Every TPC-H query composes several relational operators (join → aggregate →
-/// order, and q21 nests seventeen deep). The IVM planner builds **one operator
-/// per view**; it does not decompose a multi-operator query into a DAG of
-/// internal views. So a TPC-H query handed over verbatim has nothing the
-/// planner can match, and falls to full recompute — every time, by design.
+/// **q1 and q6 — via DECOMP-2 chains.** Since the decomposer was wired into
+/// the planner, a linear single-table multi-operator query handed over
+/// verbatim is cut into a `ViewPlan::Chain` whose every hop maintains O(Δ);
+/// q1 and q6 are the corpus's only such queries. The remaining 20 all join,
+/// which makes the plan a DAG the decomposer refuses wholesale — a partially
+/// cut query is slower than an uncut one.
 ///
 /// The larger coverage figures quoted elsewhere for TPC-H are a different
 /// measurement: what a *human* can build by hand-decomposing each query into
 /// single-hop views (166 views for 28 queries). That is a real capability and
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
-const TPCH_INCREMENTAL: usize = 0;
+const TPCH_INCREMENTAL: usize = 2;
 /// All five are NEXMark's stateless queries — projection and filter, the
 /// IVM-MAP-1 operator. They are single-operator queries, which is exactly why
 /// they are the ones that pass.

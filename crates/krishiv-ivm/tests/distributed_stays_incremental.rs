@@ -70,6 +70,18 @@ async fn resident_executor_path_keeps_views_incremental() {
             "SELECT COUNT(*) AS n FROM sales",
             Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, true)])),
         ),
+        // DECOMP-2: a decomposed chain must survive the attach round trip too —
+        // its per-hop accumulators ship inside the same full-state blob (CHN1
+        // framing) and the resident tick folds the delta through warm hops.
+        (
+            "chain",
+            "SELECT SUM(amount * 2) AS total FROM sales WHERE region = 1",
+            Arc::new(Schema::new(vec![Field::new(
+                "total",
+                DataType::Int64,
+                true,
+            )])),
+        ),
     ];
 
     // Coordinator-authoritative flow.

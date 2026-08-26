@@ -87,9 +87,62 @@ pub enum ViewPlan {
         source: String,
         op: IncrementalTopNOp,
     },
+    /// A linear pipeline of single-operator hops compiled from one
+    /// multi-operator query by [`crate::decompose`] (DECOMP-2). The first hop
+    /// reads `source`; each later hop consumes the previous hop's output
+    /// delta directly — the hops are not views, have no names of their own,
+    /// and checkpoint/restore/seed through this plan like any other. Every
+    /// hop is a single-input incremental variant (`Map`, `Aggregate`,
+    /// `Distinct`, `TopN`), enforced at build time by the decomposer's
+    /// wholesale-refusal rule and at apply time by [`apply_chain_hop`].
+    Chain { source: String, hops: Vec<ViewPlan> },
     /// Fallback: full SQL re-execution + diff against previous output (O(state)).
     DiffBased,
 }
+
+/// Apply one chain hop to a delta: the fold step for [`ViewPlan::Chain`],
+/// shared by the live tick path and snapshot seeding so the two cannot
+/// diverge. A hop's own empty-input semantics stay in charge — a map emits
+/// nothing, a global aggregate establishes its owed row (GLOBAL-1) — which is
+/// what lets EMPTY-2's empty-substitution work through a chain unchanged.
+pub(crate) fn apply_chain_hop(
+    hop: &mut ViewPlan,
+    delta: DeltaBatch,
+) -> Result<DeltaBatch, krishiv_delta::DeltaError> {
+    match hop {
+        ViewPlan::Aggregate { op, filter, .. } => {
+            let Some(delta) = apply_side_filter(filter, Some(delta))? else {
+                return Err(krishiv_delta::DeltaError::Operator(
+                    "side filter dropped a present delta".into(),
+                ));
+            };
+            op.apply(delta)
+        }
+        ViewPlan::Distinct { op, filter, .. } => {
+            let Some(delta) = apply_side_filter(filter, Some(delta))? else {
+                return Err(krishiv_delta::DeltaError::Operator(
+                    "side filter dropped a present delta".into(),
+                ));
+            };
+            op.apply(delta)
+        }
+        ViewPlan::Map { op, .. } => op.apply(delta),
+        ViewPlan::TopN { op, .. } => op.apply(delta),
+        // Unreachable by construction (the decomposer refuses joins and never
+        // nests chains), written out so a future variant cannot slide through
+        // a `_` arm and silently drop a delta.
+        ViewPlan::Join { .. } | ViewPlan::Chain { .. } | ViewPlan::DiffBased => {
+            Err(krishiv_delta::DeltaError::Operator(
+                "a chain hop must be a single-input incremental operator".into(),
+            ))
+        }
+    }
+}
+
+/// Framing magic for a [`ViewPlan::Chain`]'s checkpointed state: per-hop
+/// length-prefixed blobs, so one view's checkpoint carries every stateful
+/// hop's accumulator.
+const CHAIN_STATE_MAGIC: &[u8; 4] = b"CHN1";
 
 /// Compiled projection for a [`ViewPlan::Map`].
 ///
@@ -284,6 +337,10 @@ impl ViewPlan {
             ViewPlan::Join { .. } => {
                 "incremental equi-join — symmetric hash trace; probes only the delta rows"
             }
+            ViewPlan::Chain { .. } => {
+                "incremental chain — a multi-operator query cut into single-operator hops, \
+                 each maintained O(Δ), folded per delta (DECOMP-2)"
+            }
             ViewPlan::DiffBased => {
                 "full recompute (DiffBased) — no O(Δ) plan matched this view shape (needs a \
                  single-source GROUP BY aggregate, a projection/derived-column/filter map, \
@@ -330,6 +387,29 @@ impl ViewPlan {
             // restore seeds it rather than carrying a second encoding of the
             // same rows through the checkpoint.
             ViewPlan::TopN { .. } => None,
+            // Frame every hop's state (stateless hops as an absent slot) so a
+            // restore can put each accumulator back where it was. Framing the
+            // count makes a chain-shape change detectable at restore: a
+            // mismatch errors and the caller re-seeds instead of feeding one
+            // hop another hop's bytes.
+            ViewPlan::Chain { hops, .. } => {
+                let mut out = Vec::new();
+                out.extend_from_slice(CHAIN_STATE_MAGIC);
+                out.extend_from_slice(&(u32::try_from(hops.len()).ok()?).to_le_bytes());
+                for hop in hops {
+                    match hop.checkpoint_state() {
+                        Some(bytes) => {
+                            out.push(1);
+                            out.extend_from_slice(
+                                &(u32::try_from(bytes.len()).ok()?).to_le_bytes(),
+                            );
+                            out.extend_from_slice(&bytes);
+                        }
+                        None => out.push(0),
+                    }
+                }
+                Some(out)
+            }
             ViewPlan::DiffBased => None,
         }
     }
@@ -353,6 +433,45 @@ impl ViewPlan {
             }
             ViewPlan::Map { .. } => Ok(false),
             ViewPlan::TopN { .. } => Ok(false),
+            ViewPlan::Chain { hops, .. } => {
+                let err =
+                    |m: &str| krishiv_delta::DeltaError::Operator(format!("chain state: {m}"));
+                let rest = bytes
+                    .strip_prefix(CHAIN_STATE_MAGIC)
+                    .ok_or_else(|| err("bad magic"))?;
+                let (count_bytes, mut rest) = rest
+                    .split_at_checked(4)
+                    .ok_or_else(|| err("truncated count"))?;
+                let count =
+                    u32::from_le_bytes(count_bytes.try_into().map_err(|_| err("bad count"))?)
+                        as usize;
+                if count != hops.len() {
+                    return Err(err(&format!(
+                        "hop count changed: state has {count}, plan has {}",
+                        hops.len()
+                    )));
+                }
+                for hop in hops.iter_mut() {
+                    let (flag, tail) = rest
+                        .split_at_checked(1)
+                        .ok_or_else(|| err("truncated flag"))?;
+                    rest = tail;
+                    if flag == [1] {
+                        let (len_bytes, tail) = rest
+                            .split_at_checked(4)
+                            .ok_or_else(|| err("truncated len"))?;
+                        let len =
+                            u32::from_le_bytes(len_bytes.try_into().map_err(|_| err("bad len"))?)
+                                as usize;
+                        let (hop_bytes, tail) = tail
+                            .split_at_checked(len)
+                            .ok_or_else(|| err("truncated hop"))?;
+                        rest = tail;
+                        hop.restore_state_bytes(hop_bytes)?;
+                    }
+                }
+                Ok(true)
+            }
             ViewPlan::DiffBased => Ok(false),
         }
     }
@@ -406,6 +525,19 @@ impl ViewPlan {
             // snapshot through it would emit the whole relation as a spurious
             // insert delta, so doing nothing is the correct action, not a gap.
             ViewPlan::Map { .. } => {}
+            // Replay the source snapshot through the chain's own fold: each
+            // hop's emitted delta IS the relation the next hop reads, so after
+            // one pass every stateful hop holds exactly the state it would
+            // hold had the source arrived row by row. The final output is
+            // discarded like every other seed (the view snapshot + baseline
+            // were restored separately, in lockstep).
+            ViewPlan::Chain { source, hops } => {
+                if let Some(mut delta) = seed_delta(source)? {
+                    for hop in hops.iter_mut() {
+                        delta = apply_chain_hop(hop, delta)?;
+                    }
+                }
+            }
             ViewPlan::TopN { source, op } => {
                 // Replaying the snapshot rebuilds the ordered index; the emitted
                 // delta is discarded because the view's own snapshot already
@@ -478,6 +610,24 @@ impl ViewPlan {
                 } else {
                     Ok(0)
                 }
+            }
+            // Hop sources are internal names with no watermark trackers of
+            // their own; the chain's base source watermark bounds every hop's
+            // state (event-time columns pass through map hops unchanged).
+            ViewPlan::Chain { source, hops } => {
+                let wm = watermarks.get(source.as_str()).copied().unwrap_or(i64::MIN);
+                if wm == i64::MIN {
+                    return Ok(0);
+                }
+                let mut reclaimed = 0;
+                for hop in hops.iter_mut() {
+                    reclaimed += match hop {
+                        ViewPlan::Aggregate { op, .. } => op.gc_watermark(wm)?,
+                        ViewPlan::Distinct { op, .. } => op.gc_watermark(wm)?,
+                        _ => 0,
+                    };
+                }
+                Ok(reclaimed)
             }
             // No retained state, so nothing can be reclaimed.
             ViewPlan::Map { .. } => Ok(0),
@@ -598,6 +748,33 @@ pub async fn build_planned_view(
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
 ) -> PlannedView {
+    build_planned_view_impl(body_sql, output_schema, available_schemas, lateness, true).await
+}
+
+/// The single-operator matchers only — no chain attempt. This is what the
+/// decomposer verifies each hop with: a hop that would need its own chain
+/// means the cutting was wrong, and letting a hop re-enter chain-building
+/// recurses forever, because DataFusion replans an unparsed aggregate as
+/// `Projection(Aggregate)` — two cuts that reproduce themselves — so a
+/// refused aggregate hop would decompose into itself without terminating.
+pub(crate) async fn build_view_plan_single(
+    body_sql: &str,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+    lateness: &[krishiv_delta::LatenessSpec],
+) -> ViewPlan {
+    build_planned_view_impl(body_sql, output_schema, available_schemas, lateness, false)
+        .await
+        .plan
+}
+
+async fn build_planned_view_impl(
+    body_sql: &str,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+    lateness: &[krishiv_delta::LatenessSpec],
+    try_chain: bool,
+) -> PlannedView {
     use datafusion::datasource::MemTable;
     let ctx = SessionContext::new();
     for (name, schema) in available_schemas {
@@ -617,8 +794,26 @@ pub async fn build_planned_view(
     };
     let plan = df.logical_plan().clone();
     let order = extract_output_order(&plan);
-    let built = try_build_from_logical(&plan, output_schema, available_schemas, lateness)
+    let mut built = try_build_from_logical(&plan, output_schema, available_schemas, lateness)
         .unwrap_or(ViewPlan::DiffBased);
+    // DECOMP-2: a multi-operator query no single matcher accepts may still cut
+    // into a chain of single-operator hops, each O(Δ). Gated on empty lateness
+    // because hop plans are built without the view's lateness specs — passing
+    // them through per hop is unexamined, and silently dropping them is the
+    // AUD-1 mistake. Recursion terminates: a hop's SQL is single-operator, so
+    // a nested attempt finds fewer than two cuts and refuses immediately.
+    if try_chain
+        && matches!(built, ViewPlan::DiffBased)
+        && lateness.is_empty()
+        && let Some(chain) = Box::pin(crate::decompose::decompose_into_chain(
+            body_sql,
+            output_schema,
+            available_schemas,
+        ))
+        .await
+    {
+        built = chain;
+    }
     PlannedView { plan: built, order }
 }
 

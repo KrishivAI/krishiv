@@ -2195,6 +2195,48 @@ impl IncrementalFlow {
                             }
                         }
                     }
+                    // DECOMP-2: a decomposed chain — fold the delta through
+                    // the hops. The first hop reads the chain's base source
+                    // exactly as a map would; each later hop consumes the
+                    // previous hop's output delta. EMPTY-2 applies unchanged:
+                    // an absent source delta becomes an explicit empty one, so
+                    // a mid-chain global aggregate still establishes the row
+                    // it owes over an empty input.
+                    Some(ViewPlan::Chain { source, hops }) => {
+                        let src = source.clone();
+                        let delta = match source_relation_deltas
+                            .get(&src)
+                            .or_else(|| available_deltas.get(&src))
+                            .cloned()
+                            .or_else(|| empty_input_delta(&src))
+                        {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        let mut out = Ok(delta);
+                        for hop in hops.iter_mut() {
+                            out = match out {
+                                Ok(d) => crate::plan::apply_chain_hop(hop, d),
+                                e => e,
+                            };
+                        }
+                        match out {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view chain apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     _ => continue,
                 }
             } else {

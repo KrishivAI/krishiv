@@ -83,12 +83,21 @@ async fn a_projected_distinct_publishes_the_declared_columns_not_the_source() {
         1,
         "DISTINCT customer_id over {{7,7}} is one row"
     );
-    // The degradation must be visible, not silent — that was half the defect.
+    // Since DECOMP-2 this shape no longer degrades at all: it decomposes into
+    // a map + DISTINCT chain, and the assertions above prove the chain emits
+    // the DECLARED relation — which is the contract this file guards. If it
+    // ever degrades again the fallback must be visible, so the absence of the
+    // silent-wrong-answer is asserted from both directions.
     assert!(
-        summary.degraded_views.iter().any(|v| v == "d"),
-        "a view that fell back to full recompute must say so; got {:?}",
-        summary.degraded_views
+        !summary.degraded_views.iter().any(|v| v == "d"),
+        "a projected DISTINCT decomposes (DECOMP-2); reporting it degraded means \
+         the chain was lost"
     );
+    let (inc, why) = flow
+        .view_plan_classification("d")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "expected a chain plan: {why}");
     assert!(summary.errored_views.is_empty());
 }
 

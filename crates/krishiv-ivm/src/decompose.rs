@@ -49,7 +49,7 @@ use datafusion::datasource::MemTable;
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 
-use crate::plan::{ViewPlanKind, build_view_plan};
+use crate::plan::{ViewPlan, ViewPlanKind, build_view_plan_single};
 
 /// One hop: a single-operator query over the hop beneath it.
 #[derive(Debug, Clone)]
@@ -292,6 +292,35 @@ pub async fn decompose(
     declared: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
 ) -> Option<Vec<Hop>> {
+    decompose_core(view_name, body_sql, declared, available_schemas)
+        .await
+        .map(|(_, hops, _)| hops)
+}
+
+/// Cut `body_sql` into a single [`ViewPlan::Chain`] the flow can run in place
+/// — the wiring that makes decomposition an engine capability instead of a
+/// library call (DECOMP-2). The hops stay internal to the one registered view:
+/// no generated view names, no separate checkpoint identities, no distributed
+/// attach questions — the chain checkpoints, restores and seeds through the
+/// view's own `ViewPlan` surface like every other plan.
+pub(crate) async fn decompose_into_chain(
+    body_sql: &str,
+    declared: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<ViewPlan> {
+    let (source, _, plans) = decompose_core("chain", body_sql, declared, available_schemas).await?;
+    Some(ViewPlan::Chain {
+        source,
+        hops: plans,
+    })
+}
+
+async fn decompose_core(
+    view_name: &str,
+    body_sql: &str,
+    declared: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<(String, Vec<Hop>, Vec<ViewPlan>)> {
     let ctx = SessionContext::new();
     for (name, schema) in available_schemas {
         let empty = arrow::array::RecordBatch::new_empty(schema.clone());
@@ -335,6 +364,7 @@ pub async fn decompose(
         .collect();
 
     let mut hops: Vec<Hop> = Vec::new();
+    let mut plans: Vec<ViewPlan> = Vec::new();
     let mut visible = available_schemas.clone();
     let last = cuts.len() - 1;
 
@@ -374,10 +404,14 @@ pub async fn decompose(
         };
 
         // Per-hop verification against the schemas the flow will actually have.
-        // Anything short of a real O(delta) plan discards the whole chain.
-        if build_view_plan(&sql, &schema, &visible, &[]).await.kind() != ViewPlanKind::Incremental {
+        // Anything short of a real O(delta) plan discards the whole chain —
+        // and the verified plan IS the hop's operator, kept rather than
+        // rebuilt, so what was checked is what runs.
+        let plan = build_view_plan_single(&sql, &schema, &visible, &[]).await;
+        if plan.kind() != ViewPlanKind::Incremental {
             return None;
         }
+        plans.push(plan);
         visible.insert(name.clone(), schema.clone());
         hops.push(Hop {
             name,
@@ -386,5 +420,5 @@ pub async fn decompose(
         });
     }
 
-    Some(hops)
+    Some((source, hops, plans))
 }

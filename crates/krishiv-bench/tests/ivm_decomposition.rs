@@ -200,3 +200,71 @@ async fn a_join_is_refused_rather_than_partly_cut() {
         "a partially-cut join is slower than an uncut one; it must be refused"
     );
 }
+
+/// The wiring test (DECOMP-2): register the corpus SQL **verbatim** — no
+/// library call — and the ENGINE must cut the chain itself at plan time.
+/// Asserting the plan description names the chain pins that the values come
+/// from the O(Δ) fold, not from a DiffBased fallback agreeing trivially.
+async fn verbatim_matches_recompute(label: &str, table: &str, sql: &str) {
+    let ctx = fixture().await;
+    let rows: Vec<RecordBatch> = ctx
+        .sql(&format!("SELECT * FROM {table}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let declared: SchemaRef = Arc::new(ctx.sql(sql).await.unwrap().schema().as_arrow().clone());
+
+    let subject = IncrementalFlow::new();
+    subject
+        .register_view(spec("v", sql, declared.clone()))
+        .unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec("v", sql, declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    for batch in rows.iter() {
+        let d = DeltaBatch::from_inserts(batch.clone()).unwrap();
+        subject.feed(table, d.clone()).unwrap();
+        oracle.feed(table, d).unwrap();
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(
+            s.errored_views.is_empty(),
+            "{label}: view errored: {:?}",
+            s.errored_views
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "{label}: fell back to DiffBased: {why}");
+    assert!(
+        why.contains("chain"),
+        "{label}: incremental but not via the chain: {why}"
+    );
+
+    let got = subject.snapshot("v").unwrap().expect("subject published");
+    let want = oracle.snapshot("v").unwrap().expect("oracle published");
+    assert_eq!(
+        canonical(&got),
+        canonical(&want),
+        "{label}: the engine-built chain disagreed with recomputing the whole query"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q6_registered_verbatim_maintains_incrementally() {
+    verbatim_matches_recompute("q6", "lineitem", &corpus_sql("q6")).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q1_registered_verbatim_maintains_incrementally() {
+    verbatim_matches_recompute("q1", "lineitem", &corpus_sql("q1")).await;
+}
