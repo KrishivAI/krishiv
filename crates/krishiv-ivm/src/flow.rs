@@ -454,6 +454,10 @@ struct IncrementalFlowInner {
     // it to the fresh operator, restoring the incremental view losslessly across
     // a coordinator restart (G6/F4). Views absent here fall back to seeding.
     pending_plan_state: HashMap<String, Vec<u8>>,
+    /// IVM-AUD-STALE-1: fingerprint of the SQL each `pending_plan_state` entry
+    /// was captured under. An entry with no fingerprint, or one that disagrees
+    /// with the view's current SQL, is discarded rather than adopted.
+    pending_plan_logic: HashMap<String, u64>,
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -625,6 +629,7 @@ impl IncrementalFlow {
                 last_step_outputs: AHashMap::new(),
                 view_delta_stats: AHashMap::new(),
                 pending_plan_state: HashMap::new(),
+                pending_plan_logic: HashMap::new(),
                 view_output_ticks: AHashMap::new(),
             })),
             tick_ctx: Arc::new(tokio::sync::Mutex::new(CachedTickContext::default())),
@@ -857,6 +862,7 @@ impl IncrementalFlow {
         inner.view_output_ticks.remove(name);
         inner.view_delta_stats.remove(name);
         inner.pending_plan_state.remove(name);
+        inner.pending_plan_logic.remove(name);
         inner.last_step_outputs.remove(name);
         inner.view_registry.drop_view(name).map_err(delta_err)
     }
@@ -1880,7 +1886,25 @@ impl IncrementalFlow {
             }
         }
         for (name, mut plan, sql) in new_plans {
-            let restored = match inner.pending_plan_state.remove(&name) {
+            // IVM-AUD-STALE-1: an accumulator may only be adopted into a plan
+            // built from the SAME SQL that produced it. `pending_plan_state` is
+            // keyed by view name alone, so without this a view whose definition
+            // changed between restarts inherits the previous query's running
+            // totals — and the only thing that stood between them was the
+            // state's 5-byte format magic, which matches happily because both
+            // are aggregates. A mismatch, or an older blob carrying no
+            // fingerprint, drops the state and re-seeds: slower, and an answer
+            // that belongs to the query being asked.
+            let logic_ok = inner.pending_plan_logic.remove(&name) == Some(logic_fingerprint(&sql));
+            let stashed = inner.pending_plan_state.remove(&name);
+            if !logic_ok && stashed.is_some() {
+                tracing::warn!(
+                    view = %name,
+                    "discarding checkpointed operator state: captured under different view SQL; \
+                     the view re-seeds from snapshots"
+                );
+            }
+            let restored = match stashed.filter(|_| logic_ok) {
                 Some(state_bytes) => plan.restore_state_bytes(&state_bytes).unwrap_or_else(|e| {
                     tracing::warn!(
                         view = %name,
@@ -2647,6 +2671,7 @@ impl IncrementalFlow {
         inner.view_plans.clear();
         inner.view_plan_sqls.clear();
         inner.pending_plan_state.clear();
+        inner.pending_plan_logic.clear();
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         for name in &names {
             if let Ok(view) = inner.view_registry.get(name) {
@@ -2792,6 +2817,7 @@ impl IncrementalFlow {
         inner.view_plans.clear();
         inner.view_plan_sqls.clear();
         inner.pending_plan_state.clear();
+        inner.pending_plan_logic.clear();
         inner.state_epoch = inner.state_epoch.wrapping_add(1);
         Ok(())
     }
@@ -2855,6 +2881,26 @@ impl IncrementalFlow {
         }
         encode_exact_state(&mut out, &inner)?;
         encode_source_deficits(&mut out, &inner)?;
+        // IVM-AUD-STALE-1: which SQL every checkpointed view's state belongs
+        // to. Taken from the registry rather than `view_plan_sqls` so a view
+        // that has no cached plan yet (DiffBased, or not ticked since restart)
+        // is covered too — its snapshot and baseline are just as stale-able as
+        // an accumulator.
+        let logics: Vec<(String, u64)> = names
+            .iter()
+            .filter_map(|name| {
+                let view = inner.view_registry.get(name).ok()?;
+                Some((name.clone(), logic_fingerprint(&view.spec.body_sql)))
+            })
+            .collect();
+        out.extend_from_slice(PLAN_STATE_LOGIC_MAGIC);
+        write_u32_len(&mut out, logics.len(), "plan-logic count")?;
+        for (name, fp) in &logics {
+            let fp = *fp;
+            write_u32_len(&mut out, name.len(), "view name")?;
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&fp.to_le_bytes());
+        }
         Ok(out)
     }
 
@@ -2930,6 +2976,27 @@ impl IncrementalFlow {
                 }
             }
         }
+        // IVM-AUD-STALE-1 section, absent from older blobs.
+        let mut pending_plan_logic: HashMap<String, u64> = HashMap::new();
+        if bytes
+            .get(pos..pos + PLAN_STATE_LOGIC_MAGIC.len())
+            .is_some_and(|m| m == PLAN_STATE_LOGIC_MAGIC)
+        {
+            pos += PLAN_STATE_LOGIC_MAGIC.len();
+            let n = read_u32(bytes, &mut pos)? as usize;
+            for _ in 0..n {
+                let name_len = read_u32(bytes, &mut pos)? as usize;
+                let name =
+                    std::str::from_utf8(bytes.get(pos..pos + name_len).ok_or_else(slice_err)?)
+                        .map_err(|e| IvmError::execution(e.to_string()))?
+                        .to_string();
+                pos += name_len;
+                let raw = bytes.get(pos..pos + 8).ok_or_else(slice_err)?;
+                pos += 8;
+                pending_plan_logic
+                    .insert(name, u64::from_le_bytes(raw.try_into().unwrap_or([0; 8])));
+            }
+        }
         let mut inner = self.inner.lock().map_err(lock_err)?;
         inner.source_snapshots = source_snapshots;
         // Drop any stale cached plans so the next step rebuilds them fresh and
@@ -2937,8 +3004,40 @@ impl IncrementalFlow {
         inner.view_plans.clear();
         inner.view_plan_sqls.clear();
         inner.pending_plan_state = pending_plan_state;
+        inner.pending_plan_logic = pending_plan_logic.clone();
         let names = inner.view_registry.view_names().map_err(delta_err)?;
+        // IVM-AUD-STALE-1: adopt a view's checkpointed state ONLY when the blob
+        // says it was captured under the SQL this view now has. A view whose
+        // definition changed between restarts otherwise inherits the previous
+        // query's snapshot, baseline AND accumulator — all three keyed by name
+        // alone — and publishes numbers belonging to neither query while
+        // reporting itself healthy. Blobs written before this section existed
+        // carry no fingerprint and are refused, which costs a reseed and is the
+        // safe direction.
+        let mut stale_views: Vec<String> = Vec::new();
         for name in &names {
+            let current = inner
+                .view_registry
+                .get(name)
+                .ok()
+                .map(|v| logic_fingerprint(&v.spec.body_sql));
+            if current.is_none() || pending_plan_logic.get(name).copied() != current {
+                stale_views.push(name.clone());
+            }
+        }
+        for name in &stale_views {
+            inner.pending_plan_state.remove(name);
+            inner.pending_plan_logic.remove(name);
+            tracing::warn!(
+                view = %name,
+                "checkpointed view state was captured under different SQL; discarding it and \
+                 re-seeding rather than adopting another query's numbers"
+            );
+        }
+        for name in &names {
+            if stale_views.contains(name) {
+                continue;
+            }
             if let Ok(view) = inner.view_registry.get(name) {
                 let (snap, full) = view_state.get(name).cloned().unwrap_or((None, None));
                 view.restore_state(snap, full).map_err(delta_err)?;
@@ -3086,6 +3185,7 @@ impl IncrementalFlow {
         inner.view_plans.clear();
         inner.view_plan_sqls.clear();
         inner.pending_plan_state.clear();
+        inner.pending_plan_logic.clear();
         let names = inner.view_registry.view_names().map_err(delta_err)?;
         for name in &names {
             if let Ok(view) = inner.view_registry.get(name) {
@@ -4120,6 +4220,26 @@ fn apply_exact_state(inner: &mut IncrementalFlowInner, exact: ExactState) {
 // `DeltaBatch` — self-describing via its own trailing `_weight` column, inside
 // a section an old reader never looks at.
 const SOURCE_DEFICIT_MAGIC: &[u8; 5] = b"IVMZ1";
+
+/// Optional trailing section (IVM-AUD-STALE-1) pairing each checkpointed
+/// operator accumulator with a fingerprint of the SQL that produced it.
+/// Absent from blobs written before it existed, which is the safe direction:
+/// no fingerprint means no adoption, and the view re-seeds instead.
+const PLAN_STATE_LOGIC_MAGIC: &[u8; 5] = b"IVML1";
+
+/// FNV-1a over the view's SQL. Hand-rolled rather than `DefaultHasher` because
+/// this value is written to a checkpoint and compared against one written by a
+/// different build — `DefaultHasher` promises nothing across releases, and a
+/// hash that silently changed would turn every restore into a reseed with
+/// nobody the wiser.
+fn logic_fingerprint(sql: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in sql.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
 
 fn encode_source_deficits(out: &mut Vec<u8>, inner: &IncrementalFlowInner) -> IvmResult<()> {
     out.extend_from_slice(SOURCE_DEFICIT_MAGIC);
