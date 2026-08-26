@@ -1050,6 +1050,17 @@ fn build_map_plan(
         exprs
     };
 
+    // IVM-AUD-ALIAS-1: `FROM orders AS a` plans column references qualified by
+    // the alias, but `df_schema` above is qualified by the table name —
+    // `a.amount` does not resolve against a schema qualified `orders`, the
+    // physical compile errors, and the `.ok()?` below turned that qualifier
+    // mismatch into a silent DiffBased degrade. The names/types comments in
+    // this function warn against a second source of truth for one fact; the
+    // qualifier was that same mistake's third instance. One relation underlies
+    // a map, so a bare name is unambiguous: strip qualifiers instead of
+    // guessing which one the plan used.
+    let exprs = unqualify_columns(exprs)?;
+
     // Output field names come from the plan node's own schema, which is where
     // DataFusion already resolved aliases — re-deriving them here would be a
     // second source of truth for the same fact (the CORE-23 defect's shape).
@@ -1501,9 +1512,14 @@ fn strip_alias(expr: &Expr) -> &Expr {
     }
 }
 
-/// Rewrite every column reference to its bare (unqualified) name so a
-/// predicate lifted from above the join compiles against the source's data
-/// schema regardless of the SQL-side table alias.
+/// Rewrite every column reference to its bare (unqualified) name so an
+/// expression compiles against the source's data schema regardless of the
+/// SQL-side table alias. Sound because every caller compiles against exactly
+/// one relation, where a bare name is unambiguous: the join builder for
+/// predicates lifted from above the join, and the map builder
+/// (IVM-AUD-ALIAS-1) for projection expressions and WHERE predicates, whose
+/// plan-side references carry the alias (`a.amount`) while the compilation
+/// schema is qualified by the table name.
 fn unqualify_columns(preds: &[Expr]) -> Option<Vec<Expr>> {
     use datafusion::common::Column;
     use datafusion::common::tree_node::{Transformed, TreeNode as _};
@@ -1694,6 +1710,11 @@ fn compile_source_filter(
     if preds.is_empty() {
         return Ok(None);
     }
+    // IVM-AUD-ALIAS-1: a WHERE under `FROM orders AS a` references `a.region`,
+    // which cannot resolve against the table-qualified schema built below —
+    // same qualifier mismatch as the map's projection expressions, same silent
+    // DiffBased degrade. One relation, so bare names are unambiguous.
+    let preds = unqualify_columns(preds).ok_or(())?;
     let combined = preds.iter().cloned().reduce(|a, b| a.and(b)).ok_or(())?;
     // Qualify the schema with the source name so predicate column references of
     // either `source.col` or bare `col` resolve to the right column index.

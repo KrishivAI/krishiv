@@ -395,6 +395,15 @@ impl AggState {
 
     fn current_value(&self, agg: &Aggregation, kind: Option<NumKind>) -> Option<AggScalar> {
         match agg {
+            // SQL: SUM over zero (non-null) inputs is NULL, not 0. A SUM
+            // state's `count` advances only for non-null inputs (the Null arm
+            // returns before it), so it is exactly the "has anything been
+            // summed" bit — and it returns to 0 when every contribution is
+            // retracted, where SQL again says NULL. Emitting 0 instead was
+            // invisible to every value assertion that read the column through
+            // `Int64Array::value()` (NULL slots read as 0); the decomposed-q6
+            // text comparison against full recompute is what surfaced it.
+            Aggregation::Sum { .. } if self.count == 0 => None,
             Aggregation::Sum { .. } => match kind {
                 Some(NumKind::Int) => Some(AggScalar::I64(self.sum_i64)),
                 // DEC-1: SUM keeps the input's scale, so the running `i128` is

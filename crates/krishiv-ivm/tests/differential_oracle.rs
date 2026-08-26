@@ -47,7 +47,13 @@ fn orders(rows: &[(i64, i64, i64)]) -> RecordBatch {
 }
 
 /// Sort rows into a comparable canonical form — neither path promises an order.
-fn canonical(batch: &RecordBatch) -> Vec<Vec<i64>> {
+///
+/// NULL is preserved as `None`, never read through `value()` (which returns 0
+/// for a NULL slot). Reading through `value()` is how the SUM-over-empty
+/// defect hid: the O(Δ) path published 0 where recompute published NULL, and
+/// both canonicalized to the same 0.
+fn canonical(batch: &RecordBatch) -> Vec<Vec<Option<i64>>> {
+    use arrow::array::Array as _;
     let cols: Vec<&Int64Array> = (0..batch.num_columns())
         .map(|c| {
             batch
@@ -57,8 +63,12 @@ fn canonical(batch: &RecordBatch) -> Vec<Vec<i64>> {
                 .expect("int64 column")
         })
         .collect();
-    let mut rows: Vec<Vec<i64>> = (0..batch.num_rows())
-        .map(|r| cols.iter().map(|c| c.value(r)).collect())
+    let mut rows: Vec<Vec<Option<i64>>> = (0..batch.num_rows())
+        .map(|r| {
+            cols.iter()
+                .map(|c| (!c.is_null(r)).then(|| c.value(r)))
+                .collect()
+        })
         .collect();
     rows.sort();
     rows
@@ -204,7 +214,7 @@ async fn projected_distinct_agrees_with_full_recompute() {
         canonical(&b),
         "O(delta) disagreed with full recompute"
     );
-    assert_eq!(canonical(&a), vec![vec![10], vec![20]]);
+    assert_eq!(canonical(&a), vec![vec![Some(10)], vec![Some(20)]]);
     assert!(
         !incremental,
         "a projected DISTINCT has no O(delta) plan (IVM-AUD-SCHEMA-1); if this \
@@ -257,7 +267,7 @@ async fn an_aggregate_over_a_computed_derived_table_reads_the_computed_column() 
     // paths being broken the same way.
     assert_eq!(
         canonical(&a),
-        vec![vec![10, 750], vec![20, 1400]],
+        vec![vec![Some(10), Some(750)], vec![Some(20), Some(1400)]],
         "amount doubled: region 10 = 2*(100+200+50+25), region 20 = 2*(300+400)"
     );
 }
@@ -340,5 +350,50 @@ async fn a_global_aggregate_returns_to_zero_when_every_row_is_retracted() {
             .expect("registered")
             .0,
         "and it stays incremental"
+    );
+}
+
+/// IVM-AUD-ALIAS-1 probe: `FROM orders AS a` must not cost the O(Δ) path.
+///
+/// The map builder re-derives its compilation schema qualified by the *table*
+/// name, but the plan's column references are qualified by the *alias* —
+/// `a.amount` cannot resolve against a schema qualified `orders`, the physical
+/// compile errors, and `.ok()?` turns a wrong qualifier into a silent DiffBased
+/// degrade. Values stay right (recompute is correct), so only a plan-kind
+/// assertion can see it — the same fallback mask as DEC-1's fourth test.
+#[tokio::test]
+async fn aliased_source_map_stays_incremental() {
+    let (a, b, incremental) = both_ways(
+        "SELECT a.amount * 2 AS doubled FROM orders AS a",
+        i64_schema(&["doubled"]),
+        &two_batches(),
+    )
+    .await;
+    assert_eq!(
+        canonical(&a),
+        canonical(&b),
+        "O(delta) disagreed with recompute"
+    );
+    assert!(incremental, "an alias must not cost the O(delta) path");
+}
+
+/// Same defect, second site: a WHERE under the alias compiles its predicate
+/// against the table-qualified schema and fails the same way.
+#[tokio::test]
+async fn aliased_source_filtered_map_stays_incremental() {
+    let (a, b, incremental) = both_ways(
+        "SELECT a.amount * 2 AS doubled FROM orders AS a WHERE a.region = 10",
+        i64_schema(&["doubled"]),
+        &two_batches(),
+    )
+    .await;
+    assert_eq!(
+        canonical(&a),
+        canonical(&b),
+        "O(delta) disagreed with recompute"
+    );
+    assert!(
+        incremental,
+        "an aliased WHERE must not cost the O(delta) path"
     );
 }
