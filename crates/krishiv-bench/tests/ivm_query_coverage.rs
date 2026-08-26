@@ -188,3 +188,75 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
          the same commit as the change that moved them."
     );
 }
+
+/// q1 and q6 — the corpus's only single-table multi-operator queries. Every
+/// other TPC-H query joins, which makes the plan a DAG the decomposer refuses
+/// wholesale (a partially cut query is slower than an uncut one).
+const TPCH_DECOMPOSED: usize = 2;
+/// q14 — filter plus computed projection. The other single-table NEXMark
+/// queries are single-operator (already incremental whole, nothing to cut),
+/// windowed TVFs (unplannable), or joins.
+const NEXMARK_DECOMPOSED: usize = 1;
+
+/// How many queries the engine can cut into a chain where EVERY hop maintains
+/// incrementally. `decompose` verifies each hop's plan itself and refuses
+/// wholesale on any non-incremental hop, so a `Some` here is a machine-checked
+/// claim, not a hope — and `ivm_decomposition.rs` proves the chains answer
+/// exactly what the whole query answers.
+async fn measure_decomposed(
+    label: &str,
+    queries: Vec<(String, String)>,
+    ctx: &SessionContext,
+    schemas: &AHashMap<String, SchemaRef>,
+) -> usize {
+    let mut decomposed = 0;
+    println!("\n── {label} ──");
+    for (id, sql) in &queries {
+        let Ok(df) = ctx.sql(sql).await else {
+            println!("  {id:<28} Unplannable");
+            continue;
+        };
+        let declared: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        match krishiv_ivm::decompose("v", sql, &declared, schemas).await {
+            Some(hops) => {
+                decomposed += 1;
+                println!("  {id:<28} Decomposed ({} hops)", hops.len());
+            }
+            None => println!("  {id:<28} Refused"),
+        }
+    }
+    println!("  {label}: {decomposed}/{} decompose fully", queries.len());
+    decomposed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn standard_benchmark_queries_that_decompose_into_incremental_chains() {
+    let (ctx, schemas) = tpch_env().await;
+    let tpch: Vec<(String, String)> = TPCH_QUERIES
+        .iter()
+        .map(|q| (q.id.to_owned(), q.sql_at_scale(1.0)))
+        .collect();
+    let tpch_n = measure_decomposed("TPC-H (22 queries, decomposed)", tpch, &ctx, &schemas).await;
+
+    let (nctx, nschemas) = nexmark_env().await;
+    let nexmark: Vec<(String, String)> = SUPPORTED_QUERIES
+        .iter()
+        .map(|q| (q.name.to_owned(), q.sql.to_owned()))
+        .collect();
+    let nexmark_n = measure_decomposed(
+        "NEXMark (22 queries, decomposed)",
+        nexmark,
+        &nctx,
+        &nschemas,
+    )
+    .await;
+
+    println!("\nDECOMPOSED TOTAL: {}/44", tpch_n + nexmark_n);
+
+    assert_eq!(
+        (tpch_n, nexmark_n),
+        (TPCH_DECOMPOSED, NEXMARK_DECOMPOSED),
+        "IVM decomposition coverage moved. Re-bless deliberately, with the \
+         constants updated in the same commit as the change that moved them."
+    );
+}

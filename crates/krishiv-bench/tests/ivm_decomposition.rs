@@ -1,0 +1,202 @@
+//! A decomposed query must answer exactly what the whole query answers.
+//!
+//! `krishiv_ivm::decompose` cuts a linear multi-operator query into hops so
+//! each one gets an O(delta) plan. That is only worth anything if the chain
+//! computes the same relation the original query does, so every case here runs
+//! the ORIGINAL SQL through `force_diff_based` — full recompute, the trusted
+//! answer by construction — and compares.
+//!
+//! The comparison is textual (`ArrayFormatter`), not numeric, so a hop that
+//! widens a decimal's scale differently from DataFusion is a visible
+//! difference rather than an equal-looking one.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stdout,
+    clippy::panic
+)]
+
+use std::sync::Arc;
+
+use ahash::AHashMap;
+use arrow::array::RecordBatch;
+use arrow::datatypes::SchemaRef;
+use arrow::util::display::{ArrayFormatter, FormatOptions};
+use datafusion::prelude::SessionContext;
+use krishiv_bench::tpch_fixture::fixture_ddl;
+use krishiv_bench::tpch_queries::TPCH_QUERIES;
+use krishiv_delta::{DeltaBatch, IncrementalViewSpec};
+use krishiv_ivm::{IncrementalFlow, decompose};
+
+async fn fixture() -> SessionContext {
+    let ctx = SessionContext::new();
+    for ddl in fixture_ddl() {
+        ctx.sql(ddl).await.unwrap().collect().await.unwrap();
+    }
+    ctx
+}
+
+fn canonical(batch: &RecordBatch) -> Vec<Vec<String>> {
+    let opts = FormatOptions::default();
+    let fmts: Vec<ArrayFormatter> = batch
+        .columns()
+        .iter()
+        .map(|c| ArrayFormatter::try_new(c, &opts).unwrap())
+        .collect();
+    let mut rows: Vec<Vec<String>> = (0..batch.num_rows())
+        .map(|r| fmts.iter().map(|f| f.value(r).to_string()).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn spec(name: &str, sql: &str, out: SchemaRef) -> IncrementalViewSpec {
+    IncrementalViewSpec {
+        name: name.into(),
+        body_sql: sql.into(),
+        output_schema: out,
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    }
+}
+
+/// Decompose `sql`, run the chain, and compare against recomputing `sql` whole.
+async fn decomposed_matches_recompute(label: &str, table: &str, sql: &str) {
+    let ctx = fixture().await;
+    let rows: Vec<RecordBatch> = ctx
+        .sql(&format!("SELECT * FROM {table}"))
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    let src_schema: SchemaRef =
+        Arc::new(ctx.table(table).await.unwrap().schema().as_arrow().clone());
+    let declared: SchemaRef = Arc::new(ctx.sql(sql).await.unwrap().schema().as_arrow().clone());
+
+    let mut schemas: AHashMap<String, SchemaRef> = AHashMap::new();
+    schemas.insert(table.to_string(), src_schema);
+
+    let hops = decompose("v", sql, &declared, &schemas)
+        .await
+        .unwrap_or_else(|| panic!("{label}: refused to decompose"));
+    println!("\n== {label} == {} hops", hops.len());
+    for h in &hops {
+        println!(
+            "   {:<16} {}",
+            h.name,
+            &h.body_sql[..h.body_sql.len().min(120)]
+        );
+    }
+    assert!(hops.len() >= 2, "{label}: a chain needs at least two hops");
+    assert_eq!(
+        hops.last().unwrap().name,
+        "v",
+        "the last hop keeps the view's name"
+    );
+
+    // Subject: the decomposed chain.
+    let subject = IncrementalFlow::new();
+    for h in &hops {
+        subject
+            .register_view(spec(&h.name, &h.body_sql, h.schema.clone()))
+            .unwrap();
+    }
+    // Oracle: the ORIGINAL query, recomputed whole.
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec("v", sql, declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    for batch in rows.iter() {
+        let d = DeltaBatch::from_inserts(batch.clone()).unwrap();
+        subject.feed(table, d.clone()).unwrap();
+        oracle.feed(table, d).unwrap();
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(
+            s.errored_views.is_empty(),
+            "{label}: hop errored: {:?}",
+            s.errored_views
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // Every hop must be maintaining incrementally — the whole point.
+    for h in &hops {
+        let (inc, why) = subject
+            .view_plan_classification(&h.name)
+            .unwrap()
+            .expect("registered");
+        assert!(inc, "{label}: hop {} fell back: {why}", h.name);
+    }
+
+    for h in &hops {
+        let snap = subject.snapshot(&h.name).unwrap();
+        println!(
+            "   snapshot {:<16} rows={:?}",
+            h.name,
+            snap.map(|b| b.num_rows())
+        );
+    }
+    let got = subject.snapshot("v").unwrap().expect("chain published");
+    let want = oracle.snapshot("v").unwrap().expect("oracle published");
+    println!(
+        "   rows: chain={} recompute={}",
+        got.num_rows(),
+        want.num_rows()
+    );
+    assert_eq!(
+        canonical(&got),
+        canonical(&want),
+        "{label}: the decomposed chain disagreed with recomputing the whole query"
+    );
+}
+
+/// The corpus SQL, not a paraphrase: the claim is that the benchmark's own
+/// queries decompose, so the test must read them from where the benchmark
+/// does. On the small fixture, q6's filter admits **zero** rows, which is the
+/// point — the chain must still answer the one row SQL owes (a NULL sum).
+fn corpus_sql(id: &str) -> String {
+    TPCH_QUERIES
+        .iter()
+        .find(|q| q.id == id)
+        .unwrap_or_else(|| panic!("{id} not in corpus"))
+        .sql_at_scale(1.0)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q6_decomposes_and_agrees() {
+    decomposed_matches_recompute("q6", "lineitem", &corpus_sql("q6")).await;
+}
+
+/// q1 carries the pair `sum(a * (1-d))` and `sum(a * (1-d) * (1+t))` — one
+/// hoisted expression a subtree of another — plus three decimal AVGs and an
+/// ORDER BY that must ride the final hop. It goes through only if the hoist
+/// substitutes whole expressions top-down.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q1_decomposes_and_agrees() {
+    decomposed_matches_recompute("q1", "lineitem", &corpus_sql("q1")).await;
+}
+
+/// A join is a DAG, not a chain: refused wholesale rather than half-cut.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_is_refused_rather_than_partly_cut() {
+    let ctx = fixture().await;
+    let mut schemas: AHashMap<String, SchemaRef> = AHashMap::new();
+    for t in ["lineitem", "orders"] {
+        schemas.insert(
+            t.to_string(),
+            Arc::new(ctx.table(t).await.unwrap().schema().as_arrow().clone()),
+        );
+    }
+    let sql = "SELECT o_orderkey, sum(l_quantity) AS q FROM orders \
+               JOIN lineitem ON o_orderkey = l_orderkey GROUP BY o_orderkey";
+    let declared: SchemaRef = Arc::new(ctx.sql(sql).await.unwrap().schema().as_arrow().clone());
+    assert!(
+        decompose("v", sql, &declared, &schemas).await.is_none(),
+        "a partially-cut join is slower than an uncut one; it must be refused"
+    );
+}

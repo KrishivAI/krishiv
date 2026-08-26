@@ -5,6 +5,7 @@
 //! `IncrementalFlow` is the primary API: register views, feed source deltas,
 //! call `step_datafusion()` each tick, and subscribe to output `DeltaBatch`es.
 
+pub mod decompose;
 pub mod error;
 pub mod flow;
 pub mod partitioned;
@@ -13,6 +14,7 @@ pub mod provenance;
 pub mod spill;
 pub mod vector_sink;
 
+pub use decompose::{Hop, decompose};
 pub use error::{IvmError, IvmResult};
 pub use flow::{
     ATTACH_ECHO_MAGIC, IVM_TICK_WIRE_VERSION, IncrementalFlow, RetainedState, StepSummary,
