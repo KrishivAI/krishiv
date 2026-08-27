@@ -1430,3 +1430,95 @@ async fn a_join_above_the_mid_chain_aggregate_maintains() {
         .expect("registered");
     assert!(inc && why.contains("chain"), "not a chain: {why}");
 }
+
+/// SELFJOIN-1: one table joined TWICE — q7/q8's shape in miniature. Both
+/// person occurrences collide with the accumulated relation's bare names
+/// (`ts` rides all three tables), so BOTH rename: their levels emit
+/// `__p1__city`/`__p2__city`, references above rewrite to match, and the
+/// cross-occurrence OR condition stays a residual at p2's level — where its
+/// bare stripped references MUST bind the accumulated left, not the raw
+/// person right (the exclusive-right/disambiguation half of the mechanism;
+/// misbinding collapses the OR to constant false and silently EMPTIES the
+/// view). Tick 2 flips a person's city and auction (8,9) crosses INTO the
+/// OR through the renamed side; tick 3 retracts an auction back out.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_self_join_renames_the_second_occurrence_and_maintains() {
+    let sql = "SELECT from_city, to_city, SUM(amount) AS total FROM ( \
+               SELECT p1.city AS from_city, p2.city AS to_city, a.ts AS amount \
+               FROM auction a, person p1, person p2 \
+               WHERE a.id = p1.pid AND a.seller = p2.pid \
+               AND ((p1.city = 100 AND p2.city = 200) \
+                 OR (p1.city = 200 AND p2.city = 100))) AS x \
+               GROUP BY from_city, to_city";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("from_city", DataType::Int64, false),
+        Field::new("to_city", DataType::Int64, false),
+        Field::new("total", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let expectations: [&[(i64, i64, i64)]; 3] = [
+        // a(7→8) spans 100→200 (arm 1), a(8→7) spans 200→100 (arm 2);
+        // a(8→9) fails both arms on p2's city 300.
+        &[(100, 200, 10), (200, 100, 20)],
+        // Person 9 moves to city 100: a(8→9) crosses INTO arm 2 → 20+30.
+        &[(100, 200, 10), (200, 100, 50)],
+        // Retracting a(8→7) takes its 20 back out.
+        &[(100, 200, 10), (200, 100, 30)],
+    ];
+    type Feeds = [(Option<RecordBatch>, Vec<(RecordBatch, bool)>); 3];
+    let feeds: Feeds = [
+        (
+            Some(auctions(&[(7, 8, 10), (8, 7, 20), (8, 9, 30)])),
+            vec![(persons(&[(7, 100, 0), (8, 200, 0), (9, 300, 0)]), false)],
+        ),
+        (
+            None,
+            vec![
+                (persons(&[(9, 300, 0)]), true),
+                (persons(&[(9, 100, 0)]), false),
+            ],
+        ),
+        (Some(auctions(&[(8, 7, 20)])), vec![]),
+    ];
+    for (i, (a, ps)) in feeds.into_iter().enumerate() {
+        if let Some(a) = a {
+            let d = if i == 2 {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        for (p, retract) in ps {
+            let d = if retract {
+                DeltaBatch::from_deletes(p).unwrap()
+            } else {
+                DeltaBatch::from_inserts(p).unwrap()
+            };
+            subject.feed("person", d.clone()).unwrap();
+            oracle.feed("person", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "tick {i}: self-join disagreed with recompute");
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(f, t, v)| vec![Some(*f), Some(*t), Some(*v)])
+            .collect();
+        assert_eq!(got, expect, "tick {i}: the renamed occurrence went wrong");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}

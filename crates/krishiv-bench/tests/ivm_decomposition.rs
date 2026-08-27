@@ -1070,3 +1070,88 @@ async fn tpch_q11_registered_verbatim_maintains_incrementally() {
     )
     .await;
 }
+
+/// SELFJOIN-1 at corpus scale: q7 joins `nation` TWICE (n1 keys the
+/// supplier, n2 the customer), so the second occurrence's columns rename to
+/// `__n2__…` in the chain's hop relations and the FRANCE/GERMANY OR runs
+/// as a residual at n2's level. The fixture answer is one real row; half
+/// of lineitem is held back to the second tick, so the traces maintain the
+/// pair rather than first-build it.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q7_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute(
+        "q7",
+        &["lineitem", "supplier", "orders", "customer", "nation"],
+        &corpus_sql("q7"),
+    )
+    .await;
+}
+
+/// SELFJOIN-1 + a renamed side under an aggregate CASE: q8's `nation`
+/// appears as n1 (customer's, pinned to AMERICA through region) and n2
+/// (supplier's, the CASE's `nation` column — renamed `__n2__n_name` in the
+/// chain). The fixture answer is empty, so the proof drives it: tick 2
+/// sells an ECONOMY ANODIZED STEEL part from a GERMANY supplier to an
+/// ARGENTINA customer's 1996 order (market share 0), tick 3 adds a BRAZIL
+/// supplier's line and the share crosses above zero THROUGH the renamed
+/// occurrence.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q8_registered_verbatim_maintains_incrementally() {
+    let tables = [
+        "part", "supplier", "lineitem", "orders", "customer", "nation", "region",
+    ];
+    let d = Driven::new(&corpus_sql("q8"), &tables).await;
+    for t in tables {
+        d.feed(t, &format!("SELECT * FROM {t}"), false).await;
+    }
+    let rows = d.step_and_compare("tick 1").await;
+    assert!(rows.is_empty(), "fixture answer is empty");
+
+    d.feed(
+        "part",
+        "SELECT p_partkey * 0 + 888001 AS p_partkey, p_name, p_mfgr, p_brand, \
+         'ECONOMY ANODIZED STEEL' AS p_type, p_size, p_container, p_retailprice, \
+         p_comment FROM part LIMIT 1",
+        false,
+    )
+    .await;
+    let supplier = |key: i64, nation: &str| {
+        format!(
+            "SELECT s_suppkey * 0 + {key} AS s_suppkey, s_name, s_address, \
+             (SELECT n_nationkey FROM nation WHERE n_name = '{nation}') AS s_nationkey, \
+             s_phone, s_acctbal, s_comment FROM supplier LIMIT 1"
+        )
+    };
+    d.feed("supplier", &supplier(888002, "GERMANY"), false)
+        .await;
+    d.feed("supplier", &supplier(888003, "BRAZIL"), false).await;
+    // Customer 3 is ARGENTINA (region AMERICA) and owns order 2, dated
+    // 1996-12-01 — inside q8's window. Only the lineitem is new.
+    let line = |linenum: i64, suppkey: i64| {
+        format!(
+            "SELECT l_orderkey * 0 + 2 AS l_orderkey, l_partkey * 0 + 888001 AS l_partkey, \
+             l_suppkey * 0 + {suppkey} AS l_suppkey, l_linenumber * 0 + {linenum} AS l_linenumber, \
+             l_quantity, l_extendedprice * 0 + 1000 AS l_extendedprice, \
+             l_discount * 0 AS l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, \
+             l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment \
+             FROM lineitem LIMIT 1"
+        )
+    };
+    d.feed("lineitem", &line(101, 888002), false).await;
+    let rows = d.step_and_compare("tick 2 (volume, no BRAZIL)").await;
+    assert_eq!(rows.len(), 1, "one o_year group: {rows:?}");
+    let share: f64 = rows[0][1].parse().expect("mkt_share parses");
+    assert_eq!(share, 0.0, "GERMANY supplier only — BRAZIL share is zero");
+
+    d.feed("lineitem", &line(102, 888003), false).await;
+    let rows = d
+        .step_and_compare("tick 3 (BRAZIL crosses in through the renamed n2)")
+        .await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let share: f64 = rows[0][1].parse().expect("mkt_share parses");
+    assert!(
+        (share - 0.5).abs() < 1e-9,
+        "equal volumes → BRAZIL share 1/2, got {share}"
+    );
+    d.assert_chain();
+}

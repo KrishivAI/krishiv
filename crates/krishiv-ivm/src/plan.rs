@@ -2150,9 +2150,20 @@ fn build_join_plan(
             let all_left = cols
                 .iter()
                 .all(|c| join.left.schema().index_of_column(c).is_ok());
-            let all_right = cols
-                .iter()
-                .all(|c| join.right.schema().index_of_column(c).is_ok());
+            // SELFJOIN-1: right means EXCLUSIVELY right, the LEFTAGG-1
+            // lesson applied to the WHERE loop. A bare reference the
+            // decomposer stripped resolves against BOTH sides when the join
+            // repeats a table (q7's `n_name` vs the raw `nation` right), and
+            // the inclusive check classified the cross-side OR as an
+            // all-right push — compiled against raw nation, both arms of
+            // the disjunction collapse to `n_name = 'FRANCE' AND n_name =
+            // 'GERMANY'`: constant false, a silently EMPTY view. Anything
+            // also resolvable on the left stays a residual, which the
+            // left-first disambiguation below binds exactly.
+            let all_right = cols.iter().all(|c| {
+                join.right.schema().index_of_column(c).is_ok()
+                    && join.left.schema().index_of_column(c).is_err()
+            });
             if all_left {
                 left_preds.push((*conjunct).clone());
             } else if all_right && incr_join_type == IncrJoinType::Inner {
@@ -2272,6 +2283,34 @@ fn build_join_plan(
         lateness_col,
     )
     .ok()?;
+    // SEMI-3 / SELFJOIN-1: rewrite every column reference to the exact
+    // (qualifier, name) of whichever side resolves it, LEFT first. Bare
+    // names can collide across the pair when the join repeats a table
+    // (q21's l1/l2, q7's two nations) — and a bare reference is exact to
+    // resolve left-first, because it can only be one the decomposer
+    // STRIPPED from the accumulated left relation: anything meaning the
+    // repeated right side kept (or renamed to) a distinguishing name.
+    let disambiguate = |e: Expr| -> Option<Expr> {
+        use datafusion::common::tree_node::{Transformed, TreeNode as _};
+        e.transform(|node| {
+            if let Expr::Column(c) = &node {
+                let side_col = |schema: &DFSchema| {
+                    schema.index_of_column(c).ok().map(|i| {
+                        let (q, f) = schema.qualified_field(i);
+                        datafusion::common::Column::new(q.cloned(), f.name())
+                    })
+                };
+                if let Some(col) =
+                    side_col(join.left.schema()).or_else(|| side_col(join.right.schema()))
+                {
+                    return Ok(Transformed::yes(Expr::Column(col)));
+                }
+            }
+            Ok(Transformed::no(node))
+        })
+        .ok()
+        .map(|t| t.data)
+    };
     if !membership_conjuncts.is_empty() {
         // Compile against left ++ right (FULL — membership tests the pair,
         // nothing is emitted from the right). Bare names routinely collide
@@ -2289,27 +2328,6 @@ fn build_join_plan(
         }
         let pair_schema =
             DFSchema::new_with_metadata(pair_fields, std::collections::HashMap::new()).ok()?;
-        let disambiguate = |e: Expr| -> Option<Expr> {
-            use datafusion::common::tree_node::{Transformed, TreeNode as _};
-            e.transform(|node| {
-                if let Expr::Column(c) = &node {
-                    let side_col = |schema: &DFSchema| {
-                        schema.index_of_column(c).ok().map(|i| {
-                            let (q, f) = schema.qualified_field(i);
-                            datafusion::common::Column::new(q.cloned(), f.name())
-                        })
-                    };
-                    if let Some(col) =
-                        side_col(join.left.schema()).or_else(|| side_col(join.right.schema()))
-                    {
-                        return Ok(Transformed::yes(Expr::Column(col)));
-                    }
-                }
-                Ok(Transformed::no(node))
-            })
-            .ok()
-            .map(|t| t.data)
-        };
         let combined = membership_conjuncts
             .into_iter()
             .map(disambiguate)
@@ -2404,6 +2422,7 @@ fn build_join_plan(
         None
     } else {
         let combined = residual_conjuncts.iter().cloned().reduce(|a, b| a.and(b))?;
+        let combined = disambiguate(combined)?;
         let combined = rewrite_right_keys(combined)?;
         let mut coercion = TypeCoercionRewriter::new(&joined_schema);
         let coerced = combined.rewrite(&mut coercion).ok()?.data;

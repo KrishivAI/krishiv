@@ -301,6 +301,7 @@ fn needs_projection(node: &LogicalPlan) -> bool {
 fn explicit_projection_side_aware(
     node: &LogicalPlan,
     side_names: &ahash::AHashSet<String>,
+    rename_aliases: &std::collections::HashSet<String>,
 ) -> Option<LogicalPlan> {
     let join = match node {
         LogicalPlan::Join(j) => Some(j),
@@ -369,7 +370,20 @@ fn explicit_projection_side_aware(
             !q.as_ref()
                 .is_some_and(|q| skip.contains(&(q.to_string(), f.name().clone())))
         })
-        .map(|(qualifier, field)| Expr::Column(Column::new(qualifier.cloned(), field.name())))
+        .map(|(qualifier, field)| {
+            let col = Expr::Column(Column::new(qualifier.cloned(), field.name()));
+            // SELFJOIN-1: a RENAMED side's columns emit as `__alias__col` —
+            // the hop relation stays bare-name-unique even though the side
+            // repeats a table the accumulated relation already carries
+            // (q7/q8's second `nation`). References above were rewritten to
+            // these names by `unqualify_exprs_keeping`.
+            match qualifier {
+                Some(q) if rename_aliases.contains(&q.to_string()) => {
+                    col.alias(format!("__{}__{}", q.table(), field.name()))
+                }
+                _ => col,
+            }
+        })
         .collect();
     LogicalPlanBuilder::from(node.clone())
         .project(exprs)
@@ -399,7 +413,18 @@ fn bare_hop_scan(hop: &str, schema: &SchemaRef) -> Option<LogicalPlan> {
 /// its internal hop name (`__ivm_v_s0.pid`), and stripping that would make
 /// the reference resolve against the SPINE relation whenever the bare name
 /// exists on both — a silently wrong join key.
-fn unqualify_exprs_keeping(exprs: &[Expr], keep: &ahash::AHashSet<String>) -> Option<Vec<Expr>> {
+///
+/// SELFJOIN-1: qualifiers named in `renames` rewrite to the BARE renamed
+/// column instead — `n2.n_name` becomes `__n2__n_name`, the name a
+/// strictly-lower level's hop actually emitted for the colliding
+/// occurrence. Renames win over `keep`: an alias is only ever in both when
+/// a level below already emitted it renamed, and a kept qualified reference
+/// to it would go unresolvable.
+fn unqualify_exprs_keeping(
+    exprs: &[Expr],
+    keep: &ahash::AHashSet<String>,
+    renames: &ahash::AHashSet<String>,
+) -> Option<Vec<Expr>> {
     use datafusion::common::Column;
     exprs
         .iter()
@@ -407,14 +432,19 @@ fn unqualify_exprs_keeping(exprs: &[Expr], keep: &ahash::AHashSet<String>) -> Op
             e.clone()
                 .transform(|node| {
                     Ok(match node {
-                        Expr::Column(c)
-                            if !c
-                                .relation
-                                .as_ref()
-                                .is_some_and(|r| keep.contains(&r.to_string())) =>
-                        {
-                            Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
-                        }
+                        Expr::Column(c) => match c.relation.as_ref() {
+                            Some(r) if renames.contains(&r.to_string()) => {
+                                Transformed::yes(Expr::Column(Column::new_unqualified(format!(
+                                    "__{}__{}",
+                                    r.table(),
+                                    c.name
+                                ))))
+                            }
+                            Some(r) if keep.contains(&r.to_string()) => {
+                                Transformed::no(Expr::Column(c))
+                            }
+                            _ => Transformed::yes(Expr::Column(Column::new_unqualified(c.name))),
+                        },
                         other => Transformed::no(other),
                     })
                 })
@@ -730,6 +760,9 @@ fn decompose_plan(
 ) -> Option<CutPlan> {
     let chain = linear_chain(plan)?;
     let leaf = leaf_of(&chain)?;
+    // SELFJOIN-1: aliases of sides whose bare names COLLIDE with the
+    // accumulated relation and therefore RENAME (see the uniqueness walk).
+    let mut rename_aliases: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // DECOMP-4: a join leaf emits a flat relation whose field names are the
     // bare column names of both sides. A collision would make every reference
@@ -807,6 +840,28 @@ fn decompose_plan(
                 datafusion::logical_expr::JoinType::LeftSemi
                     | datafusion::logical_expr::JoinType::LeftAnti
             ) {
+                continue;
+            }
+            // SELFJOIN-1: a side whose bare names collide with the
+            // accumulated relation (the SECOND `nation` of q7/q8) RENAMES —
+            // every one of its columns emits as `__<alias>__<col>`, and
+            // references above rewrite to match. Only an ALIASED side can
+            // rename deterministically (the alias is the identity SQL gave
+            // the occurrence); a colliding unaliased side still refuses.
+            if let LogicalPlan::SubqueryAlias(sa) = j.right.as_ref()
+                && crate::plan::side_resolves_to_source(&j.right)
+                && j.right
+                    .schema()
+                    .iter()
+                    .any(|(_, f)| seen.contains(f.name()))
+            {
+                let alias = sa.alias.table().to_string();
+                for (_, f) in j.right.schema().iter() {
+                    if !seen.insert(format!("__{alias}__{}", f.name())) {
+                        return None;
+                    }
+                }
+                rename_aliases.insert(alias);
                 continue;
             }
             let mut right_keys: std::collections::HashSet<String> =
@@ -1268,9 +1323,36 @@ fn decompose_plan(
     // join-leaf chains and turns true the moment a mid-chain join cut lands
     // in a table-leaf one (q11's HAVING-vs-global-scalar miniature).
     let mut bare_relation = matches!(leaf, Leaf::Join);
+    // SELFJOIN-1: aliases whose levels have ALREADY emitted renamed columns
+    // (strictly below the cut being re-rooted). At the renaming level itself
+    // the alias is instead KEPT qualified — the join's own references bind
+    // the raw right side, and `build_join_plan` compiles them against the
+    // qualified joined schema — so `keep` and `renames` are disjoint by
+    // construction at every cut.
+    let mut active_renames: ahash::AHashSet<String> = ahash::AHashSet::new();
     for (i, node) in cuts.iter().enumerate() {
         if let Some(a) = cut_alias_below.get(i).cloned().flatten() {
             prev_alias = a;
+        }
+        let rename_of = |right: &LogicalPlan| -> Option<String> {
+            if let LogicalPlan::SubqueryAlias(sa) = right {
+                let alias = sa.alias.table().to_string();
+                rename_aliases.contains(&alias).then_some(alias)
+            } else {
+                None
+            }
+        };
+        let cut_rename: Option<String> = match node {
+            LogicalPlan::Join(j) => rename_of(&j.right),
+            LogicalPlan::Filter(f) if i < run_cut_count => match f.input.as_ref() {
+                LogicalPlan::Join(j) => rename_of(&j.right),
+                _ => None,
+            },
+            _ => None,
+        };
+        let mut keep = side_names.clone();
+        if let Some(a) = &cut_rename {
+            keep.insert(a.clone());
         }
 
         // Re-root onto the hop below, structurally.
@@ -1300,7 +1382,11 @@ fn decompose_plan(
                     let scan = bare_hop_scan(&prev.name, &prev.schema)?;
                     match node {
                         LogicalPlan::Join(j) => {
-                            let exprs = unqualify_exprs_keeping(&node.expressions(), &side_names)?;
+                            let exprs = unqualify_exprs_keeping(
+                                &node.expressions(),
+                                &keep,
+                                &active_renames,
+                            )?;
                             node.with_new_exprs(exprs, vec![scan, j.right.as_ref().clone()])
                                 .ok()?
                         }
@@ -1317,8 +1403,11 @@ fn decompose_plan(
                             let LogicalPlan::Join(j) = f.input.as_ref() else {
                                 return None;
                             };
-                            let join_exprs =
-                                unqualify_exprs_keeping(&f.input.expressions(), &side_names)?;
+                            let join_exprs = unqualify_exprs_keeping(
+                                &f.input.expressions(),
+                                &keep,
+                                &active_renames,
+                            )?;
                             let new_join = f
                                 .input
                                 .as_ref()
@@ -1327,7 +1416,8 @@ fn decompose_plan(
                                 .ok()?;
                             let pred = unqualify_exprs_keeping(
                                 std::slice::from_ref(&f.predicate),
-                                &side_names,
+                                &keep,
+                                &active_renames,
                             )?
                             .pop()?;
                             LogicalPlan::Filter(
@@ -1335,8 +1425,11 @@ fn decompose_plan(
                             )
                         }
                         _ => {
-                            let mut exprs =
-                                unqualify_exprs_keeping(&node.expressions(), &side_names)?;
+                            let mut exprs = unqualify_exprs_keeping(
+                                &node.expressions(),
+                                &keep,
+                                &active_renames,
+                            )?;
                             // Unqualifying changes DERIVED names — the
                             // aggregate `sum(profit.amount)` re-roots as
                             // `sum(amount)` — and the hop above references
@@ -1368,6 +1461,9 @@ fn decompose_plan(
         if matches!(node, LogicalPlan::Join(_)) {
             bare_relation = true;
         }
+        if let Some(a) = cut_rename {
+            active_renames.insert(a);
+        }
         let (name, target) = if i == last && !topn_final {
             // Re-apply ORDER BY / LIMIT so the final view keeps them. Above a
             // join leaf the relation is bare-named, so the read-time exprs
@@ -1376,7 +1472,7 @@ fn decompose_plan(
             let mut top = rooted;
             for r in &above {
                 let exprs = if bare_relation {
-                    unqualify_exprs_keeping(&r.expressions(), &side_names)?
+                    unqualify_exprs_keeping(&r.expressions(), &keep, &active_renames)?
                 } else {
                     r.expressions()
                 };
@@ -1385,7 +1481,7 @@ fn decompose_plan(
             (view_name.to_string(), top)
         } else {
             let body = if needs_projection(&rooted) {
-                explicit_projection_side_aware(&rooted, &side_names)?
+                explicit_projection_side_aware(&rooted, &side_names, &rename_aliases)?
             } else {
                 rooted
             };
@@ -1440,7 +1536,7 @@ fn decompose_plan(
         let mut top = scan;
         for r in &above {
             let exprs = if bare_relation {
-                unqualify_exprs_keeping(&r.expressions(), &side_names)?
+                unqualify_exprs_keeping(&r.expressions(), &side_names, &active_renames)?
             } else {
                 r.expressions()
             };

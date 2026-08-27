@@ -167,15 +167,19 @@ async fn measure(
 /// qualifiers kept through re-rooting. MIDJOIN-1 descends the chain
 /// THROUGH a join whose left is an operator and flips the relation
 /// convention (aliased → bare) at the first mid-chain join, so an
-/// uncorrelated side can join ABOVE the grouped aggregate (q11). Still
-/// refused, measured: self-joins collide bare names (q7, q8).
+/// uncorrelated side can join ABOVE the grouped aggregate (q11).
+/// SELFJOIN-1 completes the suite: a plain aliased side whose bare names
+/// collide with the accumulated relation RENAMES — its level emits every
+/// column as `__alias__col`, references above rewrite to match, and the
+/// cross-occurrence residual compiles left-first (q7, q8's second
+/// `nation`). All 22 TPC-H queries maintain.
 ///
 /// The larger coverage figures quoted elsewhere for TPC-H are a different
 /// measurement: what a *human* can build by hand-decomposing each query into
 /// single-hop views (166 views for 28 queries). That is a real capability and
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
-const TPCH_INCREMENTAL: usize = 20;
+const TPCH_INCREMENTAL: usize = 22;
 /// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
 /// q8, q20 — BAND-1), three TUMBLE windows (q1, q2, q7 — WINDOW-1 + UINT-1),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
@@ -233,16 +237,19 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
 /// uncorrelated global-max side keyed by its own equality, with the
 /// mid-side `revenue0` alias threaded onto the hop scans), plus q13
 /// (LEFTAGG-1), q19 (ORFACTOR-1), q22 (KEYLESS-1), q20 (NESTED-1) and q21
-/// (SEMI-3), and q11 (MIDJOIN-1).
-/// NEXMark's three band joins do NOT decompose —
-/// their side tables share the bare column name `id`, which would make every
-/// reference above the join hop ambiguous — and they need no chain: BAND-1
-/// maintains them whole.
-const TPCH_DECOMPOSED: usize = 20;
-/// q14 — filter plus computed projection. The other single-table NEXMark
-/// queries are single-operator (already incremental whole, nothing to cut),
-/// windowed TVFs (unplannable), or joins.
-const NEXMARK_DECOMPOSED: usize = 1;
+/// (SEMI-3), q11 (MIDJOIN-1), and q7/q8 (SELFJOIN-1: the second `nation`
+/// renamed through the chain).
+/// NEXMark's band joins q3/q20 decompose the same way — their aliased
+/// person/auction sides collide on bare `id` and rename. q8 still cannot:
+/// its own SELECT list emits BOTH `p.id` and `a.id`, so the view's declared
+/// output relation repeats a bare name — ambiguous as a flat hop schema no
+/// matter what the chain renames internally. BAND-1 maintains it whole.
+const TPCH_DECOMPOSED: usize = 22;
+/// q14 (filter plus computed projection) and the q3/q20 band joins
+/// (SELFJOIN-1 renames their colliding sides). The other single-table
+/// NEXMark queries are single-operator (already incremental whole, nothing
+/// to cut), windowed TVFs (unplannable), or q8 (output repeats `id`).
+const NEXMARK_DECOMPOSED: usize = 3;
 
 /// How many queries the engine can cut into a chain where EVERY hop maintains
 /// incrementally. `decompose` verifies each hop's plan itself and refuses
