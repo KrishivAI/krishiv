@@ -623,10 +623,18 @@ impl ViewPlan {
     /// were restored separately, in lockstep). A no-op when the source snapshot
     /// is absent or empty — the normal first-build case, where data has not yet
     /// arrived and the operator *should* start empty.
+    /// Returns the seed fold's FINAL OUTPUT delta — the relation the seeded
+    /// operators now represent (STALE-2). Normally the caller discards it,
+    /// because the view snapshot was restored in lockstep with the state;
+    /// when the snapshot was DISCARDED (a stale logic fingerprint), this
+    /// output is the only complete statement of the view's relation a
+    /// stateless-final plan will ever make — a chain ending in a map or join
+    /// re-emits only touched rows, so a caller that throws this away
+    /// publishes a PARTIAL relation forever.
     pub fn seed_from_snapshots(
         &mut self,
         lookup: impl Fn(&str) -> Option<RecordBatch>,
-    ) -> DeltaResult<()> {
+    ) -> DeltaResult<Option<DeltaBatch>> {
         let seed_delta = |name: &str| -> DeltaResult<Option<DeltaBatch>> {
             match lookup(name) {
                 Some(snap) if snap.num_rows() > 0 => Ok(Some(DeltaBatch::from_inserts(snap)?)),
@@ -638,18 +646,23 @@ impl ViewPlan {
                 // AUD-1: the replayed snapshot must pass the same WHERE filter,
                 // otherwise the seeded state includes rows the view excludes.
                 if let Some(delta) = apply_side_filter(filter, seed_delta(source)?)? {
-                    let _ = op.apply(delta)?;
+                    return Ok(Some(op.apply(delta)?));
                 }
             }
             ViewPlan::Distinct { source, op, filter } => {
                 if let Some(delta) = apply_side_filter(filter, seed_delta(source)?)? {
-                    let _ = op.apply(delta)?;
+                    return Ok(Some(op.apply(delta)?));
                 }
             }
-            // Stateless: there is no accumulator to seed. Replaying the
-            // snapshot through it would emit the whole relation as a spurious
-            // insert delta, so doing nothing is the correct action, not a gap.
-            ViewPlan::Map { .. } => {}
+            // Stateless: there is no accumulator to seed — but the MAPPED
+            // snapshot is still the view's relation, and the STALE-2 caller
+            // needs it when the view snapshot is gone. Applying is free of
+            // state effects.
+            ViewPlan::Map { op, source } => {
+                if let Some(delta) = seed_delta(source)? {
+                    return Ok(Some(op.apply(delta)?));
+                }
+            }
             // Replay the source snapshot through the chain's own fold: each
             // hop's emitted delta IS the relation the next hop reads, so after
             // one pass every stateful hop holds exactly the state it would
@@ -668,9 +681,39 @@ impl ViewPlan {
                 // side's seeded output, exactly as the live tick does.
                 let mut side_out: AHashMap<String, DeltaBatch> = AHashMap::new();
                 for side in sides.iter_mut() {
-                    if let Some(mut d) = seed_delta(&side.source.clone())? {
-                        for hop in side.hops.iter_mut() {
-                            d = apply_chain_hop(hop, d)?;
+                    // SIDE-3: a side is a full sub-chain; seed its join leaf
+                    // from both sources and each later join's right from its
+                    // table, mirroring the spine seed below.
+                    let Some((first, rest)) = side.hops.split_first_mut() else {
+                        continue;
+                    };
+                    let seeded = if let ViewPlan::Join {
+                        left_source,
+                        right_source,
+                        ..
+                    } = first
+                    {
+                        let l = seed_delta(&left_source.clone())?;
+                        let r = seed_delta(&right_source.clone())?;
+                        if l.is_some() || r.is_some() {
+                            Some(apply_chain_join_hop(first, l, r)?)
+                        } else {
+                            None
+                        }
+                    } else {
+                        match seed_delta(&side.source.clone())? {
+                            Some(d) => Some(apply_chain_hop(first, d)?),
+                            None => None,
+                        }
+                    };
+                    if let Some(mut d) = seeded {
+                        for hop in rest {
+                            d = if let ViewPlan::Join { right_source, .. } = hop {
+                                let right = seed_delta(&right_source.clone())?;
+                                apply_chain_join_hop(hop, Some(d), right)?
+                            } else {
+                                apply_chain_hop(hop, d)?
+                            };
                         }
                         side_out.insert(side.name.clone(), d);
                     }
@@ -710,15 +753,15 @@ impl ViewPlan {
                                 apply_chain_hop(hop, delta)?
                             };
                         }
+                        return Ok(Some(delta));
                     }
                 }
             }
             ViewPlan::TopN { source, op } => {
-                // Replaying the snapshot rebuilds the ordered index; the emitted
-                // delta is discarded because the view's own snapshot already
-                // holds the window it describes.
+                // Replaying the snapshot rebuilds the ordered index; the
+                // emitted delta is the window itself, returned for STALE-2.
                 if let Some(delta) = seed_delta(source)? {
-                    let _ = op.apply(delta)?;
+                    return Ok(Some(op.apply(delta)?));
                 }
             }
             // Traces store raw rows keyed on the equi columns; the BAND-1
@@ -736,12 +779,12 @@ impl ViewPlan {
                 let left = apply_side_filter(left_filter, seed_delta(left_source)?)?;
                 let right = apply_side_filter(right_filter, seed_delta(right_source)?)?;
                 if left.is_some() || right.is_some() {
-                    let _ = op.apply(left, right)?;
+                    return Ok(Some(op.apply(left, right)?));
                 }
             }
             ViewPlan::DiffBased => {}
         }
-        Ok(())
+        Ok(None)
     }
 
     /// GC trace state for join operators.
@@ -835,6 +878,24 @@ impl ViewPlan {
                             take(left_source);
                         }
                         take(right_source);
+                    }
+                }
+                // SIDE-3: a side's own join hops read REAL tables — their
+                // watermarks bound the side's traces exactly as the spine's
+                // bound the spine's.
+                for side in sides.iter() {
+                    for (i, hop) in side.hops.iter().enumerate() {
+                        if let ViewPlan::Join {
+                            left_source,
+                            right_source,
+                            ..
+                        } = hop
+                        {
+                            if i == 0 {
+                                take(left_source);
+                            }
+                            take(right_source);
+                        }
                     }
                 }
                 let wm = match wm {

@@ -157,20 +157,23 @@ async fn measure(
 /// padding is rejected by the query's own comparison, DataFusion's
 /// elimination proves it INNER, and the per-key aggregate maintains as the
 /// side fold with its value columns joined into the spine — q17. The
-/// remaining 10, measured from the printed decorrelated shapes: q2's scalar
-/// side reads FOUR tables (a side that is itself a join run — sides are
-/// single-table in v1); q11, q15 and q22 keep UNCORRELATED scalar
-/// subqueries the optimizer rules leave as raw Subquery exprs; q20's
-/// membership side contains its own nested scalar join; q21's semi level
-/// carries a non-equi membership conjunct (`l_suppkey !=`); self-joins
-/// collide bare names (q7, q8, and q21's triple lineitem); q13 is a LEFT
-/// OUTER aggregate; q19's equi keys hide inside an OR.
-////// The larger coverage figures quoted elsewhere for TPC-H are a different
+/// remaining 9: SIDE-3 made sides full sub-chains — a side may be a join
+/// run of its own, cut by recursing through the spine's engine, with the
+/// spine's pure-comma PREFIX relinearized when a filtered side join sits
+/// atop the run (q2). Still refused, measured: q11, q15 and q22 keep
+/// UNCORRELATED scalar subqueries the optimizer rules leave as raw Subquery
+/// exprs; q20's membership side has sides of its OWN (nested scalar —
+/// sides-of-sides refuse wholesale in v1); q21's semi level carries a
+/// non-equi membership conjunct (`l_suppkey !=`); self-joins collide bare
+/// names (q7, q8, and q21's triple lineitem); q13 is a LEFT OUTER
+/// aggregate; q19's equi keys hide inside an OR.
+///
+/// The larger coverage figures quoted elsewhere for TPC-H are a different
 /// measurement: what a *human* can build by hand-decomposing each query into
 /// single-hop views (166 views for 28 queries). That is a real capability and
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
-const TPCH_INCREMENTAL: usize = 12;
+const TPCH_INCREMENTAL: usize = 13;
 /// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
 /// q8, q20 — BAND-1), three TUMBLE windows (q1, q2, q7 — WINDOW-1 + UINT-1),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
@@ -223,12 +226,13 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
 /// graph), q4, q16 (SEMI-2 semi/anti membership levels), q18 (SIDE-1: a
 /// HAVING membership set maintained as the chain's side fold), and q17
 /// (SIDE-2 + OUTER-1: an emitted scalar-aggregate side on a
-/// proven-inner join).
+/// proven-inner join), and q2 (SIDE-3: a side that is itself a four-table
+/// join run, plus prefix relinearization).
 /// NEXMark's three band joins do NOT decompose —
 /// their side tables share the bare column name `id`, which would make every
 /// reference above the join hop ambiguous — and they need no chain: BAND-1
 /// maintains them whole.
-const TPCH_DECOMPOSED: usize = 12;
+const TPCH_DECOMPOSED: usize = 13;
 /// q14 — filter plus computed projection. The other single-table NEXMark
 /// queries are single-operator (already incremental whole, nothing to cut),
 /// windowed TVFs (unplannable), or joins.

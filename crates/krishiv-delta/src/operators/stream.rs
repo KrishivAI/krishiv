@@ -150,11 +150,24 @@ pub fn differentiate(
 /// and therefore still clamp; the rows they lose are counted and reported by
 /// `IncrementalView::clamped_retraction_rows` (IVM-AUD-CORE-2b).
 pub fn apply_delta(current: Option<RecordBatch>, delta: &DeltaBatch) -> DeltaResult<RecordBatch> {
+    // DELTA-CONS-1: the no-previous-state branches must CONSOLIDATE before
+    // keeping positive rows. A delta may legitimately carry retract+insert
+    // churn for the same row (an aggregate re-emitting an unchanged group, a
+    // join fanning a side's idempotent update) whose net weight is what the
+    // relation owes; expanding positives without netting materialized every
+    // insert copy AND kept rows whose net is zero — a silently wrong multiset
+    // on the FIRST application (fresh view over churn, restored view whose
+    // snapshot was discarded). The non-empty branch always consolidated;
+    // these two just never did.
+    let first = |delta: &DeltaBatch| -> DeltaResult<RecordBatch> {
+        let consolidated = consolidate_batch(delta.clone(), &[], delta.data_schema())?;
+        consolidated.filter_positive_expanded()
+    };
     match current {
-        None => delta.filter_positive_expanded(),
+        None => first(delta),
         Some(prev) => {
             if prev.num_rows() == 0 {
-                return delta.filter_positive_expanded();
+                return first(delta);
             }
             // Fast path: every weight exactly +1. Simply append the new rows
             // to the accumulated snapshot without the full O(n) stringify-
@@ -395,5 +408,43 @@ mod tests {
         assert!(op.is_empty());
         let empty = op.snapshot_or_empty(&s).unwrap();
         assert_eq!(empty.num_rows(), 0);
+    }
+}
+
+#[cfg(test)]
+mod delta_cons_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    /// DELTA-CONS-1: the FIRST application of a delta (no previous state)
+    /// must NET retract+insert churn, not keep every positive row. The delta
+    /// carries +(5) -(1) +(1) -(5) +(5): net weights are (1): 0, (5): +1, so
+    /// the materialized relation is exactly one row of 5 — the unconsolidated
+    /// version produced three rows [5, 1, 5], a silently wrong multiset.
+    #[test]
+    fn first_application_nets_churn() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new(crate::WEIGHT_COLUMN, DataType::Int64, false),
+        ]));
+        let batch = arrow::array::RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![5, 1, 1, 5, 5])),
+                Arc::new(Int64Array::from(vec![1, -1, 1, -1, 1])),
+            ],
+        )
+        .unwrap();
+        let delta = crate::DeltaBatch::from_weighted(batch).unwrap();
+        let out = apply_delta(None, &delta).unwrap();
+        assert_eq!(out.num_rows(), 1, "net weights are (1): 0, (5): +1");
+        let col = out.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        assert_eq!(col.value(0), 5);
+        // The empty-previous branch is the same first application.
+        let empty = arrow::array::RecordBatch::new_empty(out.schema());
+        let out2 = apply_delta(Some(empty), &delta).unwrap();
+        assert_eq!(out2.num_rows(), 1);
     }
 }

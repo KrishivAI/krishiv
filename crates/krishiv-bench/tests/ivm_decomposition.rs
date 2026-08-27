@@ -670,3 +670,20 @@ async fn tpch_q17_registered_verbatim_maintains_incrementally() {
     assert!(inc, "q17: fell back to DiffBased: {why}");
     assert!(why.contains("chain"), "q17: not via the chain: {why}");
 }
+
+/// SIDE-3: q2's scalar `min(ps_supplycost)` side reads FOUR tables — the
+/// side is itself a join run, cut by recursing through the spine's own
+/// engine. The spine additionally needs PREFIX relinearization: its FROM
+/// order (`part, supplier, …`) is disconnected at the leaf, and the side
+/// join atop the run carries a filter, so the old all-or-nothing gate never
+/// fired. Two equi keys tie the side in: the correlation key and
+/// `ps_supplycost = min(…)` itself (JOIN-2's WHERE-equality → trace key).
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q2_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute(
+        "q2",
+        &["part", "supplier", "partsupp", "nation", "region"],
+        &corpus_sql("q2"),
+    )
+    .await;
+}

@@ -776,3 +776,161 @@ async fn an_aggregate_above_a_scalar_avg_side_maintains_as_a_chain() {
         "incremental but not via the chain: {why}"
     );
 }
+
+/// SIDE-3: a scalar side that is itself a JOIN RUN — q2's shape in
+/// miniature. The side computes `MIN(a2.ts)` per seller over auction ⋈
+/// person (only sellers present in person have a group at all), and the
+/// spine keys on BOTH the correlation (seller) and the scalar equality
+/// itself (`a.ts = min`). Tick 2 inserts a lower-ts auction: the side's min
+/// SHIFTS, so the old minimum's auction leaves the view and the new one
+/// enters — one side value update fanning both directions. Tick 3 retracts
+/// it and the original returns. Every tick against full recompute, with
+/// exact expected values.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scalar_side_that_is_a_join_run_maintains_as_a_chain() {
+    let sql = "SELECT a.id, a.ts FROM auction a WHERE a.ts = \
+               (SELECT MIN(a2.ts) FROM auction a2, person p \
+                WHERE a2.seller = p.pid AND a2.seller = a.seller)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let lower = auctions(&[(3, 7, 5)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // min(seller 7) = 10 → auction 1; seller 8 has no person row, so the
+        // side holds no group for it and auction 4 never matches.
+        &[(1, 10)],
+        // min shifts to 5: auction 3 in, auction 1 out.
+        &[(3, 5)],
+        // retracted: min back to 10, auction 1 returns.
+        &[(1, 10)],
+    ];
+    for (i, (a, p, retract)) in [
+        (
+            Some(auctions(&[(1, 7, 10), (2, 7, 20), (4, 8, 1)])),
+            Some(persons(&[(7, 100, 0)])),
+            false,
+        ),
+        (Some(lower.clone()), None, false),
+        (Some(lower), None, true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mk = |b: &RecordBatch| {
+            if retract {
+                DeltaBatch::from_deletes(b.clone()).unwrap()
+            } else {
+                DeltaBatch::from_inserts(b.clone()).unwrap()
+            }
+        };
+        if let Some(a) = a {
+            subject.feed("auction", mk(&a)).unwrap();
+            oracle.feed("auction", mk(&a)).unwrap();
+        }
+        if let Some(p) = p {
+            subject.feed("person", mk(&p)).unwrap();
+            oracle.feed("person", mk(&p)).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(
+            got, want,
+            "tick {i}: join-run side disagreed with recompute"
+        );
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(id, ts)| vec![Some(*id), Some(*ts)])
+            .collect();
+        assert_eq!(got, expect, "tick {i}: the shifting min did not land");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "a join-run side must take the O(delta) path: {why}");
+    assert!(
+        why.contains("chain"),
+        "incremental but not via the chain: {why}"
+    );
+}
+
+/// SIDE-3's seed path: a JOIN-bearing side must seed BOTH its join's traces
+/// from source snapshots. Forced through the STALE-1 reseed (fingerprint
+/// mismatch discards state and snapshot); the post-restore tick feeds a new
+/// auction at exactly the seeded minimum — it joins only if the side's
+/// aggregate AND its join traces were seeded, a positive observable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_run_side_chain_reseeds_from_snapshots() {
+    let sql = "SELECT a.id, a.ts FROM auction a WHERE a.ts = \
+               (SELECT MIN(a2.ts) FROM auction a2, person p \
+                WHERE a2.seller = p.pid AND a2.seller = a.seller)";
+    let sql_variant = "SELECT a.id, a.ts  FROM auction a WHERE a.ts = \
+               (SELECT MIN(a2.ts) FROM auction a2, person p \
+                WHERE a2.seller = p.pid AND a2.seller = a.seller)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+
+    let flow = IncrementalFlow::new();
+    flow.register_view(spec(sql, out.clone())).unwrap();
+    flow.feed(
+        "auction",
+        DeltaBatch::from_inserts(auctions(&[(1, 7, 10), (2, 7, 20)])).unwrap(),
+    )
+    .unwrap();
+    flow.feed(
+        "person",
+        DeltaBatch::from_inserts(persons(&[(7, 100, 0)])).unwrap(),
+    )
+    .unwrap();
+    flow.step_datafusion().await.unwrap();
+    assert_eq!(
+        canonical(&flow.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(1), Some(10)]],
+    );
+
+    let blob = flow.checkpoint_full().unwrap();
+    let restored = IncrementalFlow::new();
+    restored.register_view(spec(sql_variant, out)).unwrap();
+    restored.restore_full(&blob).unwrap();
+
+    for f in [&restored, &flow] {
+        f.feed(
+            "auction",
+            DeltaBatch::from_inserts(auctions(&[(5, 7, 10)])).unwrap(),
+        )
+        .unwrap();
+        let s = f.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+    }
+    let (inc, why) = restored
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc && why.contains("chain"),
+        "not a chain after reseed: {why}"
+    );
+    assert_eq!(
+        canonical(&restored.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(1), Some(10)], vec![Some(5), Some(10)]],
+        "the new auction joined through the SEEDED side (aggregate + traces)"
+    );
+    assert_eq!(
+        canonical(&restored.snapshot("v").unwrap().unwrap()),
+        canonical(&flow.snapshot("v").unwrap().unwrap()),
+        "reseeded and continuous flows agree"
+    );
+}

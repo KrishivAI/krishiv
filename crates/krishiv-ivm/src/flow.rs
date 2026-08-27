@@ -1929,20 +1929,60 @@ impl IncrementalFlow {
                 }),
                 None => false,
             };
-            if !restored
-                && let Err(e) = plan.seed_from_snapshots(|src| {
+            if !restored {
+                match plan.seed_from_snapshots(|src| {
                     pre_delta_snapshots
                         .get(src)
                         .cloned()
                         .or_else(|| view_seed_snapshots.get(src).cloned())
-                })
-            {
-                tracing::warn!(
-                    view = %name,
-                    error = %e,
-                    "failed to seed incremental operator from restored state; \
-                     view may diverge until re-registered"
-                );
+                }) {
+                    Ok(seed_output) => {
+                        // STALE-2: when the view's own snapshot is GONE (a
+                        // stale-fingerprint restore discarded it, or the view
+                        // was registered over already-materialized sources),
+                        // the seed fold's final output is the only complete
+                        // statement of the relation a stateless-final plan
+                        // will ever make — publish it as the initial snapshot
+                        // and diff baseline, so the tick's delta lands on the
+                        // full relation instead of a permanently partial one.
+                        // A view whose snapshot was restored keeps it: the
+                        // seed output describes the same relation.
+                        if let Some(d) = seed_output
+                            && let Ok(view) = inner.view_registry.get(&name)
+                            && matches!(view.snapshot(), Ok(None))
+                        {
+                            match krishiv_delta::operators::stream::apply_delta(None, &d) {
+                                Ok(full) => {
+                                    if let Err(e) =
+                                        view.restore_state(Some(full.clone()), Some(full))
+                                    {
+                                        tracing::warn!(
+                                            view = %name,
+                                            error = %e,
+                                            "failed to publish seeded relation as the \
+                                             initial snapshot"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        view = %name,
+                                        error = %e,
+                                        "failed to materialize seeded relation"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            view = %name,
+                            error = %e,
+                            "failed to seed incremental operator from restored state; \
+                             view may diverge until re-registered"
+                        );
+                    }
+                }
             }
             inner.view_plan_sqls.insert(name.clone(), sql);
             inner.view_plans.insert(name, plan);
@@ -2249,26 +2289,58 @@ impl IncrementalFlow {
                             ahash::AHashMap::new();
                         let mut side_err: Option<krishiv_delta::DeltaError> = None;
                         'side: for side in sides.iter_mut() {
-                            let delta = match source_relation_deltas
-                                .get(&side.source)
-                                .or_else(|| available_deltas.get(&side.source))
-                                .cloned()
-                                .or_else(|| empty_input_delta(&side.source))
-                            {
-                                Some(d) => d,
-                                None => continue 'side,
+                            // SIDE-3: a side is a full sub-chain — its leaf
+                            // may be a JOIN reading two real sources, and its
+                            // mid-chain joins read their right table's delta,
+                            // exactly like the spine fold below.
+                            let Some((first, rest)) = side.hops.split_first_mut() else {
+                                continue 'side;
                             };
-                            let mut d = delta;
-                            for hop in side.hops.iter_mut() {
-                                d = match crate::plan::apply_chain_hop(hop, d) {
-                                    Ok(d) => d,
-                                    Err(e) => {
-                                        side_err = Some(e);
-                                        break 'side;
+                            let mut out = if let ViewPlan::Join {
+                                left_source,
+                                right_source,
+                                ..
+                            } = first
+                            {
+                                let left = available_deltas.get(left_source.as_str()).cloned();
+                                let right = available_deltas.get(right_source.as_str()).cloned();
+                                crate::plan::apply_chain_join_hop(first, left, right)
+                            } else {
+                                let delta = match source_relation_deltas
+                                    .get(&side.source)
+                                    .or_else(|| available_deltas.get(&side.source))
+                                    .cloned()
+                                    .or_else(|| empty_input_delta(&side.source))
+                                {
+                                    Some(d) => d,
+                                    None => continue 'side,
+                                };
+                                crate::plan::apply_chain_hop(first, delta)
+                            };
+                            for hop in rest {
+                                out = match out {
+                                    Ok(d) => {
+                                        if let ViewPlan::Join { right_source, .. } = hop {
+                                            let right = available_deltas
+                                                .get(right_source.as_str())
+                                                .cloned();
+                                            crate::plan::apply_chain_join_hop(hop, Some(d), right)
+                                        } else {
+                                            crate::plan::apply_chain_hop(hop, d)
+                                        }
                                     }
+                                    e => e,
                                 };
                             }
-                            side_out.insert(side.name.clone(), d);
+                            match out {
+                                Ok(d) => {
+                                    side_out.insert(side.name.clone(), d);
+                                }
+                                Err(e) => {
+                                    side_err = Some(e);
+                                    break 'side;
+                                }
+                            }
                         }
                         let Some((first, rest)) = hops.split_first_mut() else {
                             continue;
