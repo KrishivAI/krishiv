@@ -802,6 +802,7 @@ impl IncrementalFlow {
             for rewrite in [
                 crate::window_rewrite::rewrite_tumble_tvfs,
                 crate::window_rewrite::rewrite_hop_tvfs,
+                crate::window_rewrite::rewrite_session_tvfs,
                 crate::window_rewrite::rewrite_streaming_topn,
             ] {
                 if let Some(rewritten) = rewrite(&body) {
@@ -2225,6 +2226,40 @@ impl IncrementalFlow {
                                     view = %view_name,
                                     error = %e,
                                     "incremental view keyed top-N apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    // Defensive: the SESSION dialect's partition key IS the
+                    // GROUP BY, so every session plan the rewrite can produce
+                    // carries an Aggregate above the cascade and runs as a
+                    // CHAIN — this whole-view arm is unreachable today and
+                    // exists so a future recognizer shape cannot fall into
+                    // `_ => continue` and starve the view (the R59 hazard).
+                    Some(ViewPlan::Sessionize { source, op }) => {
+                        let src = source.clone();
+                        let delta = match source_relation_deltas
+                            .get(&src)
+                            .or_else(|| available_deltas.get(&src))
+                            .cloned()
+                            .or_else(|| empty_input_delta(&src))
+                        {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        match op.apply(delta) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view sessionize apply failed; skipping view"
                                 );
                                 errored_views.push(ViewError {
                                     view: view_name.clone(),

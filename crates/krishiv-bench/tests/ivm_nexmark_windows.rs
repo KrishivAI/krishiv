@@ -60,6 +60,7 @@ async fn corpus_verbatim_matches_recompute(name: &str, needle: &str) {
     for rewrite in [
         krishiv_ivm::window_rewrite::rewrite_tumble_tvfs,
         krishiv_ivm::window_rewrite::rewrite_hop_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_session_tvfs,
         krishiv_ivm::window_rewrite::rewrite_streaming_topn,
     ] {
         if let Some(r) = rewrite(&rewritten) {
@@ -225,4 +226,14 @@ async fn nexmark_q13_registered_verbatim_maintains_incrementally() {
         .expect("registered");
     assert!(inc, "q13: fell back to DiffBased: {why}");
     assert!(why.contains("chain"), "q13: not via the chain: {why}");
+}
+
+/// SESSION-1 at corpus scale: q11's per-bidder gap sessions registered
+/// verbatim. Generated bids cluster tightly in time, so sessions genuinely
+/// merge as batches land; the tick-3 retraction of half the first batch
+/// forces splits. Every tick compares against the DiffBased oracle, which
+/// computes sessions through the LAG cascade whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn nexmark_q11_registered_verbatim_maintains_incrementally() {
+    corpus_verbatim_matches_recompute("q11_user_sessions", "chain").await;
 }

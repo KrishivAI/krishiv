@@ -131,6 +131,17 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
                 chain.reverse();
                 return Some(chain);
             }
+            // SESSION-1: the sessionization cascade's top projection is a
+            // LEAF — the whole cascade compiles as one Sessionize hop. Gated
+            // on the engine-namespace marker column, which only the SESSION
+            // rewrite writes.
+            LogicalPlan::Projection(p)
+                if p.schema.fields().iter().any(|f| f.name() == "__ivm_sid") =>
+            {
+                chain.push(node);
+                chain.reverse();
+                return Some(chain);
+            }
             // DECOMP-4/MJOIN-1: a Join joins the chain. A LEFT-DEEP join
             // tree — the shape every comma join plans to — descends along the
             // left spine, each Join becoming one chain node whose RIGHT side
@@ -204,6 +215,10 @@ enum Leaf {
     /// is one flat relation, and the derived-table alias above it rides
     /// `op_alias_below` onto the hop scan exactly like q15's `revenue0`.
     Union,
+    /// SESSION-1: the sessionization cascade — one Sessionize hop, aliased
+    /// re-rooting like `Union` (the rewrite always wraps the cascade in the
+    /// table's own alias).
+    Session,
 }
 
 /// REORDER-1: rebuild a pure comma-join run in a CONNECTED order of its join
@@ -293,6 +308,9 @@ fn leaf_of(chain: &[LogicalPlan]) -> Option<Leaf> {
         LogicalPlan::TableScan(ts) => Some(Leaf::Table(ts.table_name.table().to_string())),
         LogicalPlan::Join(_) => Some(Leaf::Join),
         LogicalPlan::Union(_) => Some(Leaf::Union),
+        LogicalPlan::Projection(p) if p.schema.fields().iter().any(|f| f.name() == "__ivm_sid") => {
+            Some(Leaf::Session)
+        }
         _ => None,
     }
 }
@@ -1356,7 +1374,7 @@ fn decompose_plan(
     // qualify by the source name, so their hop shapes are unchanged.
     let mut prev_alias = match &leaf {
         Leaf::Table(t) => t.clone(),
-        Leaf::Join | Leaf::Union => String::new(),
+        Leaf::Join | Leaf::Union | Leaf::Session => String::new(),
     };
     debug_assert_eq!(cuts.len(), cut_alias_below.len());
     let last = cuts.len() - 1;
@@ -1766,7 +1784,8 @@ fn decompose_plan(
         (Leaf::Table(t), _) => t.clone(),
         (Leaf::Join, Some(ViewPlan::Join { left_source, .. })) => left_source.clone(),
         (Leaf::Union, Some(ViewPlan::FlatMap { source, .. })) => source.clone(),
-        (Leaf::Join | Leaf::Union, _) => return None,
+        (Leaf::Session, Some(ViewPlan::Sessionize { source, .. })) => source.clone(),
+        (Leaf::Join | Leaf::Union | Leaf::Session, _) => return None,
     };
     // Side hops precede the spine in the public hop list — topological order,
     // so a caller registering hops as standalone views registers each side

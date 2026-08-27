@@ -8,5 +8,6 @@ pub mod join;
 pub mod key_util;
 pub mod keyed_topn;
 pub mod map;
+pub mod session_window;
 pub mod stream;
 pub mod topn;

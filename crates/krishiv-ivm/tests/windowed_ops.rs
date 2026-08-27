@@ -235,3 +235,60 @@ async fn a_keyed_top1_keeps_the_latest_and_falls_back_on_retraction() {
     p.tick("tick 3 (fallback)", &[vec![Some(7), Some(1)]]).await;
     p.assert_incremental("keyed top-N");
 }
+
+/// SESSION-1: gap sessions per seller with COUNT — q11's shape in
+/// miniature (gap 5). Tick 2 drops a BRIDGE event between two sessions and
+/// they MERGE into one row; tick 3 retracts the bridge and the sessions
+/// SPLIT back — the exact inverse. The oracle computes sessions through
+/// the LAG cascade whole, so agreement here is agreement on the session
+/// semantics, not just on plumbing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_window_count_merges_and_splits() {
+    let sql = "SELECT seller, window_start, window_end, COUNT(*) AS c \
+               FROM SESSION(TABLE auction, DESCRIPTOR(ts), 5) \
+               GROUP BY seller, window_start, window_end";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("window_start", DataType::Int64, false),
+        Field::new("window_end", DataType::Int64, false),
+        Field::new("c", DataType::Int64, false),
+    ]));
+    let p = Pair::new(sql, out);
+
+    // Sessions: seller 7 events 1,2 → [1,7); event 8 → [8,13); seller 8: [50,55).
+    p.feed(
+        auctions(&[(1, 7, 1), (2, 7, 2), (3, 7, 8), (4, 8, 50)]),
+        false,
+    );
+    p.tick(
+        "tick 1",
+        &[
+            vec![Some(7), Some(1), Some(7), Some(2)],
+            vec![Some(7), Some(8), Some(13), Some(1)],
+            vec![Some(8), Some(50), Some(55), Some(1)],
+        ],
+    )
+    .await;
+    // ts=4 bridges (2→4 and 4→8 both < 5): ONE session [1,13) of 4 events.
+    p.feed(auctions(&[(5, 7, 4)]), false);
+    p.tick(
+        "tick 2 (merge)",
+        &[
+            vec![Some(7), Some(1), Some(13), Some(4)],
+            vec![Some(8), Some(50), Some(55), Some(1)],
+        ],
+    )
+    .await;
+    // Retracting the bridge splits them back.
+    p.feed(auctions(&[(5, 7, 4)]), true);
+    p.tick(
+        "tick 3 (split)",
+        &[
+            vec![Some(7), Some(1), Some(7), Some(2)],
+            vec![Some(7), Some(8), Some(13), Some(1)],
+            vec![Some(8), Some(50), Some(55), Some(1)],
+        ],
+    )
+    .await;
+    p.assert_incremental("chain");
+}

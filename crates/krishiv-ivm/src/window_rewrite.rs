@@ -134,6 +134,115 @@ fn parse_hop_args(args: &str) -> Option<(String, String, u64, u64)> {
     Some((table, column, slide, size))
 }
 
+/// SESSION-1: rewrite `SESSION(TABLE t, DESCRIPTOR(col), gap)` into the
+/// standard-SQL sessionization cascade — LAG marks a row whose distance to
+/// its key-predecessor is `>= gap` (the streaming engine's own boundary
+/// convention: `event_time >= last + gap` starts a new session), a framed
+/// SUM turns the marks into a per-key session ordinal, and MIN/MAX over
+/// (key, ordinal) become `window_start` / `window_end = last + gap`:
+///
+/// ```sql
+/// (SELECT *, MIN(col) OVER (PARTITION BY k, __ivm_sid) AS window_start,
+///            MAX(col) OVER (PARTITION BY k, __ivm_sid) + gap AS window_end
+///  FROM (SELECT *, SUM(__ivm_snew) OVER (PARTITION BY k ORDER BY col
+///          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS __ivm_sid
+///        FROM (SELECT *, CASE WHEN col - LAG(col) OVER (PARTITION BY k
+///                ORDER BY col) >= gap THEN 1 ELSE 0 END AS __ivm_snew
+///              FROM t) AS __ivm_s1) AS __ivm_s2) AS t
+/// ```
+///
+/// The session PARTITION KEY is not in the TVF — the streaming surface
+/// sessionizes per GROUP BY key — so the rewrite parses the query with the
+/// TVF replaced by a placeholder and reads the outer GROUP BY: its bare
+/// columns minus `window_start`/`window_end` are the keys. DataFusion
+/// executes the cascade whole (the DiffBased oracle computes real
+/// sessions), and the `__ivm_` marker names are what the O(Δ) recognizer
+/// keys on — user SQL cannot produce them. Integer gaps only, one SESSION
+/// per query, and a GROUP BY that is anything but bare columns carrying
+/// both window bounds leaves the query untouched.
+pub fn rewrite_session_tvfs(sql: &str) -> Option<String> {
+    use sqlparser::ast::{Expr as SqlExpr, GroupByExpr, SelectItem, SetExpr, Statement};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let (start, end, args) = find_tvf(sql, "SESSION")?;
+    let parts = split_top_level_args(&args)?;
+    if parts.len() != 3 {
+        return None;
+    }
+    let (table, column) = parse_table_and_descriptor(parts.first()?, parts.get(1)?)?;
+    let gap: u64 = parts.get(2)?.parse().ok()?;
+    if gap == 0 {
+        return None;
+    }
+    // One SESSION only: a second TVF anywhere means this narrow rewrite does
+    // not understand the query.
+    if find_tvf(sql.get(end..)?, "SESSION").is_some() {
+        return None;
+    }
+
+    // Parse with a placeholder standing in for the TVF to read the GROUP BY.
+    let placeholder = {
+        let (before, after) = (sql.get(..start)?, sql.get(end..)?);
+        format!("{before}__ivm_session_ph{after}")
+    };
+    let statements = Parser::parse_sql(&GenericDialect {}, &placeholder).ok()?;
+    let [Statement::Query(q)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return None;
+    };
+    let bare_name = |e: &SqlExpr| -> Option<String> {
+        match e {
+            SqlExpr::Identifier(id) => Some(id.to_string()),
+            SqlExpr::CompoundIdentifier(ids) => ids.last().map(|id| id.to_string()),
+            _ => None,
+        }
+    };
+    let GroupByExpr::Expressions(group_exprs, modifiers) = &sel.group_by else {
+        return None;
+    };
+    if !modifiers.is_empty() {
+        return None;
+    }
+    let mut keys: Vec<String> = Vec::new();
+    let mut saw_start = false;
+    let mut saw_end = false;
+    for g in group_exprs {
+        let n = bare_name(g)?;
+        if n.eq_ignore_ascii_case("window_start") {
+            saw_start = true;
+        } else if n.eq_ignore_ascii_case("window_end") {
+            saw_end = true;
+        } else {
+            keys.push(n);
+        }
+    }
+    if !saw_start || !saw_end || keys.is_empty() {
+        return None;
+    }
+    // The projection must not reference the marker columns (impossible for
+    // user SQL, checked anyway so the namespace claim is enforced, not
+    // assumed).
+    for item in &sel.projection {
+        if let SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } = item
+            && let Some(n) = bare_name(e)
+            && n.starts_with("__ivm_")
+        {
+            return None;
+        }
+    }
+
+    let key_list = keys.join(", ");
+    let cascade = format!(
+        "(SELECT *, MIN({column}) OVER (PARTITION BY {key_list}, __ivm_sid) AS window_start, MAX({column}) OVER (PARTITION BY {key_list}, __ivm_sid) + {gap} AS window_end FROM (SELECT *, SUM(__ivm_snew) OVER (PARTITION BY {key_list} ORDER BY {column} ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS __ivm_sid FROM (SELECT *, CASE WHEN {column} - LAG({column}) OVER (PARTITION BY {key_list} ORDER BY {column}) >= {gap} THEN 1 ELSE 0 END AS __ivm_snew FROM {table}) AS __ivm_s1) AS __ivm_s2) AS {alias}",
+        alias = alias_of(&table),
+    );
+    let (before, after) = (sql.get(..start)?, sql.get(end..)?);
+    Some(format!("{before}{cascade}{after}"))
+}
+
 /// TOPNK-1: reinterpret the STREAMING dialect's per-key ranking idiom as
 /// standard SQL. The streaming surface spells "top n rows per group" as
 ///
@@ -520,5 +629,31 @@ mod tests {
         assert!(
             rewrite_streaming_topn("SELECT a, b FROM t GROUP BY a ORDER BY b LIMIT 1").is_none()
         );
+    }
+
+    #[test]
+    fn session_rewrites_to_the_lag_cascade_with_the_group_key() {
+        let sql = "SELECT bidder, COUNT(*) AS c \
+                   FROM SESSION(TABLE bid, DESCRIPTOR(\"dateTime\"), 10000) \
+                   GROUP BY bidder, window_start, window_end";
+        let out = rewrite_session_tvfs(sql).expect("rewrites");
+        assert!(out.contains("PARTITION BY bidder, __ivm_sid"), "{out}");
+        assert!(
+            out.contains(
+                "LAG(\"dateTime\") OVER (PARTITION BY bidder ORDER BY \"dateTime\") >= 10000"
+            ),
+            "the engine boundary convention is diff >= gap splits: {out}"
+        );
+        assert!(out.contains("+ 10000 AS window_end"), "{out}");
+        assert!(out.contains(") AS bid"), "{out}");
+    }
+
+    #[test]
+    fn session_refuses_without_a_key_or_with_proctime() {
+        assert!(rewrite_session_tvfs(
+            "SELECT COUNT(*) FROM SESSION(TABLE b, DESCRIPTOR(ts), 10)              GROUP BY window_start, window_end"
+        )
+        .is_none(), "no session key");
+        assert!(rewrite_session_tvfs("SELECT 1 FROM SESSION(TABLE b, PROCTIME(), 10)").is_none());
     }
 }

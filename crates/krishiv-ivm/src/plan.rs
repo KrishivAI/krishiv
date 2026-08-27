@@ -116,6 +116,19 @@ pub enum ViewPlan {
         op: krishiv_delta::operators::keyed_topn::IncrementalKeyedTopNOp,
         post: Option<MapOp>,
     },
+    /// SESSION-1: gap-session assignment per partition, recognized from the
+    /// `__ivm_snew` / `__ivm_sid` marker cascade the SESSION registration
+    /// rewrite produces (user SQL cannot name that namespace). The operator
+    /// holds each partition's event multiset, recomputes only the TOUCHED
+    /// partitions per tick — an insert can MERGE sessions and a retraction
+    /// can SPLIT one, so no per-row locality survives — and emits exactly
+    /// the cascade's relation (source ++ markers ++ window bounds), so the
+    /// SCHEMA-1 rule holds by construction. State is rebuildable from the
+    /// source: checkpoint carries nothing and restore re-seeds.
+    Sessionize {
+        source: String,
+        op: krishiv_delta::operators::session_window::IncrementalSessionizeOp,
+    },
     /// Incremental `ORDER BY … LIMIT k` (IVM-TOPN-1). Unlike a bare `ORDER BY`,
     /// a LIMIT changes *which rows are in the relation*, so this is a real
     /// stateful operator — it holds the whole relation in sort order because a
@@ -225,6 +238,7 @@ pub(crate) fn apply_chain_hop(
         }
         ViewPlan::Map { op, .. } => op.apply(delta),
         ViewPlan::FlatMap { ops, .. } => apply_flatmap(ops, delta),
+        ViewPlan::Sessionize { op, .. } => op.apply(delta),
         ViewPlan::TopN { op, .. } => op.apply(delta),
         // Unreachable by construction (the decomposer refuses joins and never
         // nests chains, and a keyed top-N is only ever built whole-view),
@@ -481,6 +495,10 @@ impl ViewPlan {
                 "incremental keyed top-N — per-partition ordered index, emits only the changed \
                  partitions' window slices"
             }
+            ViewPlan::Sessionize { .. } => {
+                "incremental sessionize — per-partition event multiset, recomputes and diffs \
+                 only the touched partitions' gap sessions (merge and split exact)"
+            }
             ViewPlan::Join { .. } => {
                 "incremental equi-join — symmetric hash trace; probes only the delta rows"
             }
@@ -537,6 +555,7 @@ impl ViewPlan {
             ViewPlan::TopN { .. } => None,
             ViewPlan::FlatMap { .. } => None,
             ViewPlan::KeyedTopN { .. } => None,
+            ViewPlan::Sessionize { .. } => None,
             // Frame every hop's state (stateless hops as an absent slot) so a
             // restore can put each accumulator back where it was. Framing the
             // count makes a chain-shape change detectable at restore: a
@@ -599,6 +618,7 @@ impl ViewPlan {
             ViewPlan::TopN { .. } => Ok(false),
             ViewPlan::FlatMap { .. } => Ok(false),
             ViewPlan::KeyedTopN { .. } => Ok(false),
+            ViewPlan::Sessionize { .. } => Ok(false),
             ViewPlan::Chain { hops, sides, .. } => {
                 let err =
                     |m: &str| krishiv_delta::DeltaError::Operator(format!("chain state: {m}"));
@@ -865,6 +885,13 @@ impl ViewPlan {
                     return Ok(Some(apply_keyed_topn(pre, op, post, delta)?));
                 }
             }
+            ViewPlan::Sessionize { source, op } => {
+                // Replaying the snapshot rebuilds every partition's event
+                // multiset; the emitted delta is the sessionized relation.
+                if let Some(delta) = seed_delta(source)? {
+                    return Ok(Some(op.apply(delta)?));
+                }
+            }
             // Traces store raw rows keyed on the equi columns; the BAND-1
             // residual and post-projection shape only the EMITTED delta, so
             // seeding ignores them — the trace a residual-filtered join needs
@@ -1027,6 +1054,7 @@ impl ViewPlan {
             ViewPlan::TopN { .. } => Ok(0),
             ViewPlan::FlatMap { .. } => Ok(0),
             ViewPlan::KeyedTopN { .. } => Ok(0),
+            ViewPlan::Sessionize { .. } => Ok(0),
             ViewPlan::DiffBased => Ok(0),
         }
     }
@@ -1653,6 +1681,16 @@ fn try_build_from_logical(
                 let aliases = aggregate_output_aliases(expr);
                 return build_agg_plan(agg, output_schema, available_schemas, &aliases);
             }
+            // SESSION-1: the sessionization cascade's top projection.
+            if plan
+                .schema()
+                .fields()
+                .iter()
+                .any(|f| f.name() == "__ivm_sid")
+                && let Some(built) = build_sessionize_plan(plan, output_schema, available_schemas)
+            {
+                return Some(built);
+            }
             // TOPNK-1: `SELECT <cols> … QUALIFY ROW_NUMBER() OVER
             // (PARTITION BY …) <= k` — the keyed top-N the streaming ranking
             // idiom rewrites to. Matched here because the SELECT list is this
@@ -1971,6 +2009,99 @@ fn build_map_plan(
             predicate,
         },
     })
+}
+
+/// SESSION-1: recognize the sessionization cascade the SESSION rewrite
+/// produces and build the sessionize plan. Gated on the `__ivm_snew` /
+/// `__ivm_sid` marker columns — only the engine's own rewrite writes that
+/// namespace — so the walk extracts what it needs (source, partition
+/// columns, timestamp, gap) and verifies structure only where a mistake
+/// would change the answer: the partition/order columns come from the LAG
+/// window itself, and the gap from the `window_end = max + gap` projection.
+fn build_sessionize_plan(
+    top: &LogicalPlan,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<ViewPlan> {
+    use datafusion::logical_expr::WindowFunctionDefinition;
+    use krishiv_delta::operators::session_window::IncrementalSessionizeOp;
+
+    let names: Vec<&str> = top
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().as_str())
+        .collect();
+    if !names.contains(&"__ivm_snew")
+        || !names.contains(&"__ivm_sid")
+        || !names.contains(&"window_start")
+        || !names.contains(&"window_end")
+    {
+        return None;
+    }
+    // The gap: the top projection's `window_end` expression is
+    // `max(...) + Int64(gap)` (possibly aliased).
+    let LogicalPlan::Projection(proj) = top else {
+        return None;
+    };
+    let mut gap: Option<i64> = None;
+    for e in &proj.expr {
+        let (inner, name) = match e {
+            Expr::Alias(a) => (a.expr.as_ref(), a.name.as_str()),
+            other => (other, ""),
+        };
+        if name == "window_end"
+            && let Expr::BinaryExpr(be) = inner
+            && be.op == datafusion::logical_expr::Operator::Plus
+            && let Expr::Literal(datafusion::scalar::ScalarValue::Int64(Some(g)), _) =
+                be.right.as_ref()
+        {
+            gap = Some(*g);
+        }
+    }
+    let gap = gap.filter(|g| *g > 0)?;
+    // Walk down to the LAG window (partition + order) and the source scan.
+    let mut node: &LogicalPlan = top;
+    let mut lag: Option<(&Vec<Expr>, &Vec<datafusion::logical_expr::SortExpr>)> = None;
+    let source: String = loop {
+        match node {
+            LogicalPlan::TableScan(ts) => break ts.table_name.table().to_string(),
+            LogicalPlan::Window(w) => {
+                if let [Expr::WindowFunction(wf)] = w.window_expr.as_slice()
+                    && let WindowFunctionDefinition::WindowUDF(udf) = &wf.fun
+                    && udf.name() == "lag"
+                {
+                    lag = Some((&wf.params.partition_by, &wf.params.order_by));
+                }
+                node = w.input.as_ref();
+            }
+            LogicalPlan::Projection(p) => node = p.input.as_ref(),
+            LogicalPlan::SubqueryAlias(sa) => node = sa.input.as_ref(),
+            _ => return None,
+        }
+    };
+    let (partition_by, order_by) = lag?;
+    let source_schema = available_schemas.get(&source)?;
+    let mut partition_cols = Vec::with_capacity(partition_by.len());
+    for pe in partition_by {
+        let Expr::Column(c) = pe else { return None };
+        partition_cols.push(source_schema.index_of(&c.name).ok()?);
+    }
+    let [order] = order_by.as_slice() else {
+        return None;
+    };
+    let Expr::Column(ts_c) = &order.expr else {
+        return None;
+    };
+    let ts_col = source_schema.index_of(&ts_c.name).ok()?;
+    let emitted: SchemaRef = Arc::new(top.schema().as_arrow().clone());
+    if !emits_declared_relation(&emitted, output_schema) {
+        return None;
+    }
+    let op =
+        IncrementalSessionizeOp::new(source_schema.clone(), emitted, partition_cols, ts_col, gap)
+            .ok()?;
+    Some(ViewPlan::Sessionize { source, op })
 }
 
 /// TOPNK-1: build an O(Δ) KEYED top-N for the one window-function shape the

@@ -137,6 +137,7 @@ async fn classify(
     for rewrite in [
         krishiv_ivm::window_rewrite::rewrite_tumble_tvfs,
         krishiv_ivm::window_rewrite::rewrite_hop_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_session_tvfs,
         krishiv_ivm::window_rewrite::rewrite_streaming_topn,
     ] {
         if let Some(r) = rewrite(&owned) {
@@ -229,14 +230,17 @@ const TPCH_INCREMENTAL: usize = 22;
 /// row_number and maintained by the per-partition ordered index), and the
 /// side-input join (q13 — KEYEXPR-1: the computed key `auction % 1000`
 /// hoisted into a TRY_CAST projection under the join's left input, the
-/// side table registered as the bounded source it is),
+/// side table registered as the bounded source it is), and gap sessions
+/// (q11 — SESSION-1: the TVF rewritten to a LAG cascade whose partition
+/// key comes from the GROUP BY, maintained by a per-partition sessionizer
+/// whose inserts MERGE sessions and retractions SPLIT them),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
 /// COUNT(DISTINCT col) per-value multiplicity by sharing MIN/MAX's value
 /// multiset). The remaining eight: HOP fans out 1:N, SESSION merges
 /// statefully, PROCTIME has no delta-batch meaning, q4/q9 window a derived
 /// join, q13 needs a side input, q18 needs row_number, q19 a per-window
 /// top-N.
-const NEXMARK_INCREMENTAL: usize = 18;
+const NEXMARK_INCREMENTAL: usize = 19;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
@@ -299,12 +303,13 @@ const TPCH_DECOMPOSED: usize = 22;
 /// rewrite, so it counted them Unplannable while the single-view gate
 /// counted them Incremental: an under-measurement, corrected when the gate
 /// started mirroring the FULL rewrite chain), and q5 (HOP-1's union fans as
-/// a FlatMap chain leaf), and q13 (KEYEXPR-1's key-bearing hop under the
-/// mid-chain join). q18/q19 maintain WHOLE (the keyed top-N is one
+/// a FlatMap chain leaf), q13 (KEYEXPR-1's key-bearing hop under the
+/// mid-chain join), and q11 (SESSION-1's cascade as a Sessionize chain
+/// leaf under the aggregate). q18/q19 maintain WHOLE (the keyed top-N is one
 /// operator with its pre/post maps riding it — nothing to cut), and the
 /// remaining single-table queries are single-operator or q8 (output repeats
 /// `id`).
-const NEXMARK_DECOMPOSED: usize = 11;
+const NEXMARK_DECOMPOSED: usize = 12;
 
 /// How many queries the engine can cut into a chain where EVERY hop maintains
 /// incrementally. `decompose` verifies each hop's plan itself and refuses
@@ -326,6 +331,7 @@ async fn measure_decomposed(
         for rewrite in [
             krishiv_ivm::window_rewrite::rewrite_tumble_tvfs,
             krishiv_ivm::window_rewrite::rewrite_hop_tvfs,
+            krishiv_ivm::window_rewrite::rewrite_session_tvfs,
             krishiv_ivm::window_rewrite::rewrite_streaming_topn,
         ] {
             if let Some(r) = rewrite(&owned) {
