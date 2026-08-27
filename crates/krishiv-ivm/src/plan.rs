@@ -911,24 +911,29 @@ pub async fn build_planned_view(
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
 ) -> PlannedView {
-    build_planned_view_impl(body_sql, output_schema, available_schemas, lateness, true).await
+    build_planned_view_impl(body_sql, output_schema, available_schemas, lateness).await
 }
 
-/// The single-operator matchers only — no chain attempt. This is what the
-/// decomposer verifies each hop with: a hop that would need its own chain
-/// means the cutting was wrong, and letting a hop re-enter chain-building
-/// recurses forever, because DataFusion replans an unparsed aggregate as
-/// `Projection(Aggregate)` — two cuts that reproduce themselves — so a
-/// refused aggregate hop would decompose into itself without terminating.
-pub(crate) async fn build_view_plan_single(
-    body_sql: &str,
+/// The single-operator matchers over a `LogicalPlan` directly — no SQL, no
+/// chain attempt. This is what the decomposer verifies each hop with
+/// (PLANHOP-1): a hop that would need its own chain means the cutting was
+/// wrong, and this function structurally cannot recurse into chain-building —
+/// it never touches `decompose`. Its predecessor round-tripped each hop
+/// through `plan_to_sql` + replan + re-decorrelation instead, which (a) put
+/// three lossy transformations between the plan the decomposer cut and the
+/// operator that ran (a semi hop verified only because the unparser renders
+/// it as EXISTS and the decorrelator then reran inside verification), and
+/// (b) made recursion termination an argument about replanned shapes rather
+/// than a structural property. Measured at the switch, the two paths agreed
+/// on every corpus query — the exact coverage gates pin that equivalence.
+pub(crate) fn build_view_plan_from_logical(
+    plan: &LogicalPlan,
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
 ) -> ViewPlan {
-    build_planned_view_impl(body_sql, output_schema, available_schemas, lateness, false)
-        .await
-        .plan
+    try_build_from_logical(plan, output_schema, available_schemas, lateness)
+        .unwrap_or(ViewPlan::DiffBased)
 }
 
 async fn build_planned_view_impl(
@@ -936,7 +941,6 @@ async fn build_planned_view_impl(
     output_schema: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
     lateness: &[krishiv_delta::LatenessSpec],
-    try_chain: bool,
 ) -> PlannedView {
     use datafusion::datasource::MemTable;
     let ctx = SessionContext::new();
@@ -963,10 +967,10 @@ async fn build_planned_view_impl(
     // into a chain of single-operator hops, each O(Δ). Gated on empty lateness
     // because hop plans are built without the view's lateness specs — passing
     // them through per hop is unexamined, and silently dropping them is the
-    // AUD-1 mistake. Recursion terminates: a hop's SQL is single-operator, so
-    // a nested attempt finds fewer than two cuts and refuses immediately.
-    if try_chain
-        && matches!(built, ViewPlan::DiffBased)
+    // AUD-1 mistake. Recursion terminates structurally: hop verification is
+    // [`build_view_plan_from_logical`], which never attempts a chain, so
+    // decomposition can never re-enter itself (PLANHOP-1).
+    if matches!(built, ViewPlan::DiffBased)
         && lateness.is_empty()
         && let Some(chain) =
             crate::decompose::decompose_into_chain(body_sql, output_schema, available_schemas).await
@@ -2280,7 +2284,7 @@ fn resolve_source_with_filters(plan: &LogicalPlan) -> Option<(String, Vec<Expr>)
 /// `Int64(1), key` wrapper). Sound because nothing of a membership side is
 /// emitted and a literal cannot be a join key, so the operator reading the
 /// raw source sees exactly the columns the keys and side filters name.
-fn resolve_semi_side_with_filters(plan: &LogicalPlan) -> Option<(String, Vec<Expr>)> {
+pub(crate) fn resolve_semi_side_with_filters(plan: &LogicalPlan) -> Option<(String, Vec<Expr>)> {
     match plan {
         LogicalPlan::TableScan(ts) if ts.filters.is_empty() => {
             Some((ts.table_name.table().to_string(), Vec::new()))

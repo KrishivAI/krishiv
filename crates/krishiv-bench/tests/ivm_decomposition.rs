@@ -83,11 +83,8 @@ async fn decomposed_matches_recompute(label: &str, table: &str, sql: &str) {
         .unwrap_or_else(|| panic!("{label}: refused to decompose"));
     println!("\n== {label} == {} hops", hops.len());
     for h in &hops {
-        println!(
-            "   {:<16} {}",
-            h.name,
-            &h.body_sql[..h.body_sql.len().min(120)]
-        );
+        let sql = h.body_sql.as_deref().unwrap_or("<no SQL rendering>");
+        println!("   {:<16} {}", h.name, &sql[..sql.len().min(120)]);
     }
     assert!(hops.len() >= 2, "{label}: a chain needs at least two hops");
     assert_eq!(
@@ -100,7 +97,13 @@ async fn decomposed_matches_recompute(label: &str, table: &str, sql: &str) {
     let subject = IncrementalFlow::new();
     for h in &hops {
         subject
-            .register_view(spec(&h.name, &h.body_sql, h.schema.clone()))
+            .register_view(spec(
+                &h.name,
+                h.body_sql
+                    .as_deref()
+                    .expect("this corpus decomposes into hops standard SQL can render"),
+                h.schema.clone(),
+            ))
             .unwrap();
     }
     // Oracle: the ORIGINAL query, recomputed whole.
@@ -429,4 +432,24 @@ async fn tpch_q9_registered_verbatim_maintains_incrementally() {
         &corpus_sql("q9"),
     )
     .await;
+}
+
+/// SEMI-2: q4 is `COUNT(*)` grouped above a correlated EXISTS — the
+/// decorrelated plan's leaf is a LeftSemi join whose membership side is a
+/// filtered projection of `lineitem`, admitted by the decomposer's guard
+/// through the same peeling the join builder uses (SEMI-1) and verified on
+/// the re-rooted plan itself (PLANHOP-1).
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q4_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q4", &["orders", "lineitem"], &corpus_sql("q4")).await;
+}
+
+/// SEMI-2: q16's chain carries a MID-CHAIN LeftAnti join (`NOT IN` over
+/// suppliers with complaints) above the partsupp ⋈ part leaf, with a
+/// COUNT(DISTINCT) aggregate on top — a membership level whose right side
+/// resolves through the same peeling the join builder uses (SEMI-1).
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q16_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q16", &["partsupp", "part", "supplier"], &corpus_sql("q16"))
+        .await;
 }

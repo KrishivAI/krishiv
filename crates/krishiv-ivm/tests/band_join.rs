@@ -355,3 +355,83 @@ async fn a_correlated_not_exists_maintains_as_an_anti_join() {
         "every auction gained a match; the anti relation is empty"
     );
 }
+
+/// SEMI-2: an aggregate ABOVE a correlated EXISTS — TPC-H q4's shape in
+/// miniature. The chain's leaf is a LeftSemi join whose right side is a
+/// membership relation, admitted by the decomposer's guard through the same
+/// resolver the join builder uses. The person retract must pull seller 7's
+/// auctions out of the COUNT through the chain (crossing down), and the
+/// reinsert must restore them (crossing up) — each tick compared against
+/// full recompute.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_above_exists_maintains_as_a_chain() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE EXISTS \
+               (SELECT 1 FROM person p WHERE p.pid = a.seller) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let p7 = persons(&[(7, 100, 0)]);
+    for (a, p, retract) in [
+        // Two auctions by seller 7, one by seller 8; only person 7 exists.
+        (
+            Some(auctions(&[(1, 7, 10), (2, 7, 11), (3, 8, 20)])),
+            Some(p7.clone()),
+            false,
+        ),
+        // Person 7 leaves: both of seller 7's auctions leave the COUNT.
+        (None, Some(p7.clone()), true),
+        // Person 7 returns: the group comes back at n = 2.
+        (None, Some(p7), false),
+    ] {
+        let mk = |b: &RecordBatch| {
+            if retract {
+                DeltaBatch::from_deletes(b.clone()).unwrap()
+            } else {
+                DeltaBatch::from_inserts(b.clone()).unwrap()
+            }
+        };
+        if let Some(a) = a {
+            subject.feed("auction", mk(&a)).unwrap();
+            oracle.feed("auction", mk(&a)).unwrap();
+        }
+        if let Some(p) = p {
+            subject.feed("person", mk(&p)).unwrap();
+            oracle.feed("person", mk(&p)).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+
+        let got = subject.snapshot("v").unwrap().expect("published");
+        let want = oracle.snapshot("v").unwrap().expect("published");
+        assert_eq!(
+            canonical(&got),
+            canonical(&want),
+            "the chain over a semi join disagreed with recompute"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "an aggregate above EXISTS must take the O(delta) path: {why}"
+    );
+    assert!(
+        why.contains("chain"),
+        "incremental but not via the chain: {why}"
+    );
+    assert_eq!(
+        canonical(&subject.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(7), Some(2)]],
+        "seller 7 re-entered at n = 2 on the crossing up; seller 8 never matched"
+    );
+}

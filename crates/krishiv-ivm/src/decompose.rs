@@ -20,11 +20,20 @@
 //!
 //! # The two mechanics that make a hop a real relation
 //!
-//! **Hops are re-rooted structurally, never textually.** A hop's SQL is
-//! produced by replacing the node's input with a scan of the hop below and
-//! unparsing the result — not by editing `FROM` in generated text, which
-//! breaks on a `FROM` inside a string literal and is the sort of mechanism
-//! that yields silently wrong answers.
+//! **Hops are re-rooted structurally, never textually.** A hop is produced
+//! by replacing the node's input with a scan of the hop below — never by
+//! editing `FROM` in generated text, which breaks on a `FROM` inside a
+//! string literal and is the sort of mechanism that yields silently wrong
+//! answers. The re-rooted plan is verified DIRECTLY by the single-operator
+//! matchers, and the verified plan is the operator that runs (PLANHOP-1).
+//! Verification used to round-trip each hop through `plan_to_sql` + replan +
+//! re-decorrelation instead — three lossy transformations between the plan
+//! the cutting logic reasoned about and the operator that ran, the exact
+//! seam behind q9's rename-leak saga (REORDER-1) — and, measured before the
+//! switch, byte-equivalent in outcome across the whole corpus (the exact
+//! coverage gates moved by nothing). A hop's SQL rendering is best-effort
+//! output for callers that register hops as standalone views; admission
+//! never depends on it.
 //!
 //! **The hop below is scanned under the original table's name.** A node's
 //! expressions carry qualified references (`lineitem.l_quantity`); pointing
@@ -49,14 +58,21 @@ use datafusion::datasource::MemTable;
 use datafusion::logical_expr::{Expr, Filter as LogicalFilter, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 
-use crate::plan::{ViewPlan, ViewPlanKind, build_view_plan_single};
+use crate::plan::{ViewPlan, ViewPlanKind, build_view_plan_from_logical};
 
 /// One hop: a single-operator query over the hop beneath it.
 #[derive(Debug, Clone)]
 pub struct Hop {
     /// Generated for intermediate hops; the caller's own name for the last.
     pub name: String,
-    pub body_sql: String,
+    /// Best-effort SQL rendering of the hop, for callers that register hops
+    /// as standalone views. `None` when DataFusion's unparser cannot render
+    /// the hop's plan — no current corpus hop hits this (the unparser renders
+    /// even a semi/anti join back to EXISTS / NOT EXISTS), but chain
+    /// admission must never depend on unparser coverage, so the type says so
+    /// (PLANHOP-1). The chain itself carries the verified plan and never
+    /// round-trips through SQL.
+    pub body_sql: Option<String>,
     /// What this hop emits, and therefore what the hop above may reference.
     pub schema: SchemaRef,
 }
@@ -453,25 +469,21 @@ pub async fn decompose(
 /// no generated view names, no separate checkpoint identities, no distributed
 /// attach questions — the chain checkpoints, restores and seeds through the
 /// view's own `ViewPlan` surface like every other plan.
-/// Returns a boxed, type-erased `Send` future rather than being an `async fn`:
-/// the call graph is recursive (plan builder → decompose → per-hop plan
-/// builder), and with concrete future types the compiler's `Send` proof
-/// becomes self-referential — every async caller up to the HTTP handlers then
-/// fails with "implementation of `Send` is not general enough". Erasing at
-/// the signature keeps the concrete recursive type out of every caller's
-/// state.
-pub(crate) fn decompose_into_chain<'a>(
-    body_sql: &'a str,
-    declared: &'a SchemaRef,
-    available_schemas: &'a AHashMap<String, SchemaRef>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<ViewPlan>> + Send + 'a>> {
-    Box::pin(async move {
-        let (source, _, plans) =
-            decompose_core("chain", body_sql, declared, available_schemas).await?;
-        Some(ViewPlan::Chain {
-            source,
-            hops: plans,
-        })
+/// A plain `async fn` since PLANHOP-1: hop verification is
+/// [`build_view_plan_from_logical`], which is synchronous and never re-enters
+/// the plan builder, so the call graph is no longer recursive and the boxed
+/// type-erased future this used to return (the recursive concrete type made
+/// the compiler's `Send` proof self-referential all the way up to the HTTP
+/// handlers) has nothing left to erase.
+pub(crate) async fn decompose_into_chain(
+    body_sql: &str,
+    declared: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<ViewPlan> {
+    let (source, _, plans) = decompose_core("chain", body_sql, declared, available_schemas).await?;
+    Some(ViewPlan::Chain {
+        source,
+        hops: plans,
     })
 }
 
@@ -509,7 +521,23 @@ async fn decompose_core(
                 if top_join.is_none() && !crate::plan::side_resolves_to_source(&j.left) {
                     return None;
                 }
-                if !crate::plan::side_resolves_to_source(&j.right) {
+                // SEMI-2: a semi/anti level's right side is a MEMBERSHIP
+                // relation — never emitted, so it may be a filtered projection
+                // over one source (the shape DataFusion's decorrelator
+                // produces for EXISTS / IN, SEMI-1) rather than a plain scan.
+                // The same resolver the join builder uses decides, so what
+                // this guard admits is exactly what the hop planner accepts.
+                let membership = matches!(
+                    j.join_type,
+                    datafusion::logical_expr::JoinType::LeftSemi
+                        | datafusion::logical_expr::JoinType::LeftAnti
+                );
+                let right_ok = if membership {
+                    crate::plan::resolve_semi_side_with_filters(&j.right).is_some()
+                } else {
+                    crate::plan::side_resolves_to_source(&j.right)
+                };
+                if !right_ok {
                     return None;
                 }
                 top_join = Some(n);
@@ -770,23 +798,29 @@ async fn decompose_core(
             (hop_name(view_name, i), body)
         };
 
-        let sql = datafusion::sql::unparser::plan_to_sql(&target)
-            .ok()?
-            .to_string();
         let schema: SchemaRef = if i == last && !topn_final {
             declared.clone()
         } else {
             Arc::new(target.schema().as_arrow().clone())
         };
 
-        // Per-hop verification against the schemas the flow will actually have.
-        // Anything short of a real O(delta) plan discards the whole chain —
-        // and the verified plan IS the hop's operator, kept rather than
-        // rebuilt, so what was checked is what runs.
-        let plan = build_view_plan_single(&sql, &schema, &visible, &[]).await;
+        // Per-hop verification against the schemas the flow will actually
+        // have, on the re-rooted plan ITSELF (PLANHOP-1) — not on an unparse
+        // + replan + re-decorrelate round trip, which reconstructs a
+        // different object than the one the cutting logic reasoned about
+        // (for a semi hop the old path only worked because the unparser
+        // renders it as EXISTS and the decorrelator then ran a SECOND time
+        // inside verification). Anything short of a real O(delta) plan
+        // discards the whole chain — and the verified plan IS the hop's
+        // operator, kept rather than rebuilt, so what was checked is what
+        // runs.
+        let plan = build_view_plan_from_logical(&target, &schema, &visible, &[]);
         if plan.kind() != ViewPlanKind::Incremental {
             return None;
         }
+        let sql = datafusion::sql::unparser::plan_to_sql(&target)
+            .ok()
+            .map(|s| s.to_string());
         plans.push(plan);
         visible.insert(name.clone(), schema.clone());
         hops.push(Hop {
@@ -811,13 +845,13 @@ async fn decompose_core(
             };
             top = r.with_new_exprs(exprs, vec![top]).ok()?;
         }
-        let sql = datafusion::sql::unparser::plan_to_sql(&top)
-            .ok()?
-            .to_string();
-        let plan = build_view_plan_single(&sql, declared, &visible, &[]).await;
+        let plan = build_view_plan_from_logical(&top, declared, &visible, &[]);
         if plan.kind() != ViewPlanKind::Incremental {
             return None;
         }
+        let sql = datafusion::sql::unparser::plan_to_sql(&top)
+            .ok()
+            .map(|s| s.to_string());
         plans.push(plan);
         hops.push(Hop {
             name: view_name.to_string(),
