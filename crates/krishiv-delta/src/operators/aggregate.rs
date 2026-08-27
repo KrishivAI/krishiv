@@ -251,9 +251,18 @@ struct AggState {
     /// unscaled `i128` at the input column's own scale. Exact, and the scale is
     /// invariant under addition, so no rescaling happens on the tick path.
     sum_i128: i128,
-    /// Row count for COUNT / empty-group detection. Also used as the non-null
-    /// input count for AVG when inputs are float (avg_is_integer == false).
+    /// Row count for COUNT. Also used as the non-null input count for AVG
+    /// when inputs are float (avg_is_integer == false). NOT a group-liveness
+    /// signal — see `rows`.
     count: i64,
+    /// COUNTNULL-1: the group's TRUE row weight, accumulated BEFORE any
+    /// null-exclusion. `count` used to double as empty-group detection, but
+    /// `COUNT(col)` and SUM/MIN/MAX skip NULL inputs without counting them —
+    /// so a group whose rows were all NULL in the aggregated column read as
+    /// empty and was GC'd, deleting a group SQL says exists (`COUNT(col) =
+    /// 0` over a LEFT JOIN's padding, q13's exact shape). Liveness reads
+    /// THIS field, which no null-skip can starve.
+    rows: i64,
     /// Integer-precision weighted sum for AVG over integer-typed inputs.
     avg_sum_i64: i64,
     /// DEC-1: exact weighted sum for AVG over `Decimal128` inputs. Separate
@@ -306,6 +315,9 @@ impl AggState {
         value: AggInput,
         weight: i64,
     ) -> DeltaResult<()> {
+        // COUNTNULL-1: the row is part of the group whatever its value — the
+        // per-aggregation null-exclusions below must not starve liveness.
+        self.rows += weight;
         // DEC-1: a poisoned accumulator never silently resumes.
         if self.overflow {
             return Err(DeltaError::Operator(format!(
@@ -985,7 +997,7 @@ impl IncrementalAggOp {
             // nothing where SQL says `count(*) = 0`.
             if !self.group_by.is_empty()
                 && let Some(states) = self.state.get(&key)
-                && states.iter().all(|s| s.count == 0)
+                && states.iter().all(|s| s.rows == 0)
             {
                 self.state.remove(&key);
             }
@@ -1015,7 +1027,7 @@ impl IncrementalAggOp {
             } else {
                 before_states
                     .as_ref()
-                    .map(|s| s.iter().any(|a| a.count != 0))
+                    .map(|s| s.iter().any(|a| a.rows != 0))
                     .unwrap_or(false)
             };
             let has_after = if global {
@@ -1023,7 +1035,7 @@ impl IncrementalAggOp {
             } else {
                 self.state
                     .get(key)
-                    .map(|s| s.iter().any(|a| a.count != 0))
+                    .map(|s| s.iter().any(|a| a.rows != 0))
                     .unwrap_or(false)
             };
 
@@ -1090,7 +1102,7 @@ impl IncrementalAggOp {
                 Ok(ipc) => Some(ipc),
                 Err(_) => {
                     let mut out = Vec::new();
-                    out.extend_from_slice(AGG_STATE_MAGIC_V3);
+                    out.extend_from_slice(AGG_STATE_MAGIC_V4);
                     out.push(1u8);
                     out.extend_from_slice(&0u32.to_le_bytes());
                     return out;
@@ -1101,7 +1113,7 @@ impl IncrementalAggOp {
         };
 
         let mut out = Vec::new();
-        out.extend_from_slice(AGG_STATE_MAGIC_V3);
+        out.extend_from_slice(AGG_STATE_MAGIC_V4);
         out.push(has_group_cols as u8);
         out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
         if let Some(ipc) = &group_ipc {
@@ -1123,7 +1135,8 @@ impl IncrementalAggOp {
     /// values are transferred. An unrecognized (non-v3) blob errors so the
     /// caller can fall back to seed-from-snapshots.
     pub fn restore_state_bytes(&mut self, bytes: &[u8]) -> DeltaResult<()> {
-        if !bytes.starts_with(AGG_STATE_MAGIC_V3) {
+        let v4 = bytes.starts_with(AGG_STATE_MAGIC_V4);
+        if !v4 && !bytes.starts_with(AGG_STATE_MAGIC_V3) {
             return Err(DeltaError::Operator(
                 "aggregate state blob is not format v3 (AUD-7, DEC-1); restore falls back to \
                  seed-from-snapshots"
@@ -1167,7 +1180,7 @@ impl IncrementalAggOp {
             let n_states = read_u32(bytes, &mut pos)? as usize;
             let mut states: Vec<AggState> = Vec::with_capacity(n_states);
             for _ in 0..n_states {
-                states.push(AggState::read_bytes(bytes, &mut pos)?);
+                states.push(AggState::read_bytes(bytes, &mut pos, v4)?);
             }
             state.insert(key, states);
         }
@@ -1344,6 +1357,10 @@ impl IncrementalAggOp {
 /// checkpoint and a plausible-looking wrong total — restore rejects it and the
 /// view reseeds from snapshots, which is slower and correct.
 const AGG_STATE_MAGIC_V3: &[u8; 5] = b"AGGS3";
+/// COUNTNULL-1 added `rows` to every serialized [`AggState`]. A V3 blob
+/// restores with `rows := count` — exactly the assumption the pre-fix code
+/// baked in, and the best information a V3 checkpoint carries.
+const AGG_STATE_MAGIC_V4: &[u8; 5] = b"AGGS4";
 
 /// Serialize a `RecordBatch` to a bare Arrow IPC stream (no magic — this is an
 /// internal, length-framed payload inside the aggregate-state blob).
@@ -1440,6 +1457,7 @@ impl AggState {
         out.extend_from_slice(&self.sum_i64.to_le_bytes());
         out.extend_from_slice(&self.sum_i128.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&self.rows.to_le_bytes());
         out.extend_from_slice(&self.avg_sum_i64.to_le_bytes());
         out.extend_from_slice(&self.avg_sum_i128.to_le_bytes());
         out.extend_from_slice(&self.avg_count_i64.to_le_bytes());
@@ -1464,11 +1482,14 @@ impl AggState {
         }
     }
 
-    fn read_bytes(bytes: &[u8], pos: &mut usize) -> DeltaResult<Self> {
+    fn read_bytes(bytes: &[u8], pos: &mut usize, v4: bool) -> DeltaResult<Self> {
         let sum = read_f64(bytes, pos)?;
         let sum_i64 = read_i64(bytes, pos)?;
         let sum_i128 = read_i128(bytes, pos)?;
         let count = read_i64(bytes, pos)?;
+        // COUNTNULL-1 (V4): the true row weight. A V3 blob predates the
+        // field; `count` is the assumption its writer baked in.
+        let rows = if v4 { read_i64(bytes, pos)? } else { count };
         let avg_sum_i64 = read_i64(bytes, pos)?;
         let avg_sum_i128 = read_i128(bytes, pos)?;
         let avg_count_i64 = read_i64(bytes, pos)?;
@@ -1494,6 +1515,7 @@ impl AggState {
         let distinct_pos = min_max_set.values().filter(|w| **w > 0).count() as i64;
         Ok(Self {
             sum,
+            rows,
             sum_i64,
             sum_i128,
             count,

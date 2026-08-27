@@ -700,3 +700,129 @@ async fn tpch_q2_registered_verbatim_maintains_incrementally() {
 async fn tpch_q15_registered_verbatim_maintains_incrementally() {
     verbatim_join_matches_recompute("q15", &["lineitem", "supplier"], &corpus_sql("q15")).await;
 }
+
+/// LEFTAGG-1 + COUNTNULL-1: q13's LEFT OUTER join carries its filter IN THE
+/// ON (`… AND o_comment NOT LIKE …`) — a right-side-only predicate that
+/// pre-filters orders without touching the padding — and the count
+/// distribution above depends on zero-count customers EXISTING, which the
+/// aggregate used to GC (a group whose counted column is all NULL read as
+/// empty). Half of customer arrives at the maintenance tick.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q13_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q13", &["customer", "orders"], &corpus_sql("q13")).await;
+}
+
+/// KEYLESS-1 + SEMI-2 + UNCORR-1 composed: q22's anti join (NOT EXISTS
+/// orders) and its uncorrelated `avg(c_acctbal)` side — joined KEYLESS,
+/// admissible because the side is a global aggregate (one row by
+/// construction). Half of customer arrives at the maintenance tick, moving
+/// the average and the anti-join membership through one step.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q22_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q22", &["customer", "orders"], &corpus_sql("q22")).await;
+}
+
+/// ORFACTOR-1: q19's WHERE is a three-arm disjunction, every arm repeating
+/// `p_partkey = l_partkey`, the shipmode IN-list and the shipinstruct
+/// equality — factored, the equality keys the trace and the arms' remainder
+/// filters pairs. The fixture answer is NULL (no row satisfies any arm), so
+/// the proof DRIVES one: a synthesized Brand#12 / SM CASE / size-3 part and
+/// a qty-5 AIR DELIVER-IN-PERSON lineitem land inside arm 1 (non-NULL
+/// asserted), then retract (NULL again).
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q19_registered_verbatim_maintains_incrementally() {
+    let ctx = fixture().await;
+    let sql = corpus_sql("q19");
+    let declared: SchemaRef = Arc::new(ctx.sql(&sql).await.unwrap().schema().as_arrow().clone());
+
+    let subject = IncrementalFlow::new();
+    subject
+        .register_view(spec("v", &sql, declared.clone()))
+        .unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec("v", &sql, declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let conform = |batch: RecordBatch, want: &SchemaRef| -> RecordBatch {
+        let cols: Vec<arrow::array::ArrayRef> = batch
+            .columns()
+            .iter()
+            .zip(want.fields())
+            .map(|(c, f)| arrow::compute::cast(c, f.data_type()).unwrap())
+            .collect();
+        RecordBatch::try_new(want.clone(), cols).unwrap()
+    };
+    let mut src_schemas: AHashMap<String, SchemaRef> = AHashMap::new();
+    for t in ["lineitem", "part"] {
+        src_schemas.insert(
+            t.to_string(),
+            Arc::new(ctx.table(t).await.unwrap().schema().as_arrow().clone()),
+        );
+    }
+    let feed_sql = |table: &'static str, q: String, retract: bool| {
+        let ctx = &ctx;
+        let subject = &subject;
+        let oracle = &oracle;
+        let src_schemas = &src_schemas;
+        let conform = &conform;
+        async move {
+            for batch in ctx.sql(&q).await.unwrap().collect().await.unwrap() {
+                let batch = conform(batch, &src_schemas[table]);
+                let d = if retract {
+                    DeltaBatch::from_deletes(batch).unwrap()
+                } else {
+                    DeltaBatch::from_inserts(batch).unwrap()
+                };
+                subject.feed(table, d.clone()).unwrap();
+                oracle.feed(table, d).unwrap();
+            }
+        }
+    };
+    let step_and_compare = |label: &'static str| {
+        let subject = &subject;
+        let oracle = &oracle;
+        async move {
+            let s = subject.step_datafusion().await.unwrap();
+            oracle.step_datafusion().await.unwrap();
+            assert!(s.errored_views.is_empty(), "{label}: {:?}", s.errored_views);
+            let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+            let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+            assert_eq!(got, want, "{label}: chain disagreed with recompute");
+            got
+        }
+    };
+
+    for t in ["lineitem", "part"] {
+        feed_sql(t, format!("SELECT * FROM {t}"), false).await;
+    }
+    let rows = step_and_compare("tick 1").await;
+    assert_eq!(rows, vec![vec!["".to_string()]], "fixture answer is NULL");
+
+    let part_row = "SELECT p_partkey * 0 + 888888 AS p_partkey, p_name, p_mfgr, \
+                    'Brand#12' AS p_brand, p_type, p_size * 0 + 3 AS p_size, \
+                    'SM CASE' AS p_container, p_retailprice, p_comment FROM part LIMIT 1";
+    let li_row = "SELECT l_orderkey, l_partkey * 0 + 888888 AS l_partkey, l_suppkey, \
+                  l_linenumber, l_quantity * 0 + 5 AS l_quantity, l_extendedprice, \
+                  l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, \
+                  l_receiptdate, 'DELIVER IN PERSON' AS l_shipinstruct, 'AIR' AS l_shipmode, \
+                  l_comment FROM lineitem LIMIT 1";
+    feed_sql("part", part_row.to_string(), false).await;
+    feed_sql("lineitem", li_row.to_string(), false).await;
+    let rows = step_and_compare("tick 2 (arm 1 satisfied)").await;
+    assert_ne!(
+        rows,
+        vec![vec!["".to_string()]],
+        "arm 1 must produce revenue"
+    );
+
+    feed_sql("lineitem", li_row.to_string(), true).await;
+    let rows = step_and_compare("tick 3 (retracted)").await;
+    assert_eq!(rows, vec![vec!["".to_string()]], "back to NULL");
+
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "q19: fell back to DiffBased: {why}");
+    assert!(why.contains("chain"), "q19: not via the chain: {why}");
+}

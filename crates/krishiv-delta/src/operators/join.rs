@@ -1034,7 +1034,16 @@ fn project_columns(batch: &RecordBatch, col_names: &[String]) -> DeltaResult<Rec
         .map(|&i| Arc::new(batch.schema().field(i).clone()))
         .collect();
     let cols: Vec<Arc<dyn Array>> = indices.iter().map(|&i| batch.column(i).clone()).collect();
-    Ok(RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?)
+    // KEYLESS-1: a keyless join projects ZERO key columns, and a zero-column
+    // batch must carry its row count explicitly — every row's key is the
+    // empty tuple, one group.
+    let opts =
+        arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+    Ok(RecordBatch::try_new_with_options(
+        Arc::new(Schema::new(fields)),
+        cols,
+        &opts,
+    )?)
 }
 
 fn keys_match(

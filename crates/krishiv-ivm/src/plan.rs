@@ -1096,7 +1096,7 @@ pub fn maybe_decorrelate(plan: LogicalPlan) -> LogicalPlan {
 }
 
 /// Is this subquery plan a GLOBAL aggregate — exactly one row, always?
-fn is_global_aggregate(plan: &LogicalPlan) -> bool {
+pub(crate) fn is_global_aggregate(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Projection(p) => is_global_aggregate(&p.input),
         LogicalPlan::SubqueryAlias(sa) => is_global_aggregate(&sa.input),
@@ -2055,6 +2055,16 @@ fn build_join_plan(
     // the trace stays keyed on the equi columns and the residual filters the
     // probe's output, which is linear and therefore delta-correct.
     let mut residual_conjuncts: Vec<Expr> = Vec::new();
+    // LEFTAGG-1: an ON conjunct whose columns are all RIGHT-side pushes to
+    // the right input BEFORE the probe, for LEFT OUTER too — `LEFT JOIN b ON
+    // k AND right_pred` is definitionally `LEFT JOIN (SELECT * FROM b WHERE
+    // right_pred) ON k`: rows of b failing the predicate simply never match,
+    // and the left side's padding is exactly what it was (q13's `o_comment
+    // NOT LIKE …`). A LEFT-side ON conjunct has NO such identity — a left
+    // row failing it is PADDED, not dropped, so pushing it to the left input
+    // would delete rows the query keeps; those stay residuals and refuse
+    // under LEFT OUTER as before.
+    let mut on_right_pushes: Vec<Expr> = Vec::new();
     if let Some(filter) = &join.filter {
         for conjunct in datafusion::logical_expr::utils::split_conjunction(filter) {
             let equi = match strip_alias(conjunct) {
@@ -2080,7 +2090,18 @@ fn build_join_plan(
                     left_key_cols.push(l);
                     right_key_cols.push(r);
                 }
-                None => residual_conjuncts.push((*conjunct).clone()),
+                None => {
+                    let cols = conjunct.column_refs();
+                    let all_right = !cols.is_empty()
+                        && cols
+                            .iter()
+                            .all(|c| join.right.schema().index_of_column(c).is_ok());
+                    if all_right {
+                        on_right_pushes.push((*conjunct).clone());
+                    } else {
+                        residual_conjuncts.push((*conjunct).clone());
+                    }
+                }
             }
         }
     }
@@ -2091,8 +2112,20 @@ fn build_join_plan(
     // join effectively inner) — both bail to DiffBased.
     let mut left_preds = left_side_preds;
     let mut right_preds = right_side_preds;
+    right_preds.extend(on_right_pushes);
     if let Some(filter) = outer_filter {
-        for conjunct in datafusion::logical_expr::utils::split_conjunction(filter) {
+        // ORFACTOR-1: a disjunction whose every arm repeats the same
+        // conjuncts (q19 repeats `p_partkey = l_partkey`, the shipmode IN
+        // list and the shipinstruct equality in all three arms) factors the
+        // common conjuncts out — `(k AND a1) OR (k AND a2)` ≡ `k AND (a1 OR
+        // a2)`, plain distributivity — so the equality can become the trace
+        // key and the OR-remainder a BAND-1 residual instead of the whole
+        // disjunction refusing the join for keylessness.
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        for c in datafusion::logical_expr::utils::split_conjunction(filter) {
+            conjuncts.extend(factor_common_from_or(c));
+        }
+        for conjunct in conjuncts.iter() {
             let cols = conjunct.column_refs();
             if cols.is_empty() {
                 return None;
@@ -2156,7 +2189,17 @@ fn build_join_plan(
     if !residual_conjuncts.is_empty() && incr_join_type != IncrJoinType::Inner {
         return None;
     }
-    if left_key_cols.is_empty() {
+    // KEYLESS-1: a join with no equi key is normally refused — a keyless
+    // trace is the O(N×M) cross product. The exception is an INNER join
+    // whose right side is an ENGINE-BUILT side relation (`__ivm_` names are
+    // outside user space): the decomposer admits a keyless side join only
+    // when the side's plan is a GLOBAL aggregate — one row by construction —
+    // so the "cross product" is left × 1, the shape an uncorrelated scalar
+    // comparison takes (UNCORR-1's q22 `c_acctbal > avg(…)`). Empty key
+    // vectors make the operator a single group, which is exactly right.
+    if left_key_cols.is_empty()
+        && !(incr_join_type == IncrJoinType::Inner && right_source.starts_with("__ivm_"))
+    {
         return None;
     }
 
@@ -2352,6 +2395,79 @@ pub(crate) fn side_resolves_to_source(plan: &LogicalPlan) -> bool {
 }
 
 /// Peel `Alias` wrappers off an expression (planners wrap freely).
+/// ORFACTOR-1: factor conjuncts common to EVERY arm of a disjunction out of
+/// it — `(k AND a) OR (k AND b)` ≡ `k AND (a OR b)`, plain distributivity.
+/// Returns the replacement conjunct list for `conjunct` (itself, when there
+/// is nothing to factor). An arm equal to the common set alone subsumes the
+/// disjunction entirely (`k OR (k AND a)` ≡ `k`), so the OR-remainder is
+/// dropped in that case.
+fn factor_common_from_or(conjunct: &Expr) -> Vec<Expr> {
+    use datafusion::logical_expr::Operator;
+    fn flatten_or(e: &Expr, arms: &mut Vec<Expr>) {
+        if let Expr::BinaryExpr(be) = e
+            && be.op == Operator::Or
+        {
+            flatten_or(&be.left, arms);
+            flatten_or(&be.right, arms);
+        } else {
+            arms.push(e.clone());
+        }
+    }
+    let mut arms = Vec::new();
+    flatten_or(conjunct, &mut arms);
+    if arms.len() < 2 {
+        return vec![conjunct.clone()];
+    }
+    let arm_sets: Vec<Vec<Expr>> = arms
+        .iter()
+        .map(|a| {
+            datafusion::logical_expr::utils::split_conjunction(a)
+                .into_iter()
+                .cloned()
+                .collect()
+        })
+        .collect();
+    let Some(first) = arm_sets.first() else {
+        return vec![conjunct.clone()];
+    };
+    let common: Vec<Expr> = first
+        .iter()
+        .filter(|c| arm_sets.iter().all(|set| set.contains(c)))
+        .cloned()
+        .collect();
+    if common.is_empty() {
+        return vec![conjunct.clone()];
+    }
+    let mut residual_arms: Vec<Expr> = Vec::new();
+    let mut any_arm_fully_common = false;
+    for set in &arm_sets {
+        let mut used = vec![false; common.len()];
+        let mut rest: Vec<Expr> = Vec::new();
+        'c: for c in set {
+            for (i, k) in common.iter().enumerate() {
+                if let Some(u) = used.get_mut(i)
+                    && !*u
+                    && c == k
+                {
+                    *u = true;
+                    continue 'c;
+                }
+            }
+            rest.push(c.clone());
+        }
+        match rest.into_iter().reduce(|a, b| a.and(b)) {
+            Some(r) => residual_arms.push(r),
+            None => any_arm_fully_common = true,
+        }
+    }
+    let mut out = common;
+    if !any_arm_fully_common && let Some(or_rest) = residual_arms.into_iter().reduce(|a, b| a.or(b))
+    {
+        out.push(or_rest);
+    }
+    out
+}
+
 fn strip_alias(expr: &Expr) -> &Expr {
     match expr {
         Expr::Alias(alias) => strip_alias(&alias.expr),

@@ -1014,3 +1014,205 @@ async fn an_aggregate_above_an_uncorrelated_scalar_maintains_as_a_chain() {
         "incremental but not via the chain: {why}"
     );
 }
+
+/// LEFTAGG-1: COUNT over a LEFT OUTER join whose ON carries a RIGHT-side
+/// predicate — q13's shape in miniature. `ON pid = seller AND ts > 10`
+/// pre-filters auctions without touching the padding: person 8 counts 0 and
+/// STAYS a row. Tick 2 retracts person 7's only qualifying auction — the
+/// count drops to 0 but the group must remain (padding, not deletion);
+/// tick 3 gives person 8 its first match.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_left_outer_count_with_an_on_side_predicate_maintains() {
+    let sql = "SELECT pid, COUNT(id) AS n FROM person p LEFT JOIN auction a \
+               ON p.pid = a.seller AND a.ts > 10 GROUP BY pid";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("pid", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let qualifying = auctions(&[(2, 7, 20)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // (1,7,5) fails ts > 10; only (2,7,20) counts. Person 8 pads to 0.
+        &[(7, 1), (8, 0)],
+        // The qualifying auction retracts: person 7 drops to 0 but REMAINS.
+        &[(7, 0), (8, 0)],
+        // Person 8's first match.
+        &[(7, 0), (8, 1)],
+    ];
+    for (i, (a, p, retract)) in [
+        (
+            Some(auctions(&[(1, 7, 5), (2, 7, 20)])),
+            Some(persons(&[(7, 100, 0), (8, 200, 0)])),
+            false,
+        ),
+        (Some(qualifying), None, true),
+        (Some(auctions(&[(3, 8, 30)])), None, false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mk = |b: &RecordBatch| {
+            if retract {
+                DeltaBatch::from_deletes(b.clone()).unwrap()
+            } else {
+                DeltaBatch::from_inserts(b.clone()).unwrap()
+            }
+        };
+        if let Some(a) = a {
+            subject.feed("auction", mk(&a)).unwrap();
+            oracle.feed("auction", mk(&a)).unwrap();
+        }
+        if let Some(p) = p {
+            subject.feed("person", mk(&p)).unwrap();
+            oracle.feed("person", mk(&p)).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(
+            got, want,
+            "tick {i}: LEFT OUTER count disagreed with recompute"
+        );
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(p, n)| vec![Some(*p), Some(*n)])
+            .collect();
+        assert_eq!(got, expect, "tick {i}: padding did not hold");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}
+
+/// ORFACTOR-1: a disjunction whose every arm repeats the join key — q19's
+/// shape in miniature. `(seller = pid AND city = 100) OR (seller = pid AND
+/// city = 200)` factors to `seller = pid AND (city = 100 OR city = 200)`,
+/// so the equality keys the trace and the OR-remainder filters pairs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_or_with_a_common_key_factors_and_maintains() {
+    let sql = "SELECT a.id, a.ts FROM auction a, person p WHERE \
+               (a.seller = p.pid AND p.city = 100) OR \
+               (a.seller = p.pid AND p.city = 200)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    for (a, p) in [
+        // Sellers 7 (city 100 — arm 1), 8 (city 300 — neither arm), and
+        // 9 (city 200 — arm 2).
+        (
+            Some(auctions(&[(1, 7, 10), (2, 8, 20), (3, 9, 30)])),
+            Some(persons(&[(7, 100, 0), (8, 300, 0), (9, 200, 0)])),
+        ),
+        // A second auction for the never-matching seller stays out.
+        (Some(auctions(&[(4, 8, 40)])), None),
+    ] {
+        if let Some(a) = a {
+            let d = DeltaBatch::from_inserts(a).unwrap();
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        if let Some(p) = p {
+            let d = DeltaBatch::from_inserts(p).unwrap();
+            subject.feed("person", d.clone()).unwrap();
+            oracle.feed("person", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        assert_eq!(
+            canonical(&subject.snapshot("v").unwrap().expect("published")),
+            canonical(&oracle.snapshot("v").unwrap().expect("published")),
+            "factored OR disagreed with recompute"
+        );
+    }
+    assert_eq!(
+        canonical(&subject.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(1), Some(10)], vec![Some(3), Some(30)]],
+        "arms 1 and 2 match; the city-300 seller never does"
+    );
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "a factored OR must take the O(delta) path: {why}");
+}
+
+/// KEYLESS-1: an aggregate above `ts < (SELECT AVG(ts) …)` — q22's shape in
+/// miniature. The `<` comparison against the one-row side leaves NO equi
+/// key: the join runs as a single group, sound because the side is a GLOBAL
+/// aggregate (one row by construction). Tick 2 drags the average up and
+/// rows CROSS INTO the view; tick 3 pulls it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_above_a_keyless_singleton_side_maintains() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE ts < \
+               (SELECT AVG(ts) FROM auction) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let heavy = auctions(&[(4, 9, 1000)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // avg = 20: ts 10 is below → seller 7 counts 1.
+        &[(7, 1)],
+        // +1000: avg = 265 → ts 10, 20, 30 all below.
+        &[(7, 2), (8, 1)],
+        // retracted: back to avg 20.
+        &[(7, 1)],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 7, 10), (2, 7, 20), (3, 8, 30)])), false),
+        (Some(heavy.clone()), false),
+        (Some(heavy), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "tick {i}: keyless side disagreed with recompute");
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(s, n)| vec![Some(*s), Some(*n)])
+            .collect();
+        assert_eq!(got, expect, "tick {i}: the shifting average did not cross");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}

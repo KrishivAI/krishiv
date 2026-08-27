@@ -300,7 +300,13 @@ fn explicit_projection_side_aware(
             .iter()
             .filter_map(|(q, _)| q.map(|t| t.to_string()))
             .collect();
-        if right_quals.iter().any(|q| side_names.contains(q)) {
+        // LEFTAGG-1: a LEFT OUTER cut must ALSO skip its right keys — the
+        // operator drops them, and the reference-rewrite that re-derives a
+        // dropped right key from its left pair is exact only for INNER (an
+        // unmatched padded row has a NULL right key against a non-NULL left
+        // one), so projecting the key would refuse the hop outright (q13).
+        let left_outer = j.join_type == datafusion::logical_expr::JoinType::Left;
+        if left_outer || right_quals.iter().any(|q| side_names.contains(q)) {
             let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (_, r) in &j.on {
                 if let Expr::Column(c) = r {
@@ -330,7 +336,7 @@ fn explicit_projection_side_aware(
             }
             for (q, f) in j.right.schema().iter() {
                 if let Some(q) = q
-                    && side_names.contains(&q.to_string())
+                    && (left_outer || side_names.contains(&q.to_string()))
                     && keys.contains(f.name())
                 {
                     skip.insert((q.to_string(), f.name().clone()));
@@ -666,7 +672,25 @@ async fn decompose_core(
     let plan = crate::plan::maybe_decorrelate(ctx.sql(body_sql).await.ok()?.logical_plan().clone());
     // Two cuts minimum for a registered view: one operator is what the
     // planner already handles, so cutting buys nothing.
-    decompose_plan(view_name, &plan, declared, available_schemas, 2)
+    //
+    // The cutting engine runs on its OWN thread with a deep stack: per-hop
+    // verification recurses through DataFusion's type coercion and physical
+    // planning for every cut, and a wide predicate (q19's three-arm
+    // disjunction over a dozen conjuncts each) blows the default worker
+    // stack at the depth the flow's tick path calls this from — measured as
+    // a coordinator-killing SIGABRT, not a refusal. Plan-time only, once
+    // per chain build, and scoped so the borrowed inputs need no cloning.
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("ivm-decompose".into())
+            .stack_size(64 * 1024 * 1024)
+            .spawn_scoped(scope, || {
+                decompose_plan(view_name, &plan, declared, available_schemas, 2)
+            })
+            .ok()?
+            .join()
+            .ok()?
+    })
 }
 
 /// The synchronous cutting engine (SIDE-3): everything after SQL planning.
@@ -1094,6 +1118,42 @@ fn decompose_plan(
         };
         if !needs_side {
             continue;
+        }
+        // KEYLESS-1 policy: a level with no cross-side equality ANYWHERE (no
+        // ON pairs, no equi in the join filter, none in its distributed
+        // WHERE pred) joins its side as a single group. That is admitted
+        // only when the side is a GLOBAL aggregate — one row by
+        // construction, so the "cross product" is left × 1 (an uncorrelated
+        // scalar comparison, UNCORR-1) — and refused for any multi-row side,
+        // which would be the O(N×M) blowup the planner refuses everywhere
+        // else.
+        if !membership {
+            let mut keyed = !join.on.is_empty();
+            let scan_equi = |e: &Expr| {
+                for conjunct in datafusion::logical_expr::utils::split_conjunction(e) {
+                    if let Expr::BinaryExpr(be) = conjunct
+                        && be.op == datafusion::logical_expr::Operator::Eq
+                        && let (Expr::Column(a), Expr::Column(b)) =
+                            (be.left.as_ref(), be.right.as_ref())
+                    {
+                        let a_left = join.left.schema().index_of_column(a).is_ok();
+                        let b_left = join.left.schema().index_of_column(b).is_ok();
+                        if a_left != b_left {
+                            return true;
+                        }
+                    }
+                }
+                false
+            };
+            if let Some(f) = &join.filter {
+                keyed = keyed || scan_equi(f);
+            }
+            if let Some(pdr) = &pred {
+                keyed = keyed || scan_equi(pdr);
+            }
+            if !keyed && !crate::plan::is_global_aggregate(&join.right) {
+                return None;
+            }
         }
         let (side, records) = decompose_side(view_name, sides.len(), &join.right, &mut visible)?;
         let side_schema = visible.get(&side.name)?.clone();
