@@ -227,7 +227,7 @@ impl IncrementalTopNOp {
     }
 }
 
-fn append_weights(batch: &RecordBatch, weights: &[i64]) -> DeltaResult<RecordBatch> {
+pub(crate) fn append_weights(batch: &RecordBatch, weights: &[i64]) -> DeltaResult<RecordBatch> {
     use arrow::array::{ArrayRef, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     let mut columns: Vec<ArrayRef> = batch.columns().to_vec();

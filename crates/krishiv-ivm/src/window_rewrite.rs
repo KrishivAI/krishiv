@@ -62,12 +62,253 @@ fn alias_of(table: &str) -> &str {
 /// `(start, end, table, column, size)`. Case-insensitive on keywords;
 /// identifiers are taken verbatim (quoting preserved).
 fn find_tumble(sql: &str) -> Option<(usize, usize, String, String, u64)> {
+    find_tvf(sql, "TUMBLE").and_then(|(start, end, args)| {
+        parse_tumble_args(&args).map(|(t, c, n)| (start, end, t, c, n))
+    })
+}
+
+/// HOP-1: rewrite every integer `HOP(TABLE t, DESCRIPTOR(col), slide, size)`
+/// into a UNION ALL of `size / slide` phase-shifted TUMBLE-style derived
+/// tables — a row at time `t` belongs to exactly the windows starting at
+/// `t - t % slide - k*slide` for `k in 0..size/slide` (each start is ≤ t and
+/// `t - start = t % slide + k*slide < size`), so the union IS the hopping
+/// window relation with no filter and no duplicates. Union-all is linear over
+/// Z-sets, which is what lets the fan-out maintain O(Δ) as a FlatMap.
+///
+/// Deliberately narrow, like TUMBLE: integer slide/size only, and `size`
+/// must be a positive multiple of `slide` (a non-multiple hop needs a window
+/// calendar, not a phase shift). Anything else is left untouched — the query
+/// stays as unplannable as it was, which is honest.
+pub fn rewrite_hop_tvfs(sql: &str) -> Option<String> {
+    let mut current = sql.to_owned();
+    let mut rewrote = false;
+    for _ in 0..16 {
+        let Some((start, end, args)) = find_tvf(&current, "HOP") else {
+            break;
+        };
+        let Some((table, column, slide, size)) = parse_hop_args(&args) else {
+            break;
+        };
+        let branches: Vec<String> = (0..size / slide)
+            .map(|k| {
+                let shift = k * slide;
+                let ws = if shift == 0 {
+                    format!("{column} - {column} % {slide}")
+                } else {
+                    format!("{column} - {column} % {slide} - {shift}")
+                };
+                format!("SELECT *, {ws} AS window_start, {ws} + {size} AS window_end FROM {table}")
+            })
+            .collect();
+        let replacement = format!(
+            "({}) AS {alias}",
+            branches.join(" UNION ALL "),
+            alias = alias_of(&table),
+        );
+        let (Some(before), Some(after)) = (current.get(..start), current.get(end..)) else {
+            break;
+        };
+        let mut next = before.to_owned();
+        next.push_str(&replacement);
+        next.push_str(after);
+        current = next;
+        rewrote = true;
+    }
+    rewrote.then_some(current)
+}
+
+fn parse_hop_args(args: &str) -> Option<(String, String, u64, u64)> {
+    let parts = split_top_level_args(args)?;
+    if parts.len() != 4 {
+        return None;
+    }
+    let (table, column) = parse_table_and_descriptor(parts.first()?, parts.get(1)?)?;
+    let slide: u64 = parts.get(2)?.parse().ok()?;
+    let size: u64 = parts.get(3)?.parse().ok()?;
+    // A zero slide never advances; a non-multiple size has no phase-shift
+    // decomposition; and an absurd fan-out (size/slide branches) would plan
+    // a query no one meant — 64 copies is already generous.
+    if slide == 0 || size == 0 || !size.is_multiple_of(slide) || size / slide > 64 {
+        return None;
+    }
+    Some((table, column, slide, size))
+}
+
+/// TOPNK-1: reinterpret the STREAMING dialect's per-key ranking idiom as
+/// standard SQL. The streaming surface spells "top n rows per group" as
+///
+/// ```sql
+/// SELECT auction, bidder, price FROM <windowed>
+/// GROUP BY auction, window_start, window_end ORDER BY price DESC LIMIT 10
+/// ```
+///
+/// — which standard SQL REJECTS (`bidder`/`price` are neither grouped nor
+/// aggregated), so the rewrite can never change the meaning of a query the
+/// batch planner accepts: it claims only what was unplannable. The same
+/// relation in standard SQL is
+///
+/// ```sql
+/// SELECT auction, bidder, price FROM <windowed>
+/// QUALIFY ROW_NUMBER() OVER (PARTITION BY auction, window_start,
+///                            window_end ORDER BY price DESC) <= 10
+/// ```
+///
+/// Deliberately narrow: the whole query must be one plain SELECT whose
+/// projection, GROUP BY and ORDER BY are all bare column references, the
+/// GROUP BY must carry `window_start` AND `window_end` (the marker that the
+/// query came through a window TVF — this dialect exists nowhere else), the
+/// LIMIT must be a positive integer, and at least one projected column must
+/// be absent from the GROUP BY (the proof the query is NOT standard SQL).
+/// Anything else is left untouched.
+pub fn rewrite_streaming_topn(sql: &str) -> Option<String> {
+    use sqlparser::ast::{
+        Expr as SqlExpr, GroupByExpr, LimitClause, OrderByKind, SelectItem, SetExpr, Statement,
+        Value,
+    };
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).ok()?;
+    let [Statement::Query(q)] = statements.as_slice() else {
+        return None;
+    };
+    if q.with.is_some() || q.fetch.is_some() {
+        return None;
+    }
+    let SetExpr::Select(sel) = q.body.as_ref() else {
+        return None;
+    };
+    if sel.distinct.is_some()
+        || sel.having.is_some()
+        || sel.qualify.is_some()
+        || sel.top.is_some()
+        || !sel.lateral_views.is_empty()
+        || !sel.named_window.is_empty()
+        || !sel.cluster_by.is_empty()
+        || !sel.distribute_by.is_empty()
+        || !sel.sort_by.is_empty()
+        || sel.from.len() != 1
+    {
+        return None;
+    }
+    // A bare (possibly qualified) column reference, by its unqualified name.
+    let bare_name = |e: &SqlExpr| -> Option<String> {
+        match e {
+            SqlExpr::Identifier(id) => Some(id.value.clone()),
+            SqlExpr::CompoundIdentifier(ids) => ids.last().map(|id| id.value.clone()),
+            _ => None,
+        }
+    };
+    let GroupByExpr::Expressions(group_exprs, modifiers) = &sel.group_by else {
+        return None;
+    };
+    if group_exprs.is_empty() || !modifiers.is_empty() {
+        return None;
+    }
+    let group_names = group_exprs
+        .iter()
+        .map(bare_name)
+        .collect::<Option<Vec<_>>>()?;
+    if !group_names
+        .iter()
+        .any(|n| n.eq_ignore_ascii_case("window_start"))
+        || !group_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case("window_end"))
+    {
+        return None;
+    }
+    let order_by = q.order_by.as_ref()?;
+    let OrderByKind::Expressions(order_exprs) = &order_by.kind else {
+        return None;
+    };
+    if order_exprs.is_empty() || order_by.interpolate.is_some() {
+        return None;
+    }
+    for oe in order_exprs {
+        bare_name(&oe.expr)?;
+    }
+    let LimitClause::LimitOffset {
+        limit: Some(limit_expr),
+        offset: None,
+        limit_by,
+    } = q.limit_clause.as_ref()?
+    else {
+        return None;
+    };
+    if !limit_by.is_empty() {
+        return None;
+    }
+    let SqlExpr::Value(v) = limit_expr else {
+        return None;
+    };
+    let Value::Number(n, _) = &v.value else {
+        return None;
+    };
+    let k: u64 = n.parse().ok()?;
+    if k == 0 {
+        return None;
+    }
+    // Every projected item must be a bare column; at least one must be
+    // OUTSIDE the GROUP BY, or the query was standard SQL all along and is
+    // not this rewrite's to claim.
+    let mut ungrouped = false;
+    for item in &sel.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => e,
+            SelectItem::ExprWithAlias { expr, .. } => expr,
+            _ => return None,
+        };
+        let name = bare_name(expr)?;
+        if !group_names.iter().any(|g| g == &name) {
+            ungrouped = true;
+        }
+    }
+    if !ungrouped {
+        return None;
+    }
+
+    let projection = sel
+        .projection
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let from = sel
+        .from
+        .iter()
+        .map(|f| f.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let where_clause = sel
+        .selection
+        .as_ref()
+        .map(|w| format!(" WHERE {w}"))
+        .unwrap_or_default();
+    let partition = group_exprs
+        .iter()
+        .map(|e| e.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ranking = order_exprs
+        .iter()
+        .map(|o| o.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "SELECT {projection} FROM {from}{where_clause} QUALIFY ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {ranking}) <= {k}"
+    ))
+}
+
+/// Find the next `<name>(...)` TVF call at a word boundary, returning
+/// `(start, one_past_close, args)`.
+fn find_tvf(sql: &str, name: &str) -> Option<(usize, usize, String)> {
     let upper = sql.to_uppercase();
     let bytes = sql.as_bytes();
     let mut search_from = 0;
-    while let Some(rel) = upper.get(search_from..).and_then(|s| s.find("TUMBLE")) {
+    while let Some(rel) = upper.get(search_from..).and_then(|s| s.find(name)) {
         let start = search_from + rel;
-        search_from = start + 6;
+        search_from = start + name.len();
         // Word boundary on the left (not e.g. `my_tumble`).
         if start > 0
             && let Some(&prev) = bytes.get(start - 1)
@@ -76,7 +317,7 @@ fn find_tumble(sql: &str) -> Option<(usize, usize, String, String, u64)> {
             continue;
         }
         // Opening paren (allow whitespace).
-        let mut i = start + 6;
+        let mut i = start + name.len();
         while bytes.get(i).is_some_and(|b| (*b as char).is_whitespace()) {
             i += 1;
         }
@@ -98,18 +339,30 @@ fn find_tumble(sql: &str) -> Option<(usize, usize, String, String, u64)> {
         }
         let end = j; // one past the closing paren
         let args = sql.get(args_start..end.checked_sub(1)?)?;
-        if let Some(parsed) = parse_tumble_args(args) {
-            return Some((start, end, parsed.0, parsed.1, parsed.2));
-        }
-        // Unsupported argument shape (interval string, PROCTIME): leave it —
-        // the query stays as unplannable as it was, which is honest.
+        // An unsupported argument shape (interval string, PROCTIME) is left
+        // in place — the query stays as unplannable as it was, which is
+        // honest — so the caller decides parseability, not the finder.
+        return Some((start, end, args.to_owned()));
     }
     None
 }
 
 fn parse_tumble_args(args: &str) -> Option<(String, String, u64)> {
-    // Split on top-level commas only (DESCRIPTOR(...) contains none today,
-    // but stay paren-aware anyway).
+    let parts = split_top_level_args(args)?;
+    if parts.len() != 3 {
+        return None;
+    }
+    let (table, column) = parse_table_and_descriptor(parts.first()?, parts.get(1)?)?;
+    let size: u64 = parts.get(2)?.parse().ok()?;
+    if size == 0 {
+        return None;
+    }
+    Some((table, column, size))
+}
+
+/// Split on top-level commas only (DESCRIPTOR(...) contains none today,
+/// but stay paren-aware anyway).
+fn split_top_level_args(args: &str) -> Option<Vec<String>> {
     let mut parts: Vec<String> = Vec::new();
     let mut depth = 0usize;
     let mut cur = String::new();
@@ -131,17 +384,15 @@ fn parse_tumble_args(args: &str) -> Option<(String, String, u64)> {
         }
     }
     parts.push(cur.trim().to_owned());
-    if parts.len() != 3 {
-        return None;
-    }
+    Some(parts)
+}
 
-    let table = parts
-        .first()?
+fn parse_table_and_descriptor(table_arg: &str, descriptor: &str) -> Option<(String, String)> {
+    let table = table_arg
         .strip_prefix("TABLE ")
-        .or_else(|| parts.first()?.strip_prefix("table "))?
+        .or_else(|| table_arg.strip_prefix("table "))?
         .trim()
         .to_owned();
-    let descriptor = parts.get(1)?;
     let upper = descriptor.to_uppercase();
     if !upper.starts_with("DESCRIPTOR") {
         return None;
@@ -161,11 +412,7 @@ fn parse_tumble_args(args: &str) -> Option<(String, String, u64)> {
     } else {
         format!("\"{column}\"")
     };
-    let size: u64 = parts.get(2)?.parse().ok()?;
-    if size == 0 {
-        return None;
-    }
-    Some((table, column, size))
+    Some((table, column))
 }
 
 #[cfg(test)]
@@ -213,5 +460,65 @@ mod tests {
     fn an_interval_string_size_is_refused_not_mangled() {
         let sql = "SELECT k FROM TUMBLE(TABLE t, DESCRIPTOR(ts), '10 seconds') GROUP BY k";
         assert!(rewrite_tumble_tvfs(sql).is_none());
+    }
+
+    #[test]
+    fn hop_fans_into_phase_shifted_union_branches() {
+        let sql = "SELECT auction, COUNT(*) AS c \
+                   FROM HOP(TABLE bid, DESCRIPTOR(\"dateTime\"), 2000, 10000) \
+                   GROUP BY auction, window_start, window_end";
+        let out = rewrite_hop_tvfs(sql).expect("rewrites");
+        assert_eq!(out.matches("UNION ALL").count(), 4, "5 branches: {out}");
+        assert!(out.contains("\"dateTime\" - \"dateTime\" % 2000 AS window_start"));
+        assert!(out.contains("\"dateTime\" - \"dateTime\" % 2000 - 8000 AS window_start"));
+        assert!(out.contains("- 8000 + 10000 AS window_end"));
+        assert!(out.contains(") AS bid"), "wears the table alias: {out}");
+    }
+
+    #[test]
+    fn hop_refuses_a_non_multiple_size_and_proctime() {
+        assert!(
+            rewrite_hop_tvfs("SELECT 1 FROM HOP(TABLE t, DESCRIPTOR(ts), 3000, 10000)").is_none(),
+            "size not a multiple of slide has no phase-shift decomposition"
+        );
+        assert!(rewrite_hop_tvfs("SELECT 1 FROM HOP(TABLE t, PROCTIME(), 2000, 10000)").is_none());
+        assert!(rewrite_hop_tvfs("SELECT 1 FROM my_hop(x)").is_none());
+    }
+
+    #[test]
+    fn streaming_topn_rewrites_to_qualify() {
+        // q18's shape after the TUMBLE rewrite: a derived table + the
+        // GROUP BY … ORDER BY … LIMIT ranking idiom.
+        let sql = "SELECT bidder, auction, price FROM (SELECT *, \
+                   \"dateTime\" - \"dateTime\" % 10000 AS window_start, \
+                   \"dateTime\" - \"dateTime\" % 10000 + 10000 AS window_end FROM bid) AS bid \
+                   GROUP BY bidder, auction, window_start, window_end \
+                   ORDER BY \"dateTime\" DESC LIMIT 1";
+        let out = rewrite_streaming_topn(sql).expect("rewrites");
+        assert!(
+            out.contains(
+                "QUALIFY ROW_NUMBER() OVER (PARTITION BY bidder, auction, window_start, window_end ORDER BY \"dateTime\" DESC) <= 1"
+            ),
+            "{out}"
+        );
+        assert!(
+            !out.contains("GROUP BY"),
+            "the idiom clauses are consumed: {out}"
+        );
+        assert!(!out.contains("LIMIT"), "{out}");
+    }
+
+    #[test]
+    fn streaming_topn_leaves_standard_sql_alone() {
+        // q5's shape: every projected column is grouped or aggregated —
+        // standard SQL, not this rewrite's to claim.
+        assert!(rewrite_streaming_topn(
+            "SELECT auction, COUNT(*) AS c FROM b GROUP BY auction, window_start, window_end              ORDER BY auction LIMIT 5"
+        )
+        .is_none());
+        // No window marker in the GROUP BY: not the streaming idiom.
+        assert!(
+            rewrite_streaming_topn("SELECT a, b FROM t GROUP BY a ORDER BY b LIMIT 1").is_none()
+        );
     }
 }

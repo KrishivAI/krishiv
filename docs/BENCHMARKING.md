@@ -6,14 +6,14 @@ a published project claim.
 
 ## Do not benchmark a standard suite against the IVM path without checking the plan
 
-**Measured, and gated: 36 of 44 registered verbatim.** `cargo test -p
+**Measured, and gated: 39 of 44 registered verbatim.** `cargo test -p
 krishiv-bench --test ivm_query_coverage -- --nocapture` classifies every query
 in the committed TPC-H and NEXMark corpora. As of 2026-08-27:
 
 | suite | verbatim (engine) | how |
 |---|---|---|
 | TPC-H | **22 / 22** (the full suite) | chains (DECOMP-3), join-leaf chains (DECOMP-4 + JOIN-2), left-deep multi-way runs with WHERE distributed per level (MJOIN-1), `ORDER BY … LIMIT` as its own top-N hop (TOPN-2), join-graph relinearization when the FROM order is not a connected order (REORDER-1), decorrelated EXISTS / NOT IN as semi/anti membership levels in the chain (DECORR-1 + SEMI-2), aggregate membership sides (`IN (… GROUP BY … HAVING …)`) maintained as the chain's side fold (SIDE-1), emitted scalar-aggregate sides on proven-inner joins — correlated `avg`/`min` comparisons (SIDE-2 + OUTER-1), sides that are themselves join runs, recursing through the spine's own cutting engine (SIDE-3), uncorrelated global-aggregate scalar subqueries keyed by their own equality (UNCORR-1), LEFT OUTER right-side ON pushdown (LEFTAGG-1), OR-arm common-conjunct factoring (ORFACTOR-1), keyless joins against singleton global-aggregate sides (KEYLESS-1), flattened sides-of-sides (NESTED-1), non-equi membership conditions evaluated per left row (SEMI-3), and joins above the mid-chain aggregate (MIDJOIN-1), and self-joins whose second occurrence renames its columns through the chain (`__n2__n_name` for the second `nation` of q7/q8), with the cross-occurrence OR compiled as a left-first-disambiguated residual (SELFJOIN-1) |
-| NEXMark | **14 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20 + q1, q2, q7 + q15, q16, q17) | 5 single-operator maps + 3 band joins (BAND-1) + 3 TUMBLE windows (WINDOW-1 + UINT-1) + 3 statistics queries (CDIST-1: COUNT(DISTINCT col) via per-value multiplicity shared with MIN/MAX's multiset) |
+| NEXMark | **17 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20 + q1, q2, q7 + q15, q16, q17 + q5, q18, q19) | 5 single-operator maps + 3 band joins (BAND-1) + 3 TUMBLE windows (WINDOW-1 + UINT-1) + 3 statistics queries (CDIST-1: COUNT(DISTINCT col) via per-value multiplicity shared with MIN/MAX's multiset) + the HOP window (HOP-1: the 1:N fan-out rewritten to phase-shifted UNION ALL branches and maintained as a stateless FlatMap chain leaf, q5) + keyed rankings (TOPNK-1: the streaming `GROUP BY … ORDER BY … LIMIT n` idiom rewritten to `QUALIFY ROW_NUMBER()` and maintained by a per-partition ordered index — q18 keep-last dedup, q19 per-auction top-10). The remaining 5 are refused by design: SESSION merges statefully (q11), PROCTIME has no delta-batch meaning (q12), q13 needs a side-input channel, and q4/q9 are written in the streaming WITH-pipeline dialect |
 
 Since DECOMP-3 the planner cuts a linear single-table multi-operator query into
 a `ViewPlan::Chain` at plan time: every hop must classify `Incremental` or the

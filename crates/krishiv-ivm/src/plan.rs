@@ -93,6 +93,29 @@ pub enum ViewPlan {
     /// relation. That is why this variant carries no operator state: there is
     /// nothing to accumulate, checkpoint, restore, seed or garbage-collect.
     Map { source: String, op: MapOp },
+    /// HOP-1: stateless 1:N fan-out — ONE source delta through every map in
+    /// `ops`, outputs concatenated. Each map is linear, and union-all is
+    /// addition of Z-sets, so the fan-out is linear too: `flat_map(A + B) =
+    /// flat_map(A) + flat_map(B)`. Like [`ViewPlan::Map`] it holds no state —
+    /// nothing to checkpoint, restore, seed or GC. This is what a hopping
+    /// window compiles to: `size/slide` phase-shifted window-column maps.
+    FlatMap { source: String, ops: Vec<MapOp> },
+    /// TOPNK-1: `ORDER BY … LIMIT k` **per partition** — the streaming
+    /// dialect's per-key-per-window ranking (NEXMark q19's top-10 by price,
+    /// q18's keep-last dedup as top-1 by event time), recognized from the
+    /// standard `QUALIFY ROW_NUMBER() OVER (PARTITION BY …) <= k` shape the
+    /// registration rewrite produces. `pre` is the windowed derived table's
+    /// projection (window_start/window_end), `post` the SELECT list over the
+    /// operator's emitted relation — both stateless maps riding the operator
+    /// so the whole view stays a single plan. Like [`ViewPlan::TopN`] the
+    /// ordered index is rebuildable from the source, so checkpoints carry no
+    /// second encoding of it and restore re-seeds.
+    KeyedTopN {
+        source: String,
+        pre: Option<MapOp>,
+        op: krishiv_delta::operators::keyed_topn::IncrementalKeyedTopNOp,
+        post: Option<MapOp>,
+    },
     /// Incremental `ORDER BY … LIMIT k` (IVM-TOPN-1). Unlike a bare `ORDER BY`,
     /// a LIMIT changes *which rows are in the relation*, so this is a real
     /// stateful operator — it holds the whole relation in sort order because a
@@ -141,6 +164,39 @@ pub struct ChainSide {
     pub hops: Vec<ViewPlan>,
 }
 
+/// HOP-1: one delta through every fan map, outputs concatenated — addition
+/// of Z-sets, which is exactly what UNION ALL is.
+pub(crate) fn apply_flatmap(
+    ops: &[MapOp],
+    delta: DeltaBatch,
+) -> Result<DeltaBatch, krishiv_delta::DeltaError> {
+    let mut outs: Vec<DeltaBatch> = Vec::with_capacity(ops.len());
+    for op in ops {
+        outs.push(op.apply(delta.clone())?);
+    }
+    krishiv_delta::DeltaBatch::concat(&outs)
+}
+
+/// TOPNK-1: the keyed top-N's full per-delta path — windowing projection,
+/// operator, SELECT-list projection — shared by the tick and seeding so the
+/// two cannot diverge.
+pub(crate) fn apply_keyed_topn(
+    pre: &Option<MapOp>,
+    op: &mut krishiv_delta::operators::keyed_topn::IncrementalKeyedTopNOp,
+    post: &Option<MapOp>,
+    delta: DeltaBatch,
+) -> Result<DeltaBatch, krishiv_delta::DeltaError> {
+    let delta = match pre {
+        Some(m) => m.apply(delta)?,
+        None => delta,
+    };
+    let delta = op.apply(delta)?;
+    match post {
+        Some(m) => m.apply(delta),
+        None => Ok(delta),
+    }
+}
+
 /// Apply one chain hop to a delta: the fold step for [`ViewPlan::Chain`],
 /// shared by the live tick path and snapshot seeding so the two cannot
 /// diverge. A hop's own empty-input semantics stay in charge — a map emits
@@ -168,15 +224,18 @@ pub(crate) fn apply_chain_hop(
             op.apply(delta)
         }
         ViewPlan::Map { op, .. } => op.apply(delta),
+        ViewPlan::FlatMap { ops, .. } => apply_flatmap(ops, delta),
         ViewPlan::TopN { op, .. } => op.apply(delta),
         // Unreachable by construction (the decomposer refuses joins and never
-        // nests chains), written out so a future variant cannot slide through
-        // a `_` arm and silently drop a delta.
-        ViewPlan::Join { .. } | ViewPlan::Chain { .. } | ViewPlan::DiffBased => {
-            Err(krishiv_delta::DeltaError::Operator(
-                "a chain hop must be a single-input incremental operator".into(),
-            ))
-        }
+        // nests chains, and a keyed top-N is only ever built whole-view),
+        // written out so a future variant cannot slide through a `_` arm and
+        // silently drop a delta.
+        ViewPlan::Join { .. }
+        | ViewPlan::KeyedTopN { .. }
+        | ViewPlan::Chain { .. }
+        | ViewPlan::DiffBased => Err(krishiv_delta::DeltaError::Operator(
+            "a chain hop must be a single-input incremental operator".into(),
+        )),
     }
 }
 
@@ -414,6 +473,14 @@ impl ViewPlan {
             ViewPlan::TopN { .. } => {
                 "incremental top-N — ordered index over the relation, emits only the change to the window"
             }
+            ViewPlan::FlatMap { .. } => {
+                "incremental flat-map — one delta through k parallel maps (a hopping window's \
+                 phase-shifted copies), outputs concatenated, stateless"
+            }
+            ViewPlan::KeyedTopN { .. } => {
+                "incremental keyed top-N — per-partition ordered index, emits only the changed \
+                 partitions' window slices"
+            }
             ViewPlan::Join { .. } => {
                 "incremental equi-join — symmetric hash trace; probes only the delta rows"
             }
@@ -465,8 +532,11 @@ impl ViewPlan {
             ViewPlan::Map { .. } => None,
             // The ordered index is rebuildable from the source relation, so
             // restore seeds it rather than carrying a second encoding of the
-            // same rows through the checkpoint.
+            // same rows through the checkpoint. Per-partition indexes make the
+            // same trade; a flat-map is stateless outright.
             ViewPlan::TopN { .. } => None,
+            ViewPlan::FlatMap { .. } => None,
+            ViewPlan::KeyedTopN { .. } => None,
             // Frame every hop's state (stateless hops as an absent slot) so a
             // restore can put each accumulator back where it was. Framing the
             // count makes a chain-shape change detectable at restore: a
@@ -527,6 +597,8 @@ impl ViewPlan {
             }
             ViewPlan::Map { .. } => Ok(false),
             ViewPlan::TopN { .. } => Ok(false),
+            ViewPlan::FlatMap { .. } => Ok(false),
+            ViewPlan::KeyedTopN { .. } => Ok(false),
             ViewPlan::Chain { hops, sides, .. } => {
                 let err =
                     |m: &str| krishiv_delta::DeltaError::Operator(format!("chain state: {m}"));
@@ -774,6 +846,25 @@ impl ViewPlan {
                     return Ok(Some(op.apply(delta)?));
                 }
             }
+            ViewPlan::FlatMap { source, ops } => {
+                // Stateless like Map: the fanned output IS the relation.
+                if let Some(delta) = seed_delta(source)? {
+                    return Ok(Some(apply_flatmap(ops, delta)?));
+                }
+            }
+            ViewPlan::KeyedTopN {
+                source,
+                pre,
+                op,
+                post,
+            } => {
+                // Replaying the snapshot through pre → operator → post
+                // rebuilds every partition's ordered index and emits the
+                // union of window slices, exactly the view relation.
+                if let Some(delta) = seed_delta(source)? {
+                    return Ok(Some(apply_keyed_topn(pre, op, post, delta)?));
+                }
+            }
             // Traces store raw rows keyed on the equi columns; the BAND-1
             // residual and post-projection shape only the EMITTED delta, so
             // seeding ignores them — the trace a residual-filtered join needs
@@ -930,8 +1021,12 @@ impl ViewPlan {
             // No retained state, so nothing can be reclaimed.
             ViewPlan::Map { .. } => Ok(0),
             // The index holds exactly the relation; nothing in it is reclaimable
-            // without changing the answer.
+            // without changing the answer. The per-partition index makes the
+            // same argument partition by partition, and a flat-map is
+            // stateless.
             ViewPlan::TopN { .. } => Ok(0),
+            ViewPlan::FlatMap { .. } => Ok(0),
+            ViewPlan::KeyedTopN { .. } => Ok(0),
             ViewPlan::DiffBased => Ok(0),
         }
     }
@@ -1558,6 +1653,17 @@ fn try_build_from_logical(
                 let aliases = aggregate_output_aliases(expr);
                 return build_agg_plan(agg, output_schema, available_schemas, &aliases);
             }
+            // TOPNK-1: `SELECT <cols> … QUALIFY ROW_NUMBER() OVER
+            // (PARTITION BY …) <= k` — the keyed top-N the streaming ranking
+            // idiom rewrites to. Matched here because the SELECT list is this
+            // projection; the filter and window below are the operator.
+            if let LogicalPlan::Filter(f) = input.as_ref()
+                && let LogicalPlan::Window(w) = f.input.as_ref()
+                && let Some(plan) =
+                    build_keyed_topn_plan(expr, proj_schema, f, w, output_schema, available_schemas)
+            {
+                return Some(plan);
+            }
             // BAND-1: a projected join — `SELECT p.name, a.id FROM a JOIN p …`
             // (optionally with a WHERE between) — compiles the projection as a
             // post-map over the joined relation instead of being refused for
@@ -1674,8 +1780,56 @@ fn try_build_from_logical(
         // source, so a top-N over an aggregate or a narrowing projection is a
         // two-hop DAG rather than a fused operator.
         LogicalPlan::Limit(limit) => build_topn_plan(limit, output_schema, available_schemas),
+        // HOP-1: a UNION ALL whose every branch is a stateless map over the
+        // SAME single source — the shape a hopping window rewrites to
+        // (size/slide phase-shifted window-column projections). Union-all is
+        // Z-set addition, so applying each branch map to the delta and
+        // concatenating IS the delta of the union. Branches over different
+        // sources are NOT linear in one input and refuse.
+        LogicalPlan::Union(u) => {
+            // The SQL planner LEFT-ASSOCIATES a k-way UNION ALL into nested
+            // binary Unions; flatten to the real branch list first.
+            fn branches<'a>(
+                u: &'a datafusion::logical_expr::Union,
+                out: &mut Vec<&'a LogicalPlan>,
+            ) {
+                for input in &u.inputs {
+                    match input.as_ref() {
+                        LogicalPlan::Union(inner) => branches(inner, out),
+                        other => out.push(other),
+                    }
+                }
+            }
+            let mut leaves: Vec<&LogicalPlan> = Vec::new();
+            branches(u, &mut leaves);
+            let mut ops: Vec<MapOp> = Vec::with_capacity(leaves.len());
+            let mut source: Option<String> = None;
+            for input in leaves {
+                let built =
+                    try_build_from_logical(input, output_schema, available_schemas, lateness)?;
+                let ViewPlan::Map { source: s, op } = built else {
+                    return None;
+                };
+                match &source {
+                    None => source = Some(s),
+                    Some(prev) if *prev == s => {}
+                    _ => return None,
+                }
+                ops.push(op);
+            }
+            if ops.len() < 2 {
+                return None;
+            }
+            Some(ViewPlan::FlatMap {
+                source: source?,
+                ops,
+            })
+        }
         // Window functions (ROW_NUMBER, RANK, rolling aggregates) cannot be
-        // computed O(Δ) in general. Fall through to DiffBased explicitly.
+        // computed O(Δ) in general in this position. The ONE recognized shape
+        // — `QUALIFY ROW_NUMBER() OVER (PARTITION BY …) <= k`, the keyed
+        // top-N — is claimed by the Projection arm above; anything else falls
+        // through to DiffBased explicitly.
         LogicalPlan::Window(Window { .. }) => None,
         // All other patterns (subqueries, set operations, multi-way joins, etc.)
         // fall back to DiffBased full SQL re-execution.
@@ -1816,6 +1970,158 @@ fn build_map_plan(
             output_schema: emitted,
             predicate,
         },
+    })
+}
+
+/// TOPNK-1: build an O(Δ) KEYED top-N for the one window-function shape the
+/// registration rewrite produces: `Projection(select list)` over
+/// `Filter(row_number_col <= k)` over `WindowAggr(row_number() PARTITION BY
+/// plain-cols ORDER BY plain-cols)` over an optionally aliased projection of
+/// one source (the TUMBLE/HOP derived table). The row-number column is a
+/// planning artifact: the operator never materializes it — membership in the
+/// partition's top-k IS the rank test — so the select list may not reference
+/// it (such a reference fails the post compile and refuses, rather than
+/// inventing a rank column the operator does not have).
+fn build_keyed_topn_plan(
+    proj_exprs: &[Expr],
+    proj_schema: &DFSchema,
+    filter: &datafusion::logical_expr::Filter,
+    w: &Window,
+    output_schema: &SchemaRef,
+    available_schemas: &AHashMap<String, SchemaRef>,
+) -> Option<ViewPlan> {
+    use datafusion::logical_expr::WindowFunctionDefinition;
+    use krishiv_delta::operators::keyed_topn::IncrementalKeyedTopNOp;
+
+    // Exactly one window expression, and it is a bare `row_number()`.
+    let [wexpr] = w.window_expr.as_slice() else {
+        return None;
+    };
+    let Expr::WindowFunction(wf) = wexpr else {
+        return None;
+    };
+    match &wf.fun {
+        WindowFunctionDefinition::WindowUDF(udf) if udf.name() == "row_number" => {}
+        _ => return None,
+    }
+    if !wf.params.args.is_empty() || wf.params.filter.is_some() {
+        return None;
+    }
+    // The WindowAggr emits its input columns plus the row-number column,
+    // named by the window expression's display — the LAST field. The filter
+    // must be `<that column> <= <positive integer>`: exactly what QUALIFY
+    // planned to, and nothing looser.
+    let rn_name = w.schema.fields().last()?.name().clone();
+    let Expr::BinaryExpr(be) = &filter.predicate else {
+        return None;
+    };
+    if be.op != datafusion::logical_expr::Operator::LtEq {
+        return None;
+    }
+    let Expr::Column(rn_col) = be.left.as_ref() else {
+        return None;
+    };
+    if rn_col.name != rn_name {
+        return None;
+    }
+    let k = match be.right.as_ref() {
+        Expr::Literal(datafusion::scalar::ScalarValue::Int64(Some(n)), _) if *n >= 1 => {
+            usize::try_from(*n).ok()?
+        }
+        _ => return None,
+    };
+    // The ranked relation: an optionally aliased projection of ONE source
+    // (the windowed derived table), or the bare source itself.
+    let (alias, inner) = match w.input.as_ref() {
+        LogicalPlan::SubqueryAlias(sa) => (Some(sa.alias.table().to_string()), sa.input.as_ref()),
+        other => (None, other),
+    };
+    let (pre, source, input_arrow): (Option<MapOp>, String, SchemaRef) = match inner {
+        LogicalPlan::Projection(p) => {
+            let out: SchemaRef = Arc::new(p.schema.as_arrow().clone());
+            let built = build_map_plan(
+                &p.expr,
+                &p.schema,
+                p.input.as_ref(),
+                &out,
+                available_schemas,
+            )?;
+            let ViewPlan::Map { source, op } = built else {
+                return None;
+            };
+            (Some(op), source, out)
+        }
+        LogicalPlan::TableScan(ts) => {
+            let source = ts.table_name.table().to_string();
+            let schema = available_schemas.get(&source)?.clone();
+            (None, source, schema)
+        }
+        _ => return None,
+    };
+    let mut partition_cols = Vec::with_capacity(wf.params.partition_by.len());
+    for pe in &wf.params.partition_by {
+        let Expr::Column(c) = pe else {
+            return None;
+        };
+        partition_cols.push(input_arrow.index_of(&c.name).ok()?);
+    }
+    if partition_cols.is_empty() {
+        // An unpartitioned rank is a GLOBAL top-N; that shape has its own
+        // operator and its own recognizer (IVM-TOPN-1) — refuse here rather
+        // than build a keyed operator with no key.
+        return None;
+    }
+    let mut keys = Vec::with_capacity(wf.params.order_by.len());
+    for se in &wf.params.order_by {
+        let Expr::Column(c) = &se.expr else {
+            return None;
+        };
+        keys.push(TopNSortKey {
+            column: input_arrow.index_of(&c.name).ok()?,
+            descending: !se.asc,
+            nulls_first: se.nulls_first,
+        });
+    }
+    if keys.is_empty() {
+        return None;
+    }
+    let op = IncrementalKeyedTopNOp::new(input_arrow.clone(), partition_cols, keys, k).ok()?;
+    // The SELECT list compiles against the operator's emitted relation — the
+    // ranked input, qualified as the plan qualified it. A reference to the
+    // row-number column fails this compile (the batch has no such column),
+    // which is the refusal the doc comment promises.
+    let qualifier = alias.unwrap_or_else(|| source.clone());
+    let df_schema = DFSchema::try_from_qualified_schema(&qualifier, input_arrow.as_ref()).ok()?;
+    let props = ExecutionProps::new();
+    if proj_schema.fields().len() != proj_exprs.len() {
+        return None;
+    }
+    let mut compiled: Vec<(String, Arc<dyn PhysicalExpr>)> = Vec::with_capacity(proj_exprs.len());
+    let mut fields: Vec<Field> = Vec::with_capacity(proj_exprs.len());
+    for (expr, planned) in proj_exprs.iter().zip(proj_schema.fields().iter()) {
+        let mut coercion = TypeCoercionRewriter::new(&df_schema);
+        let coerced = expr.clone().rewrite(&mut coercion).ok()?.data;
+        let physical = create_physical_expr(&coerced, &df_schema, &props).ok()?;
+        compiled.push((planned.name().clone(), physical));
+        fields.push(Field::new(
+            planned.name(),
+            planned.data_type().clone(),
+            planned.is_nullable(),
+        ));
+    }
+    let post = MapOp {
+        exprs: compiled,
+        output_schema: Arc::new(Schema::new(fields)),
+        predicate: None,
+    };
+    if !emits_declared_relation(&post.output_schema, output_schema) {
+        return None;
+    }
+    Some(ViewPlan::KeyedTopN {
+        source,
+        pre,
+        op,
+        post: Some(post),
     })
 }
 

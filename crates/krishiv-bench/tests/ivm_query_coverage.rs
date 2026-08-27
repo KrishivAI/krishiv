@@ -98,12 +98,22 @@ async fn classify(
     schemas: &AHashMap<String, SchemaRef>,
     sql: &str,
 ) -> Verdict {
-    // WINDOW-1: registration rewrites `TUMBLE(TABLE …)` into standard SQL, so
-    // this measurement applies the same rewrite — it measures what the engine
-    // does to a query handed over verbatim, and verbatim registration IS the
-    // engine's surface.
-    let rewritten = krishiv_ivm::window_rewrite::rewrite_tumble_tvfs(sql);
-    let sql = rewritten.as_deref().unwrap_or(sql);
+    // WINDOW-1 / HOP-1 / TOPNK-1: registration rewrites the TVF and
+    // streaming-ranking dialects into standard SQL, so this measurement
+    // applies the same rewrite chain — it measures what the engine does to a
+    // query handed over verbatim, and verbatim registration IS the engine's
+    // surface.
+    let mut owned = sql.to_owned();
+    for rewrite in [
+        krishiv_ivm::window_rewrite::rewrite_tumble_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_hop_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_streaming_topn,
+    ] {
+        if let Some(r) = rewrite(&owned) {
+            owned = r;
+        }
+    }
+    let sql = owned.as_str();
     // DataFusion's own logical schema is the view's declared contract.
     let Ok(df) = ctx.sql(sql).await else {
         return Verdict::Unplannable;
@@ -182,13 +192,18 @@ async fn measure(
 const TPCH_INCREMENTAL: usize = 22;
 /// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
 /// q8, q20 — BAND-1), three TUMBLE windows (q1, q2, q7 — WINDOW-1 + UINT-1),
+/// the HOP window (q5 — HOP-1: the fan-out rewritten to phase-shifted UNION
+/// ALL branches, maintained as a stateless FlatMap chain leaf), and the two
+/// keyed rankings (q18 keep-last dedup, q19 per-auction top-10 — TOPNK-1:
+/// the streaming `GROUP BY … ORDER BY … LIMIT n` idiom rewritten to QUALIFY
+/// row_number and maintained by the per-partition ordered index),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
 /// COUNT(DISTINCT col) per-value multiplicity by sharing MIN/MAX's value
 /// multiset). The remaining eight: HOP fans out 1:N, SESSION merges
 /// statefully, PROCTIME has no delta-batch meaning, q4/q9 window a derived
 /// join, q13 needs a side input, q18 needs row_number, q19 a per-window
 /// top-N.
-const NEXMARK_INCREMENTAL: usize = 14;
+const NEXMARK_INCREMENTAL: usize = 17;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
@@ -245,11 +260,17 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
 /// output relation repeats a bare name — ambiguous as a flat hop schema no
 /// matter what the chain renames internally. BAND-1 maintains it whole.
 const TPCH_DECOMPOSED: usize = 22;
-/// q14 (filter plus computed projection) and the q3/q20 band joins
-/// (SELFJOIN-1 renames their colliding sides). The other single-table
-/// NEXMark queries are single-operator (already incremental whole, nothing
-/// to cut), windowed TVFs (unplannable), or q8 (output repeats `id`).
-const NEXMARK_DECOMPOSED: usize = 3;
+/// q14 (filter plus computed projection), the q3/q20 band joins (SELFJOIN-1
+/// renames their colliding sides), the six TUMBLE windows (q1, q2, q7, q15,
+/// q16, q17 — this gate previously never applied WINDOW-1's registration
+/// rewrite, so it counted them Unplannable while the single-view gate
+/// counted them Incremental: an under-measurement, corrected when the gate
+/// started mirroring the FULL rewrite chain), and q5 (HOP-1's union fans as
+/// a FlatMap chain leaf). q18/q19 maintain WHOLE (the keyed top-N is one
+/// operator with its pre/post maps riding it — nothing to cut), and the
+/// remaining single-table queries are single-operator or q8 (output repeats
+/// `id`).
+const NEXMARK_DECOMPOSED: usize = 10;
 
 /// How many queries the engine can cut into a chain where EVERY hop maintains
 /// incrementally. `decompose` verifies each hop's plan itself and refuses
@@ -265,6 +286,19 @@ async fn measure_decomposed(
     let mut decomposed = 0;
     println!("\n── {label} ──");
     for (id, sql) in &queries {
+        // The same registration rewrite chain as `classify` — the decomposer
+        // sees what registration hands it, not the raw dialect.
+        let mut owned = sql.clone();
+        for rewrite in [
+            krishiv_ivm::window_rewrite::rewrite_tumble_tvfs,
+            krishiv_ivm::window_rewrite::rewrite_hop_tvfs,
+            krishiv_ivm::window_rewrite::rewrite_streaming_topn,
+        ] {
+            if let Some(r) = rewrite(&owned) {
+                owned = r;
+            }
+        }
+        let sql = &owned;
         let Ok(df) = ctx.sql(sql).await else {
             println!("  {id:<28} Unplannable");
             continue;

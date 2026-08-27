@@ -6,6 +6,7 @@ pub mod distinct;
 pub mod filter;
 pub mod join;
 pub mod key_util;
+pub mod keyed_topn;
 pub mod map;
 pub mod stream;
 pub mod topn;

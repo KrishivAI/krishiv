@@ -794,12 +794,24 @@ impl IncrementalFlow {
         // the attach protocol — sees one consistent, plannable query. Without
         // the rewrite the TVF syntax parses nowhere in the batch engine and
         // the view is not merely DiffBased but unplannable outright.
-        let spec = match crate::window_rewrite::rewrite_tumble_tvfs(&spec.body_sql) {
-            Some(rewritten) => IncrementalViewSpec {
-                body_sql: rewritten,
+        // HOP-1 fans after TUMBLE (both are TVF surgery); TOPNK-1 runs LAST —
+        // it parses the SQL, so the TVFs must already be standard derived
+        // tables, and it only ever claims a query the batch planner rejects.
+        let spec = {
+            let mut body = spec.body_sql.clone();
+            for rewrite in [
+                crate::window_rewrite::rewrite_tumble_tvfs,
+                crate::window_rewrite::rewrite_hop_tvfs,
+                crate::window_rewrite::rewrite_streaming_topn,
+            ] {
+                if let Some(rewritten) = rewrite(&body) {
+                    body = rewritten;
+                }
+            }
+            IncrementalViewSpec {
+                body_sql: body,
                 ..spec
-            },
-            None => spec,
+            }
         };
         let mut inner = self.inner.lock().map_err(lock_err)?;
         if let Ok(existing) = inner.view_registry.get(&spec.name) {
@@ -2156,6 +2168,73 @@ impl IncrementalFlow {
                     // map it reads the *relation* delta, not the raw input —
                     // an un-cancellable retraction never entered the relation
                     // and must not enter the window's index either.
+                    // HOP-1 / TOPNK-1: stateless fan-out and the keyed
+                    // window ranking. Explicit arms — the `_ => continue`
+                    // below would otherwise silently DROP their deltas and
+                    // leave the view permanently stale while reporting
+                    // Incremental (the exact hazard apply_chain_hop's
+                    // unreachable arm documents).
+                    Some(ViewPlan::FlatMap { source, ops }) => {
+                        let src = source.clone();
+                        let delta = match source_relation_deltas
+                            .get(&src)
+                            .or_else(|| available_deltas.get(&src))
+                            .cloned()
+                            .or_else(|| empty_input_delta(&src))
+                        {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        match crate::plan::apply_flatmap(ops, delta) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view flat-map apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    Some(ViewPlan::KeyedTopN {
+                        source,
+                        pre,
+                        op,
+                        post,
+                    }) => {
+                        let src = source.clone();
+                        let delta = match source_relation_deltas
+                            .get(&src)
+                            .or_else(|| available_deltas.get(&src))
+                            .cloned()
+                            .or_else(|| empty_input_delta(&src))
+                        {
+                            Some(d) => d,
+                            None => continue,
+                        };
+                        match crate::plan::apply_keyed_topn(pre, op, post, delta) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                tracing::warn!(
+                                    view = %view_name,
+                                    error = %e,
+                                    "incremental view keyed top-N apply failed; skipping view"
+                                );
+                                errored_views.push(ViewError {
+                                    view: view_name.clone(),
+                                    kind: ViewErrorKind::OperatorApply,
+                                    message: e.to_string(),
+                                });
+                                continue;
+                            }
+                        }
+                    }
                     Some(ViewPlan::TopN { source, op }) => {
                         let src = source.clone();
                         let delta = match source_relation_deltas

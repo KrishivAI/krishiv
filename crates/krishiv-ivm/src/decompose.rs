@@ -123,6 +123,14 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
                 chain.reverse();
                 return Some(chain);
             }
+            // HOP-1: a UNION ALL is a LEAF — the hopping window's fan-out
+            // over one source, compiled whole as a FlatMap hop (the plan
+            // builder enforces the every-branch-same-source rule).
+            LogicalPlan::Union(_) => {
+                chain.push(node);
+                chain.reverse();
+                return Some(chain);
+            }
             // DECOMP-4/MJOIN-1: a Join joins the chain. A LEFT-DEEP join
             // tree — the shape every comma join plans to — descends along the
             // left spine, each Join becoming one chain node whose RIGHT side
@@ -191,6 +199,11 @@ enum Leaf {
     /// UNALIASED scan with their references unqualified, which is the sound
     /// transform ALIAS-1 established for a single relation.
     Join,
+    /// HOP-1: a UNION ALL fan-out over one source (the hopping window's
+    /// phase-shifted copies). Behaves like `Table` for re-rooting: the union
+    /// is one flat relation, and the derived-table alias above it rides
+    /// `op_alias_below` onto the hop scan exactly like q15's `revenue0`.
+    Union,
 }
 
 /// REORDER-1: rebuild a pure comma-join run in a CONNECTED order of its join
@@ -279,6 +292,7 @@ fn leaf_of(chain: &[LogicalPlan]) -> Option<Leaf> {
     match chain.first()? {
         LogicalPlan::TableScan(ts) => Some(Leaf::Table(ts.table_name.table().to_string())),
         LogicalPlan::Join(_) => Some(Leaf::Join),
+        LogicalPlan::Union(_) => Some(Leaf::Union),
         _ => None,
     }
 }
@@ -1154,7 +1168,7 @@ fn decompose_plan(
     // qualify by the source name, so their hop shapes are unchanged.
     let mut prev_alias = match &leaf {
         Leaf::Table(t) => t.clone(),
-        Leaf::Join => String::new(),
+        Leaf::Join | Leaf::Union => String::new(),
     };
     debug_assert_eq!(cuts.len(), cut_alias_below.len());
     let last = cuts.len() - 1;
@@ -1563,7 +1577,8 @@ fn decompose_plan(
     let source = match (&leaf, plans.first()) {
         (Leaf::Table(t), _) => t.clone(),
         (Leaf::Join, Some(ViewPlan::Join { left_source, .. })) => left_source.clone(),
-        (Leaf::Join, _) => return None,
+        (Leaf::Union, Some(ViewPlan::FlatMap { source, .. })) => source.clone(),
+        (Leaf::Join | Leaf::Union, _) => return None,
     };
     // Side hops precede the spine in the public hop list — topological order,
     // so a caller registering hops as standalone views registers each side
