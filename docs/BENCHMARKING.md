@@ -364,6 +364,45 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-27 — post-coverage-completion IVM + NEXMark bench
+
+- **Revision**: engine `66d96a8` — the commit completing IVM corpus
+  coverage at 40/44 (TPC-H 22/22, NEXMark 18/22, 4 refused by design).
+- **Hardware**: Intel i7-9750H (6c/12t) developer laptop, NOT the EPYC
+  yardstick VM of the entries above — absolute numbers are not
+  comparable across entries; the within-run incremental-vs-recompute
+  comparison and the qualitative findings are what this entry records.
+- **Why this entry exists**: the SELFJOIN-1 / HOP-1 / TOPNK-1 / KEYEXPR-1
+  window touched the join classifier (exclusive right-pushes, key-type
+  guard, residual disambiguation) and the decomposer's hot registration
+  path; this run is the post-landing check that the O(Δ) ladder still
+  holds its shape, plus the first recorded numbers at this revision.
+
+**IVM tick vs full recompute** (`ivm_vs_full_recompute`, criterion
+median, ms per tick):
+
+| Accumulated rows | IVM tick | full recompute |
+|------------------|---------:|---------------:|
+| 50 k             | 8.93     | 2.53           |
+| 200 k            | 8.61     | 3.17           |
+| 500 k            | 8.67     | 4.21           |
+| 1 M              | 13.93    | 9.62           |
+| 10 M             | 49.87    | 83.32          |
+
+**NEXMark SQL executor** (`nexmark`, 100 k events per iteration):
+q1 1.25 ms · q2 2.55 ms · q5 2.83 ms · q8 1.28 ms.
+
+Findings:
+
+1. **The crossover finding of 2026-07-21 replicates on different
+   hardware**: full recompute still wins at ≤1 M accumulated rows (9.62 ms
+   vs 13.93 ms at 1 M) and the incremental tick wins 1.67× at 10 M
+   (49.9 ms vs 83.3 ms), with the flat ~8.7 ms tick floor below 500 k
+   showing the fixed per-tick cost, not state-dependent work.
+2. **No regression from this window's classifier and decomposer changes**
+   — the 10 M tick (49.9 ms) sits at the good end of the 38.5–64.6 ms
+   spread the 2026-07-21 entry recorded across its own back-to-back runs.
+
 ### 2026-07-21 — Phase 66 #208: post-Phase-57 IVM re-benchmark
 
 - **Revision**: engine `301a3f9e` plus the `benchmarks/`/`scripts/bench-tier.sh`
