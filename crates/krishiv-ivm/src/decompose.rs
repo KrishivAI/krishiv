@@ -765,6 +765,182 @@ async fn decompose_core(
 /// verification are the spine's own, under the side's name prefix. The
 /// recursion is bounded by plan depth and entirely synchronous (PLANHOP-1
 /// made hop verification sync), so there is no boxed-future story here.
+/// KEYEXPR-1: hoist a COMPUTED equi key out of an inner join's condition —
+/// `b.auction % 1000 = s.k` (NEXMark q13's side-input shape) becomes a
+/// projection `TRY_CAST(b.auction % 1000 AS <k's type>) AS __ivm_jk0` UNDER
+/// the join's left input, with the conjunct rewritten to `__ivm_jk0 = s.k`.
+/// The join's left is then an OPERATOR, so the chain runs it as a MID-CHAIN
+/// join (MIDJOIN-1) over the key-bearing hop, and the trace keys on a plain
+/// same-typed column pair.
+///
+/// The TRY_CAST is the type story, and it is exact only where it is allowed:
+/// for INTEGER-family targets (and integer or scale-0-decimal sources), a
+/// value representable in the target casts losslessly — equality in either
+/// type agrees — and a value OUTSIDE the target's range becomes NULL, which
+/// equals nothing, exactly what the original comparison would have said.
+/// A fractional source could TRUNCATE onto a false equality, so anything
+/// non-integer refuses the hoist and the conjunct stays where it was.
+///
+/// Narrow by construction: INNER joins only; the expression's columns must
+/// resolve EXCLUSIVELY left and the other side must be a plain column
+/// resolving EXCLUSIVELY right (the LEFTAGG-1 lesson — a bare name on both
+/// sides must not be claimed); the expression is a whitelist of
+/// column/literal/arithmetic/cast shapes (no functions, nothing volatile);
+/// and the right side stays untouched — it must remain a plain source.
+fn hoist_computed_join_keys(plan: &LogicalPlan) -> Option<LogicalPlan> {
+    use datafusion::logical_expr::{ExprSchemable as _, Operator, TryCast};
+
+    fn integer_family(dt: &arrow::datatypes::DataType) -> bool {
+        use arrow::datatypes::DataType as DT;
+        matches!(
+            dt,
+            DT::Int8
+                | DT::Int16
+                | DT::Int32
+                | DT::Int64
+                | DT::UInt8
+                | DT::UInt16
+                | DT::UInt32
+                | DT::UInt64
+        )
+    }
+    fn integer_or_whole_decimal(dt: &arrow::datatypes::DataType) -> bool {
+        integer_family(dt) || matches!(dt, arrow::datatypes::DataType::Decimal128(_, 0))
+    }
+    fn deterministic_shape(e: &Expr) -> bool {
+        match e {
+            Expr::Column(_) | Expr::Literal(_, _) => true,
+            Expr::BinaryExpr(be) => {
+                matches!(
+                    be.op,
+                    Operator::Plus
+                        | Operator::Minus
+                        | Operator::Multiply
+                        | Operator::Divide
+                        | Operator::Modulo
+                ) && deterministic_shape(&be.left)
+                    && deterministic_shape(&be.right)
+            }
+            Expr::Cast(c) => deterministic_shape(&c.expr),
+            Expr::TryCast(c) => deterministic_shape(&c.expr),
+            Expr::Negative(inner) => deterministic_shape(inner),
+            _ => false,
+        }
+    }
+
+    let transformed = plan
+        .clone()
+        .transform_up(|node| {
+            let LogicalPlan::Join(join) = &node else {
+                return Ok(Transformed::no(node));
+            };
+            if join.join_type != datafusion::logical_expr::JoinType::Inner
+                || !crate::plan::side_resolves_to_source(&join.left)
+                || !crate::plan::side_resolves_to_source(&join.right)
+            {
+                return Ok(Transformed::no(node));
+            }
+            let Some(filter) = &join.filter else {
+                return Ok(Transformed::no(node));
+            };
+            let mut hoists: Vec<(Expr, String)> = Vec::new();
+            let mut new_conjuncts: Vec<Expr> = Vec::new();
+            for conjunct in datafusion::logical_expr::utils::split_conjunction(filter) {
+                let hoistable = if let Expr::BinaryExpr(be) = conjunct
+                    && be.op == Operator::Eq
+                {
+                    // Which side is the computed-left expression?
+                    let classify = |e: &Expr| -> (bool, bool) {
+                        let cols = e.column_refs();
+                        let excl_left = !cols.is_empty()
+                            && cols.iter().all(|c| {
+                                join.left.schema().index_of_column(c).is_ok()
+                                    && join.right.schema().index_of_column(c).is_err()
+                            });
+                        let excl_right = !cols.is_empty()
+                            && cols.iter().all(|c| {
+                                join.right.schema().index_of_column(c).is_ok()
+                                    && join.left.schema().index_of_column(c).is_err()
+                            });
+                        (excl_left, excl_right)
+                    };
+                    let pick = |expr: &Expr, col: &Expr| -> Option<(Expr, Expr)> {
+                        if matches!(expr, Expr::Column(_)) || !deterministic_shape(expr) {
+                            return None;
+                        }
+                        let Expr::Column(_) = col else { return None };
+                        let (el, _) = classify(expr);
+                        let (_, cr) = classify(col);
+                        (el && cr).then(|| (expr.clone(), col.clone()))
+                    };
+                    pick(&be.left, &be.right).or_else(|| pick(&be.right, &be.left))
+                } else {
+                    None
+                };
+                match hoistable {
+                    Some((expr, right_col)) => {
+                        let Expr::Column(rc) = &right_col else {
+                            return Ok(Transformed::no(node));
+                        };
+                        let Ok(ridx) = join.right.schema().index_of_column(rc) else {
+                            return Ok(Transformed::no(node));
+                        };
+                        let right_type = join.right.schema().field(ridx).data_type().clone();
+                        let Ok(expr_type) = expr.get_type(join.schema.as_ref()) else {
+                            return Ok(Transformed::no(node));
+                        };
+                        let key_expr = if expr_type == right_type {
+                            expr
+                        } else if integer_family(&right_type)
+                            && integer_or_whole_decimal(&expr_type)
+                        {
+                            Expr::TryCast(TryCast::new(Box::new(expr), right_type))
+                        } else {
+                            // No exact type story — leave the conjunct alone.
+                            new_conjuncts.push((*conjunct).clone());
+                            continue;
+                        };
+                        let name = format!("__ivm_jk{}", hoists.len());
+                        new_conjuncts.push(
+                            Expr::Column(datafusion::common::Column::new_unqualified(name.clone()))
+                                .eq(right_col),
+                        );
+                        hoists.push((key_expr, name));
+                    }
+                    None => new_conjuncts.push((*conjunct).clone()),
+                }
+            }
+            if hoists.is_empty() {
+                return Ok(Transformed::no(node));
+            }
+            let mut proj: Vec<Expr> = join
+                .left
+                .schema()
+                .iter()
+                .map(|(q, f)| Expr::Column(datafusion::common::Column::new(q.cloned(), f.name())))
+                .collect();
+            for (key_expr, name) in hoists {
+                proj.push(key_expr.alias(name));
+            }
+            let new_left = LogicalPlanBuilder::from(join.left.as_ref().clone())
+                .project(proj)
+                .and_then(datafusion::logical_expr::LogicalPlanBuilder::build)
+                .map_err(|e| datafusion::common::DataFusionError::Plan(e.to_string()))?;
+            let new_filter = new_conjuncts.into_iter().reduce(|a, b| a.and(b));
+            let mut new_join = join.clone();
+            new_join.left = Arc::new(new_left);
+            new_join.filter = new_filter;
+            // Rebuild through try_new-equivalent validation: with_new_exprs
+            // re-derives the join schema from the new inputs.
+            let exprs = LogicalPlan::Join(new_join.clone()).expressions();
+            let rebuilt = LogicalPlan::Join(new_join).recompute_schema()?;
+            let _ = exprs;
+            Ok(Transformed::yes(rebuilt))
+        })
+        .ok()?;
+    transformed.transformed.then_some(transformed.data)
+}
+
 fn decompose_plan(
     view_name: &str,
     plan: &LogicalPlan,
@@ -772,6 +948,18 @@ fn decompose_plan(
     available_schemas: &AHashMap<String, SchemaRef>,
     min_cuts: usize,
 ) -> Option<CutPlan> {
+    // KEYEXPR-1 pre-pass: computed equi keys hoist into a projection under
+    // the join's left input, making the join MID-CHAIN over a key-bearing
+    // hop. Runs before anything reads the chain, so every later stage sees
+    // one shape.
+    let hoisted_plan;
+    let plan = match hoist_computed_join_keys(plan) {
+        Some(h) => {
+            hoisted_plan = h;
+            &hoisted_plan
+        }
+        None => plan,
+    };
     let chain = linear_chain(plan)?;
     let leaf = leaf_of(&chain)?;
     // SELFJOIN-1: aliases of sides whose bare names COLLIDE with the

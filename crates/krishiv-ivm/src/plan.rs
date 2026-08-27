@@ -2549,6 +2549,24 @@ fn build_join_plan(
     {
         return None;
     }
+    // KEYEXPR-1: every key pair must be SAME-TYPED — the trace compares key
+    // values as raw arrays, so an Int64 5 never matches a UInt64 5 and a
+    // mismatched pair is not a refusal but a silently EMPTY view. Planner
+    // paths never produced one (a coerced equality wraps a cast and stops
+    // being Column = Column), but the key-hoist pass now synthesizes key
+    // columns, and this guard is what makes a hoist mistake loud.
+    for (l, r) in left_key_cols.iter().zip(right_key_cols.iter()) {
+        let lt = left_schema.field_with_name(l).ok().map(|f| f.data_type());
+        let rt = right_schema.field_with_name(r).ok().map(|f| f.data_type());
+        if lt.is_none() || rt.is_none() || lt != rt {
+            tracing::warn!(
+                left = %l,
+                right = %r,
+                "IVM plan degraded to O(state) DiffBased: join key pair is                  missing or differently typed; a raw-array trace would match                  nothing"
+            );
+            return None;
+        }
+    }
 
     // Outer-filter columns are qualified by the join-side relation (a table
     // alias, e.g. `t.dist`), which the source-schema compile below cannot

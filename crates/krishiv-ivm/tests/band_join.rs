@@ -1522,3 +1522,71 @@ async fn a_self_join_renames_the_second_occurrence_and_maintains() {
         .expect("registered");
     assert!(inc && why.contains("chain"), "not a chain: {why}");
 }
+
+/// KEYEXPR-1: a COMPUTED equi key — `a.ts % 100 = p.pid` — hoists into a
+/// key projection under the join's left input and the chain runs the join
+/// mid-chain over the key-bearing hop, keyed on a plain same-typed column
+/// pair. Tick 2 inserts a row whose computed key matches nobody; tick 3
+/// retracts a matching row. Exact values, and the classification must be a
+/// CHAIN — before the hoist this shape was keyless and refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_computed_join_key_hoists_and_maintains() {
+    let sql = "SELECT a.id, p.city FROM auction a JOIN person p ON a.ts % 100 = p.pid";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("city", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let expectations: [&[(i64, i64)]; 3] = [
+        // ts 105 % 100 = 5 → person 5 (city 50); ts 207 % 100 = 7 → person 7.
+        &[(1, 50), (2, 70)],
+        // ts 399 % 100 = 99 → nobody.
+        &[(1, 50), (2, 70)],
+        // Retract auction 2.
+        &[(1, 50)],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 9, 105), (2, 9, 207)])), false),
+        (Some(auctions(&[(3, 9, 399)])), false),
+        (Some(auctions(&[(2, 9, 207)])), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i == 0 {
+            let d = DeltaBatch::from_inserts(persons(&[(5, 50, 0), (7, 70, 0)])).unwrap();
+            subject.feed("person", d.clone()).unwrap();
+            oracle.feed("person", d).unwrap();
+        }
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "tick {i}: computed key disagreed with recompute");
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(id, c)| vec![Some(*id), Some(*c)])
+            .collect();
+        assert_eq!(got, expect, "tick {i}");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}

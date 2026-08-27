@@ -35,6 +35,7 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
+use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
 use krishiv_bench::nexmark::{NexmarkGenerator, SUPPORTED_QUERIES};
@@ -82,9 +83,38 @@ async fn nexmark_env() -> (SessionContext, AHashMap<String, SchemaRef>) {
     let auction = g.next_auction_batch(1).unwrap();
     let person = g.next_person_batch(1).unwrap();
 
+    // q13's side input: bounded reference data the STREAMING bench registers
+    // once before the stream starts (k UInt64, label Utf8 — the same shape).
+    // In the delta-batch world a side input is simply another SOURCE, fed
+    // once and never ticked again, so the measurement env registers it too —
+    // without it the query referenced a table that did not exist and was
+    // counted Unplannable for a reason that had nothing to do with the
+    // engine.
+    let side = {
+        use arrow::array::{StringArray, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+        let keys: Vec<u64> = (0..1000).collect();
+        let labels: Vec<String> = keys.iter().map(|k| format!("cat-{k}")).collect();
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("k", DataType::UInt64, false),
+                Field::new("label", DataType::Utf8, false),
+            ])),
+            vec![
+                Arc::new(UInt64Array::from(keys)),
+                Arc::new(StringArray::from(labels)),
+            ],
+        )
+        .unwrap()
+    };
     let ctx = SessionContext::new();
     let mut schemas = AHashMap::new();
-    for (name, batch) in [("bid", bid), ("auction", auction), ("person", person)] {
+    for (name, batch) in [
+        ("bid", bid),
+        ("auction", auction),
+        ("person", person),
+        ("side", side),
+    ] {
         let schema = batch.schema();
         ctx.register_batch(name, batch).unwrap();
         schemas.insert(name.to_owned(), schema);
@@ -196,14 +226,17 @@ const TPCH_INCREMENTAL: usize = 22;
 /// ALL branches, maintained as a stateless FlatMap chain leaf), and the two
 /// keyed rankings (q18 keep-last dedup, q19 per-auction top-10 — TOPNK-1:
 /// the streaming `GROUP BY … ORDER BY … LIMIT n` idiom rewritten to QUALIFY
-/// row_number and maintained by the per-partition ordered index),
+/// row_number and maintained by the per-partition ordered index), and the
+/// side-input join (q13 — KEYEXPR-1: the computed key `auction % 1000`
+/// hoisted into a TRY_CAST projection under the join's left input, the
+/// side table registered as the bounded source it is),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
 /// COUNT(DISTINCT col) per-value multiplicity by sharing MIN/MAX's value
 /// multiset). The remaining eight: HOP fans out 1:N, SESSION merges
 /// statefully, PROCTIME has no delta-batch meaning, q4/q9 window a derived
 /// join, q13 needs a side input, q18 needs row_number, q19 a per-window
 /// top-N.
-const NEXMARK_INCREMENTAL: usize = 17;
+const NEXMARK_INCREMENTAL: usize = 18;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
@@ -266,11 +299,12 @@ const TPCH_DECOMPOSED: usize = 22;
 /// rewrite, so it counted them Unplannable while the single-view gate
 /// counted them Incremental: an under-measurement, corrected when the gate
 /// started mirroring the FULL rewrite chain), and q5 (HOP-1's union fans as
-/// a FlatMap chain leaf). q18/q19 maintain WHOLE (the keyed top-N is one
+/// a FlatMap chain leaf), and q13 (KEYEXPR-1's key-bearing hop under the
+/// mid-chain join). q18/q19 maintain WHOLE (the keyed top-N is one
 /// operator with its pre/post maps riding it — nothing to cut), and the
 /// remaining single-table queries are single-operator or q8 (output repeats
 /// `id`).
-const NEXMARK_DECOMPOSED: usize = 10;
+const NEXMARK_DECOMPOSED: usize = 11;
 
 /// How many queries the engine can cut into a chain where EVERY hop maintains
 /// incrementally. `decompose` verifies each hop's plan itself and refuses
