@@ -683,9 +683,19 @@ impl ViewPlan {
                 for side in sides.iter_mut() {
                     // SIDE-3: a side is a full sub-chain; seed its join leaf
                     // from both sources and each later join's right from its
-                    // table, mirroring the spine seed below.
+                    // table — or, NESTED-1, from an EARLIER side's seeded
+                    // output (flattened dependency order) — mirroring the
+                    // spine seed below.
                     let Some((first, rest)) = side.hops.split_first_mut() else {
                         continue;
+                    };
+                    let seed_side_right = |name: &str,
+                                           side_out: &AHashMap<String, DeltaBatch>|
+                     -> DeltaResult<Option<DeltaBatch>> {
+                        match side_out.get(name) {
+                            Some(d) => Ok(Some(d.clone())),
+                            None => seed_delta(name),
+                        }
                     };
                     let seeded = if let ViewPlan::Join {
                         left_source,
@@ -694,7 +704,7 @@ impl ViewPlan {
                     } = first
                     {
                         let l = seed_delta(&left_source.clone())?;
-                        let r = seed_delta(&right_source.clone())?;
+                        let r = seed_side_right(&right_source.clone(), &side_out)?;
                         if l.is_some() || r.is_some() {
                             Some(apply_chain_join_hop(first, l, r)?)
                         } else {
@@ -709,7 +719,7 @@ impl ViewPlan {
                     if let Some(mut d) = seeded {
                         for hop in rest {
                             d = if let ViewPlan::Join { right_source, .. } = hop {
-                                let right = seed_delta(&right_source.clone())?;
+                                let right = seed_side_right(&right_source.clone(), &side_out)?;
                                 apply_chain_join_hop(hop, Some(d), right)?
                             } else {
                                 apply_chain_hop(hop, d)?
@@ -2091,12 +2101,19 @@ fn build_join_plan(
                     right_key_cols.push(r);
                 }
                 None => {
+                    // Right-only means EXCLUSIVELY right: a bare column name
+                    // that exists on BOTH sides (q21's `l_suppkey` — l1 and
+                    // l2 are both lineitem) resolves against either schema,
+                    // and pushing it right would silently rewrite a
+                    // cross-side condition into a same-side filter. Anything
+                    // that also resolves left stays a residual.
                     let cols = conjunct.column_refs();
-                    let all_right = !cols.is_empty()
-                        && cols
-                            .iter()
-                            .all(|c| join.right.schema().index_of_column(c).is_ok());
-                    if all_right {
+                    let all_right_only = !cols.is_empty()
+                        && cols.iter().all(|c| {
+                            join.right.schema().index_of_column(c).is_ok()
+                                && join.left.schema().index_of_column(c).is_err()
+                        });
+                    if all_right_only {
                         on_right_pushes.push((*conjunct).clone());
                     } else {
                         residual_conjuncts.push((*conjunct).clone());
@@ -2186,6 +2203,19 @@ fn build_join_plan(
     // band-failing pair still owes a null-padded left row — which a
     // post-probe filter cannot express. Refuse rather than change the
     // query's meaning.
+    // SEMI-3: a residual under SEMI/ANTI is a non-equi MEMBERSHIP condition
+    // (`… AND l2.l_suppkey != l1.l_suppkey`) — legal, compiled below into a
+    // per-pair predicate the operator evaluates inside the key group. LEFT
+    // OUTER keeps the refusal: its residual decides PADDING, which no
+    // post-filter or membership test expresses.
+    let membership_conjuncts: Vec<Expr> = if matches!(
+        incr_join_type,
+        IncrJoinType::LeftSemi | IncrJoinType::LeftAnti
+    ) {
+        std::mem::take(&mut residual_conjuncts)
+    } else {
+        Vec::new()
+    };
     if !residual_conjuncts.is_empty() && incr_join_type != IncrJoinType::Inner {
         return None;
     }
@@ -2233,7 +2263,7 @@ fn build_join_plan(
              join traces will not be watermark-GC'd"
         );
     }
-    let op = IncrementalJoinOp::new_with_lateness(
+    let mut op = IncrementalJoinOp::new_with_lateness(
         left_schema.clone(),
         right_schema.clone(),
         left_key_cols.clone(),
@@ -2242,6 +2272,69 @@ fn build_join_plan(
         lateness_col,
     )
     .ok()?;
+    if !membership_conjuncts.is_empty() {
+        // Compile against left ++ right (FULL — membership tests the pair,
+        // nothing is emitted from the right). Bare names routinely collide
+        // across the pair (q21's l1 vs l2 are both lineitem), so every
+        // column reference is DISAMBIGUATED first: rewritten to the exact
+        // (qualifier, name) of whichever side resolves it — plan-side
+        // resolution; the operator evaluates positionally.
+        let mut pair_fields: Vec<(Option<datafusion::common::TableReference>, Arc<Field>)> =
+            Vec::new();
+        for (q, f) in join.left.schema().iter() {
+            pair_fields.push((q.cloned(), Arc::clone(f)));
+        }
+        for (q, f) in join.right.schema().iter() {
+            pair_fields.push((q.cloned(), Arc::clone(f)));
+        }
+        let pair_schema =
+            DFSchema::new_with_metadata(pair_fields, std::collections::HashMap::new()).ok()?;
+        let disambiguate = |e: Expr| -> Option<Expr> {
+            use datafusion::common::tree_node::{Transformed, TreeNode as _};
+            e.transform(|node| {
+                if let Expr::Column(c) = &node {
+                    let side_col = |schema: &DFSchema| {
+                        schema.index_of_column(c).ok().map(|i| {
+                            let (q, f) = schema.qualified_field(i);
+                            datafusion::common::Column::new(q.cloned(), f.name())
+                        })
+                    };
+                    if let Some(col) =
+                        side_col(join.left.schema()).or_else(|| side_col(join.right.schema()))
+                    {
+                        return Ok(Transformed::yes(Expr::Column(col)));
+                    }
+                }
+                Ok(Transformed::no(node))
+            })
+            .ok()
+            .map(|t| t.data)
+        };
+        let combined = membership_conjuncts
+            .into_iter()
+            .map(disambiguate)
+            .collect::<Option<Vec<_>>>()?
+            .into_iter()
+            .reduce(|a, b| a.and(b))?;
+        let mut coercion = TypeCoercionRewriter::new(&pair_schema);
+        let coerced = combined.rewrite(&mut coercion).ok()?.data;
+        let props2 = ExecutionProps::new();
+        let predicate = create_physical_expr(&coerced, &pair_schema, &props2).ok()?;
+        op.set_membership_residual(Arc::new(move |pair: &RecordBatch| {
+            let v = predicate.evaluate(pair).map_err(|e| {
+                krishiv_delta::DeltaError::Operator(format!("membership residual failed: {e}"))
+            })?;
+            let arr = v
+                .into_array(pair.num_rows())
+                .map_err(|e| krishiv_delta::DeltaError::Operator(e.to_string()))?;
+            arr.as_any()
+                .downcast_ref::<arrow::array::BooleanArray>()
+                .cloned()
+                .ok_or_else(|| {
+                    krishiv_delta::DeltaError::Operator("membership residual is not boolean".into())
+                })
+        }));
+    }
 
     // BAND-1: the residual and any projection compile against the JOINED
     // relation — the plan's own qualified fields (so `p."dateTime"` and

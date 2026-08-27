@@ -2296,6 +2296,16 @@ impl IncrementalFlow {
                             let Some((first, rest)) = side.hops.split_first_mut() else {
                                 continue 'side;
                             };
+                            // NESTED-1: a side's join may read an EARLIER
+                            // side's output (flattened dependency order).
+                            let side_right = |name: &str,
+                                              side_out: &ahash::AHashMap<String, DeltaBatch>|
+                             -> Option<DeltaBatch> {
+                                side_out
+                                    .get(name)
+                                    .cloned()
+                                    .or_else(|| available_deltas.get(name).cloned())
+                            };
                             let mut out = if let ViewPlan::Join {
                                 left_source,
                                 right_source,
@@ -2303,7 +2313,7 @@ impl IncrementalFlow {
                             } = first
                             {
                                 let left = available_deltas.get(left_source.as_str()).cloned();
-                                let right = available_deltas.get(right_source.as_str()).cloned();
+                                let right = side_right(right_source.as_str(), &side_out);
                                 crate::plan::apply_chain_join_hop(first, left, right)
                             } else {
                                 let delta = match source_relation_deltas
@@ -2321,9 +2331,8 @@ impl IncrementalFlow {
                                 out = match out {
                                     Ok(d) => {
                                         if let ViewPlan::Join { right_source, .. } = hop {
-                                            let right = available_deltas
-                                                .get(right_source.as_str())
-                                                .cloned();
+                                            let right =
+                                                side_right(right_source.as_str(), &side_out);
                                             crate::plan::apply_chain_join_hop(hop, Some(d), right)
                                         } else {
                                             crate::plan::apply_chain_hop(hop, d)

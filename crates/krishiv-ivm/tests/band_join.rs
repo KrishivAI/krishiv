@@ -1216,3 +1216,145 @@ async fn an_aggregate_above_a_keyless_singleton_side_maintains() {
         .expect("registered");
     assert!(inc && why.contains("chain"), "not a chain: {why}");
 }
+
+/// NESTED-1: a membership side with a scalar side of its OWN — q20's shape
+/// in miniature. The IN-side (sellers with an above-their-average auction)
+/// contains a correlated avg side; flattened, the avg side evaluates first,
+/// the membership side's join reads its output, and the spine's semi join
+/// reads the membership side. Tick 2 drops a low auction into seller 7's
+/// history: their average FALLS, auction (2) rises above it, seller 7
+/// enters the membership and person 7 enters the view. Tick 3 retracts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_membership_side_with_its_own_scalar_side_maintains() {
+    let sql = "SELECT p.pid FROM person p WHERE p.pid IN \
+               (SELECT a.seller FROM auction a WHERE a.ts > \
+                (SELECT AVG(a2.ts) FROM auction a2 WHERE a2.seller = a.seller))";
+    let out = Arc::new(Schema::new(vec![Field::new("pid", DataType::Int64, false)]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let low = auctions(&[(3, 7, 1)]);
+    let expectations: [&[i64]; 3] = [
+        // Seller 7's auctions both at ts 10: nothing exceeds the avg (10).
+        &[],
+        // +ts 1: avg = 7, auction at 10 exceeds it — person 7 enters.
+        &[7],
+        // Retracted: back to nothing above the average.
+        &[],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 7, 10), (2, 7, 10)])), false),
+        (Some(low.clone()), false),
+        (Some(low), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i == 0 {
+            let d = DeltaBatch::from_inserts(persons(&[(7, 100, 0), (8, 200, 0)])).unwrap();
+            subject.feed("person", d.clone()).unwrap();
+            oracle.feed("person", d).unwrap();
+        }
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "tick {i}: nested side disagreed with recompute");
+        let expect: Vec<Vec<Option<i64>>> =
+            expectations[i].iter().map(|p| vec![Some(*p)]).collect();
+        assert_eq!(got, expect, "tick {i}: the falling average did not cross");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}
+
+/// SEMI-3: EXISTS with a NON-EQUI membership condition — q21's shape in
+/// miniature. `EXISTS (… a2.seller = a.seller AND a2.ts > a.ts)` keeps the
+/// auctions that are NOT their seller's maximum: membership is per LEFT ROW
+/// (it depends on a.ts), so the per-key crossing shortcut cannot answer it —
+/// the operator evaluates the pair predicate inside the key group. Tick 2
+/// raises the ceiling and the old maximum gains a higher sibling; tick 3
+/// lowers it back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_equi_membership_condition_maintains() {
+    let sql = "SELECT a.id, a.ts FROM auction a WHERE EXISTS \
+               (SELECT 1 FROM auction a2 WHERE a2.seller = a.seller AND a2.ts > a.ts)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let ceiling = auctions(&[(3, 7, 30)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // Auction 2 is seller 7's max: only auction 1 has a higher sibling.
+        &[(1, 10)],
+        // A higher ceiling: auction 2 gains a sibling above it and enters.
+        &[(1, 10), (2, 20)],
+        // Retracted: auction 2 is the max again.
+        &[(1, 10)],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 7, 10), (2, 7, 20)])), false),
+        (Some(ceiling.clone()), false),
+        (Some(ceiling), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(
+            got, want,
+            "tick {i}: non-equi membership disagreed with recompute"
+        );
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(id, ts)| vec![Some(*id), Some(*ts)])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "tick {i}: the ceiling shift did not flip membership"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "a non-equi membership must take the O(delta) path: {why}"
+    );
+}

@@ -157,24 +157,23 @@ async fn measure(
 /// padding is rejected by the query's own comparison, DataFusion's
 /// elimination proves it INNER, and the per-key aggregate maintains as the
 /// side fold with its value columns joined into the spine — q17. The
-/// remaining 5 mechanisms landed together (batch 1): LEFTAGG-1 pushes a
-/// LEFT OUTER's right-side-only ON conjuncts to the right input — padding
-/// untouched by definition (q13); ORFACTOR-1 factors conjuncts common to
-/// every OR arm so the equality keys the trace (q19); KEYLESS-1 admits an
-/// INNER join with NO equi key when the right side is an engine-built
-/// GLOBAL-aggregate side — one row by construction, so the cross product is
-/// left × 1 (q22). Still refused, measured: q11's uncorrelated side joins
-/// ABOVE the mid-chain aggregate (a join whose left is an operator — the
-/// chain walk stops at joins); q20's membership side has sides of its OWN;
-/// q21's semi level carries a non-equi membership conjunct; self-joins
-/// collide bare names (q7, q8).
+/// remaining mechanisms landed in two batches. Batch 1: LEFTAGG-1 pushes a
+/// LEFT OUTER's right-side-only ON conjuncts to the right input (q13);
+/// ORFACTOR-1 factors conjuncts common to every OR arm (q19); KEYLESS-1
+/// admits keyless INNER joins against engine-built GLOBAL-aggregate sides
+/// (q22). Batch 2: NESTED-1 flattens sides-of-sides into dependency order
+/// (q20); SEMI-3 evaluates NON-EQUI membership conditions per left row
+/// inside the key group (q21), with resolver-resolved membership sides'
+/// qualifiers kept through re-rooting. Still refused, measured: q11's
+/// uncorrelated side joins ABOVE the mid-chain aggregate (MIDJOIN-1);
+/// self-joins collide bare names (q7, q8).
 ///
 /// The larger coverage figures quoted elsewhere for TPC-H are a different
 /// measurement: what a *human* can build by hand-decomposing each query into
 /// single-hop views (166 views for 28 queries). That is a real capability and
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
-const TPCH_INCREMENTAL: usize = 17;
+const TPCH_INCREMENTAL: usize = 19;
 /// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
 /// q8, q20 — BAND-1), three TUMBLE windows (q1, q2, q7 — WINDOW-1 + UINT-1),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
@@ -231,12 +230,13 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
 /// join run, plus prefix relinearization), and q15 (UNCORR-1: an
 /// uncorrelated global-max side keyed by its own equality, with the
 /// mid-side `revenue0` alias threaded onto the hop scans), plus q13
-/// (LEFTAGG-1), q19 (ORFACTOR-1) and q22 (KEYLESS-1).
+/// (LEFTAGG-1), q19 (ORFACTOR-1), q22 (KEYLESS-1), q20 (NESTED-1) and q21
+/// (SEMI-3).
 /// NEXMark's three band joins do NOT decompose —
 /// their side tables share the bare column name `id`, which would make every
 /// reference above the join hop ambiguous — and they need no chain: BAND-1
 /// maintains them whole.
-const TPCH_DECOMPOSED: usize = 17;
+const TPCH_DECOMPOSED: usize = 19;
 /// q14 — filter plus computed projection. The other single-table NEXMark
 /// queries are single-operator (already incremental whole, nothing to cut),
 /// windowed TVFs (unplannable), or joins.

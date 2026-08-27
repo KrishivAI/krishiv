@@ -590,17 +590,20 @@ fn decompose_side(
     k: usize,
     side: &LogicalPlan,
     visible: &mut AHashMap<String, SchemaRef>,
-) -> Option<(ChainSide, Vec<Hop>)> {
+) -> Option<(ChainSide, Vec<Hop>, Vec<ChainSide>)> {
     side_chain_shape(side)?;
     let base = format!(
         "__ivm_{}_s{k}",
         view_name.trim_start_matches("__ivm_").to_lowercase()
     );
     let declared: SchemaRef = Arc::new(side.schema().as_arrow().clone());
+    // NESTED-1: a side may have sides of its OWN (q20's scalar side inside
+    // its membership side) — the recursion returns them and the caller
+    // FLATTENS: sub-sides are prepended to the top-level list, so evaluation
+    // order is dependency order and a side's join hops read earlier sides'
+    // outputs exactly as the spine's do. Names nest deterministically
+    // (`__ivm_v_s0_s0`), because they are checkpoint identity.
     let (source, records, plans, sub_sides) = decompose_plan(&base, side, &declared, visible, 1)?;
-    if !sub_sides.is_empty() {
-        return None;
-    }
     for r in &records {
         visible.insert(r.name.clone(), r.schema.clone());
     }
@@ -611,6 +614,7 @@ fn decompose_side(
             hops: plans,
         },
         records,
+        sub_sides,
     ))
 }
 
@@ -1107,6 +1111,20 @@ fn decompose_plan(
             datafusion::logical_expr::JoinType::LeftSemi
                 | datafusion::logical_expr::JoinType::LeftAnti
         );
+        // SEMI-3: a membership side that RESOLVES (a filtered projection of
+        // one source) keeps its original subplan, and the join's condition
+        // references it by ITS qualifiers (`__correlated_sq_1.l_suppkey`).
+        // Those must survive re-rooting — stripped, they collide with the
+        // spine's bare names (q21's l1 vs l2 are both lineitem) and the equi
+        // classifies as same-side, refusing the key. The keep set carries
+        // them like side names.
+        if membership && crate::plan::resolve_semi_side_with_filters(&join.right).is_some() {
+            for (q, _) in join.right.schema().iter() {
+                if let Some(q) = q {
+                    side_names.insert(q.table().to_string());
+                }
+            }
+        }
         let needs_side = if membership {
             crate::plan::resolve_semi_side_with_filters(&join.right).is_none()
         } else if join.join_type == datafusion::logical_expr::JoinType::Inner {
@@ -1155,7 +1173,8 @@ fn decompose_plan(
                 return None;
             }
         }
-        let (side, records) = decompose_side(view_name, sides.len(), &join.right, &mut visible)?;
+        let (side, records, sub_sides) =
+            decompose_side(view_name, sides.len(), &join.right, &mut visible)?;
         let side_schema = visible.get(&side.name)?.clone();
         let scan = bare_hop_scan(&side.name, &side_schema)?;
         let right_quals: ahash::AHashSet<String> = join
@@ -1206,6 +1225,11 @@ fn decompose_plan(
         };
         *cuts.get_mut(idx)? = new_cut;
         side_names.insert(side.name.clone());
+        // NESTED-1: sub-sides run BEFORE the side that reads them.
+        for sub in &sub_sides {
+            side_names.insert(sub.name.clone());
+        }
+        sides.extend(sub_sides);
         sides.push(side);
         side_records.extend(records);
     }

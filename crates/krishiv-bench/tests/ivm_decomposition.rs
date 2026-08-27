@@ -826,3 +826,231 @@ async fn tpch_q19_registered_verbatim_maintains_incrementally() {
     assert!(inc, "q19: fell back to DiffBased: {why}");
     assert!(why.contains("chain"), "q19: not via the chain: {why}");
 }
+
+/// Shared scaffolding for tests that DRIVE a NULL/empty fixture answer
+/// through a threshold: feed SQL-synthesized rows conformed to the source
+/// schemas, step both flows, compare.
+struct Driven {
+    ctx: SessionContext,
+    subject: IncrementalFlow,
+    oracle: IncrementalFlow,
+    src_schemas: AHashMap<String, SchemaRef>,
+}
+
+impl Driven {
+    async fn new(sql: &str, tables: &[&str]) -> Self {
+        let ctx = fixture().await;
+        let declared: SchemaRef = Arc::new(ctx.sql(sql).await.unwrap().schema().as_arrow().clone());
+        let subject = IncrementalFlow::new();
+        subject
+            .register_view(spec("v", sql, declared.clone()))
+            .unwrap();
+        let oracle = IncrementalFlow::new();
+        oracle.register_view(spec("v", sql, declared)).unwrap();
+        oracle.force_diff_based().unwrap();
+        let mut src_schemas: AHashMap<String, SchemaRef> = AHashMap::new();
+        for t in tables {
+            src_schemas.insert(
+                t.to_string(),
+                Arc::new(ctx.table(*t).await.unwrap().schema().as_arrow().clone()),
+            );
+        }
+        Self {
+            ctx,
+            subject,
+            oracle,
+            src_schemas,
+        }
+    }
+
+    async fn feed(&self, table: &str, q: &str, retract: bool) {
+        for batch in self.ctx.sql(q).await.unwrap().collect().await.unwrap() {
+            let want = self.src_schemas.get(table).expect("table schema loaded");
+            let cols: Vec<arrow::array::ArrayRef> = batch
+                .columns()
+                .iter()
+                .zip(want.fields())
+                .map(|(c, f)| arrow::compute::cast(c, f.data_type()).unwrap())
+                .collect();
+            let batch = RecordBatch::try_new(want.clone(), cols).unwrap();
+            let d = if retract {
+                DeltaBatch::from_deletes(batch).unwrap()
+            } else {
+                DeltaBatch::from_inserts(batch).unwrap()
+            };
+            self.subject.feed(table, d.clone()).unwrap();
+            self.oracle.feed(table, d).unwrap();
+        }
+    }
+
+    async fn step_and_compare(&self, label: &str) -> Vec<Vec<String>> {
+        let s = self.subject.step_datafusion().await.unwrap();
+        self.oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{label}: {:?}", s.errored_views);
+        let got = canonical(&self.subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&self.oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "{label}: chain disagreed with recompute");
+        got
+    }
+
+    fn assert_chain(&self) {
+        let (inc, why) = self
+            .subject
+            .view_plan_classification("v")
+            .unwrap()
+            .expect("registered");
+        assert!(inc, "fell back to DiffBased: {why}");
+        assert!(why.contains("chain"), "not via the chain: {why}");
+    }
+}
+
+/// NESTED-1 + KEYLESS-1 composed at corpus scale: q20's membership side
+/// (partsupp) contains a scalar side of its OWN (half the 1994 shipped
+/// quantity). The fixture answer is empty, so the proof drives it: a CANADA
+/// supplier stocking a 'forest' part with availqty far above half its
+/// shipped quantity appears; tick 3 ships a huge quantity and the supplier
+/// crosses OUT through the nested scalar.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q20_registered_verbatim_maintains_incrementally() {
+    let d = Driven::new(
+        &corpus_sql("q20"),
+        &["supplier", "nation", "partsupp", "part", "lineitem"],
+    )
+    .await;
+    for t in ["supplier", "nation", "partsupp", "part", "lineitem"] {
+        d.feed(t, &format!("SELECT * FROM {t}"), false).await;
+    }
+    let rows = d.step_and_compare("tick 1").await;
+    assert!(rows.is_empty(), "fixture answer is empty");
+
+    d.feed(
+        "part",
+        "SELECT p_partkey * 0 + 777001 AS p_partkey, 'forest green' AS p_name, \
+        p_mfgr, p_brand, p_type, p_size, p_container, p_retailprice, p_comment \
+        FROM part LIMIT 1",
+        false,
+    )
+    .await;
+    d.feed(
+        "supplier",
+        "SELECT s_suppkey * 0 + 777002 AS s_suppkey, s_name, s_address, \
+        (SELECT n_nationkey FROM nation WHERE n_name = 'CANADA') AS s_nationkey, \
+        s_phone, s_acctbal, s_comment FROM supplier LIMIT 1",
+        false,
+    )
+    .await;
+    d.feed(
+        "partsupp",
+        "SELECT ps_partkey * 0 + 777001 AS ps_partkey, \
+        ps_suppkey * 0 + 777002 AS ps_suppkey, ps_availqty * 0 + 1000 AS ps_availqty, \
+        ps_supplycost, ps_comment FROM partsupp LIMIT 1",
+        false,
+    )
+    .await;
+    let ship = |qty: i64| {
+        format!(
+            "SELECT l_orderkey, l_partkey * 0 + 777001 AS l_partkey, \
+             l_suppkey * 0 + 777002 AS l_suppkey, l_linenumber, \
+             l_quantity * 0 + {qty} AS l_quantity, l_extendedprice, l_discount, l_tax, \
+             l_returnflag, l_linestatus, CAST('1994-06-01' AS DATE) AS l_shipdate, \
+             l_commitdate, l_receiptdate, l_shipinstruct, l_shipmode, l_comment \
+             FROM lineitem LIMIT 1"
+        )
+    };
+    d.feed("lineitem", &ship(10), false).await;
+    let rows = d.step_and_compare("tick 2 (in)").await;
+    assert!(!rows.is_empty(), "availqty 1000 > half of 10 shipped");
+
+    d.feed("lineitem", &ship(100000), false).await;
+    let rows = d
+        .step_and_compare("tick 3 (out via the nested scalar)")
+        .await;
+    assert!(rows.is_empty(), "half of 100010 shipped exceeds availqty");
+    d.assert_chain();
+}
+
+/// SEMI-3 at corpus scale: q21's semi AND anti joins both carry the
+/// non-equi membership conjunct (`l2.l_suppkey != l1.l_suppkey`). Driven: a
+/// SAUDI ARABIA supplier late on a multi-supplier 'F' order counts; tick 3
+/// makes the OTHER supplier late too and the anti join's membership flips
+/// the count away.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q21_registered_verbatim_maintains_incrementally() {
+    let d = Driven::new(
+        &corpus_sql("q21"),
+        &["supplier", "lineitem", "orders", "nation"],
+    )
+    .await;
+    for t in ["supplier", "lineitem", "orders", "nation"] {
+        d.feed(t, &format!("SELECT * FROM {t}"), false).await;
+    }
+    let rows = d.step_and_compare("tick 1").await;
+    assert!(rows.is_empty(), "fixture answer is empty");
+
+    // The fixture's nation table has ten nations and no SAUDI ARABIA —
+    // synthesize it, then hang the counting supplier off it.
+    d.feed(
+        "nation",
+        "SELECT n_nationkey * 0 + 777010 AS n_nationkey, 'SAUDI ARABIA' AS n_name, \
+         n_regionkey, n_comment FROM nation LIMIT 1",
+        false,
+    )
+    .await;
+    for suppkey in [777003i64, 777004] {
+        let nation = if suppkey == 777003 {
+            "777010"
+        } else {
+            "(SELECT n_nationkey FROM nation WHERE n_name = 'CANADA')"
+        };
+        d.feed(
+            "supplier",
+            &format!(
+                "SELECT s_suppkey * 0 + {suppkey} AS s_suppkey, s_name, s_address, \
+             {nation} AS s_nationkey, s_phone, s_acctbal, s_comment FROM supplier LIMIT 1"
+            ),
+            false,
+        )
+        .await;
+    }
+    d.feed(
+        "orders",
+        "SELECT o_orderkey * 0 + 777005 AS o_orderkey, o_custkey, \
+        'F' AS o_orderstatus, o_totalprice, o_orderdate, o_orderpriority, o_clerk, \
+        o_shippriority, o_comment FROM orders LIMIT 1",
+        false,
+    )
+    .await;
+    let line = |suppkey: i64, late: bool| {
+        let (commit, receipt) = if late {
+            ("CAST('1995-01-01' AS DATE)", "CAST('1995-03-01' AS DATE)")
+        } else {
+            ("CAST('1995-01-01' AS DATE)", "CAST('1995-01-01' AS DATE)")
+        };
+        format!(
+            "SELECT l_orderkey * 0 + 777005 AS l_orderkey, l_partkey, \
+             l_suppkey * 0 + {suppkey} AS l_suppkey, l_linenumber, l_quantity, \
+             l_extendedprice, l_discount, l_tax, l_returnflag, l_linestatus, \
+             l_shipdate, {commit} AS l_commitdate, {receipt} AS l_receiptdate, \
+             l_shipinstruct, l_shipmode, l_comment FROM lineitem LIMIT 1"
+        )
+    };
+    d.feed("lineitem", &line(777003, true), false).await;
+    d.feed("lineitem", &line(777004, false), false).await;
+    let rows = d
+        .step_and_compare("tick 2 (the lone late supplier counts)")
+        .await;
+    assert!(
+        !rows.is_empty(),
+        "S1 is late, another supplier shipped, none other late"
+    );
+
+    d.feed("lineitem", &line(777004, true), false).await;
+    let rows = d
+        .step_and_compare("tick 3 (a second late supplier flips the anti)")
+        .await;
+    assert!(
+        rows.is_empty(),
+        "another supplier is now ALSO late — nobody counts"
+    );
+    d.assert_chain();
+}

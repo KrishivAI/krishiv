@@ -59,7 +59,23 @@ pub struct IncrementalJoinOp {
     /// When this sum crosses zero (0→positive or positive→0), the operator
     /// retracts or emits null-padded output rows for all matching left rows.
     right_key_group_weights: AHashMap<Vec<Option<String>>, i64>,
+    /// The right side's data schema, kept for SEMI-3's pair batches.
+    right_schema: SchemaRef,
+    /// SEMI-3: a non-equi MEMBERSHIP condition for semi/anti joins — `EXISTS
+    /// (… WHERE key match AND l2.l_suppkey != l1.l_suppkey)`. Membership is
+    /// then per LEFT ROW, not per key: a left row is a member iff the summed
+    /// weight of key-matching right rows PASSING this predicate is positive
+    /// (semi) or zero (anti). Evaluated over pair batches whose columns are
+    /// left fields ++ right fields, positionally — the caller compiled the
+    /// expression against that layout. Plan-compiled, never checkpointed.
+    membership_residual: Option<MembershipResidual>,
 }
+
+/// SEMI-3: evaluates the membership predicate over a (left ++ right) pair
+/// batch, returning the boolean mask. NULL means "does not pass", exactly
+/// SQL's EXISTS semantics.
+pub type MembershipResidual =
+    Arc<dyn Fn(&RecordBatch) -> DeltaResult<arrow::array::BooleanArray> + Send + Sync>;
 
 impl IncrementalJoinOp {
     /// Create a new incremental join operator.
@@ -138,7 +154,15 @@ impl IncrementalJoinOp {
             join_type,
             left_field_count,
             right_key_group_weights: AHashMap::new(),
+            right_schema,
+            membership_residual: None,
         })
+    }
+
+    /// SEMI-3: install the non-equi membership predicate (semi/anti only —
+    /// the caller guarantees the join type). See [`MembershipResidual`].
+    pub fn set_membership_residual(&mut self, residual: MembershipResidual) {
+        self.membership_residual = Some(residual);
     }
 
     pub fn output_schema(&self) -> &SchemaRef {
@@ -169,6 +193,9 @@ impl IncrementalJoinOp {
             self.join_type,
             IncrJoinType::LeftSemi | IncrJoinType::LeftAnti
         ) {
+            if self.membership_residual.is_some() {
+                return self.apply_left_semi_anti_residual(delta_left, delta_right);
+            }
             return self.apply_left_semi_anti(delta_left, delta_right);
         }
         // Inner join path.
@@ -528,6 +555,218 @@ impl IncrementalJoinOp {
                 let inner = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?;
                 parts.push(DeltaBatch::from_weighted(inner)?);
             }
+        }
+
+        // Update traces AFTER all probes.
+        if let Some(dl) = delta_left {
+            self.left_trace.insert(dl);
+        }
+        if let Some(dr) = delta_right {
+            self.right_trace.insert(dr);
+        }
+
+        combine_parts(parts, &self.output_schema)
+    }
+
+    /// SEMI-3: summed weight of `rights` rows passing the membership
+    /// predicate against left row `li` — the left row replicated across a
+    /// (left ++ right) pair batch, the mask applied to the rights' weights.
+    fn residual_pass_weight(
+        &self,
+        left_data: &RecordBatch,
+        li: usize,
+        rights: &DeltaBatch,
+    ) -> DeltaResult<i64> {
+        let n = rights.data_batch().num_rows();
+        if n == 0 {
+            return Ok(0);
+        }
+        let Some(residual) = &self.membership_residual else {
+            return Err(DeltaError::Operator(
+                "membership residual evaluated without one installed".into(),
+            ));
+        };
+        let idx = arrow::array::UInt64Array::from(vec![li as u64; n]);
+        let mut cols: Vec<Arc<dyn Array>> = Vec::new();
+        let mut fields: Vec<Arc<Field>> = Vec::new();
+        for (c, f) in left_data
+            .columns()
+            .iter()
+            .zip(left_data.schema().fields().iter())
+        {
+            cols.push(arrow::compute::take(c, &idx, None)?);
+            fields.push(f.clone());
+        }
+        let rd = rights.data_batch();
+        for (c, f) in rd.columns().iter().zip(rd.schema().fields().iter()) {
+            cols.push(c.clone());
+            fields.push(f.clone());
+        }
+        let pair = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?;
+        let mask = residual(&pair)?;
+        let rw = rights.weights();
+        let mut total = 0i64;
+        for i in 0..n {
+            if mask.is_valid(i) && mask.value(i) {
+                total += rw.value(i);
+            }
+        }
+        Ok(total)
+    }
+
+    /// SEMI-3: semi/anti with a non-equi membership condition. Membership is
+    /// per LEFT ROW — `∃ right: key match AND residual(left, right)` — so
+    /// the per-key crossing shortcut does not apply; each affected left row
+    /// re-evaluates against its key group, which is bounded by key fanout.
+    /// ΔA rows evaluate against the POST-tick right state (trace + ΔB);
+    /// ΔB-driven flips probe the PRE-insert left trace, so same-tick ΔA rows
+    /// are never counted twice — the same discipline as the keyed path.
+    fn apply_left_semi_anti_residual(
+        &mut self,
+        delta_left: Option<DeltaBatch>,
+        delta_right: Option<DeltaBatch>,
+    ) -> DeltaResult<DeltaBatch> {
+        let semi = self.join_type == IncrJoinType::LeftSemi;
+        let mut parts: Vec<DeltaBatch> = Vec::new();
+
+        // ΔB rows grouped by key, for both ΔA's post-state and the flips.
+        let mut dr_by_key: AHashMap<Vec<Option<String>>, Vec<usize>> = AHashMap::new();
+        if let Some(ref dr) = delta_right
+            && !dr.is_empty()
+        {
+            let rd = dr.data_batch();
+            let rki = col_indices(&rd, &self.right_key_cols)?;
+            for ri in 0..rd.num_rows() {
+                dr_by_key
+                    .entry(extract_key(&rd, ri, &rki)?)
+                    .or_default()
+                    .push(ri);
+            }
+        }
+        let dr_rows_for = |key: &Vec<Option<String>>| -> DeltaResult<Option<DeltaBatch>> {
+            match (&delta_right, dr_by_key.get(key)) {
+                (Some(dr), Some(rows)) => Ok(Some(select_rows(dr, rows)?)),
+                _ => Ok(None),
+            }
+        };
+
+        // ΔA: membership under the post-tick right state.
+        if let Some(ref dl) = delta_left
+            && !dl.is_empty()
+        {
+            let ld = dl.data_batch();
+            let lw = dl.weights();
+            let lki = col_indices(&ld, &self.left_key_cols)?;
+            let mut keep: Vec<usize> = Vec::new();
+            for li in 0..ld.num_rows() {
+                let key = extract_key(&ld, li, &lki)?;
+                let probe = keys_to_probe_batch(
+                    std::slice::from_ref(&key),
+                    &self.right_key_cols,
+                    &self.right_schema,
+                )?;
+                let trace_rights = self.right_trace.probe_by_keys(&probe)?;
+                let mut w = self.residual_pass_weight(&ld, li, &trace_rights)?;
+                if let Some(db) = dr_rows_for(&key)? {
+                    w += self.residual_pass_weight(&ld, li, &db)?;
+                }
+                let member = if semi { w > 0 } else { w == 0 };
+                if member {
+                    keep.push(li);
+                }
+            }
+            let _ = lw;
+            if !keep.is_empty() {
+                parts.push(select_rows(dl, &keep)?);
+            }
+        }
+
+        // ΔB: per affected key, each PRE-insert left-trace row's membership
+        // may flip between the pre-tick and post-tick right states.
+        for key in dr_by_key.keys() {
+            let probe = keys_to_probe_batch(
+                std::slice::from_ref(key),
+                &self.left_key_cols,
+                &self.left_schema,
+            )?;
+            let left_matches = self.left_trace.probe_by_keys(&probe)?;
+            if left_matches.is_empty() {
+                continue;
+            }
+            let rprobe = keys_to_probe_batch(
+                std::slice::from_ref(key),
+                &self.right_key_cols,
+                &self.right_schema,
+            )?;
+            let trace_rights = self.right_trace.probe_by_keys(&rprobe)?;
+            let db = dr_rows_for(key)?;
+            let lm = left_matches.data_batch();
+            let lmw = left_matches.weights();
+            let mut flip_idx: Vec<usize> = Vec::new();
+            let mut flip_sign: Vec<i64> = Vec::new();
+            for li in 0..lm.num_rows() {
+                let pre_w = self.residual_pass_weight(&lm, li, &trace_rights)?;
+                let delta_w = match &db {
+                    Some(d) => self.residual_pass_weight(&lm, li, d)?,
+                    None => 0,
+                };
+                let post_w = pre_w + delta_w;
+                let (pre_m, post_m) = if semi {
+                    (pre_w > 0, post_w > 0)
+                } else {
+                    (pre_w == 0, post_w == 0)
+                };
+                match (pre_m, post_m) {
+                    (false, true) => {
+                        flip_idx.push(li);
+                        flip_sign.push(1);
+                    }
+                    (true, false) => {
+                        flip_idx.push(li);
+                        flip_sign.push(-1);
+                    }
+                    _ => {}
+                }
+            }
+            if flip_idx.is_empty() {
+                continue;
+            }
+            let take_idx = arrow::array::UInt64Array::from(
+                flip_idx.iter().map(|&i| i as u64).collect::<Vec<_>>(),
+            );
+            let mut cols: Vec<Arc<dyn Array>> = Vec::new();
+            for c in lm.columns() {
+                cols.push(arrow::compute::take(c, &take_idx, None)?);
+            }
+            let signed: Vec<i64> = flip_idx
+                .iter()
+                .zip(flip_sign.iter())
+                .map(|(&i, &s)| s * lmw.value(i))
+                .collect();
+            cols.push(Arc::new(Int64Array::from(signed)));
+            let mut fields: Vec<_> = lm.schema().fields().iter().cloned().collect();
+            fields.push(Arc::new(Field::new(WEIGHT_COLUMN, DataType::Int64, false)));
+            let inner = RecordBatch::try_new(Arc::new(Schema::new(fields)), cols)?;
+            parts.push(DeltaBatch::from_weighted(inner)?);
+        }
+
+        // Keep the per-key bookkeeping identical to the keyed path, so a
+        // checkpoint restored into either path sees the same state.
+        if let Some(ref dr) = delta_right
+            && !dr.is_empty()
+        {
+            let rd = dr.data_batch();
+            let rw = dr.weights();
+            let rki = col_indices(&rd, &self.right_key_cols)?;
+            for ri in 0..rd.num_rows() {
+                let key = extract_key(&rd, ri, &rki)?;
+                let e = self.right_key_group_weights.entry(key).or_insert(0);
+                *e += rw.value(ri);
+                if *e == 0 {
+                    // Entry removal mirrors the keyed path.
+                }
+            }
+            self.right_key_group_weights.retain(|_, w| *w != 0);
         }
 
         // Update traces AFTER all probes.
