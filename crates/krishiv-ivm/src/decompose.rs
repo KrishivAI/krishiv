@@ -58,7 +58,7 @@ use datafusion::datasource::MemTable;
 use datafusion::logical_expr::{Expr, Filter as LogicalFilter, LogicalPlan, LogicalPlanBuilder};
 use datafusion::prelude::SessionContext;
 
-use crate::plan::{ViewPlan, ViewPlanKind, build_view_plan_from_logical};
+use crate::plan::{ChainSide, ViewPlan, ViewPlanKind, build_view_plan_from_logical};
 
 /// One hop: a single-operator query over the hop beneath it.
 #[derive(Debug, Clone)]
@@ -299,8 +299,12 @@ fn bare_hop_scan(hop: &str, schema: &SchemaRef) -> Option<LogicalPlan> {
 }
 
 /// Strip qualifiers from every column reference in `exprs` — sound over one
-/// relation with unique bare names (see `Leaf::Join`).
-fn unqualify_exprs(exprs: &[Expr]) -> Option<Vec<Expr>> {
+/// relation with unique bare names (see `Leaf::Join`). Qualifiers named in
+/// `keep` survive: a SIDE-1 join condition references the side's relation by
+/// its internal hop name (`__ivm_v_s0.pid`), and stripping that would make
+/// the reference resolve against the SPINE relation whenever the bare name
+/// exists on both — a silently wrong join key.
+fn unqualify_exprs_keeping(exprs: &[Expr], keep: &ahash::AHashSet<String>) -> Option<Vec<Expr>> {
     use datafusion::common::Column;
     exprs
         .iter()
@@ -308,7 +312,12 @@ fn unqualify_exprs(exprs: &[Expr]) -> Option<Vec<Expr>> {
             e.clone()
                 .transform(|node| {
                     Ok(match node {
-                        Expr::Column(c) => {
+                        Expr::Column(c)
+                            if !c
+                                .relation
+                                .as_ref()
+                                .is_some_and(|r| keep.contains(&r.to_string())) =>
+                        {
                             Transformed::yes(Expr::Column(Column::new_unqualified(c.name)))
                         }
                         other => Transformed::no(other),
@@ -447,6 +456,131 @@ fn hoist_computed_inputs(node: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)>
     Some((hop, rewritten))
 }
 
+/// SIDE-1: is this join side maintainable as its own linear fold over one
+/// table? Returns the side's chain (leaf first) and its source. The checks
+/// mirror the spine's refusals: one table, no read-time nodes (a `LIMIT`
+/// inside a membership side would change WHICH keys are members — refusing
+/// is the only honest answer), no subquery expressions anywhere.
+fn side_chain_shape(plan: &LogicalPlan) -> Option<(Vec<LogicalPlan>, String)> {
+    let chain = linear_chain(plan)?;
+    let source = match leaf_of(&chain)? {
+        Leaf::Table(t) => t,
+        Leaf::Join => return None,
+    };
+    if chain.iter().any(is_read_time) {
+        return None;
+    }
+    let mut has_operator = false;
+    for n in &chain {
+        if !is_passthrough(n) {
+            has_operator = true;
+        }
+        for e in n.expressions() {
+            let mut has_subquery = false;
+            let _ = e.apply(|node| {
+                if matches!(
+                    node,
+                    Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                ) {
+                    has_subquery = true;
+                    return Ok(datafusion::common::tree_node::TreeNodeRecursion::Stop);
+                }
+                Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+            });
+            if has_subquery {
+                return None;
+            }
+        }
+    }
+    if !has_operator {
+        return None;
+    }
+    Some((chain, source))
+}
+
+/// SIDE-1: cut a join side into its own hop run — a decorrelated subquery
+/// side (aggregate + HAVING + projection over one table) maintained exactly
+/// like a `Leaf::Table` spine: each cut re-rooted onto an aliased scan of the
+/// hop below, each verified on the re-rooted plan itself, wholesale-refused
+/// on any non-incremental hop. Side hop names derive from the view name and
+/// side index — deterministic, because they are checkpoint identity — and
+/// the final hop's name (`__ivm_<view>_s<k>`) is what the spine join's
+/// rewritten right side scans.
+fn decompose_side(
+    view_name: &str,
+    k: usize,
+    side: &LogicalPlan,
+    visible: &mut AHashMap<String, SchemaRef>,
+) -> Option<(ChainSide, Vec<Hop>)> {
+    let (chain, source) = side_chain_shape(side)?;
+    let mut operator_nodes: Vec<&LogicalPlan> = Vec::new();
+    for n in &chain {
+        if !is_passthrough(n) {
+            operator_nodes.push(n);
+        }
+    }
+    let mut cuts: Vec<LogicalPlan> = Vec::new();
+    for n in &operator_nodes {
+        match hoist_computed_inputs(n) {
+            Some((hoist, rewritten)) => {
+                let agg = n.with_new_exprs(rewritten, vec![hoist.clone()]).ok()?;
+                cuts.push(hoist);
+                cuts.push(agg);
+            }
+            None => cuts.push((*n).clone()),
+        }
+    }
+    // A single-operator side is one hop — unlike the spine, where one
+    // operator means there was nothing to cut, a side ALWAYS needs its own
+    // fold because its output feeds a join, not a registered view.
+    let base = format!("__ivm_{}_s{k}", view_name.to_lowercase());
+    let mut records: Vec<Hop> = Vec::new();
+    let mut plans: Vec<ViewPlan> = Vec::new();
+    let last = cuts.len().checked_sub(1)?;
+    for (i, node) in cuts.iter().enumerate() {
+        let rooted = if i == 0 {
+            node.clone()
+        } else {
+            let prev = records.last()?;
+            let scan = aliased_hop_scan(&prev.name, &prev.schema, &source)?;
+            node.with_new_exprs(node.expressions(), vec![scan]).ok()?
+        };
+        let target = if needs_projection(&rooted) {
+            explicit_projection(&rooted)?
+        } else {
+            rooted
+        };
+        let name = if i == last {
+            base.clone()
+        } else {
+            format!("{base}_h{i}")
+        };
+        let schema: SchemaRef = Arc::new(target.schema().as_arrow().clone());
+        let plan = build_view_plan_from_logical(&target, &schema, visible, &[]);
+        if plan.kind() != ViewPlanKind::Incremental {
+            return None;
+        }
+        let sql = datafusion::sql::unparser::plan_to_sql(&target)
+            .ok()
+            .map(|s| s.to_string());
+        plans.push(plan);
+        visible.insert(name.clone(), schema.clone());
+        records.push(Hop {
+            name,
+            body_sql: sql,
+            schema,
+        });
+    }
+    Some((
+        ChainSide {
+            name: base,
+            source,
+            hops: plans,
+        },
+        records,
+    ))
+}
+
 /// Cut `body_sql` into hops, or return `None` to leave the view alone.
 ///
 /// The last hop keeps the caller's `view_name` and `declared` schema, so the
@@ -460,7 +594,7 @@ pub async fn decompose(
 ) -> Option<Vec<Hop>> {
     decompose_core(view_name, body_sql, declared, available_schemas)
         .await
-        .map(|(_, hops, _)| hops)
+        .map(|(_, hops, _, _)| hops)
 }
 
 /// Cut `body_sql` into a single [`ViewPlan::Chain`] the flow can run in place
@@ -480,10 +614,12 @@ pub(crate) async fn decompose_into_chain(
     declared: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
 ) -> Option<ViewPlan> {
-    let (source, _, plans) = decompose_core("chain", body_sql, declared, available_schemas).await?;
+    let (source, _, plans, sides) =
+        decompose_core("chain", body_sql, declared, available_schemas).await?;
     Some(ViewPlan::Chain {
         source,
         hops: plans,
+        sides,
     })
 }
 
@@ -492,7 +628,7 @@ async fn decompose_core(
     body_sql: &str,
     declared: &SchemaRef,
     available_schemas: &AHashMap<String, SchemaRef>,
-) -> Option<(String, Vec<Hop>, Vec<ViewPlan>)> {
+) -> Option<(String, Vec<Hop>, Vec<ViewPlan>, Vec<ChainSide>)> {
     let ctx = SessionContext::new();
     for (name, schema) in available_schemas {
         let empty = arrow::array::RecordBatch::new_empty(schema.clone());
@@ -534,6 +670,7 @@ async fn decompose_core(
                 );
                 let right_ok = if membership {
                     crate::plan::resolve_semi_side_with_filters(&j.right).is_some()
+                        || side_chain_shape(&j.right).is_some()
                 } else {
                     crate::plan::side_resolves_to_source(&j.right)
                 };
@@ -691,7 +828,6 @@ async fn decompose_core(
 
     let mut hops: Vec<Hop> = Vec::new();
     let mut plans: Vec<ViewPlan> = Vec::new();
-    let mut visible = available_schemas.clone();
     let last = cuts.len() - 1;
     // TOPN-2: a bare `Sort` is a read-time property (ORDER-1) and rides the
     // final hop; a `Sort` under a `Limit` is a TOP-N — it changes which rows
@@ -699,6 +835,85 @@ async fn decompose_core(
     // over the last cut, where a projection's renames (`sum(…) AS revenue`)
     // are already plain columns the top-N matcher accepts.
     let topn_final = above.iter().any(|n| matches!(n, LogicalPlan::Limit(_)));
+
+    // SIDE-1 pre-pass: a MEMBERSHIP level (semi/anti) whose right side is not
+    // a plain filtered source becomes a SIDE sub-chain — the decorrelated
+    // aggregate + HAVING membership set maintained as its own fold. The join
+    // cut is rewritten IN PLACE: its right input becomes a scan of the side's
+    // final hop, and every reference into the old right subplan requalifies
+    // to the side's name — kept qualified, because the side's bare column
+    // names (`l_orderkey`) routinely also exist on the spine relation, and an
+    // unqualified reference would silently bind to the wrong side of the
+    // join. Any failure refuses the whole chain (the wholesale rule).
+    let mut sides: Vec<ChainSide> = Vec::new();
+    let mut side_records: Vec<Hop> = Vec::new();
+    let mut side_names: ahash::AHashSet<String> = ahash::AHashSet::new();
+    let mut visible = available_schemas.clone();
+    for idx in 0..cuts.len() {
+        let (pred, join) = match cuts.get(idx)? {
+            LogicalPlan::Join(j) => (None, j.clone()),
+            LogicalPlan::Filter(f) => match f.input.as_ref() {
+                LogicalPlan::Join(j) => (Some(f.predicate.clone()), j.clone()),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let membership = matches!(
+            join.join_type,
+            datafusion::logical_expr::JoinType::LeftSemi
+                | datafusion::logical_expr::JoinType::LeftAnti
+        );
+        if !membership || crate::plan::resolve_semi_side_with_filters(&join.right).is_some() {
+            continue;
+        }
+        let (side, records) = decompose_side(view_name, sides.len(), &join.right, &mut visible)?;
+        let side_schema = visible.get(&side.name)?.clone();
+        let scan = bare_hop_scan(&side.name, &side_schema)?;
+        let right_quals: ahash::AHashSet<String> = join
+            .right
+            .schema()
+            .iter()
+            .filter_map(|(q, _)| q.map(|t| t.to_string()))
+            .collect();
+        let side_name = side.name.clone();
+        let requalify = |exprs: &[Expr]| -> Option<Vec<Expr>> {
+            exprs
+                .iter()
+                .map(|e| {
+                    e.clone()
+                        .transform(|node| {
+                            Ok(match node {
+                                Expr::Column(c)
+                                    if c.relation
+                                        .as_ref()
+                                        .is_some_and(|r| right_quals.contains(&r.to_string())) =>
+                                {
+                                    Transformed::yes(Expr::Column(datafusion::common::Column::new(
+                                        Some(side_name.clone()),
+                                        c.name,
+                                    )))
+                                }
+                                other => Transformed::no(other),
+                            })
+                        })
+                        .map(|t| t.data)
+                        .ok()
+                })
+                .collect()
+        };
+        let left = join.left.as_ref().clone();
+        let join_plan = LogicalPlan::Join(join);
+        let exprs = requalify(&join_plan.expressions())?;
+        let rebuilt = join_plan.with_new_exprs(exprs, vec![left, scan]).ok()?;
+        let new_cut = match pred {
+            Some(pdr) => LogicalPlan::Filter(LogicalFilter::try_new(pdr, Arc::new(rebuilt)).ok()?),
+            None => rebuilt,
+        };
+        *cuts.get_mut(idx)? = new_cut;
+        side_names.insert(side.name.clone());
+        sides.push(side);
+        side_records.extend(records);
+    }
 
     for (i, node) in cuts.iter().enumerate() {
         // Re-root onto the hop below, structurally.
@@ -722,7 +937,7 @@ async fn decompose_core(
                     let scan = bare_hop_scan(&prev.name, &prev.schema)?;
                     match node {
                         LogicalPlan::Join(j) => {
-                            let exprs = unqualify_exprs(&node.expressions())?;
+                            let exprs = unqualify_exprs_keeping(&node.expressions(), &side_names)?;
                             node.with_new_exprs(exprs, vec![scan, j.right.as_ref().clone()])
                                 .ok()?
                         }
@@ -732,21 +947,26 @@ async fn decompose_core(
                             let LogicalPlan::Join(j) = f.input.as_ref() else {
                                 return None;
                             };
-                            let join_exprs = unqualify_exprs(&f.input.expressions())?;
+                            let join_exprs =
+                                unqualify_exprs_keeping(&f.input.expressions(), &side_names)?;
                             let new_join = f
                                 .input
                                 .as_ref()
                                 .clone()
                                 .with_new_exprs(join_exprs, vec![scan, j.right.as_ref().clone()])
                                 .ok()?;
-                            let pred =
-                                unqualify_exprs(std::slice::from_ref(&f.predicate))?.pop()?;
+                            let pred = unqualify_exprs_keeping(
+                                std::slice::from_ref(&f.predicate),
+                                &side_names,
+                            )?
+                            .pop()?;
                             LogicalPlan::Filter(
                                 LogicalFilter::try_new(pred, Arc::new(new_join)).ok()?,
                             )
                         }
                         _ => {
-                            let mut exprs = unqualify_exprs(&node.expressions())?;
+                            let mut exprs =
+                                unqualify_exprs_keeping(&node.expressions(), &side_names)?;
                             // Unqualifying changes DERIVED names — the
                             // aggregate `sum(profit.amount)` re-roots as
                             // `sum(amount)` — and the hop above references
@@ -783,7 +1003,7 @@ async fn decompose_core(
             let mut top = rooted;
             for r in &above {
                 let exprs = match &leaf {
-                    Leaf::Join => unqualify_exprs(&r.expressions())?,
+                    Leaf::Join => unqualify_exprs_keeping(&r.expressions(), &side_names)?,
                     Leaf::Table(_) => r.expressions(),
                 };
                 top = r.with_new_exprs(exprs, vec![top]).ok()?;
@@ -840,7 +1060,7 @@ async fn decompose_core(
         let mut top = scan;
         for r in &above {
             let exprs = match &leaf {
-                Leaf::Join => unqualify_exprs(&r.expressions())?,
+                Leaf::Join => unqualify_exprs_keeping(&r.expressions(), &side_names)?,
                 Leaf::Table(_) => r.expressions(),
             };
             top = r.with_new_exprs(exprs, vec![top]).ok()?;
@@ -868,5 +1088,10 @@ async fn decompose_core(
         (Leaf::Join, Some(ViewPlan::Join { left_source, .. })) => left_source.clone(),
         (Leaf::Join, _) => return None,
     };
-    Some((source, hops, plans))
+    // Side hops precede the spine in the public hop list — topological order,
+    // so a caller registering hops as standalone views registers each side
+    // before the join that reads it.
+    let mut all_hops = side_records;
+    all_hops.extend(hops);
+    Some((source, all_hops, plans, sides))
 }

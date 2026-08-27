@@ -453,3 +453,100 @@ async fn tpch_q16_registered_verbatim_maintains_incrementally() {
     verbatim_join_matches_recompute("q16", &["partsupp", "part", "supplier"], &corpus_sql("q16"))
         .await;
 }
+
+/// SIDE-1: q18's membership side is an AGGREGATE — `o_orderkey IN (SELECT
+/// l_orderkey … GROUP BY … HAVING sum(l_quantity) > 300)` — maintained as the
+/// chain's side fold. The fixture's orders all sum under 300, so the honest
+/// proof DRIVES one across the threshold: tick 2 feeds the heaviest order's
+/// lineitem rows twenty more times (Z-set weights multiply its sum by 21),
+/// which must cross it INTO the HAVING set and surface it through the
+/// customer ⋈ orders ⋈ lineitem spine; tick 3 retracts the copies and it
+/// must leave again. Every tick is compared against full recompute, and the
+/// crossed tick is asserted non-empty so agreement is never vacuous.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q18_registered_verbatim_maintains_incrementally() {
+    let ctx = fixture().await;
+    let sql = corpus_sql("q18");
+    let declared: SchemaRef = Arc::new(ctx.sql(&sql).await.unwrap().schema().as_arrow().clone());
+
+    let subject = IncrementalFlow::new();
+    subject
+        .register_view(spec("v", &sql, declared.clone()))
+        .unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec("v", &sql, declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let feed_sql = |q: String, retract: bool| {
+        let ctx = &ctx;
+        let subject = &subject;
+        let oracle = &oracle;
+        async move {
+            for batch in ctx.sql(&q).await.unwrap().collect().await.unwrap() {
+                let d = if retract {
+                    DeltaBatch::from_deletes(batch).unwrap()
+                } else {
+                    DeltaBatch::from_inserts(batch).unwrap()
+                };
+                let table = if q.contains("customer") {
+                    "customer"
+                } else if q.contains("orders") {
+                    "orders"
+                } else {
+                    "lineitem"
+                };
+                subject.feed(table, d.clone()).unwrap();
+                oracle.feed(table, d).unwrap();
+            }
+        }
+    };
+    let step_and_compare = |label: &'static str| {
+        let subject = &subject;
+        let oracle = &oracle;
+        async move {
+            let s = subject.step_datafusion().await.unwrap();
+            oracle.step_datafusion().await.unwrap();
+            assert!(s.errored_views.is_empty(), "{label}: {:?}", s.errored_views);
+            let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+            let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+            assert_eq!(got, want, "{label}: chain disagreed with recompute");
+            got
+        }
+    };
+
+    // Tick 1: the whole fixture. No order reaches sum(l_quantity) > 300.
+    for t in ["customer", "orders", "lineitem"] {
+        feed_sql(format!("SELECT * FROM {t}"), false).await;
+    }
+    let rows = step_and_compare("tick 1").await;
+    assert!(rows.is_empty(), "the fixture starts below the threshold");
+
+    // The heaviest order, whose sum a 21x multiplication will push past 300.
+    let boost = "SELECT * FROM lineitem WHERE l_orderkey = \
+                 (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey \
+                  ORDER BY sum(l_quantity) DESC LIMIT 1)";
+    for _ in 0..20 {
+        feed_sql(boost.to_string(), false).await;
+    }
+    let rows = step_and_compare("tick 2 (crossing up)").await;
+    assert!(
+        !rows.is_empty(),
+        "the boosted order must cross INTO the HAVING membership"
+    );
+
+    for _ in 0..20 {
+        feed_sql(boost.to_string(), true).await;
+    }
+    let rows = step_and_compare("tick 3 (crossing down)").await;
+    assert!(
+        rows.is_empty(),
+        "retracting the copies leaves the set again"
+    );
+
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "q18: fell back to DiffBased: {why}");
+    assert!(why.contains("chain"), "q18: not via the chain: {why}");
+}

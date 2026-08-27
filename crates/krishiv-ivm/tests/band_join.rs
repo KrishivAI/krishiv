@@ -435,3 +435,259 @@ async fn an_aggregate_above_exists_maintains_as_a_chain() {
         "seller 7 re-entered at n = 2 on the crossing up; seller 8 never matched"
     );
 }
+
+/// SIDE-1: an aggregate above `IN (SELECT … GROUP BY … HAVING …)` — TPC-H
+/// q18's shape in miniature. The membership side is itself an AGGREGATE,
+/// maintained as the chain's SIDE fold: a seller is a member while they hold
+/// at least two person rows, and the side aggregate's retract+insert pairs
+/// net to a single signed row exactly when a pid crosses the HAVING
+/// threshold — which is precisely a semi-join membership crossing. Tick 2
+/// retracts one of pid 7's two rows (count 2 → 1, leaves the set, seller 7's
+/// auctions leave the COUNT); tick 3 restores it. Every tick is compared
+/// against full recompute.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_above_a_having_membership_side_maintains_as_a_chain() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE seller IN \
+               (SELECT pid FROM person GROUP BY pid HAVING COUNT(*) > 1) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let second_p7 = persons(&[(7, 200, 1)]);
+    for (a, p, retract) in [
+        // Sellers 7 (two auctions) and 8 (one); pid 7 has TWO person rows
+        // (a member), pid 8 has one (not a member).
+        (
+            Some(auctions(&[(1, 7, 10), (2, 7, 11), (3, 8, 20)])),
+            Some(persons(&[(7, 100, 0), (7, 200, 1), (8, 300, 0)])),
+            false,
+        ),
+        // pid 7 drops to one row: count crosses 2 -> 1, membership lost.
+        (None, Some(second_p7.clone()), true),
+        // And back: membership regained, the group returns at n = 2.
+        (None, Some(second_p7), false),
+    ] {
+        let mk = |b: &RecordBatch| {
+            if retract {
+                DeltaBatch::from_deletes(b.clone()).unwrap()
+            } else {
+                DeltaBatch::from_inserts(b.clone()).unwrap()
+            }
+        };
+        if let Some(a) = a {
+            subject.feed("auction", mk(&a)).unwrap();
+            oracle.feed("auction", mk(&a)).unwrap();
+        }
+        if let Some(p) = p {
+            subject.feed("person", mk(&p)).unwrap();
+            oracle.feed("person", mk(&p)).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+
+        let got = subject.snapshot("v").unwrap().expect("published");
+        let want = oracle.snapshot("v").unwrap().expect("published");
+        assert_eq!(
+            canonical(&got),
+            canonical(&want),
+            "the chain with a HAVING membership side disagreed with recompute"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "an aggregate above a HAVING membership must take the O(delta) path: {why}"
+    );
+    assert!(
+        why.contains("chain"),
+        "incremental but not via the chain: {why}"
+    );
+    assert_eq!(
+        canonical(&subject.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(7), Some(2)]],
+        "seller 7 re-entered at n = 2; seller 8's pid never held two rows"
+    );
+}
+
+/// SIDE-1's checkpoint framing (CHN2): a side-bearing chain must restore its
+/// SIDE hop state losslessly. The side source carries a genuinely duplicate
+/// person row — pid 7 is a member only because its COUNT(*) is 2 via
+/// duplicates, which the materialized source snapshot (a set) cannot
+/// represent. After restore, retracting ONE copy must cross membership down
+/// and empty the view; a restore that fell back to snapshot seeding holds
+/// count 1, sees no crossing, and leaves the restored snapshot published —
+/// a wrong answer wearing a healthy view's clothes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_side_bearing_chain_checkpoints_and_restores_losslessly() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE seller IN \
+               (SELECT pid FROM person GROUP BY pid HAVING COUNT(*) > 1) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let mk_spec = || spec(sql, out.clone());
+
+    let flow = IncrementalFlow::new();
+    flow.register_view(mk_spec()).unwrap();
+    flow.feed(
+        "auction",
+        DeltaBatch::from_inserts(auctions(&[(1, 7, 10), (2, 7, 11)])).unwrap(),
+    )
+    .unwrap();
+    // The SAME person row twice — the duplicate is the point.
+    flow.feed(
+        "person",
+        DeltaBatch::from_inserts(persons(&[(7, 100, 0), (7, 100, 0)])).unwrap(),
+    )
+    .unwrap();
+    flow.step_datafusion().await.unwrap();
+    let (inc, why) = flow
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+    assert_eq!(
+        canonical(&flow.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(7), Some(2)]],
+        "pid 7 is a member through its duplicate rows"
+    );
+
+    let blob = flow.checkpoint_full().unwrap();
+    let restored = IncrementalFlow::new();
+    restored.register_view(mk_spec()).unwrap();
+    restored.restore_full(&blob).unwrap();
+
+    // One copy retracts: the TRUE count crosses 2 -> 1, membership is lost,
+    // and the group must leave the view. Only the CHN2-framed side aggregate
+    // state knows the count was 2.
+    for f in [&restored, &flow] {
+        f.feed(
+            "person",
+            DeltaBatch::from_deletes(persons(&[(7, 100, 0)])).unwrap(),
+        )
+        .unwrap();
+        f.step_datafusion().await.unwrap();
+    }
+    let restored_rows = canonical(&restored.snapshot("v").unwrap().unwrap());
+    let continuous_rows = canonical(&flow.snapshot("v").unwrap().unwrap());
+    assert_eq!(
+        restored_rows,
+        Vec::<Vec<Option<i64>>>::new(),
+        "membership crossed down through the restored side state"
+    );
+    assert_eq!(
+        restored_rows, continuous_rows,
+        "restore changed nothing but the process"
+    );
+}
+
+/// SIDE-1's seed path: when restored operator state cannot be adopted
+/// (IVM-AUD-STALE-1 — here forced by re-registering the view with
+/// cosmetically different SQL, which changes the logic fingerprint while
+/// planning identically), the chain re-seeds from source snapshots — and the
+/// SIDE must seed from ITS source's snapshot, then feed the join's right
+/// trace. pid 7's membership comes from two DISTINCT person rows (a set
+/// snapshot represents them faithfully), so the seeded side aggregate holds
+/// count 2; the first post-restore tick retracts one row, membership crosses
+/// down, and the view must empty. A seed that never wires the side into the
+/// join leaves the restored snapshot published unchanged — frozen wrong.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_side_bearing_chain_reseeds_from_snapshots_when_state_is_stale() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE seller IN \
+               (SELECT pid FROM person GROUP BY pid HAVING COUNT(*) > 1) GROUP BY seller";
+    // Same query, one extra space: identical plan, different fingerprint.
+    let sql_variant = "SELECT seller,  COUNT(*) AS n FROM auction a WHERE seller IN \
+               (SELECT pid FROM person GROUP BY pid HAVING COUNT(*) > 1) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+
+    let flow = IncrementalFlow::new();
+    flow.register_view(spec(sql, out.clone())).unwrap();
+    flow.feed(
+        "auction",
+        DeltaBatch::from_inserts(auctions(&[(1, 7, 10), (2, 7, 11)])).unwrap(),
+    )
+    .unwrap();
+    // Two DISTINCT rows for pid 7 — membership survives the set snapshot.
+    flow.feed(
+        "person",
+        DeltaBatch::from_inserts(persons(&[(7, 100, 0), (7, 200, 1)])).unwrap(),
+    )
+    .unwrap();
+    flow.step_datafusion().await.unwrap();
+    assert_eq!(
+        canonical(&flow.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(7), Some(2)]],
+    );
+
+    let blob = flow.checkpoint_full().unwrap();
+    let restored = IncrementalFlow::new();
+    restored.register_view(spec(sql_variant, out)).unwrap();
+    restored.restore_full(&blob).unwrap();
+
+    // The mismatched fingerprint discarded state AND snapshot, so the first
+    // post-restore tick runs against operators seeded from the restored
+    // SOURCE snapshots alone. Feeding a NEW auction for seller 7 makes the
+    // seeding observable POSITIVELY: the auction joins only if the side's
+    // seeded aggregate (count 2 > 1) put pid 7 in the join's membership
+    // trace — an unseeded side leaves the view empty instead.
+    for f in [&restored, &flow] {
+        f.feed(
+            "auction",
+            DeltaBatch::from_inserts(auctions(&[(4, 7, 12)])).unwrap(),
+        )
+        .unwrap();
+        let s = f.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+    }
+    let (inc, why) = restored
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc && why.contains("chain"),
+        "not a chain after reseed: {why}"
+    );
+    assert_eq!(
+        canonical(&restored.snapshot("v").unwrap().unwrap()),
+        vec![vec![Some(7), Some(3)]],
+        "the new auction joined through the SEEDED side membership"
+    );
+    assert_eq!(
+        canonical(&restored.snapshot("v").unwrap().unwrap()),
+        canonical(&flow.snapshot("v").unwrap().unwrap()),
+        "reseeded and continuous flows agree"
+    );
+
+    // And the crossing still works on the reseeded state: one person copy
+    // retracts, count crosses 2 -> 1, the whole group leaves.
+    for f in [&restored, &flow] {
+        f.feed(
+            "person",
+            DeltaBatch::from_deletes(persons(&[(7, 100, 0)])).unwrap(),
+        )
+        .unwrap();
+        f.step_datafusion().await.unwrap();
+    }
+    assert_eq!(
+        canonical(&restored.snapshot("v").unwrap().unwrap()),
+        Vec::<Vec<Option<i64>>>::new(),
+        "membership crossed down through the reseeded side state"
+    );
+    assert_eq!(
+        canonical(&restored.snapshot("v").unwrap().unwrap()),
+        canonical(&flow.snapshot("v").unwrap().unwrap()),
+    );
+}

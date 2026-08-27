@@ -101,17 +101,44 @@ pub enum ViewPlan {
         source: String,
         op: IncrementalTopNOp,
     },
-    /// A linear pipeline of single-operator hops compiled from one
-    /// multi-operator query by [`crate::decompose`] (DECOMP-2). The first hop
-    /// reads `source`; each later hop consumes the previous hop's output
-    /// delta directly — the hops are not views, have no names of their own,
-    /// and checkpoint/restore/seed through this plan like any other. Every
-    /// hop is a single-input incremental variant (`Map`, `Aggregate`,
-    /// `Distinct`, `TopN`), enforced at build time by the decomposer's
-    /// wholesale-refusal rule and at apply time by [`apply_chain_hop`].
-    Chain { source: String, hops: Vec<ViewPlan> },
+    /// A pipeline of single-operator hops compiled from one multi-operator
+    /// query by [`crate::decompose`] (DECOMP-2). The SPINE (`hops`) is a
+    /// linear fold: the first hop reads `source` (or, for a join leaf, its
+    /// own two sources); each later hop consumes the previous hop's output
+    /// delta directly. SIDE-1 adds `sides`: each side is its own linear fold
+    /// over ONE real source, evaluated BEFORE the spine each tick, and a
+    /// spine join hop whose `right_source` names a side reads that side's
+    /// output delta instead of an external source — the shape a decorrelated
+    /// subquery side (an aggregate + HAVING membership set) takes. Hops are
+    /// not views and checkpoint/restore/seed through this plan like any
+    /// other; every spine hop is enforced single-operator at build time by
+    /// the decomposer's wholesale-refusal rule and at apply time by
+    /// [`apply_chain_hop`].
+    Chain {
+        source: String,
+        hops: Vec<ViewPlan>,
+        sides: Vec<ChainSide>,
+    },
     /// Fallback: full SQL re-execution + diff against previous output (O(state)).
     DiffBased,
+}
+
+/// One side branch of a [`ViewPlan::Chain`] (SIDE-1): a decorrelated
+/// subquery side maintained as its own linear fold over one real source. The
+/// spine join hop whose `right_source` equals `name` consumes the side's
+/// final output delta — for a semi/anti level that is the MEMBERSHIP SET
+/// (e.g. `l_orderkey`s whose `sum(l_quantity) > 300`), whose Z-set weights
+/// cross 0↔1 exactly when a key enters or leaves the HAVING set.
+pub struct ChainSide {
+    /// Internal name (`__ivm_<view>_s<k>`); what the spine join's
+    /// `right_source` says. Deterministic — it is checkpoint identity, like
+    /// a hop name.
+    pub name: String,
+    /// The side's own REAL source table.
+    pub source: String,
+    /// The side's linear fold over `source`, leaf first. Never contains a
+    /// join (v1 refuses non-linear sides wholesale).
+    pub hops: Vec<ViewPlan>,
 }
 
 /// Apply one chain hop to a delta: the fold step for [`ViewPlan::Chain`],
@@ -189,8 +216,13 @@ pub(crate) fn apply_chain_join_hop(
 
 /// Framing magic for a [`ViewPlan::Chain`]'s checkpointed state: per-hop
 /// length-prefixed blobs, so one view's checkpoint carries every stateful
-/// hop's accumulator.
+/// hop's accumulator. A chain WITHOUT sides frames as `CHN1`, byte-identical
+/// to every checkpoint written before SIDE-1 existed; a side-bearing chain
+/// frames as `CHN2` (side frames first, then the spine's CHN1-shaped body).
+/// Restoring a blob whose magic does not match the plan's shape errors, and
+/// the caller re-seeds — never feed one hop another hop's bytes.
 const CHAIN_STATE_MAGIC: &[u8; 4] = b"CHN1";
+const CHAIN_SIDES_MAGIC: &[u8; 4] = b"CHN2";
 
 /// Compiled projection for a [`ViewPlan::Map`].
 ///
@@ -439,23 +471,37 @@ impl ViewPlan {
             // restore can put each accumulator back where it was. Framing the
             // count makes a chain-shape change detectable at restore: a
             // mismatch errors and the caller re-seeds instead of feeding one
-            // hop another hop's bytes.
-            ViewPlan::Chain { hops, .. } => {
-                let mut out = Vec::new();
-                out.extend_from_slice(CHAIN_STATE_MAGIC);
-                out.extend_from_slice(&(u32::try_from(hops.len()).ok()?).to_le_bytes());
-                for hop in hops {
-                    match hop.checkpoint_state() {
-                        Some(bytes) => {
-                            out.push(1);
-                            out.extend_from_slice(
-                                &(u32::try_from(bytes.len()).ok()?).to_le_bytes(),
-                            );
-                            out.extend_from_slice(&bytes);
+            // hop another hop's bytes. A sideless chain writes CHN1 —
+            // byte-identical to pre-SIDE-1 checkpoints; sides make it CHN2
+            // with each side's hop run framed before the spine.
+            ViewPlan::Chain { hops, sides, .. } => {
+                fn frame_hops(hops: &[ViewPlan], out: &mut Vec<u8>) -> Option<()> {
+                    out.extend_from_slice(&(u32::try_from(hops.len()).ok()?).to_le_bytes());
+                    for hop in hops {
+                        match hop.checkpoint_state() {
+                            Some(bytes) => {
+                                out.push(1);
+                                out.extend_from_slice(
+                                    &(u32::try_from(bytes.len()).ok()?).to_le_bytes(),
+                                );
+                                out.extend_from_slice(&bytes);
+                            }
+                            None => out.push(0),
                         }
-                        None => out.push(0),
+                    }
+                    Some(())
+                }
+                let mut out = Vec::new();
+                if sides.is_empty() {
+                    out.extend_from_slice(CHAIN_STATE_MAGIC);
+                } else {
+                    out.extend_from_slice(CHAIN_SIDES_MAGIC);
+                    out.extend_from_slice(&(u32::try_from(sides.len()).ok()?).to_le_bytes());
+                    for side in sides.iter() {
+                        frame_hops(&side.hops, &mut out)?;
                     }
                 }
+                frame_hops(hops, &mut out)?;
                 Some(out)
             }
             ViewPlan::DiffBased => None,
@@ -481,43 +527,74 @@ impl ViewPlan {
             }
             ViewPlan::Map { .. } => Ok(false),
             ViewPlan::TopN { .. } => Ok(false),
-            ViewPlan::Chain { hops, .. } => {
+            ViewPlan::Chain { hops, sides, .. } => {
                 let err =
                     |m: &str| krishiv_delta::DeltaError::Operator(format!("chain state: {m}"));
-                let rest = bytes
-                    .strip_prefix(CHAIN_STATE_MAGIC)
-                    .ok_or_else(|| err("bad magic"))?;
-                let (count_bytes, mut rest) = rest
-                    .split_at_checked(4)
-                    .ok_or_else(|| err("truncated count"))?;
-                let count =
-                    u32::from_le_bytes(count_bytes.try_into().map_err(|_| err("bad count"))?)
-                        as usize;
-                if count != hops.len() {
-                    return Err(err(&format!(
-                        "hop count changed: state has {count}, plan has {}",
-                        hops.len()
-                    )));
-                }
-                for hop in hops.iter_mut() {
-                    let (flag, tail) = rest
-                        .split_at_checked(1)
-                        .ok_or_else(|| err("truncated flag"))?;
+                fn unframe_hops<'a>(
+                    hops: &mut [ViewPlan],
+                    mut rest: &'a [u8],
+                    err: &dyn Fn(&str) -> krishiv_delta::DeltaError,
+                ) -> Result<&'a [u8], krishiv_delta::DeltaError> {
+                    let (count_bytes, tail) = rest
+                        .split_at_checked(4)
+                        .ok_or_else(|| err("truncated count"))?;
                     rest = tail;
-                    if flag == [1] {
-                        let (len_bytes, tail) = rest
-                            .split_at_checked(4)
-                            .ok_or_else(|| err("truncated len"))?;
-                        let len =
-                            u32::from_le_bytes(len_bytes.try_into().map_err(|_| err("bad len"))?)
-                                as usize;
-                        let (hop_bytes, tail) = tail
-                            .split_at_checked(len)
-                            .ok_or_else(|| err("truncated hop"))?;
-                        rest = tail;
-                        hop.restore_state_bytes(hop_bytes)?;
+                    let count =
+                        u32::from_le_bytes(count_bytes.try_into().map_err(|_| err("bad count"))?)
+                            as usize;
+                    if count != hops.len() {
+                        return Err(err(&format!(
+                            "hop count changed: state has {count}, plan has {}",
+                            hops.len()
+                        )));
                     }
+                    for hop in hops.iter_mut() {
+                        let (flag, tail) = rest
+                            .split_at_checked(1)
+                            .ok_or_else(|| err("truncated flag"))?;
+                        rest = tail;
+                        if flag == [1] {
+                            let (len_bytes, tail) = rest
+                                .split_at_checked(4)
+                                .ok_or_else(|| err("truncated len"))?;
+                            let len = u32::from_le_bytes(
+                                len_bytes.try_into().map_err(|_| err("bad len"))?,
+                            ) as usize;
+                            let (hop_bytes, tail) = tail
+                                .split_at_checked(len)
+                                .ok_or_else(|| err("truncated hop"))?;
+                            rest = tail;
+                            hop.restore_state_bytes(hop_bytes)?;
+                        }
+                    }
+                    Ok(rest)
                 }
+                let rest = if sides.is_empty() {
+                    bytes
+                        .strip_prefix(CHAIN_STATE_MAGIC)
+                        .ok_or_else(|| err("bad magic"))?
+                } else {
+                    let rest = bytes
+                        .strip_prefix(CHAIN_SIDES_MAGIC)
+                        .ok_or_else(|| err("bad magic (side-bearing chain wants CHN2)"))?;
+                    let (count_bytes, mut rest) = rest
+                        .split_at_checked(4)
+                        .ok_or_else(|| err("truncated side count"))?;
+                    let count = u32::from_le_bytes(
+                        count_bytes.try_into().map_err(|_| err("bad side count"))?,
+                    ) as usize;
+                    if count != sides.len() {
+                        return Err(err(&format!(
+                            "side count changed: state has {count}, plan has {}",
+                            sides.len()
+                        )));
+                    }
+                    for side in sides.iter_mut() {
+                        rest = unframe_hops(&mut side.hops, rest, &err)?;
+                    }
+                    rest
+                };
+                let _ = unframe_hops(hops, rest, &err)?;
                 Ok(true)
             }
             ViewPlan::DiffBased => Ok(false),
@@ -581,7 +658,29 @@ impl ViewPlan {
             // were restored separately, in lockstep). A join leaf (DECOMP-4)
             // seeds both traces AND emits the joined relation as the seed
             // delta for the hops above it — the same fold, two inputs.
-            ViewPlan::Chain { source, hops } => {
+            ViewPlan::Chain {
+                source,
+                hops,
+                sides,
+            } => {
+                // SIDE-1: seed each side's fold from ITS source snapshot
+                // first; a spine join whose right names a side reads the
+                // side's seeded output, exactly as the live tick does.
+                let mut side_out: AHashMap<String, DeltaBatch> = AHashMap::new();
+                for side in sides.iter_mut() {
+                    if let Some(mut d) = seed_delta(&side.source.clone())? {
+                        for hop in side.hops.iter_mut() {
+                            d = apply_chain_hop(hop, d)?;
+                        }
+                        side_out.insert(side.name.clone(), d);
+                    }
+                }
+                let seed_right = |name: &str| -> DeltaResult<Option<DeltaBatch>> {
+                    match side_out.get(name) {
+                        Some(d) => Ok(Some(d.clone())),
+                        None => seed_delta(name),
+                    }
+                };
                 if let Some((first, rest)) = hops.split_first_mut() {
                     let seeded = if let ViewPlan::Join {
                         left_source,
@@ -590,7 +689,7 @@ impl ViewPlan {
                     } = first
                     {
                         let l = seed_delta(&left_source.clone())?;
-                        let r = seed_delta(&right_source.clone())?;
+                        let r = seed_right(&right_source.clone())?;
                         if l.is_some() || r.is_some() {
                             Some(apply_chain_join_hop(first, l, r)?)
                         } else {
@@ -605,7 +704,7 @@ impl ViewPlan {
                     if let Some(mut delta) = seeded {
                         for hop in rest {
                             delta = if let ViewPlan::Join { right_source, .. } = hop {
-                                let right = seed_delta(&right_source.clone())?;
+                                let right = seed_right(&right_source.clone())?;
                                 apply_chain_join_hop(hop, Some(delta), right)?
                             } else {
                                 apply_chain_hop(hop, delta)?
@@ -697,18 +796,29 @@ impl ViewPlan {
             // (event-time columns pass through map hops unchanged). A join
             // leaf uses the minimum of its OWN two sources, like the
             // standalone join arm, and GCs its traces at it.
-            ViewPlan::Chain { source, hops } => {
+            ViewPlan::Chain {
+                source,
+                hops,
+                sides,
+            } => {
                 // The minimum watermark across EVERY involved source bounds
                 // every hop's state: the leaf's side(s) plus each mid-chain
-                // join's right table (MJOIN-1).
+                // join's right table (MJOIN-1) plus each side branch's own
+                // source (SIDE-1).
                 // Only REAL sources carry trackers: the leaf join's two
                 // sides, and each later join's RIGHT table — a mid-chain
                 // join's left is an internal hop name, and treating its
                 // missing tracker as MIN would silently disable GC for every
-                // multi-join chain.
+                // multi-join chain. A join right that names a SIDE reads the
+                // side's real source instead, same rule.
                 let mut wm: Option<i64> = None;
                 let mut take = |name: &str| {
-                    let w = watermarks.get(name).copied().unwrap_or(i64::MIN);
+                    let real = sides
+                        .iter()
+                        .find(|s| s.name == name)
+                        .map(|s| s.source.as_str())
+                        .unwrap_or(name);
+                    let w = watermarks.get(real).copied().unwrap_or(i64::MIN);
                     wm = Some(match wm {
                         Some(cur) => cur.min(w),
                         None => w,
@@ -735,7 +845,8 @@ impl ViewPlan {
                     return Ok(0);
                 }
                 let mut reclaimed = 0;
-                for hop in hops.iter_mut() {
+                let side_hops = sides.iter_mut().flat_map(|s| s.hops.iter_mut());
+                for hop in side_hops.chain(hops.iter_mut()) {
                     reclaimed += match hop {
                         ViewPlan::Aggregate { op, .. } => op.gc_watermark(wm)?,
                         ViewPlan::Distinct { op, .. } => op.gc_watermark(wm)?,

@@ -2233,44 +2233,93 @@ impl IncrementalFlow {
                     // an absent source delta becomes an explicit empty one, so
                     // a mid-chain global aggregate still establishes the row
                     // it owes over an empty input.
-                    Some(ViewPlan::Chain { source, hops }) => {
+                    Some(ViewPlan::Chain {
+                        source,
+                        hops,
+                        sides,
+                    }) => {
                         let src = source.clone();
+                        // SIDE-1: fold each side branch FIRST — its output
+                        // delta is what a spine join hop whose right names
+                        // the side consumes this tick. A side whose source
+                        // carries no delta this tick folds the EMPTY delta
+                        // (EMPTY-2's substitution), so a stateful side hop
+                        // still establishes what it owes.
+                        let mut side_out: ahash::AHashMap<String, DeltaBatch> =
+                            ahash::AHashMap::new();
+                        let mut side_err: Option<krishiv_delta::DeltaError> = None;
+                        'side: for side in sides.iter_mut() {
+                            let delta = match source_relation_deltas
+                                .get(&side.source)
+                                .or_else(|| available_deltas.get(&side.source))
+                                .cloned()
+                                .or_else(|| empty_input_delta(&side.source))
+                            {
+                                Some(d) => d,
+                                None => continue 'side,
+                            };
+                            let mut d = delta;
+                            for hop in side.hops.iter_mut() {
+                                d = match crate::plan::apply_chain_hop(hop, d) {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        side_err = Some(e);
+                                        break 'side;
+                                    }
+                                };
+                            }
+                            side_out.insert(side.name.clone(), d);
+                        }
                         let Some((first, rest)) = hops.split_first_mut() else {
                             continue;
                         };
+                        let right_delta = |name: &str,
+                                           side_out: &ahash::AHashMap<String, DeltaBatch>|
+                         -> Option<DeltaBatch> {
+                            side_out
+                                .get(name)
+                                .cloned()
+                                .or_else(|| available_deltas.get(name).cloned())
+                        };
                         // DECOMP-4: a join leaf reads its own two sources; a
                         // scan leaf reads the chain's source like a map would.
-                        let mut out = if let ViewPlan::Join {
-                            left_source,
-                            right_source,
-                            ..
-                        } = first
-                        {
-                            let left = available_deltas.get(left_source.as_str()).cloned();
-                            let right = available_deltas.get(right_source.as_str()).cloned();
-                            crate::plan::apply_chain_join_hop(first, left, right)
-                        } else {
-                            let delta = match source_relation_deltas
-                                .get(&src)
-                                .or_else(|| available_deltas.get(&src))
-                                .cloned()
-                                .or_else(|| empty_input_delta(&src))
-                            {
-                                Some(d) => d,
-                                None => continue,
-                            };
-                            crate::plan::apply_chain_hop(first, delta)
+                        let mut out = match side_err {
+                            Some(e) => Err(e),
+                            None => {
+                                if let ViewPlan::Join {
+                                    left_source,
+                                    right_source,
+                                    ..
+                                } = first
+                                {
+                                    let left = available_deltas.get(left_source.as_str()).cloned();
+                                    let right = right_delta(right_source.as_str(), &side_out);
+                                    crate::plan::apply_chain_join_hop(first, left, right)
+                                } else {
+                                    let delta = match source_relation_deltas
+                                        .get(&src)
+                                        .or_else(|| available_deltas.get(&src))
+                                        .cloned()
+                                        .or_else(|| empty_input_delta(&src))
+                                    {
+                                        Some(d) => d,
+                                        None => continue,
+                                    };
+                                    crate::plan::apply_chain_hop(first, delta)
+                                }
+                            }
                         };
                         for hop in rest {
                             out = match out {
                                 // MJOIN-1: a mid-chain join hop probes the
                                 // folded delta (its left) against its right
                                 // table's trace, and this tick's right delta
-                                // against the accumulated left trace.
+                                // against the accumulated left trace. SIDE-1:
+                                // a right that names a side branch reads the
+                                // side's folded output instead.
                                 Ok(d) => {
                                     if let ViewPlan::Join { right_source, .. } = hop {
-                                        let right =
-                                            available_deltas.get(right_source.as_str()).cloned();
+                                        let right = right_delta(right_source.as_str(), &side_out);
                                         crate::plan::apply_chain_join_hop(hop, Some(d), right)
                                     } else {
                                         crate::plan::apply_chain_hop(hop, d)
