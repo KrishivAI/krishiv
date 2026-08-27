@@ -283,6 +283,86 @@ fn explicit_projection(node: &LogicalPlan) -> Option<LogicalPlan> {
         .ok()
 }
 
+/// SIDE-2: [`explicit_projection`] for a cut whose join right side is a SIDE
+/// scan. The side's equi-KEY columns are skipped: the operator never emits
+/// them (JOIN-2 drops right keys), and a side key routinely shares its bare
+/// name with a spine column (q17's side `l_partkey` vs lineitem's), so
+/// projecting it would hand every hop above an ambiguous relation. Narrowed
+/// to side joins so no pre-existing chain's hop schema changes shape.
+fn explicit_projection_side_aware(
+    node: &LogicalPlan,
+    side_names: &ahash::AHashSet<String>,
+) -> Option<LogicalPlan> {
+    let join = match node {
+        LogicalPlan::Join(j) => Some(j),
+        LogicalPlan::Filter(f) => match f.input.as_ref() {
+            LogicalPlan::Join(j) => Some(j),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut skip: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+    if let Some(j) = join {
+        let right_quals: std::collections::HashSet<String> = j
+            .right
+            .schema()
+            .iter()
+            .filter_map(|(q, _)| q.map(|t| t.to_string()))
+            .collect();
+        if right_quals.iter().any(|q| side_names.contains(q)) {
+            let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (_, r) in &j.on {
+                if let Expr::Column(c) = r {
+                    keys.insert(c.name.clone());
+                }
+            }
+            if let Some(f) = &j.filter {
+                for conjunct in datafusion::logical_expr::utils::split_conjunction(f) {
+                    if let Expr::BinaryExpr(be) = conjunct
+                        && be.op == datafusion::logical_expr::Operator::Eq
+                        && let (Expr::Column(a), Expr::Column(b)) =
+                            (be.left.as_ref(), be.right.as_ref())
+                    {
+                        let a_left = j.left.schema().index_of_column(a).is_ok();
+                        let b_left = j.left.schema().index_of_column(b).is_ok();
+                        match (a_left, b_left) {
+                            (true, false) => {
+                                keys.insert(b.name.clone());
+                            }
+                            (false, true) => {
+                                keys.insert(a.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            for (q, f) in j.right.schema().iter() {
+                if let Some(q) = q
+                    && side_names.contains(&q.to_string())
+                    && keys.contains(f.name())
+                {
+                    skip.insert((q.to_string(), f.name().clone()));
+                }
+            }
+        }
+    }
+    let exprs: Vec<Expr> = node
+        .schema()
+        .iter()
+        .filter(|(q, f)| {
+            !q.as_ref()
+                .is_some_and(|q| skip.contains(&(q.to_string(), f.name().clone())))
+        })
+        .map(|(qualifier, field)| Expr::Column(Column::new(qualifier.cloned(), field.name())))
+        .collect();
+    LogicalPlanBuilder::from(node.clone())
+        .project(exprs)
+        .ok()?
+        .build()
+        .ok()
+}
+
 /// A plain scan of `hop` — for hops above a join leaf, whose relation carries
 /// flat bare names that qualified references are unqualified against.
 fn bare_hop_scan(hop: &str, schema: &SchemaRef) -> Option<LogicalPlan> {
@@ -519,17 +599,86 @@ fn decompose_side(
             operator_nodes.push(n);
         }
     }
+    // SIDE-2: the decorrelator's marker group key (`Boolean(true) AS
+    // __always_true`) exists so a LEFT OUTER join can tell "no group" from
+    // "NULL aggregate"; once OUTER-1 proves the join INNER the marker
+    // carries no grouping information — a constant groups nothing — and the
+    // incremental aggregate has no constant-group-column notion. FOLD it:
+    // the Aggregate cut drops its literal group keys BEFORE the computed-
+    // input hoist sees them (hoisting a literal into a projection column
+    // would hide it), and every later reference to a dropped column
+    // substitutes the literal itself, aliased back to the same output name —
+    // exact, because the column IS that constant on every row the aggregate
+    // emits.
+    let mut lit_groups: AHashMap<String, Expr> = AHashMap::new();
     let mut cuts: Vec<LogicalPlan> = Vec::new();
     for n in &operator_nodes {
-        match hoist_computed_inputs(n) {
+        // Substitute references to already-dropped literal columns first
+        // (only nodes ABOVE the aggregate can reference them).
+        let n_owned: LogicalPlan = if lit_groups.is_empty() {
+            (*n).clone()
+        } else {
+            let exprs: Option<Vec<Expr>> = n
+                .expressions()
+                .iter()
+                .map(|e| {
+                    e.clone()
+                        .transform(|node| {
+                            Ok(match &node {
+                                Expr::Column(c) => match lit_groups.get(&c.name) {
+                                    Some(lit) => Transformed::yes(lit.clone()),
+                                    None => Transformed::no(node),
+                                },
+                                _ => Transformed::no(node),
+                            })
+                        })
+                        .map(|t| t.data)
+                        .ok()
+                })
+                .collect();
+            let inputs: Vec<LogicalPlan> = n.inputs().into_iter().cloned().collect();
+            n.with_new_exprs(exprs?, inputs).ok()?
+        };
+        let n_owned = if let LogicalPlan::Aggregate(agg) = &n_owned {
+            let mut kept: Vec<Expr> = Vec::new();
+            for g in &agg.group_expr {
+                let (inner, name) = match g {
+                    Expr::Alias(a) => (a.expr.as_ref(), a.name.clone()),
+                    other => (other, other.schema_name().to_string()),
+                };
+                if matches!(inner, Expr::Literal(_, _)) {
+                    lit_groups.insert(name.clone(), inner.clone().alias(name));
+                } else {
+                    kept.push(g.clone());
+                }
+            }
+            if kept.len() == agg.group_expr.len() {
+                n_owned
+            } else {
+                LogicalPlan::Aggregate(
+                    datafusion::logical_expr::Aggregate::try_new(
+                        agg.input.clone(),
+                        kept,
+                        agg.aggr_expr.clone(),
+                    )
+                    .ok()?,
+                )
+            }
+        } else {
+            n_owned
+        };
+        match hoist_computed_inputs(&n_owned) {
             Some((hoist, rewritten)) => {
-                let agg = n.with_new_exprs(rewritten, vec![hoist.clone()]).ok()?;
+                let agg = n_owned
+                    .with_new_exprs(rewritten, vec![hoist.clone()])
+                    .ok()?;
                 cuts.push(hoist);
                 cuts.push(agg);
             }
-            None => cuts.push((*n).clone()),
+            None => cuts.push(n_owned),
         }
     }
+
     // A single-operator side is one hop — unlike the spine, where one
     // operator means there was nothing to cut, a side ALWAYS needs its own
     // fold because its output feeds a join, not a registered view.
@@ -537,12 +686,19 @@ fn decompose_side(
     let mut records: Vec<Hop> = Vec::new();
     let mut plans: Vec<ViewPlan> = Vec::new();
     let last = cuts.len().checked_sub(1)?;
+    // The alias each hop's scan wears is the qualifier the hop ABOVE actually
+    // references — a subquery written `FROM lineitem` qualifies by the table
+    // name, but `FROM auction a2` qualifies by `a2`, and re-rooting under the
+    // wrong name leaves every reference unresolvable. The previous hop's own
+    // schema says which (its first qualified field); a fully-unqualified
+    // relation falls back to the source name, where any name resolves.
+    let mut prev_alias = source.clone();
     for (i, node) in cuts.iter().enumerate() {
         let rooted = if i == 0 {
             node.clone()
         } else {
             let prev = records.last()?;
-            let scan = aliased_hop_scan(&prev.name, &prev.schema, &source)?;
+            let scan = aliased_hop_scan(&prev.name, &prev.schema, &prev_alias)?;
             node.with_new_exprs(node.expressions(), vec![scan]).ok()?
         };
         let target = if needs_projection(&rooted) {
@@ -555,6 +711,11 @@ fn decompose_side(
         } else {
             format!("{base}_h{i}")
         };
+        prev_alias = target
+            .schema()
+            .iter()
+            .find_map(|(q, _)| q.map(|t| t.table().to_string()))
+            .unwrap_or_else(|| source.clone());
         let schema: SchemaRef = Arc::new(target.schema().as_arrow().clone());
         let plan = build_view_plan_from_logical(&target, &schema, visible, &[]);
         if plan.kind() != ViewPlanKind::Incremental {
@@ -671,6 +832,14 @@ async fn decompose_core(
                 let right_ok = if membership {
                     crate::plan::resolve_semi_side_with_filters(&j.right).is_some()
                         || side_chain_shape(&j.right).is_some()
+                } else if j.join_type == datafusion::logical_expr::JoinType::Inner {
+                    // SIDE-2: an INNER level's side may also be its own
+                    // sub-chain — the shape a decorrelated SCALAR aggregate
+                    // takes after OUTER-1 proves the padding away. Its
+                    // columns are EMITTED (minus the equi keys the operator
+                    // drops), unlike a membership side's.
+                    crate::plan::side_resolves_to_source(&j.right)
+                        || side_chain_shape(&j.right).is_some()
                 } else {
                     crate::plan::side_resolves_to_source(&j.right)
                 };
@@ -680,13 +849,72 @@ async fn decompose_core(
                 top_join = Some(n);
             }
         }
-        // Every bare column name across the ACCUMULATED relation must be
-        // unique — hops above the joins reference them unqualified, and the
-        // topmost join's schema carries all of them.
+        // Every bare column name across the ACCUMULATED EMITTED relation
+        // must be unique — hops above the joins reference them unqualified.
+        // The EMITTED relation is what matters: the join operator drops each
+        // level's equi-key RIGHT columns (JOIN-2 rewrites references to the
+        // paired left key), so a side whose key shares a bare name with a
+        // spine column (q17's side `l_partkey` vs lineitem's) is not a
+        // collision — the duplicate never exists downstream. Keys named in a
+        // level's ON/filter are visible here; comma-join keys live in the
+        // WHERE and are not subtracted, which only leaves the check exactly
+        // as strict as it was for those shapes. A membership level (semi/
+        // anti) emits nothing of its right side at all.
+        let _ = top_join;
         let mut seen = std::collections::HashSet::new();
-        for (_, f) in top_join?.schema().iter() {
-            if !seen.insert(f.name().clone()) {
-                return None;
+        let mut first_join = true;
+        for n in &chain {
+            let LogicalPlan::Join(j) = n else { continue };
+            if first_join {
+                for (_, f) in j.left.schema().iter() {
+                    if !seen.insert(f.name().clone()) {
+                        return None;
+                    }
+                }
+                first_join = false;
+            }
+            if matches!(
+                j.join_type,
+                datafusion::logical_expr::JoinType::LeftSemi
+                    | datafusion::logical_expr::JoinType::LeftAnti
+            ) {
+                continue;
+            }
+            let mut right_keys: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for (_, r) in &j.on {
+                if let Expr::Column(c) = r {
+                    right_keys.insert(c.name.clone());
+                }
+            }
+            if let Some(f) = &j.filter {
+                for conjunct in datafusion::logical_expr::utils::split_conjunction(f) {
+                    if let Expr::BinaryExpr(be) = conjunct
+                        && be.op == datafusion::logical_expr::Operator::Eq
+                        && let (Expr::Column(a), Expr::Column(b)) =
+                            (be.left.as_ref(), be.right.as_ref())
+                    {
+                        let a_left = j.left.schema().index_of_column(a).is_ok();
+                        let b_left = j.left.schema().index_of_column(b).is_ok();
+                        match (a_left, b_left) {
+                            (true, false) => {
+                                right_keys.insert(b.name.clone());
+                            }
+                            (false, true) => {
+                                right_keys.insert(a.name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            for (_, f) in j.right.schema().iter() {
+                if right_keys.contains(f.name()) {
+                    continue;
+                }
+                if !seen.insert(f.name().clone()) {
+                    return None;
+                }
             }
         }
     }
@@ -863,7 +1091,16 @@ async fn decompose_core(
             datafusion::logical_expr::JoinType::LeftSemi
                 | datafusion::logical_expr::JoinType::LeftAnti
         );
-        if !membership || crate::plan::resolve_semi_side_with_filters(&join.right).is_some() {
+        let needs_side = if membership {
+            crate::plan::resolve_semi_side_with_filters(&join.right).is_none()
+        } else if join.join_type == datafusion::logical_expr::JoinType::Inner {
+            // SIDE-2: an emitted inner side that is not a plain source.
+            !crate::plan::side_resolves_to_source(&join.right)
+                && side_chain_shape(&join.right).is_some()
+        } else {
+            false
+        };
+        if !needs_side {
             continue;
         }
         let (side, records) = decompose_side(view_name, sides.len(), &join.right, &mut visible)?;
@@ -906,7 +1143,13 @@ async fn decompose_core(
         let exprs = requalify(&join_plan.expressions())?;
         let rebuilt = join_plan.with_new_exprs(exprs, vec![left, scan]).ok()?;
         let new_cut = match pred {
-            Some(pdr) => LogicalPlan::Filter(LogicalFilter::try_new(pdr, Arc::new(rebuilt)).ok()?),
+            // The level's own predicate may reference the side too (q17's
+            // `l_quantity < 0.2 * avg(…)` attaches HERE by the WHERE
+            // distribution) — requalified the same way as the join exprs.
+            Some(pdr) => {
+                let pdr = requalify(std::slice::from_ref(&pdr))?.pop()?;
+                LogicalPlan::Filter(LogicalFilter::try_new(pdr, Arc::new(rebuilt)).ok()?)
+            }
             None => rebuilt,
         };
         *cuts.get_mut(idx)? = new_cut;
@@ -1011,7 +1254,7 @@ async fn decompose_core(
             (view_name.to_string(), top)
         } else {
             let body = if needs_projection(&rooted) {
-                explicit_projection(&rooted)?
+                explicit_projection_side_aware(&rooted, &side_names)?
             } else {
                 rooted
             };

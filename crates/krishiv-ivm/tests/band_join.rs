@@ -691,3 +691,88 @@ async fn a_side_bearing_chain_reseeds_from_snapshots_when_state_is_stale() {
         canonical(&flow.snapshot("v").unwrap().unwrap()),
     );
 }
+
+/// SIDE-2 + OUTER-1: an aggregate above a correlated SCALAR subquery — TPC-H
+/// q17's shape in miniature. Decorrelation produces a LEFT OUTER join against
+/// an avg-per-seller side whose value is EMITTED and compared (`ts < avg`);
+/// the comparison rejects the padding, DataFusion's own elimination proves
+/// the join INNER, and the side maintains as the chain's side fold. Tick 2
+/// shifts seller 7's average UP so two previously-excluded auctions enter
+/// the COUNT (a side VALUE update — retract+insert of the side row fans out
+/// through the join); tick 3 retracts the shifting row and they leave again.
+/// Every tick is compared against full recompute.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_above_a_scalar_avg_side_maintains_as_a_chain() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE ts < \
+               (SELECT AVG(ts) FROM auction a2 WHERE a2.seller = a.seller) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let shifting = auctions(&[(5, 7, 100)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // avg(7) = 20 → only ts=10 is below; avg(8) = 5 → 5 < 5 is false.
+        &[(7, 1)],
+        // +ts=100: avg(7) = 40 → ts 10, 20, 30 all below (crossing IN).
+        &[(7, 3)],
+        // retracted: back to avg 20 (crossing OUT).
+        &[(7, 1)],
+    ];
+    for (i, (a, retract)) in [
+        (
+            Some(auctions(&[(1, 7, 10), (2, 7, 20), (3, 7, 30), (4, 8, 5)])),
+            false,
+        ),
+        (Some(shifting.clone()), false),
+        (Some(shifting), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(
+            got, want,
+            "tick {i}: scalar-side chain disagreed with recompute"
+        );
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(s, n)| vec![Some(*s), Some(*n)])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "tick {i}: crossing did not land where the math says"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "a scalar-aggregate side must take the O(delta) path: {why}"
+    );
+    assert!(
+        why.contains("chain"),
+        "incremental but not via the chain: {why}"
+    );
+}

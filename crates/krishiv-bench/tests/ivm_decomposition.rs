@@ -550,3 +550,123 @@ async fn tpch_q18_registered_verbatim_maintains_incrementally() {
     assert!(inc, "q18: fell back to DiffBased: {why}");
     assert!(why.contains("chain"), "q18: not via the chain: {why}");
 }
+
+/// SIDE-2 + OUTER-1: q17's correlated scalar `avg` decorrelates to a LEFT
+/// OUTER join against a per-partkey aggregate side; the query's own
+/// `l_quantity < 0.2 * avg(…)` rejects the padding, the join proves INNER,
+/// and the side maintains as the chain's side fold. The fixture holds no
+/// Brand#23 / MED BOX part at all, so the honest proof SYNTHESIZES one
+/// (fresh key, every value derived from real columns so types match) and
+/// drives its lineitem through the threshold: tick 2 lands one row under
+/// 0.2×avg (a non-NULL answer must appear), tick 3 retracts the heavy row so
+/// the average collapses and the answer must return to NULL. Every tick is
+/// compared against full recompute.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q17_registered_verbatim_maintains_incrementally() {
+    let ctx = fixture().await;
+    let sql = corpus_sql("q17");
+    let declared: SchemaRef = Arc::new(ctx.sql(&sql).await.unwrap().schema().as_arrow().clone());
+
+    let subject = IncrementalFlow::new();
+    subject
+        .register_view(spec("v", &sql, declared.clone()))
+        .unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec("v", &sql, declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    // The synthesized rows come out of SQL arithmetic with widened types;
+    // conform each column back to the SOURCE schema before feeding.
+    let conform = |batch: RecordBatch, want: &SchemaRef| -> RecordBatch {
+        let cols: Vec<arrow::array::ArrayRef> = batch
+            .columns()
+            .iter()
+            .zip(want.fields())
+            .map(|(c, f)| arrow::compute::cast(c, f.data_type()).unwrap())
+            .collect();
+        RecordBatch::try_new(want.clone(), cols).unwrap()
+    };
+    let mut src_schemas: AHashMap<String, SchemaRef> = AHashMap::new();
+    for t in ["lineitem", "part"] {
+        src_schemas.insert(
+            t.to_string(),
+            Arc::new(ctx.table(t).await.unwrap().schema().as_arrow().clone()),
+        );
+    }
+    let feed_sql = |table: &'static str, q: String, retract: bool| {
+        let ctx = &ctx;
+        let subject = &subject;
+        let oracle = &oracle;
+        let src_schemas = &src_schemas;
+        let conform = &conform;
+        async move {
+            for batch in ctx.sql(&q).await.unwrap().collect().await.unwrap() {
+                let batch = conform(batch, &src_schemas[table]);
+                let d = if retract {
+                    DeltaBatch::from_deletes(batch).unwrap()
+                } else {
+                    DeltaBatch::from_inserts(batch).unwrap()
+                };
+                subject.feed(table, d.clone()).unwrap();
+                oracle.feed(table, d).unwrap();
+            }
+        }
+    };
+    let step_and_compare = |label: &'static str| {
+        let subject = &subject;
+        let oracle = &oracle;
+        async move {
+            let s = subject.step_datafusion().await.unwrap();
+            oracle.step_datafusion().await.unwrap();
+            assert!(s.errored_views.is_empty(), "{label}: {:?}", s.errored_views);
+            let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+            let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+            assert_eq!(got, want, "{label}: chain disagreed with recompute");
+            got
+        }
+    };
+
+    // Tick 1: the whole fixture — no part qualifies, the global sum is NULL.
+    for t in ["lineitem", "part"] {
+        feed_sql(t, format!("SELECT * FROM {t}"), false).await;
+    }
+    let rows = step_and_compare("tick 1").await;
+    assert_eq!(rows, vec![vec!["".to_string()]], "fixture answer is NULL");
+
+    // Tick 2: a synthesized Brand#23 / MED BOX part under a fresh key, one
+    // light lineitem row (qty 1) and one heavy (qty 100): avg = 50.5, the
+    // threshold is 10.1, the light row qualifies — non-NULL answer.
+    let part_row = "SELECT p_partkey * 0 + 999999 AS p_partkey, p_name, p_mfgr, \
+                    'Brand#23' AS p_brand, p_type, p_size, 'MED BOX' AS p_container, \
+                    p_retailprice, p_comment FROM part LIMIT 1";
+    let li = |qty: i64| {
+        format!(
+            "SELECT l_orderkey, l_partkey * 0 + 999999 AS l_partkey, l_suppkey, \
+             l_linenumber, l_quantity * 0 + {qty} AS l_quantity, l_extendedprice, \
+             l_discount, l_tax, l_returnflag, l_linestatus, l_shipdate, l_commitdate, \
+             l_receiptdate, l_shipinstruct, l_shipmode, l_comment FROM lineitem LIMIT 1"
+        )
+    };
+    feed_sql("part", part_row.to_string(), false).await;
+    feed_sql("lineitem", li(1), false).await;
+    feed_sql("lineitem", li(100), false).await;
+    let rows = step_and_compare("tick 2 (crossing in)").await;
+    assert_ne!(
+        rows,
+        vec![vec!["".to_string()]],
+        "the light row must land under 0.2 * avg and produce a value"
+    );
+
+    // Tick 3: the heavy row retracts, the average collapses to 1, the
+    // threshold to 0.2 — nothing qualifies and the answer returns to NULL.
+    feed_sql("lineitem", li(100), true).await;
+    let rows = step_and_compare("tick 3 (crossing out)").await;
+    assert_eq!(rows, vec![vec!["".to_string()]], "back to NULL");
+
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "q17: fell back to DiffBased: {why}");
+    assert!(why.contains("chain"), "q17: not via the chain: {why}");
+}

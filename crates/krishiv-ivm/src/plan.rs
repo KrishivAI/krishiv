@@ -1008,6 +1008,13 @@ pub fn maybe_decorrelate(plan: LogicalPlan) -> LogicalPlan {
             datafusion::optimizer::decorrelate_predicate_subquery::DecorrelatePredicateSubquery::new(),
         ),
         Arc::new(datafusion::optimizer::scalar_subquery_to_join::ScalarSubqueryToJoin::new()),
+        // OUTER-1: a decorrelated scalar side arrives as a LEFT OUTER join
+        // whose padding the query's own comparison then rejects (`l_quantity
+        // < 0.2 * avg(…)` is false on NULL) — DataFusion's own elimination
+        // proves the null-rejection and converts it to INNER, which is the
+        // join type the incremental operator maintains with emitted side
+        // columns. Runs only here, so plans without subqueries are untouched.
+        Arc::new(datafusion::optimizer::eliminate_outer_join::EliminateOuterJoin::new()),
     ];
     let optimizer = Optimizer::with_rules(rules);
     optimizer
