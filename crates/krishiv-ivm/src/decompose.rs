@@ -130,9 +130,27 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
             // planner and refuses the chain). The bottom-most Join, whose
             // left side is also plain, is the leaf.
             LogicalPlan::Join(join) => {
-                let left_is_join = matches!(join.left.as_ref(), LogicalPlan::Join(_));
+                let left = join.left.as_ref();
+                // A join whose left is a PLAIN SOURCE (scan, aliased scan,
+                // filtered projection of one table) is the LEAF — descending
+                // through it would misfile the join as mid-chain and refuse
+                // every join-leaf chain that ever worked.
+                let left_descends = matches!(left, LogicalPlan::Join(_))
+                    || (matches!(
+                        left,
+                        LogicalPlan::Projection(_)
+                            | LogicalPlan::Filter(_)
+                            | LogicalPlan::Aggregate(_)
+                            | LogicalPlan::Distinct(_)
+                            | LogicalPlan::SubqueryAlias(_)
+                    ) && !crate::plan::side_resolves_to_source(left));
                 chain.push(node.clone());
-                if left_is_join {
+                if left_descends {
+                    // MIDJOIN-1: a join whose left is an OPERATOR is a
+                    // MID-CHAIN join — the chain continues beneath it (q11's
+                    // uncorrelated side joins ABOVE the grouped aggregate).
+                    // A join whose left is another join descends the run as
+                    // before; either way the walk keeps going left.
                     let LogicalPlan::Join(join) = node else {
                         return None;
                     };
@@ -954,6 +972,14 @@ fn decompose_plan(
     // hoist can bury them in a projection column; later references substitute
     // the literal itself — exact, because the column IS that constant on
     // every row the aggregate emits.
+    // The join-run region ends here: cuts below this index are LEVEL cuts,
+    // whose Filter wrappers were built by predicate distribution around the
+    // level's own join. A GENERIC-section Filter cut still EMBEDS its
+    // original input (replaced at re-root by the hop scan), so the pre-pass
+    // must never mistake that stale embedded join for a level of its own —
+    // q11's `Filter(sum > …)` above the mid-chain join was side-decomposed
+    // TWICE through exactly that confusion.
+    let run_cut_count = cuts.len();
     let mut lit_groups: AHashMap<String, Expr> = AHashMap::new();
     for (op_idx, n) in operator_nodes.iter().enumerate().skip(next) {
         let alias_below = op_alias_below.get(op_idx).cloned().flatten();
@@ -1100,7 +1126,7 @@ fn decompose_plan(
     for idx in 0..cuts.len() {
         let (pred, join) = match cuts.get(idx)? {
             LogicalPlan::Join(j) => (None, j.clone()),
-            LogicalPlan::Filter(f) => match f.input.as_ref() {
+            LogicalPlan::Filter(f) if idx < run_cut_count => match f.input.as_ref() {
                 LogicalPlan::Join(j) => (Some(f.predicate.clone()), j.clone()),
                 _ => continue,
             },
@@ -1234,20 +1260,31 @@ fn decompose_plan(
         side_records.extend(records);
     }
 
+    // MIDJOIN-1: the relation convention FLIPS at the first join. Below it,
+    // a Leaf::Table chain re-roots onto ALIASED scans with original
+    // qualified references; from the join on, the emitted relation carries
+    // flat bare names and every hop above re-roots bare + unqualified — the
+    // Leaf::Join convention, which is why `bare_relation` starts true for
+    // join-leaf chains and turns true the moment a mid-chain join cut lands
+    // in a table-leaf one (q11's HAVING-vs-global-scalar miniature).
+    let mut bare_relation = matches!(leaf, Leaf::Join);
     for (i, node) in cuts.iter().enumerate() {
         if let Some(a) = cut_alias_below.get(i).cloned().flatten() {
             prev_alias = a;
         }
+
         // Re-root onto the hop below, structurally.
         let rooted = if i == 0 {
             node.clone()
         } else {
             let prev = hops.last()?;
-            match &leaf {
-                Leaf::Table(_) => {
+            let cut_is_join = matches!(node, LogicalPlan::Join(_));
+            match (bare_relation, cut_is_join) {
+                (false, false) => {
                     let scan = aliased_hop_scan(&prev.name, &prev.schema, &prev_alias)?;
                     node.with_new_exprs(node.expressions(), vec![scan]).ok()?
                 }
+
                 // The hop below carries flat bare names (collision-refused
                 // above), so references unqualify — the accumulated relation
                 // plus the level's right table have pairwise-unique bare
@@ -1255,7 +1292,11 @@ fn decompose_plan(
                 // ALIAS-1 rule). A mid-chain JOIN cut (MJOIN-1) re-roots its
                 // LEFT input onto the hop below and keeps its right table; a
                 // Filter(Join) cut rebuilds both layers.
-                Leaf::Join => {
+                // A mid-chain JOIN cut over a table-leaf chain routes here
+                // too (measured equivalent to a dedicated aliased arm — the
+                // hop below the join is effectively bare-named), and FLIPS
+                // the convention for everything above.
+                (true, _) | (false, true) => {
                     let scan = bare_hop_scan(&prev.name, &prev.schema)?;
                     match node {
                         LogicalPlan::Join(j) => {
@@ -1263,8 +1304,15 @@ fn decompose_plan(
                             node.with_new_exprs(exprs, vec![scan, j.right.as_ref().clone()])
                                 .ok()?
                         }
+                        // A Filter cut EMBEDS its original input; only a
+                        // RUN-LEVEL cut's embedded join is real (predicate
+                        // distribution built it) — a generic-section Filter
+                        // above a mid-chain join re-roots as a plain filter
+                        // over the join HOP below, or it would re-join the
+                        // side a second time (q11).
                         LogicalPlan::Filter(f)
-                            if matches!(f.input.as_ref(), LogicalPlan::Join(_)) =>
+                            if i < run_cut_count
+                                && matches!(f.input.as_ref(), LogicalPlan::Join(_)) =>
                         {
                             let LogicalPlan::Join(j) = f.input.as_ref() else {
                                 return None;
@@ -1317,6 +1365,9 @@ fn decompose_plan(
             }
         };
 
+        if matches!(node, LogicalPlan::Join(_)) {
+            bare_relation = true;
+        }
         let (name, target) = if i == last && !topn_final {
             // Re-apply ORDER BY / LIMIT so the final view keeps them. Above a
             // join leaf the relation is bare-named, so the read-time exprs
@@ -1324,9 +1375,10 @@ fn decompose_plan(
             // `profit.nation` reads plain `nation` from the hop relation).
             let mut top = rooted;
             for r in &above {
-                let exprs = match &leaf {
-                    Leaf::Join => unqualify_exprs_keeping(&r.expressions(), &side_names)?,
-                    Leaf::Table(_) => r.expressions(),
+                let exprs = if bare_relation {
+                    unqualify_exprs_keeping(&r.expressions(), &side_names)?
+                } else {
+                    r.expressions()
                 };
                 top = r.with_new_exprs(exprs, vec![top]).ok()?;
             }
@@ -1380,15 +1432,17 @@ fn decompose_plan(
     // TOPN-2: the synthesized final top-N hop over the last intermediate hop.
     if topn_final {
         let prev = hops.last()?;
-        let scan = match &leaf {
-            Leaf::Table(source) => aliased_hop_scan(&prev.name, &prev.schema, source)?,
-            Leaf::Join => bare_hop_scan(&prev.name, &prev.schema)?,
+        let scan = if bare_relation {
+            bare_hop_scan(&prev.name, &prev.schema)?
+        } else {
+            aliased_hop_scan(&prev.name, &prev.schema, &prev_alias)?
         };
         let mut top = scan;
         for r in &above {
-            let exprs = match &leaf {
-                Leaf::Join => unqualify_exprs_keeping(&r.expressions(), &side_names)?,
-                Leaf::Table(_) => r.expressions(),
+            let exprs = if bare_relation {
+                unqualify_exprs_keeping(&r.expressions(), &side_names)?
+            } else {
+                r.expressions()
             };
             top = r.with_new_exprs(exprs, vec![top]).ok()?;
         }

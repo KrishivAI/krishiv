@@ -1054,3 +1054,19 @@ async fn tpch_q21_registered_verbatim_maintains_incrementally() {
     );
     d.assert_chain();
 }
+
+/// MIDJOIN-1 + KEYLESS-1 + SIDE-3 composed: q11's uncorrelated global-scalar
+/// side joins ABOVE the mid-chain grouped aggregate — the chain descends
+/// through a join whose left is an operator, and both the side and the spine
+/// read the same three-table run. Half of partsupp arrives at the
+/// maintenance tick, moving every group total AND the global threshold
+/// through one step.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q11_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute(
+        "q11",
+        &["partsupp", "supplier", "nation"],
+        &corpus_sql("q11"),
+    )
+    .await;
+}

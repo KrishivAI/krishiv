@@ -164,16 +164,18 @@ async fn measure(
 /// (q22). Batch 2: NESTED-1 flattens sides-of-sides into dependency order
 /// (q20); SEMI-3 evaluates NON-EQUI membership conditions per left row
 /// inside the key group (q21), with resolver-resolved membership sides'
-/// qualifiers kept through re-rooting. Still refused, measured: q11's
-/// uncorrelated side joins ABOVE the mid-chain aggregate (MIDJOIN-1);
-/// self-joins collide bare names (q7, q8).
+/// qualifiers kept through re-rooting. MIDJOIN-1 descends the chain
+/// THROUGH a join whose left is an operator and flips the relation
+/// convention (aliased → bare) at the first mid-chain join, so an
+/// uncorrelated side can join ABOVE the grouped aggregate (q11). Still
+/// refused, measured: self-joins collide bare names (q7, q8).
 ///
 /// The larger coverage figures quoted elsewhere for TPC-H are a different
 /// measurement: what a *human* can build by hand-decomposing each query into
 /// single-hop views (166 views for 28 queries). That is a real capability and
 /// a fair claim, but it is not this one, and the two must never be quoted as
 /// though they were.
-const TPCH_INCREMENTAL: usize = 19;
+const TPCH_INCREMENTAL: usize = 20;
 /// Five stateless queries (q0, q10, q14, q21, q22), three band joins (q3,
 /// q8, q20 — BAND-1), three TUMBLE windows (q1, q2, q7 — WINDOW-1 + UINT-1),
 /// and the three statistics queries (q15, q16, q17 — CDIST-1 gives
@@ -231,12 +233,12 @@ async fn standard_benchmark_queries_that_maintain_on_delta_batch() {
 /// uncorrelated global-max side keyed by its own equality, with the
 /// mid-side `revenue0` alias threaded onto the hop scans), plus q13
 /// (LEFTAGG-1), q19 (ORFACTOR-1), q22 (KEYLESS-1), q20 (NESTED-1) and q21
-/// (SEMI-3).
+/// (SEMI-3), and q11 (MIDJOIN-1).
 /// NEXMark's three band joins do NOT decompose —
 /// their side tables share the bare column name `id`, which would make every
 /// reference above the join hop ambiguous — and they need no chain: BAND-1
 /// maintains them whole.
-const TPCH_DECOMPOSED: usize = 19;
+const TPCH_DECOMPOSED: usize = 20;
 /// q14 — filter plus computed projection. The other single-table NEXMark
 /// queries are single-operator (already incremental whole, nothing to cut),
 /// windowed TVFs (unplannable), or joins.

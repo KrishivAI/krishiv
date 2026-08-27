@@ -1358,3 +1358,75 @@ async fn a_non_equi_membership_condition_maintains() {
         "a non-equi membership must take the O(delta) path: {why}"
     );
 }
+
+/// MIDJOIN-1: a keyless singleton join ABOVE the mid-chain aggregate —
+/// q11's HAVING-vs-global-scalar shape in miniature. The chain descends
+/// THROUGH the join (its left is the grouped aggregate, an operator), the
+/// side is the global half-sum, and the comparison filters groups. Tick 2
+/// grows seller 9's total, dragging the global half-sum past seller 7's —
+/// membership flips BOTH directions from one delta; tick 3 retracts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_join_above_the_mid_chain_aggregate_maintains() {
+    let sql = "SELECT seller, SUM(ts) AS s FROM auction GROUP BY seller \
+               HAVING SUM(ts) > (SELECT SUM(ts) * 0.5 FROM auction)";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("s", DataType::Int64, true),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let growth = auctions(&[(3, 9, 200)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // Totals: 7 -> 60, 9 -> 40; half-sum = 50: only seller 7 clears it.
+        &[(7, 60)],
+        // +200 on seller 9: totals 60/240, half-sum 150: seller 7 OUT,
+        // seller 9 IN — one delta flips both directions.
+        &[(9, 240)],
+        // Retracted: back to seller 7.
+        &[(7, 60)],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 7, 60), (2, 9, 40)])), false),
+        (Some(growth.clone()), false),
+        (Some(growth), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(
+            got, want,
+            "tick {i}: mid-chain join disagreed with recompute"
+        );
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(sl, sm)| vec![Some(*sl), Some(*sm)])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "tick {i}: the half-sum shift did not flip both ways"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}
