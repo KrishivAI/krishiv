@@ -1078,9 +1078,94 @@ pub fn maybe_decorrelate(plan: LogicalPlan) -> LogicalPlan {
         Arc::new(datafusion::optimizer::eliminate_outer_join::EliminateOuterJoin::new()),
     ];
     let optimizer = Optimizer::with_rules(rules);
-    optimizer
+    let plan = optimizer
         .optimize(plan.clone(), &OptimizerContext::new(), |_, _| {})
-        .unwrap_or(plan)
+        .unwrap_or(plan);
+    // UNCORR-1: DataFusion's rules leave UNCORRELATED scalar subqueries as
+    // raw `Subquery` exprs — measured, its own full optimizer does too (they
+    // execute natively in its physical planner, a luxury the delta-batch
+    // path does not have). The rewrite here is deliberately narrow: only a
+    // subquery whose plan is a GLOBAL aggregate (projections over
+    // `groupBy=[[]]`) is taken, because a global aggregate emits EXACTLY one
+    // row by construction — over empty input too — which is what makes
+    // `expr op (subquery)` ≡ `CROSS JOIN side` + `expr op side.col` sound.
+    // An equality comparison then becomes an ordinary trace key (q15's
+    // `total_revenue = max(…)`); anything not provably one-row is left as a
+    // Subquery and the view degrades to DiffBased exactly as before.
+    rewrite_uncorrelated_scalar_aggs(plan)
+}
+
+/// Is this subquery plan a GLOBAL aggregate — exactly one row, always?
+fn is_global_aggregate(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(p) => is_global_aggregate(&p.input),
+        LogicalPlan::SubqueryAlias(sa) => is_global_aggregate(&sa.input),
+        LogicalPlan::Aggregate(a) => a.group_expr.is_empty(),
+        _ => false,
+    }
+}
+
+/// UNCORR-1 (see [`maybe_decorrelate`]): rewrite `Filter` predicates whose
+/// uncorrelated scalar subqueries are global aggregates into cross joins
+/// against the one-row side, under a deterministic internal alias.
+fn rewrite_uncorrelated_scalar_aggs(plan: LogicalPlan) -> LogicalPlan {
+    use datafusion::common::tree_node::{Transformed, TreeNode as _};
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    let mut counter = 0usize;
+    let rewritten = plan.clone().transform_up(|node| {
+        let LogicalPlan::Filter(filter) = &node else {
+            return Ok(Transformed::no(node));
+        };
+        // Collect qualifying subqueries first; bail to no-op on anything odd.
+        let mut sides: Vec<(String, Arc<LogicalPlan>, String)> = Vec::new();
+        let pred = filter.predicate.clone().transform(|e| {
+            if let Expr::ScalarSubquery(sq) = &e
+                && sq.outer_ref_columns.is_empty()
+                && is_global_aggregate(&sq.subquery)
+                && let Some((_, field)) = sq.subquery.schema().iter().next()
+            {
+                let alias = format!("__uncorr_sq_{counter}");
+                counter += 1;
+                let col = field.name().clone();
+                sides.push((alias.clone(), Arc::clone(&sq.subquery), col.clone()));
+                return Ok(Transformed::yes(Expr::Column(
+                    datafusion::common::Column::new(Some(alias), col),
+                )));
+            }
+            Ok(Transformed::no(e))
+        });
+        let Ok(pred) = pred else {
+            return Ok(Transformed::no(node));
+        };
+        if sides.is_empty() {
+            return Ok(Transformed::no(node));
+        }
+        let mut input = filter.input.as_ref().clone();
+        for (alias, side_plan, _) in &sides {
+            let aliased = match datafusion::logical_expr::SubqueryAlias::try_new(
+                Arc::clone(side_plan),
+                alias.as_str(),
+            ) {
+                Ok(a) => LogicalPlan::SubqueryAlias(a),
+                Err(_) => return Ok(Transformed::no(node)),
+            };
+            input = match LogicalPlanBuilder::from(input)
+                .cross_join(aliased)
+                .and_then(|b| b.build())
+            {
+                Ok(p) => p,
+                Err(_) => return Ok(Transformed::no(node)),
+            };
+        }
+        match datafusion::logical_expr::Filter::try_new(pred.data, Arc::new(input)) {
+            Ok(f) => Ok(Transformed::yes(LogicalPlan::Filter(f))),
+            Err(_) => Ok(Transformed::no(node)),
+        }
+    });
+    match rewritten {
+        Ok(t) => t.data,
+        Err(_) => plan,
+    }
 }
 
 /// [`build_view_plan`] plus the view's output ordering (IVM-ORDER-1).

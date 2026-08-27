@@ -814,12 +814,24 @@ fn decompose_plan(
     // held in this future's state trips rustc's higher-ranked `FnOnce` proof
     // once the future must be `Send` (the boxed recursive edge requires it).
     let mut operator_nodes: Vec<&LogicalPlan> = Vec::new();
+    // A `SubqueryAlias` between two operators RENAMES the relation the upper
+    // one references (q15's `revenue0`, a `FROM auction a2`): the alias is a
+    // passthrough — never a cut — but the hop scan the upper operator
+    // re-roots onto must WEAR it, or every qualified reference above goes
+    // unresolvable. Track, per operator, the alias that took effect below it.
+    let mut op_alias_below: Vec<Option<String>> = Vec::new();
+    let mut pending_alias: Option<String> = None;
     for n in &chain {
+        if let LogicalPlan::SubqueryAlias(sa) = n {
+            pending_alias = Some(sa.alias.table().to_string());
+        }
         if !is_passthrough(n) && !is_read_time(n) {
             operator_nodes.push(n);
+            op_alias_below.push(pending_alias.take());
         }
     }
     let mut cuts: Vec<LogicalPlan> = Vec::new();
+    let mut cut_alias_below: Vec<Option<String>> = Vec::new();
     let mut next = 0usize;
     if matches!(leaf, Leaf::Join) {
         // MJOIN-1: the run of join levels at the bottom of the chain, leaf
@@ -898,6 +910,7 @@ fn decompose_plan(
                 LogicalPlan::Filter(LogicalFilter::try_new(combined, Arc::new((*jn).clone())).ok()?)
             };
             cuts.push(cut);
+            cut_alias_below.push(None);
         }
         if !above_preds.is_empty() {
             let combined = above_preds.iter().cloned().reduce(|a, b| a.and(b))?;
@@ -905,6 +918,7 @@ fn decompose_plan(
             cuts.push(LogicalPlan::Filter(
                 LogicalFilter::try_new(combined, Arc::new(top)).ok()?,
             ));
+            cut_alias_below.push(None);
         }
     }
     // SIDE-2: fold literal group keys (the decorrelator's `Boolean(true) AS
@@ -913,7 +927,8 @@ fn decompose_plan(
     // the literal itself — exact, because the column IS that constant on
     // every row the aggregate emits.
     let mut lit_groups: AHashMap<String, Expr> = AHashMap::new();
-    for n in operator_nodes.iter().skip(next) {
+    for (op_idx, n) in operator_nodes.iter().enumerate().skip(next) {
+        let alias_below = op_alias_below.get(op_idx).cloned().flatten();
         let n_owned: LogicalPlan = if lit_groups.is_empty() {
             (*n).clone()
         } else {
@@ -972,9 +987,14 @@ fn decompose_plan(
                     .with_new_exprs(rewritten, vec![hoist.clone()])
                     .ok()?;
                 cuts.push(hoist);
+                cut_alias_below.push(alias_below);
                 cuts.push(agg);
+                cut_alias_below.push(None);
             }
-            None => cuts.push(n_owned),
+            None => {
+                cuts.push(n_owned);
+                cut_alias_below.push(alias_below);
+            }
         }
     }
     // For a registered view (min_cuts = 2) one operator is what the planner
@@ -1027,6 +1047,7 @@ fn decompose_plan(
         Leaf::Table(t) => t.clone(),
         Leaf::Join => String::new(),
     };
+    debug_assert_eq!(cuts.len(), cut_alias_below.len());
     let last = cuts.len() - 1;
     // TOPN-2: a bare `Sort` is a read-time property (ORDER-1) and rides the
     // final hop; a `Sort` under a `Limit` is a TOP-N — it changes which rows
@@ -1130,6 +1151,9 @@ fn decompose_plan(
     }
 
     for (i, node) in cuts.iter().enumerate() {
+        if let Some(a) = cut_alias_below.get(i).cloned().flatten() {
+            prev_alias = a;
+        }
         // Re-root onto the hop below, structurally.
         let rooted = if i == 0 {
             node.clone()

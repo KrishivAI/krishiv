@@ -934,3 +934,83 @@ async fn a_join_run_side_chain_reseeds_from_snapshots() {
         "reseeded and continuous flows agree"
     );
 }
+
+/// UNCORR-1: an aggregate above an UNCORRELATED scalar subquery — q15's
+/// shape in miniature. No optimizer rule rewrites these (measured:
+/// DataFusion's own full optimizer executes them natively instead), so the
+/// engine's narrow rewrite turns the global-aggregate subquery into a
+/// one-row side joined by the comparison's own equality. Tick 2 raises the
+/// global max: the old maximum's group leaves and the new one enters — the
+/// entire membership pivots on one side row's value. Tick 3 retracts it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_aggregate_above_an_uncorrelated_scalar_maintains_as_a_chain() {
+    let sql = "SELECT seller, COUNT(*) AS n FROM auction a WHERE ts = \
+               (SELECT MAX(ts) FROM auction) GROUP BY seller";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("seller", DataType::Int64, false),
+        Field::new("n", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let higher = auctions(&[(4, 9, 99)]);
+    let expectations: [&[(i64, i64)]; 3] = [
+        // max = 30, held by seller 7 twice (two ts=30 auctions).
+        &[(7, 2)],
+        // max jumps to 99: seller 7's group leaves, seller 9 enters.
+        &[(9, 1)],
+        // retracted: back to 30.
+        &[(7, 2)],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 7, 30), (2, 7, 30), (3, 8, 10)])), false),
+        (Some(higher.clone()), false),
+        (Some(higher), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(
+            got, want,
+            "tick {i}: uncorrelated side disagreed with recompute"
+        );
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(s, n)| vec![Some(*s), Some(*n)])
+            .collect();
+        assert_eq!(
+            got, expect,
+            "tick {i}: the global max did not pivot the view"
+        );
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(
+        inc,
+        "an uncorrelated scalar must take the O(delta) path: {why}"
+    );
+    assert!(
+        why.contains("chain"),
+        "incremental but not via the chain: {why}"
+    );
+}

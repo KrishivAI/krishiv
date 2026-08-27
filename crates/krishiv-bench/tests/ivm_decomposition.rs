@@ -687,3 +687,16 @@ async fn tpch_q2_registered_verbatim_maintains_incrementally() {
     )
     .await;
 }
+
+/// UNCORR-1 + SIDE-3: q15's `total_revenue = (SELECT max(total_revenue) FROM
+/// revenue0)` — an UNCORRELATED scalar subquery no optimizer rule rewrites
+/// (DataFusion executes them natively; the delta-batch path cannot). The
+/// engine's narrow rewrite cross-joins the one-row global-max side, the
+/// equality itself becomes the trace key, and BOTH sides (revenue0, and the
+/// max over revenue0) maintain as sub-chains over lineitem. Half of
+/// lineitem arrives at the maintenance tick, moving per-supplier revenues
+/// AND the global max through the same step.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_q15_registered_verbatim_maintains_incrementally() {
+    verbatim_join_matches_recompute("q15", &["lineitem", "supplier"], &corpus_sql("q15")).await;
+}

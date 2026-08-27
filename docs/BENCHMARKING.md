@@ -6,13 +6,13 @@ a published project claim.
 
 ## Do not benchmark a standard suite against the IVM path without checking the plan
 
-**Measured, and gated: 27 of 44 registered verbatim.** `cargo test -p
+**Measured, and gated: 28 of 44 registered verbatim.** `cargo test -p
 krishiv-bench --test ivm_query_coverage -- --nocapture` classifies every query
 in the committed TPC-H and NEXMark corpora. As of 2026-08-27:
 
 | suite | verbatim (engine) | how |
 |---|---|---|
-| TPC-H | **13 / 22** (q1, q2, q3, q4, q5, q6, q9, q10, q12, q14, q16, q17, q18) | chains (DECOMP-3), join-leaf chains (DECOMP-4 + JOIN-2), left-deep multi-way runs with WHERE distributed per level (MJOIN-1), `ORDER BY … LIMIT` as its own top-N hop (TOPN-2), join-graph relinearization when the FROM order is not a connected order (REORDER-1), decorrelated EXISTS / NOT IN as semi/anti membership levels in the chain (DECORR-1 + SEMI-2), aggregate membership sides (`IN (… GROUP BY … HAVING …)`) maintained as the chain's side fold (SIDE-1), emitted scalar-aggregate sides on proven-inner joins — correlated `avg`/`min` comparisons (SIDE-2 + OUTER-1), and sides that are themselves join runs, recursing through the spine's own cutting engine (SIDE-3) |
+| TPC-H | **14 / 22** (q1, q2, q3, q4, q5, q6, q9, q10, q12, q14, q15, q16, q17, q18) | chains (DECOMP-3), join-leaf chains (DECOMP-4 + JOIN-2), left-deep multi-way runs with WHERE distributed per level (MJOIN-1), `ORDER BY … LIMIT` as its own top-N hop (TOPN-2), join-graph relinearization when the FROM order is not a connected order (REORDER-1), decorrelated EXISTS / NOT IN as semi/anti membership levels in the chain (DECORR-1 + SEMI-2), aggregate membership sides (`IN (… GROUP BY … HAVING …)`) maintained as the chain's side fold (SIDE-1), emitted scalar-aggregate sides on proven-inner joins — correlated `avg`/`min` comparisons (SIDE-2 + OUTER-1), sides that are themselves join runs, recursing through the spine's own cutting engine (SIDE-3), and uncorrelated global-aggregate scalar subqueries keyed by their own equality (UNCORR-1) |
 | NEXMark | **14 / 22** (q0, q10, q14, q21, q22 + q3, q8, q20 + q1, q2, q7 + q15, q16, q17) | 5 single-operator maps + 3 band joins (BAND-1) + 3 TUMBLE windows (WINDOW-1 + UINT-1) + 3 statistics queries (CDIST-1: COUNT(DISTINCT col) via per-value multiplicity shared with MIN/MAX's multiset) |
 
 Since DECOMP-3 the planner cuts a linear single-table multi-operator query into
