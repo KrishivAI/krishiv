@@ -364,6 +364,49 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28d — TPC-H on delta-batch, measured for the first time
+
+Every prior entry said TPC-H delta-batch tick cost was unmeasured. It no longer
+is. `tpchgen-cli parquet -s 1` generates the dataset, `ivm_corpus_tick` grew a
+TPC-H arm sharing the SAME measure/seed/tick path as the NEXMark arm (one path
+deliberately: a second copy is a second place for the arms to drift into
+measuring different things), and the dataset directory comes from the existing
+`KRISHIV_TPCH_DATA_DIR_SF1`. No dataset => an explicit SKIPPED line, because
+"no output" and "no dataset" must not look alike.
+
+**All 22 TPC-H queries, seed 20k/table, delta 5k/table, median of 3 ticks**
+(incr tick / diff-based / ratio, ms):
+
+| q | incr | diff | x | q | incr | diff | x |
+|---|---:|---:|---|---|---:|---:|---|
+| q1 | 29.6 | 40.2 | 1.36 | q12 | 55.6 | 66.1 | 1.19 |
+| q2 | 63.9 | 46.4 | 0.73 | q13 | 83.0 | 43.4 | 0.52 |
+| q3 | 87.2 | 65.2 | 0.75 | q14 | 69.1 | 54.5 | 0.79 |
+| q4 | 63.9 | 61.0 | 0.95 | q15 | 30.4 | 36.2 | 1.19 |
+| q5 | 100.7 | 58.8 | 0.58 | q16 | 54.9 | 38.7 | 0.70 |
+| q6 | 31.3 | 31.8 | 1.02 | q17 | 66.9 | 55.6 | 0.83 |
+| q7 | 79.8 | 77.5 | 0.97 | q18 | 117.5 | 83.3 | 0.71 |
+| q8 | 101.9 | 105.3 | 1.03 | q19 | 52.5 | 84.6 | 1.61 |
+| q9 | 117.4 | 84.1 | 0.72 | q20 | 87.2 | 83.8 | 0.96 |
+| q10 | 75.1 | 77.6 | 1.03 | q21 | 80.1 | 62.5 | 0.78 |
+| q11 | 36.0 | 23.7 | 0.66 | q22 | 59.7 | 48.0 | 0.80 |
+
+Read these with the same caution as the NEXMark arm: at seed 20k the delta is
+25% of state, which is below crossover for most shapes. The ratio column is not
+a defect list — the seed-scaling axis is what separates a real O(state) term
+from being below crossover.
+
+**A harness bug this run exposed, recorded because it produced a plausible
+wrong number.** The first TPC-H run reported q21 at **473 ms (0.14x)** and four
+queries as hard ERRORs. Both had one cause: source detection walked the plan
+tree with `apply`, and a subquery lives inside an EXPRESSION, so tables read
+only from `EXISTS`/`IN (SELECT …)` were never fed — q4, q16, q20, q22 died on
+"table not found", and q21 ran starved of `lineitem`. Switched to
+`apply_with_subqueries`; q21 then reads **80 ms (0.78x)**. The 473 ms figure
+was measuring a starved query, and it looked entirely credible. Same shape as
+the earlier `bid.auction`-is-a-column mistake: the harness's blind spot
+presenting as an engine finding.
+
 ### 2026-08-28c — ladder re-measured at the IVM-AUD-PERF-2 fix (81c4e94)
 
 - **Hardware**: same i7-9750H laptop; comparable to the other 08-27/28 entries

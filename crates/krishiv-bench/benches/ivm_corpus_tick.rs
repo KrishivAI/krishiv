@@ -61,11 +61,12 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ahash::AHashMap;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
-use datafusion::common::tree_node::TreeNode;
-use datafusion::prelude::SessionContext;
+use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use krishiv_bench::nexmark::{BATCH_DIALECT_EQUIVALENTS, NexmarkGenerator, SUPPORTED_QUERIES};
+use krishiv_bench::tpch_queries::TPCH_QUERIES;
 use krishiv_delta::{DeltaBatch, IncrementalViewSpec};
 use krishiv_ivm::IncrementalFlow;
 
@@ -156,10 +157,19 @@ fn side_batch() -> RecordBatch {
 /// that mistake: a column reference is not a table scan.
 fn sources_of(plan: &datafusion::logical_expr::LogicalPlan) -> Vec<&'static str> {
     let mut found: Vec<&'static str> = Vec::new();
-    plan.apply(|node| {
+    // `apply` walks the plan tree only, and a subquery lives inside an
+    // EXPRESSION (`EXISTS (…)`, `x IN (SELECT …)`), so a plain walk misses the
+    // tables TPC-H q4/q16/q20/q22 read from their subqueries. Those four then
+    // went unfed and died at tick time with "table not found" — the harness's
+    // blind spot presenting as an engine failure, the same shape as the
+    // earlier `bid.auction`-is-not-a-table mistake.
+    plan.apply_with_subqueries(|node| {
         if let datafusion::logical_expr::LogicalPlan::TableScan(scan) = node {
             let name = scan.table_name.table();
-            for s in ["bid", "auction", "person"] {
+            for s in [
+                "bid", "auction", "person", "region", "nation", "supplier", "customer", "part",
+                "partsupp", "orders", "lineitem",
+            ] {
                 if name.eq_ignore_ascii_case(s) && !found.contains(&s) {
                     found.push(s);
                 }
@@ -200,6 +210,92 @@ async fn schema_ctx() -> SessionContext {
 /// `None` when there are no samples — reachable via
 /// `KRISHIV_BENCH_CORPUS_TICKS=0`, which must report as an error rather than
 /// panic or invent a duration.
+/// Where a corpus gets its rows. NEXMark synthesises them; TPC-H reads the
+/// generated Parquet dataset and hands out successive slices.
+///
+/// Both corpora go through ONE `measure` path deliberately: a second copy of
+/// the seed/tick/compare loop is a second place for the two arms to drift into
+/// measuring different things.
+enum RowSource {
+    Nexmark,
+    Tpch(AHashMap<String, RecordBatch>),
+}
+
+impl RowSource {
+    fn new_cursor(&self) -> RowCursor<'_> {
+        match self {
+            Self::Nexmark => RowCursor::Nexmark(Box::new(NexmarkGenerator::new(42, 1_000, 0, 0))),
+            Self::Tpch(tables) => RowCursor::Tpch {
+                tables,
+                offsets: AHashMap::new(),
+            },
+        }
+    }
+}
+
+enum RowCursor<'a> {
+    Nexmark(Box<NexmarkGenerator>),
+    Tpch {
+        tables: &'a AHashMap<String, RecordBatch>,
+        offsets: AHashMap<String, usize>,
+    },
+}
+
+impl RowCursor<'_> {
+    /// The next `n` rows for `source`, or `None` when that table is exhausted.
+    /// TPC-H `nation` holds 25 rows total, so it seeds and then has nothing
+    /// left — a legitimate empty delta, not a failure.
+    fn next(&mut self, source: &str, n: usize) -> Option<RecordBatch> {
+        match self {
+            Self::Nexmark(g) => Some(next_batch(g, source, n)),
+            Self::Tpch { tables, offsets } => {
+                let table = tables.get(source)?;
+                let off = offsets.entry(source.to_owned()).or_insert(0);
+                if *off >= table.num_rows() {
+                    return None;
+                }
+                let take = n.min(table.num_rows() - *off);
+                let slice = table.slice(*off, take);
+                *off += take;
+                Some(slice)
+            }
+        }
+    }
+}
+
+/// Load the TPC-H tables from a Parquet dataset directory, capped so the
+/// harness holds a bounded amount in memory. `None` when the dataset is absent
+/// — the arm then reports itself SKIPPED rather than silently measuring
+/// nothing, because "no output" and "no dataset" must not look alike.
+async fn tpch_tables(dir: &str) -> Option<AHashMap<String, RecordBatch>> {
+    const TABLES: &[&str] = &[
+        "region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem",
+    ];
+    let cap = seed_rows() + delta_rows() * ticks() + 1;
+    let ctx = SessionContext::new();
+    let mut out = AHashMap::new();
+    for t in TABLES {
+        let path = format!("{dir}/{t}.parquet");
+        if std::fs::metadata(&path).is_err() {
+            return None;
+        }
+        ctx.register_parquet(*t, &path, ParquetReadOptions::default())
+            .await
+            .ok()?;
+        let batches = ctx
+            .sql(&format!("SELECT * FROM {t} LIMIT {cap}"))
+            .await
+            .ok()?
+            .collect()
+            .await
+            .ok()?;
+        let schema = batches.first()?.schema();
+        let one = arrow::compute::concat_batches(&schema, batches.iter()).ok()?;
+        out.insert((*t).to_owned(), one);
+    }
+    Some(out)
+}
+
 fn median(mut xs: Vec<Duration>) -> Option<Duration> {
     xs.sort();
     xs.get(xs.len() / 2).copied()
@@ -217,6 +313,7 @@ async fn measure(
     sql: &str,
     declared: SchemaRef,
     sources: &[&'static str],
+    rows: &RowSource,
     diff_based: bool,
 ) -> Result<(Duration, bool), String> {
     let flow = IncrementalFlow::new();
@@ -234,16 +331,18 @@ async fn measure(
     })
     .map_err(|e| format!("register: {e}"))?;
 
-    let mut g = NexmarkGenerator::new(42, 1_000, 0, 0);
+    let mut cursor = rows.new_cursor();
 
     // The side input is fed once, before any timed tick.
-    if sql.to_lowercase().contains("side") {
+    if matches!(rows, RowSource::Nexmark) && sql.to_lowercase().contains("side") {
         let d = DeltaBatch::from_inserts(side_batch()).map_err(|e| format!("side delta: {e}"))?;
         flow.feed("side", d)
             .map_err(|e| format!("feed side: {e}"))?;
     }
     for s in sources {
-        let b = next_batch(&mut g, s, seed_rows());
+        let Some(b) = cursor.next(s, seed_rows()) else {
+            continue;
+        };
         let d = DeltaBatch::from_inserts(b).map_err(|e| format!("seed delta {s}: {e}"))?;
         flow.feed(*s, d)
             .map_err(|e| format!("feed seed {s}: {e}"))?;
@@ -258,10 +357,21 @@ async fn measure(
 
     let mut samples = Vec::with_capacity(ticks());
     for _ in 0..ticks() {
+        let mut fed_any = false;
         for s in sources {
-            let b = next_batch(&mut g, s, delta_rows());
+            let Some(b) = cursor.next(s, delta_rows()) else {
+                continue;
+            };
             let d = DeltaBatch::from_inserts(b).map_err(|e| format!("delta {s}: {e}"))?;
             flow.feed(*s, d).map_err(|e| format!("feed {s}: {e}"))?;
+            fed_any = true;
+        }
+        if !fed_any {
+            // A tick with nothing fed measures the empty-tick path, not the
+            // query — say so rather than reporting a flattering number.
+            return Err("source data exhausted before the timed ticks finished; \
+                        lower KRISHIV_BENCH_CORPUS_SEED/DELTA"
+                .to_string());
         }
         let t0 = Instant::now();
         let summary = flow
@@ -284,64 +394,141 @@ async fn measure(
     Ok((median, incremental))
 }
 
+/// Time one corpus. Shared by both arms so they cannot drift apart.
+async fn run_corpus(
+    label: &str,
+    queries: Vec<(&'static str, &'static str)>,
+    ctx: &SessionContext,
+    rows: &RowSource,
+    wins: &mut usize,
+    losses: &mut usize,
+) {
+    let borrowed: Vec<(&str, &str)> = queries.iter().map(|(a, b)| (*a, *b)).collect();
+    run_corpus_str(label, &borrowed, ctx, rows, wins, losses).await;
+}
+
+async fn run_corpus_str(
+    label: &str,
+    queries: &[(&str, &str)],
+    ctx: &SessionContext,
+    rows: &RowSource,
+    wins: &mut usize,
+    losses: &mut usize,
+) {
+    println!(
+        "\n{label} corpus tick — seed {}/source, delta {}/source, median of {} ticks\n",
+        seed_rows(),
+        delta_rows(),
+        ticks()
+    );
+    println!(
+        "{:<32} {:>6} {:>12} {:>14} {:>9}",
+        "query", "plan", "incr tick", "diff-based", "speedup"
+    );
+    println!("{}", "-".repeat(84));
+
+    let only = std::env::var("KRISHIV_BENCH_CORPUS_ONLY").unwrap_or_default();
+    for (name, raw) in queries {
+        if !only.is_empty() && !name.contains(only.as_str()) {
+            continue;
+        }
+        let sql = rewrite(raw);
+        let Ok(df) = ctx.sql(&sql).await else {
+            println!("{name:<32} {:>6}", "unplan");
+            continue;
+        };
+        let declared: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+        let sources = sources_of(df.logical_plan());
+
+        let inc = measure(&sql, declared.clone(), &sources, rows, false).await;
+        let dif = measure(&sql, declared, &sources, rows, true).await;
+        match (inc, dif) {
+            (Ok((i, is_incremental)), Ok((d, _))) => {
+                let ratio = d.as_secs_f64() / i.as_secs_f64();
+                if is_incremental && ratio >= 1.0 {
+                    *wins += 1;
+                } else if is_incremental {
+                    *losses += 1;
+                }
+                println!(
+                    "{name:<32} {:>6} {:>10.2}ms {:>12.2}ms {:>8.2}x",
+                    if is_incremental { "incr" } else { "diff" },
+                    i.as_secs_f64() * 1e3,
+                    d.as_secs_f64() * 1e3,
+                    ratio
+                );
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                println!("{name:<32} {:>6}  {e}", "ERROR");
+            }
+        }
+    }
+}
+
 fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .unwrap();
     rt.block_on(async {
-        let ctx = schema_ctx().await;
-        println!(
-            "\nNEXMark corpus tick — seed {}/source, delta {}/source, median of {} ticks\n",
-            seed_rows(),
-            delta_rows(),
-            ticks()
-        );
-        println!(
-            "{:<32} {:>6} {:>12} {:>14} {:>9}",
-            "query", "plan", "incr tick", "diff-based", "speedup"
-        );
-        println!("{}", "-".repeat(78));
-
         let mut wins = 0usize;
         let mut losses = 0usize;
-        let only = std::env::var("KRISHIV_BENCH_CORPUS_ONLY").unwrap_or_default();
-        for (name, raw) in corpus() {
-            if !only.is_empty() && !name.contains(only.as_str()) {
-                continue;
-            }
-            let sql = rewrite(raw);
-            let Ok(df) = ctx.sql(&sql).await else {
-                println!("{name:<32} {:>6}", "unplan");
-                continue;
-            };
-            let declared: SchemaRef = Arc::new(df.schema().as_arrow().clone());
-            let sources = sources_of(df.logical_plan());
 
-            let inc = measure(&sql, declared.clone(), &sources, false).await;
-            let dif = measure(&sql, declared, &sources, true).await;
-            match (inc, dif) {
-                (Ok((i, is_incremental)), Ok((d, _))) => {
-                    let ratio = d.as_secs_f64() / i.as_secs_f64();
-                    if is_incremental && ratio >= 1.0 {
-                        wins += 1;
-                    } else if is_incremental {
-                        losses += 1;
-                    }
-                    println!(
-                        "{name:<32} {:>6} {:>10.2}ms {:>12.2}ms {:>8.2}x",
-                        if is_incremental { "incr" } else { "diff" },
-                        i.as_secs_f64() * 1e3,
-                        d.as_secs_f64() * 1e3,
-                        ratio
-                    );
+        // ── NEXMark ──
+        let ctx = schema_ctx().await;
+        run_corpus(
+            "NEXMark",
+            corpus(),
+            &ctx,
+            &RowSource::Nexmark,
+            &mut wins,
+            &mut losses,
+        )
+        .await;
+
+        // ── TPC-H ──
+        // Dataset path comes from the SAME env var the other TPC-H benches
+        // read, so there is one place to point at a dataset. Absent dataset =>
+        // an explicit SKIPPED line: TPC-H delta-batch tick cost has never been
+        // measured, and a silent omission would let that keep being true while
+        // looking covered.
+        let dir = std::env::var("KRISHIV_TPCH_DATA_DIR_SF1")
+            .or_else(|_| std::env::var("KRISHIV_TPCH_DATA_DIR"))
+            .unwrap_or_default();
+        match if dir.is_empty() {
+            None
+        } else {
+            tpch_tables(&dir).await
+        } {
+            Some(tables) => {
+                let ctx = SessionContext::new();
+                for (name, batch) in &tables {
+                    ctx.register_batch(name, batch.clone()).unwrap();
                 }
-                (Err(e), _) | (_, Err(e)) => {
-                    println!("{name:<32} {:>6}  {e}", "ERROR");
-                }
+                let queries: Vec<(&'static str, String)> = TPCH_QUERIES
+                    .iter()
+                    .map(|q| (q.id, q.sql_at_scale(1.0)))
+                    .collect();
+                let borrowed: Vec<(&str, &str)> =
+                    queries.iter().map(|(a, b)| (*a, b.as_str())).collect();
+                run_corpus_str(
+                    "TPC-H (SF1 slices)",
+                    &borrowed,
+                    &ctx,
+                    &RowSource::Tpch(tables),
+                    &mut wins,
+                    &mut losses,
+                )
+                .await;
             }
+            None => println!(
+                "\nTPC-H — SKIPPED: no dataset. Set KRISHIV_TPCH_DATA_DIR_SF1 to a \n\
+                 directory of <table>.parquet files (tpchgen-cli parquet -s 1 --output-dir=…).\n\
+                 TPC-H delta-batch tick cost is UNMEASURED until this runs."
+            ),
         }
-        println!("{}", "-".repeat(78));
+
+        println!("{}", "-".repeat(84));
         println!(
             "incremental plans faster than recompute at this seed/delta: {wins}; \
              slower: {losses}"
