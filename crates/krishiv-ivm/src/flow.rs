@@ -1256,6 +1256,11 @@ impl IncrementalFlow {
 
         // Differentiate: true delta vs previous snapshot.
         let mut inner = self.inner.lock().map_err(lock_err)?;
+        // IVM-AUD-CORE-31: same guard as `feed`/`feed_coalesced`, and it must
+        // run BEFORE the prev-snapshot is recorded — a rejected name that had
+        // already stored a snapshot would make a later legitimate call
+        // differentiate against rows the flow never accepted.
+        validate_feed_target(&inner, &name)?;
         let prev = inner.streaming_prev_snapshots.get(&name);
         let delta = differentiate(&schema, prev, &new_snapshot).map_err(delta_err)?;
         inner
@@ -3619,9 +3624,24 @@ impl std::fmt::Debug for IncrementalFlow {
 
 /// Hash all data column values for a single row using XxHash64.
 ///
-/// Uses string representations with null-byte separators so different column
-/// counts cannot collide.  Retractions (weight < 0) are never hashed —
-/// callers must gate on weight before calling.
+/// Each column's encoding is LENGTH-PREFIXED, so the column boundaries are
+/// unambiguous and the concatenation is injective in the per-column encodings.
+/// Retractions (weight < 0) are never hashed — callers must gate on weight
+/// before calling.
+///
+/// IVM-AUD-CORE-32: this used a trailing NUL byte as the separator and claimed
+/// that made column counts unambiguous. A NUL is a legal character inside an
+/// Arrow Utf8 value, so a value carrying one moves the boundary: rows
+/// `("x", "\0vy")` and `("x\0v", "y")` produced the SAME byte string and
+/// therefore the same hash. Content-addressed dedup drops rows that hash
+/// alike, so the collision was silent row loss — and provenance, which keys
+/// lineage on this hash, attributed one row's outputs to the other.
+///
+/// The encoding change means dedup hashes restored from a checkpoint written
+/// by an older build no longer match rows re-fed after the upgrade. That
+/// degrades exactly like the bounded dedup set's existing eviction — a
+/// re-delivered row may be admitted once more — and is strictly the milder
+/// failure of the two.
 pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> IvmResult<u64> {
     let mut combined: Vec<u8> = Vec::with_capacity(64);
     for col in batch.columns() {
@@ -3634,8 +3654,8 @@ pub(crate) fn hash_row(batch: &RecordBatch, row: usize) -> IvmResult<u64> {
         // rows that hash alike — silent data loss.
         let s = krishiv_delta::operators::key_util::scalar_to_group_key(col.as_ref(), row)
             .map_err(|e| IvmError::execution(e.to_string()))?;
+        combined.extend_from_slice(&(s.len() as u64).to_le_bytes());
         combined.extend_from_slice(s.as_bytes());
-        combined.push(0u8);
     }
     Ok(twox_hash::XxHash64::oneshot(
         0xcafe_babe_dead_beef_u64,
@@ -3797,27 +3817,81 @@ fn dedup_filter(
 }
 
 fn validate_feed_target(inner: &IncrementalFlowInner, source_name: &str) -> IvmResult<()> {
-    if inner.view_deps.is_empty() {
+    // IVM-AUD-CORE-31: the known-target set must be derived from EVERY
+    // registered view, by the same rule the tick uses to decide whether a
+    // view is dirty — otherwise the guard and the tick disagree about what a
+    // source name means, and both directions of that disagreement are
+    // data-losing:
+    //
+    //   * `view_deps` only holds views whose deps `extract_sql_table_refs`
+    //     could parse, and that function bails on any body with a second
+    //     `SELECT` — every CTE, subquery and UNION, i.e. essentially the whole
+    //     corpus. A flow of only such views left `view_deps` EMPTY, and the
+    //     old `is_empty()` bypass then waved through every name: a typo'd feed
+    //     was accepted, buffered under a key nothing reads, and drained by the
+    //     next tick. Silent loss — exactly what this guard exists to stop.
+    //   * Mixed flows failed the other way: one parseable view pinned the set
+    //     to ITS sources, so another view's real source was REJECTED, with an
+    //     error listing "known sources" that omitted it.
+    //
+    // So: bypass only when nothing is registered yet (feed-then-register stays
+    // legal), and for a view without a parsed dep set fall back to
+    // `sql_identifiers` — the same tokenizer the dirty-bit check falls back to
+    // at tick time. It over-accepts (a column name or a CTE name is a legal
+    // target) in exactly the cases where the tick would also consider the view
+    // dirty, which is the honest bound: this guard promises to reject names no
+    // view could possibly read, not to type-check the caller.
+    let view_names = inner.view_registry.view_names().map_err(delta_err)?;
+    if view_names.is_empty() {
         return Ok(());
     }
     let wanted = source_name.to_lowercase();
-    // A view name is itself a legal feed target on the view-DAG path (a
+    // Cheap pass first — this is the ingestion path, called once per fed
+    // batch. A view name is itself a legal feed target on the view-DAG path (a
     // derived view reads its parent's output).
-    let known: Vec<String> = inner
-        .view_deps
-        .iter()
-        .flat_map(|(view, deps)| {
-            std::iter::once(view.to_lowercase()).chain(deps.iter().map(|d| d.to_lowercase()))
-        })
-        .collect();
+    let mut known: Vec<String> = Vec::new();
+    for view in &view_names {
+        known.push(view.to_lowercase());
+        if let Some(deps) = inner.view_deps.get(view) {
+            known.extend(deps.iter().map(|d| d.to_lowercase()));
+        }
+    }
     if known.contains(&wanted) {
         return Ok(());
     }
+    // Only now pay for tokenizing the bodies whose deps could not be parsed.
+    for view in &view_names {
+        if inner.view_deps.contains_key(view) {
+            continue;
+        }
+        let Ok(v) = inner.view_registry.get(view) else {
+            continue;
+        };
+        let tokens = sql_identifiers(&v.spec.body_sql);
+        if tokens.iter().any(|t| t == &wanted) {
+            return Ok(());
+        }
+        known.extend(tokens);
+    }
+    // The listing is a typo hint, so it is labelled for what it actually is:
+    // for token-fallback views it contains every identifier in the body, not
+    // just relations. Bounded so a large corpus cannot turn one rejected feed
+    // into a wall of text.
     let mut sorted = known;
     sorted.sort();
     sorted.dedup();
+    const MAX_LISTED: usize = 40;
+    let elided = sorted.len().saturating_sub(MAX_LISTED);
+    sorted.truncate(MAX_LISTED);
+    let more = if elided > 0 {
+        format!(" (+{elided} more)")
+    } else {
+        String::new()
+    };
     Err(IvmError::execution(format!(
-        "no registered view reads source '{source_name}'; feeding it would silently          discard the delta at the next tick. Known sources: {sorted:?}"
+        "no registered view reads source '{source_name}'; feeding it would silently \
+         discard the delta at the next tick. Names any registered view could read: \
+         {sorted:?}{more}"
     )))
 }
 
@@ -5814,6 +5888,261 @@ mod integration_tests {
             DeltaBatch::from_inserts(make_batch(&[4])).unwrap(),
         )
         .unwrap();
+    }
+
+    /// The guard above only ever ran against a view whose dep set could be
+    /// parsed. `extract_sql_table_refs` bails to `None` on any body with a
+    /// second `SELECT` — every CTE, subquery and UNION, which is to say
+    /// essentially the whole TPC-H/NEXMark corpus — so those views recorded no
+    /// deps, `view_deps` stayed empty, and the guard's `is_empty()` bypass
+    /// waved through EVERY name. A typo'd feed against a CTE view was accepted,
+    /// buffered under a key nothing reads, and drained by the next tick.
+    ///
+    /// Revert-proof: restore `if inner.view_deps.is_empty() { return Ok(()) }`
+    /// and the typo is accepted again — the assertion fails.
+    #[tokio::test]
+    async fn a_typo_is_rejected_for_a_cte_view_whose_deps_cannot_be_parsed() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let flow = IncrementalFlow::new();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Int64,
+            true,
+        )]));
+        // Two SELECTs: `extract_sql_table_refs` refuses, so `view_deps` has no
+        // entry for this view.
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "totals".into(),
+            body_sql: "WITH kept AS (SELECT id FROM orders WHERE id > 0) \
+                       SELECT SUM(id) AS total FROM kept"
+                .into(),
+            output_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        let err = flow
+            .feed(
+                "order",
+                DeltaBatch::from_inserts(make_batch(&[1, 2])).unwrap(),
+            )
+            .expect_err("a typo'd source must be rejected for a CTE view too");
+        assert!(
+            err.to_string()
+                .contains("no registered view reads source 'order'"),
+            "the error must name the offending source: {err}"
+        );
+
+        // The real source, read only from inside the CTE, is still accepted.
+        flow.feed(
+            "orders",
+            DeltaBatch::from_inserts(make_batch(&[3])).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The other half of the same defect. One parseable view pins `view_deps`
+    /// to ITS sources only; a second view whose deps could not be parsed
+    /// contributed nothing, so feeding that second view's real source was
+    /// rejected outright — the guard refusing the very data the flow exists to
+    /// consume, with an error listing the wrong set of "known sources".
+    ///
+    /// Revert-proof: restore the `view_deps`-only `known` set and the feed
+    /// errors instead of moving the view.
+    #[tokio::test]
+    async fn a_second_views_real_source_is_not_rejected_because_a_sibling_pinned_the_deps() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let flow = IncrementalFlow::new();
+        let out = |name: &str| Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, true)]));
+        // Parseable: records deps {orders}.
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "order_totals".into(),
+            body_sql: "SELECT SUM(id) AS total FROM orders".into(),
+            output_schema: out("total"),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+        // Unparseable dep set (two SELECTs): contributes nothing to `view_deps`.
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "line_totals".into(),
+            body_sql: "WITH kept AS (SELECT id FROM lineitem WHERE id > 0) \
+                       SELECT SUM(id) AS total FROM kept"
+                .into(),
+            output_schema: out("total"),
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        flow.feed(
+            "lineitem",
+            DeltaBatch::from_inserts(make_batch(&[4, 6])).unwrap(),
+        )
+        .expect("a real source of a registered view must be feedable");
+        let summary = flow.step_datafusion().await.unwrap();
+        assert!(
+            summary.errored_views.is_empty(),
+            "tick errors: {:?}",
+            summary.errored_views
+        );
+        let snap = flow
+            .snapshot("line_totals")
+            .unwrap()
+            .expect("the view must have published");
+        let total = snap
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(total, 10, "the fed rows must reach the view");
+    }
+
+    /// `feed_snapshot` is the other live ingestion door — the Python handle,
+    /// MCP and the coordinator's `/stream-bridge` route all enter through it —
+    /// and it had no target guard at all. A typo'd name differentiated against
+    /// its own private `streaming_prev_snapshots` entry and pushed the delta
+    /// into `pending` under a key nothing reads: silent loss, and a poisoned
+    /// prev-snapshot that makes every later call on that name differentiate
+    /// against garbage.
+    ///
+    /// Revert-proof: delete the `validate_feed_target` line from
+    /// `feed_snapshot` and the typo is accepted again.
+    #[tokio::test]
+    async fn feed_snapshot_rejects_a_source_no_view_reads() {
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let flow = IncrementalFlow::new();
+        let output_schema = Arc::new(Schema::new(vec![Field::new(
+            "total",
+            DataType::Int64,
+            true,
+        )]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "totals".into(),
+            body_sql: "SELECT SUM(id) AS total FROM orders".into(),
+            output_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        let err = flow
+            .feed_snapshot("order", &[make_batch(&[1, 2])])
+            .expect_err("feed_snapshot must reject a source no view reads");
+        assert!(
+            err.to_string()
+                .contains("no registered view reads source 'order'"),
+            "the error must name the offending source: {err}"
+        );
+        // The rejected name must not have left a snapshot behind: a poisoned
+        // prev-snapshot would make a later correct feed differentiate against
+        // rows the flow never accepted.
+        flow.feed_snapshot("orders", &[make_batch(&[1, 2])])
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+        let snap = flow.snapshot("totals").unwrap().expect("published");
+        assert_eq!(
+            snap.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+    }
+
+    // ── row hashing (IVM-AUD-CORE-32) ─────────────────────────────────────────
+
+    /// `hash_row` claimed its NUL separators made column boundaries
+    /// unambiguous. They do not: a NUL is a legal character inside an Arrow
+    /// Utf8 value, so a value carrying one can move the boundary and two
+    /// DISTINCT rows can hash identically. Content-addressed dedup drops rows
+    /// that hash alike, so the collision is silent row loss.
+    ///
+    /// Revert-proof: restore the `extend(s.as_bytes()); push(0u8)` encoding and
+    /// the two hashes come out equal.
+    #[test]
+    fn two_distinct_rows_with_embedded_nuls_do_not_hash_alike() {
+        use crate::flow::hash_row;
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        // Row 0 encodes as v,x | v,NUL,v,y  and row 1 as v,x,NUL,v | v,y —
+        // the same byte string once the separators are folded in.
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x\u{0}v"])),
+                Arc::new(StringArray::from(vec!["\u{0}vy", "y"])),
+            ],
+        )
+        .unwrap();
+        assert_ne!(
+            hash_row(&batch, 0).unwrap(),
+            hash_row(&batch, 1).unwrap(),
+            "distinct rows must not share a content hash"
+        );
+    }
+
+    /// The consequence at the production surface: with content-addressed dedup
+    /// on, a colliding row was discarded as "already seen" and never reached
+    /// the view. Both rows are distinct, so both must count.
+    #[tokio::test]
+    async fn dedup_keeps_two_distinct_rows_that_used_to_collide() {
+        use arrow::array::StringArray;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let flow = IncrementalFlow::new();
+        flow.enable_input_dedup().unwrap();
+        let output_schema = Arc::new(Schema::new(vec![Field::new("c", DataType::Int64, true)]));
+        flow.register_view(krishiv_delta::IncrementalViewSpec {
+            name: "counted".into(),
+            body_sql: "SELECT COUNT(*) AS c FROM rows_in".into(),
+            output_schema,
+            is_materialized: true,
+            is_recursive: false,
+            lateness: vec![],
+        })
+        .unwrap();
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["x", "x\u{0}v"])),
+                Arc::new(StringArray::from(vec!["\u{0}vy", "y"])),
+            ],
+        )
+        .unwrap();
+        flow.feed("rows_in", DeltaBatch::from_inserts(batch).unwrap())
+            .unwrap();
+        flow.step_datafusion().await.unwrap();
+        let snap = flow.snapshot("counted").unwrap().expect("published");
+        assert_eq!(
+            snap.column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+                .unwrap()
+                .value(0),
+            2,
+            "dedup dropped a distinct row as a false duplicate"
+        );
     }
 
     /// Pre-registration feeds stay legal: with no views there is nothing to

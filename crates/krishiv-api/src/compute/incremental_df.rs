@@ -286,6 +286,14 @@ impl IncrementalDataFrame {
         &self.sources
     }
 
+    /// Deliberately permissive on an explicit name: it is passed through to
+    /// the flow, which is the authority on what is feedable (a name may be a
+    /// source of a *sibling* view co-registered on the same job, which this
+    /// handle cannot see). The flow rejects a name no registered view could
+    /// read — see `validate_feed_target` / IVM-AUD-CORE-31 — so a typo still
+    /// fails loudly rather than being buffered under a key nothing reads.
+    /// Checking `self.sources` here as well would re-introduce exactly the
+    /// false-rejection half of that defect one layer up.
     fn resolve_source(&self, source: Option<&str>) -> Result<String> {
         match source {
             Some(s) => Ok(s.to_string()),

@@ -5966,3 +5966,81 @@ it was measuring something else.**
 
 Proptest pinned the discovering seed to `proptest_checkpoint_kill.proptest-regressions`, so this
 input is now part of the deterministic suite rather than a lucky draw.
+
+## §62 — IVM T1 (#156): the guard that only guarded a third of the corpus, and a separator that was not one
+
+Task #156 listed six data-corruption cores. Four were already closed by the
+`IVM-AUD-CORE` series and are recorded here as **verified, not re-fixed**, with
+where to look:
+
+| item | state | evidence |
+|---|---|---|
+| `key_util` injective for all Arrow types, fail-closed on unknown | closed (IVM-AUD-1) | every type has a value-faithful branch; nested types go through Arrow's own formatter; an unencodable type is `Err`, never a placeholder |
+| `view.rs` publish / `apply_output_delta` restore-on-error | closed (CORE-14, CORE-15) | both compute from clones and commit only after every fallible step succeeds — a failed apply can no longer leave snapshot **or** baseline `None` |
+| `step()` re-feeds pending on error **and** cancellation | closed (PART-1) | `DrainedPending` is a Drop guard, so `?` paths and dropped futures both restore custody, oldest-first |
+| partitioned `try_join_all` | closed (PART-1, PART-3) | `join_all`: no shard is cancelled, and the error names every failed shard |
+| `restore()` clears `view_plans` + snapshots consistently | closed (CORE-16) | plans, plan SQLs, stashed plan state and every view's baseline+snapshot reset together, then `rebuild_all_views` |
+
+The remaining item — "silent source drop" — was live, in **two opposite
+directions at once**, and one ingestion door had no guard at all.
+
+**IVM-AUD-CORE-31 — `validate_feed_target` measured the wrong set.** The guard
+was built from `view_deps`, which `register_view` populates only when
+`extract_sql_table_refs` can parse the body. That function bails to `None` on
+any body containing a second `SELECT` — every CTE, subquery and UNION, which is
+to say essentially the entire TPC-H/NEXMark corpus. Two failures follow, and
+both were reproduced before either was fixed:
+
+1. **Silent loss.** A flow whose views are all CTE-shaped leaves `view_deps`
+   empty, and the guard's `is_empty()` bypass then waved through *every* name.
+   A typo'd feed was accepted, buffered under a key nothing reads, and drained
+   by the next tick — the exact behaviour the guard exists to prevent, in the
+   shape where the guard was never exercised.
+2. **False rejection.** In a mixed flow, one parseable view pinned the known
+   set to *its* sources, so a second view's real source was rejected outright.
+   The probe's failure message is the whole story: feeding `lineitem` errored
+   with `Known sources: ["order_totals", "orders"]`.
+
+The fix derives the known set from **every registered view**, by the same rule
+the tick uses to decide whether a view is dirty: precise deps where they were
+parsed, `sql_identifiers` (the tokenizer fallback) where they were not. The
+bypass now means "nothing is registered yet", so feed-then-register stays
+legal. It over-accepts for token-fallback views — a column or CTE name is a
+legal target — in exactly the cases where the tick would also consider that
+view dirty; the guard's honest promise is *"no view could possibly read this
+name"*, not a type-check of the caller. Cheap set first, tokenizer only on the
+miss, so the ingestion path does not pay for it in the common case.
+
+`feed_snapshot` — the door the Python handle, MCP and the coordinator's
+`/stream-bridge` route all enter through — had **no target validation at all**.
+Worse than plain `feed`: it also records a per-name entry in
+`streaming_prev_snapshots`, so a typo'd stream is swallowed forever *and*
+poisons the baseline any later call on that name differentiates against. The
+guard now runs before the snapshot is recorded.
+
+**IVM-AUD-CORE-32 — the NUL separator that a value can contain.** `hash_row`
+concatenated per-column encodings with a trailing `0u8` and its doc claimed
+this made column counts unambiguous. A NUL is a legal character inside an Arrow
+Utf8 value, so a value carrying one moves the boundary: `("x", "\0vy")` and
+`("x\0v", "y")` produce the same byte string, hence the same hash — measured,
+both rows hashing to `3342886964737431137`. Content-addressed dedup drops rows
+that hash alike, so this is silent row loss (the flow-level probe fed two
+distinct rows and the view counted **1**), and provenance, which keys lineage
+on the same hash, attributed one row's outputs to the other. Components are now
+length-prefixed. Stated consequence: dedup hashes restored from a checkpoint
+written by an older build no longer match rows re-fed after the upgrade — that
+degrades exactly like the dedup set's existing bounded-capacity eviction (a
+re-delivered row may be admitted once more), which is the milder of the two
+failures by a wide margin.
+
+**Revert-proofs, all run:**
+
+| test | revert | result |
+|---|---|---|
+| `a_typo_is_rejected_for_a_cte_view_whose_deps_cannot_be_parsed` | restore the `view_deps.is_empty()` bypass | RED — typo accepted |
+| `a_second_views_real_source_is_not_rejected_because_a_sibling_pinned_the_deps` | restore the `view_deps`-only known set | RED — real source rejected |
+| `feed_snapshot_rejects_a_source_no_view_reads` | delete the new `validate_feed_target` call | RED — typo accepted |
+| `two_distinct_rows_with_embedded_nuls_do_not_hash_alike` | restore `extend(bytes); push(0u8)` | RED — hashes equal |
+| `dedup_keeps_two_distinct_rows_that_used_to_collide` | same | RED — view counts 1, not 2 |
+
+All five were written and observed red **before** the fixes, not after.
