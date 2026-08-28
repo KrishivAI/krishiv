@@ -396,10 +396,33 @@ the WRONG way: q9, q12, q18, q3 and q7 all regress with scale. So the residual
 recorded in §65 is not one small constant; it is concentrated in the join and
 semi-join paths.
 
-**q21's incremental tick grew 72x for 5x the state** — superlinear — and takes
-13.7 SECONDS to absorb a 5k-row delta that full recompute handles in 121 ms.
-Worse in ratio than the PERF-2 join defect, and invisible at the seed 20k the
-corpus normally runs. Tracked as task #167.
+**q21's incremental tick is superlinear in state.** Curve fit with the machine
+idle, delta pinned at 5k:
+
+| seed | incr tick | growth |
+|---|---:|---|
+| 200 k | 251.9 ms | — |
+| 400 k | 468.3 ms | 1.86x for 2x |
+| 800 k | **7,932.7 ms** | **16.9x for 2x** |
+| 1 M | 13,660 ms | — |
+
+Linear to 400k, then it explodes. **A correction to a correction, both recorded:**
+the 13,660 ms at 1M was first reported as a 72x superlinear blow-up; I then
+noticed the SF10 dataset generation had been running concurrently and called the
+figure contaminated. The idle re-run refutes THAT: 800k alone reaches 7.9 s, so
+the superlinearity is real and the contention doubt was wrong. Both the original
+over-claim and the wrong retraction are left here because a benchmark's
+credibility comes from what it says about its own mistakes.
+
+Partially attributed (task #167): `Trace::probe_by_keys` is O(entire trace), and
+the SEMI-3 residual membership path calls it ONCE PER DELTA ROW — O(delta x
+state). That explains the LINEAR segment. It does not explain a 17x jump for 2x
+state, so a second compounding factor remains unidentified and is NOT claimed.
+
+Also visible in the same run, on the other side: NEXMark's q21_channel_id is
+where IVM wins biggest — 79 -> 201 ms incremental against 880 -> 4049 ms
+recompute, reaching **20.1x** at seed 800k. Same query number, opposite result,
+different corpus: further reason not to quote a single corpus-wide ratio.
 
 **Therefore no extrapolation to 1 TB is offered.** At 5x state several queries
 move the wrong way and one moves catastrophically; a favourable ratio quoted
