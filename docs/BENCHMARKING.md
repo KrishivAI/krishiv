@@ -364,6 +364,54 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28g — Distributed IVM: a 28.5x penalty on a routing flag (cluster-only finding)
+
+First run of the corpus through the DISTRIBUTED path — coordinator + 2 executors
+on kind, engine `fast-d906ba9` (HEAD), driven via the IVM HTTP API
+(`scripts/ivm_distributed_bench.py`).
+
+| query | tick (dispatch + compute) | rows out |
+|---|---:|---:|
+| global_sum | 488.4 ms | 2 |
+| grouped_sum | **14.4 ms** | 16 |
+| filtered | 490.5 ms | 989 |
+
+Two shapes at ~490 ms and one at 14 ms is a threshold, not a cost curve. The two
+slow ones are exactly the shapes `partitioned.rs`'s auto-rule cannot shard (no
+grouping key; stateless projection), while the shardable single-key aggregate is
+34x faster.
+
+**Confirmed by A/B** (`scripts/ivm_partitioning_ab.py`) — identical SQL,
+identical data, identical seed/delta, only the `partitioned` flag on
+`POST /ivm/jobs` differs:
+
+| partitioned | median tick |
+|---|---:|
+| `true` | **17.4 ms** |
+| `false` | **495.4 ms** |
+
+**28.5x on a routing flag alone**, with every query-shape confounder eliminated.
+
+**The implication.** The distributed IVM path is fast only for provably
+shardable single-key aggregates. Every other shape — global aggregates,
+stateless maps, joins, top-N, sessions — takes the non-partitioned route and
+pays a ~490 ms per-tick floor regardless of how little work the tick does. For a
+46-query corpus where most shapes are not single-key aggregates, that makes
+distributed IVM unattractive for the majority of queries TODAY, and it is the
+number to fix before any distributed corpus number is worth quoting.
+
+Nothing in the single-node corpus could have surfaced this — it exists only on
+the wire.
+
+**Scope and caveats.** 3 query shapes, not the 46-entry corpus (extending the
+driver means porting the NEXMark generator and TPC-H slices into its feed path).
+Every tick includes Arrow-IPC-base64 encode/decode plus HTTP round-trip, so this
+axis measures DISPATCH, not incremental maintenance, and is not comparable to
+the in-process tables above — the driver prints that note with its own results.
+`CreateJobResponse.partitioned` did not read back under the expected key, so the
+A/B proves cause and effect but the *mechanism* (that the cost is the fallback
+route specifically) still wants the log-ring check in task #168.
+
 ### 2026-08-28f — TPC-H crossover sweep: the "IVM wins at scale" claim is query-dependent, and q21 is pathological
 
 Asked whether delta-batch could be compared against batch on a 1 TB TPC-H
