@@ -645,17 +645,52 @@ impl IncrementalJoinOp {
             let ld = dl.data_batch();
             let lw = dl.weights();
             let lki = col_indices(&ld, &self.left_key_cols)?;
+            // IVM-AUD-PERF-5: probe the trace ONCE for all delta keys, not once
+            // per delta row. `probe_by_keys` is O(THE ENTIRE TRACE) — it scans
+            // every level and batch building a match mask — and it already
+            // accepts a BATCH of keys, so calling it per row turned an O(state)
+            // operation into O(delta x state): 5,000 delta rows against a 1M-row
+            // trace is 5 billion row-scans per tick. Measured on TPC-H q21
+            // before this: 252 ms at seed 200k, 7.9 s at 800k, ~10 s at 1M.
+            //
+            // The fix is to use the seam as designed. Probe once with every
+            // distinct key, then group the matched rows by their key so each
+            // left row still evaluates its residual against exactly the rows it
+            // would have seen. The per-key match sets are identical; only the
+            // number of trace scans changes.
+            let left_keys: Vec<Vec<Option<String>>> = (0..ld.num_rows())
+                .map(|li| extract_key(&ld, li, &lki))
+                .collect::<DeltaResult<Vec<_>>>()?;
+            let mut distinct: Vec<Vec<Option<String>>> = left_keys.clone();
+            distinct.sort();
+            distinct.dedup();
+            let matches_by_key: AHashMap<Vec<Option<String>>, DeltaBatch> = if distinct.is_empty() {
+                AHashMap::new()
+            } else {
+                let probe =
+                    keys_to_probe_batch(&distinct, &self.right_key_cols, &self.right_schema)?;
+                let all = self.right_trace.probe_by_keys(&probe)?;
+                let ad = all.data_batch();
+                let arki = col_indices(&ad, &self.right_key_cols)?;
+                let mut rows_by_key: AHashMap<Vec<Option<String>>, Vec<usize>> = AHashMap::new();
+                for ri in 0..ad.num_rows() {
+                    rows_by_key
+                        .entry(extract_key(&ad, ri, &arki)?)
+                        .or_default()
+                        .push(ri);
+                }
+                rows_by_key
+                    .into_iter()
+                    .map(|(k, rows)| select_rows(&all, &rows).map(|b| (k, b)))
+                    .collect::<DeltaResult<AHashMap<_, _>>>()?
+            };
+            let empty_right = DeltaBatch::empty(self.right_schema.clone())?;
+
             let mut keep: Vec<usize> = Vec::new();
-            for li in 0..ld.num_rows() {
-                let key = extract_key(&ld, li, &lki)?;
-                let probe = keys_to_probe_batch(
-                    std::slice::from_ref(&key),
-                    &self.right_key_cols,
-                    &self.right_schema,
-                )?;
-                let trace_rights = self.right_trace.probe_by_keys(&probe)?;
-                let mut w = self.residual_pass_weight(&ld, li, &trace_rights)?;
-                if let Some(db) = dr_rows_for(&key)? {
+            for (li, key) in left_keys.iter().enumerate() {
+                let trace_rights = matches_by_key.get(key).unwrap_or(&empty_right);
+                let mut w = self.residual_pass_weight(&ld, li, trace_rights)?;
+                if let Some(db) = dr_rows_for(key)? {
                     w += self.residual_pass_weight(&ld, li, &db)?;
                 }
                 let member = if semi { w > 0 } else { w == 0 };

@@ -6281,3 +6281,64 @@ the operator's own partition map. The method stands — establish the shape, the
 attribute, then fix — and this entry is what that method looks like when the
 attribution step says no.
 
+
+## §66 — IVM-AUD-PERF-5: an API designed for batch probing, called one row at a time
+
+TPC-H q21's tick was 252 ms at seed 200k and **7.9 s at 800k** — linear, then a
+cliff, then linear again (§65's curve, machine idle). Attribution, from reading
+rather than guessing:
+
+`Trace::probe_by_keys` is **O(the entire trace)**: it hashes the probe keys and
+then scans every level and every batch building a match mask. Only the probe
+side is indexed. And `apply_left_semi_anti_residual` — the SEMI-3 non-equi
+membership path that q21's `EXISTS`/`NOT EXISTS` with
+`l2.l_suppkey <> l1.l_suppkey` takes — called it **once per delta row**:
+
+```rust
+for li in 0..ld.num_rows() {                     // 5,000 delta rows
+    let probe = keys_to_probe_batch(&[key], ..); // a ONE-ROW probe
+    let trace_rights = self.right_trace.probe_by_keys(&probe)?;  // scans ALL trace rows
+```
+
+5,000 × 1M = 5 billion row-scans per tick.
+
+**The architectural point, and why the fix is not an index.** `probe_by_keys`
+and `keys_to_probe_batch` both already take a BATCH of keys — the seam is
+designed for batched probing. The defect was a caller ignoring that design and
+turning an O(state) operation into O(delta × state). The right fix is to use
+the API as intended, not to bolt an index onto `Trace` underneath a caller that
+is holding it wrong. (A hash index on `Trace`, taking probes from O(state) to
+O(matches), remains worth doing — it would help every probe site — and is
+recorded as the NEXT step, not this one.)
+
+Probe once with every distinct left key, group the returned rows by their
+right-side key, hand each left row its own group. The per-key match sets are
+identical — `probe_by_keys` filters by key-set membership, so probing {k1,k2}
+and partitioning by key gives the same partition as probing k1 and k2
+separately. Only the number of trace scans changes: |delta| → 1.
+
+Three details that would have been silent wrong answers:
+- a key with NO matches must still evaluate its residual against an EMPTY right
+  side rather than be skipped — otherwise anti-join membership (`w == 0` ⇒
+  member) silently drops rows. Hence the `empty_right` fallback, not a
+  `continue`.
+- duplicate keys across left rows collapse in the probe but each left row still
+  reads the full group, so multiplicity is untouched.
+- the ΔB branch, which probes per DISTINCT right key, was deliberately left
+  alone: it is O(distinct keys × state), a much smaller factor, and changing
+  both paths in one pass would double the correctness surface for a fraction of
+  the win.
+
+**Result** (TPC-H q21, delta pinned 5k, machine idle):
+
+| seed | before | after |
+|---|---:|---:|
+| 200 k | 251.9 ms | 208.3 ms |
+| 800 k | **7,932.7 ms** | **1,192.7 ms** (6.6× faster) |
+
+Growth across 4× state fell from **31.5× to 5.7×**. The cliff is largely gone.
+
+**What is NOT claimed.** q21 still LOSES to recompute at 800k (0.08×), and 5.7×
+for 4× state is still superlinear, so residue remains — the ΔB branch and
+`probe_by_keys` being O(state) even when called once. This entry fixes the
+dominant term and names what is left rather than declaring the query healthy.
