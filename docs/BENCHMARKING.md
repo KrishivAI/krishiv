@@ -364,6 +364,50 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28f — TPC-H crossover sweep: the "IVM wins at scale" claim is query-dependent, and q21 is pathological
+
+Asked whether delta-batch could be compared against batch on a 1 TB TPC-H
+dataset. It cannot on this machine, and the reason is architectural rather than
+incidental: **IVM state is RAM-resident** (`SourceState` chunks + the PERF-3
+snapshot index; `spill.rs` governs DataFusion's SQL execution, not IVM state).
+SF1000 lineitem alone is 6 billion rows — roughly 1.8 TB of engine state against
+25 GB available. Disk was never the constraint (345 GB parquet into 942 GB free).
+**Spillable IVM state is a real gap**: the streaming path has a RocksDB backend,
+the delta-batch path has none, so delta-batch is RAM-bounded on any single node
+regardless of dataset size.
+
+So the crossover was measured instead, since it is what a 1 TB run would be
+probing: seed scaled with the delta pinned at 5k, SF1 data.
+
+| query | 200k | 1M | incr tick 200k → 1M |
+|---|---|---|---|
+| **q21** | 0.33x | **0.01x** | **189 ms → 13,660 ms** |
+| q9 | 0.50x | 0.27x | 139 → 332 ms |
+| q12 | 0.71x | 0.40x | 69 → 211 ms |
+| q18 | 0.51x | 0.55x | 107 → 307 ms |
+| q1 | 0.97x | **3.11x** | 39 → 22.6 ms |
+| q6 | 0.80x | **1.69x** | 43 → 25.4 ms |
+| q22 | 1.22x | **1.71x** | 27.7 → 23.3 ms |
+
+**The split is the finding.** Simple aggregates flatten and win — their ticks get
+FASTER in absolute terms as state grows, which is what O(delta) looks like when
+the per-tick constant stops being dominated by warm-up. Join-heavy queries move
+the WRONG way: q9, q12, q18, q3 and q7 all regress with scale. So the residual
+recorded in §65 is not one small constant; it is concentrated in the join and
+semi-join paths.
+
+**q21's incremental tick grew 72x for 5x the state** — superlinear — and takes
+13.7 SECONDS to absorb a 5k-row delta that full recompute handles in 121 ms.
+Worse in ratio than the PERF-2 join defect, and invisible at the seed 20k the
+corpus normally runs. Tracked as task #167.
+
+**Therefore no extrapolation to 1 TB is offered.** At 5x state several queries
+move the wrong way and one moves catastrophically; a favourable ratio quoted
+from the seed-20k table would not survive scale. Three queries (q2, q11, q16)
+report `source data exhausted` at seed 1M because SF1's partsupp/supplier are
+smaller than the seed — the harness refusing to time an empty tick rather than
+printing a flattering number.
+
 ### 2026-08-28e — IVM-AUD-PERF-3 fixed: view snapshots maintained in O(delta)
 
 The O(state) snapshot maintenance diagnosed in the 08-28c entry (and register
