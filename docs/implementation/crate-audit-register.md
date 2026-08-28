@@ -6342,3 +6342,56 @@ Growth across 4× state fell from **31.5× to 5.7×**. The cliff is largely gone
 for 4× state is still superlinear, so residue remains — the ΔB branch and
 `probe_by_keys` being O(state) even when called once. This entry fixes the
 dominant term and names what is left rather than declaring the query healthy.
+
+## §67 — IVM-AUD-DIST-1: the fourth copy of the wait loop, and the one nobody fixed
+
+The distributed corpus run (BENCHMARKING 2026-08-28g) found a tick cost that no
+amount of compute explains: **~490 ms for a non-partitioned IVM step against
+~17 ms for the sharded path**, confirmed by A/B on the `partitioned` flag alone —
+identical SQL, identical data, identical seed and delta, 28.5x apart.
+
+Attribution: `ivm_http.rs`'s job-completion wait loop did
+
+```rust
+let recheck = { …read job state… };
+if !terminal { continue }
+let state_changed = notify.notified();   // ← created AFTER the read
+tokio::select! { _ = state_changed => {} _ = sleep(100ms) => {} }
+```
+
+`Notify` wakes only already-PARKED waiters and stores no permit. A state change
+landing between the read and the park is **lost**, and the iteration falls
+through to the 100 ms sleep. Roughly five dropped notifications per step is the
+~490 ms.
+
+**This register already knew this defect.** The cross-cutting checklist carries
+it verbatim — *"`Notify::notify_waiters()` treated as a delivery guarantee … a
+real 300s hang in batch-SQL; four copies of the wait loop, one correct."* The
+batch-SQL hang was fixed; this copy was not. Checked all four:
+
+| copy | ordering |
+|---|---|
+| `bounded_window.rs:178` | `notified()` before the read — correct |
+| `batch_sql.rs:238` | correct |
+| `batch_sql.rs:379` | correct |
+| `ivm_http.rs` | **`notified()` after the read — the bug** |
+
+Three independent implementations agree on the ordering; the one that disagreed
+is exactly the one showing a floor no compute explains. Fixed by creating
+`notified()` first, so the future captures any notification from that moment and
+the recheck cannot open a lost-wakeup window. Four copies, four correct.
+
+**What is NOT yet shown, and how to show it.** The fix compiles and matches its
+siblings, but it has NOT been re-measured: that needs an image rebuild (~20 min),
+a reload to three kind nodes, a redeploy, and a re-run of the A/B. The
+falsifiable prediction is that `partitioned=false` drops from ~495 ms toward the
+sharded path's ~17 ms. The test is already scripted —
+`scripts/ivm_partitioning_ab.py` against a rebuilt image — and it either shows
+the floor gone or it does not. Recorded as a prediction rather than a result
+because this session produced five plausible explanations that measurement
+overturned, including one (PERF-4) implemented, measured, refuted and reverted.
+
+**Why the single-node work could never have found this.** The in-process harness
+constructs `IncrementalFlow` directly; there is no coordinator, no job state
+machine, and no wait loop. This defect exists only on the wire, and it took
+deploying HEAD to a real cluster and driving the HTTP API to surface it.

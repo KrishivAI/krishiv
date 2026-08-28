@@ -1117,6 +1117,21 @@ async fn run_ivm_fragment_job(
             JobState::Succeeded => break true,
             JobState::Failed | JobState::Cancelled => break false,
             _ => {
+                // IVM-AUD-DIST-1: register interest BEFORE re-reading state.
+                // `Notify` wakes only already-PARKED waiters and stores no
+                // permit, so a state change landing between the read and the
+                // park is LOST and this iteration falls through to the 100 ms
+                // sleep. Measured cost of that miss: a non-partitioned IVM tick
+                // took ~490 ms against ~17 ms for the sharded path — roughly
+                // five dropped notifications per step — while doing the same
+                // work on the same data (A/B on the `partitioned` flag alone,
+                // BENCHMARKING 2026-08-28g).
+                //
+                // This is the register's recurring shape: four copies of this
+                // wait loop, one correct. `notified()` must be created first;
+                // the future then captures any notification from that moment,
+                // so the recheck below cannot open a lost-wakeup window.
+                let state_changed = notify.notified();
                 let recheck = {
                     let coord = coordinator.read().await;
                     coord
@@ -1130,7 +1145,6 @@ async fn run_ivm_fragment_job(
                 ) {
                     continue;
                 }
-                let state_changed = notify.notified();
                 tokio::select! {
                     _ = state_changed => {}
                     _ = tokio::time::sleep(Duration::from_millis(100)) => {}
