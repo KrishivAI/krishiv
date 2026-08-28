@@ -6234,3 +6234,50 @@ before. Something state-proportional remains — most likely `flow.rs:1411`,
 which materializes every view's snapshot into `prev_outputs` each tick and now
 pays a decode when the state is indexed and the cache was just invalidated.
 That is the next thing to measure, and it is NOT claimed as fixed here.
+
+## §65 — IVM-AUD-PERF-4: a hypothesis about the residual, measured and REFUTED
+
+§64 left the view tick near-flat but not flat: with the delta pinned at 5k,
+q18 still grew ~1.9x across 5x the state (50.6 → 97.9 ms at seeds 20k/100k).
+The stated prime suspect was `flow.rs:1411`, which collects EVERY registered
+view's snapshot at the start of every tick — free when a snapshot was a
+`RecordBatch` (an `Arc` bump), O(state) once PERF-3 made it a lazily
+materialized index.
+
+The change was implemented: collect a prev snapshot only for views that will
+actually be asked for one — no plan yet (operator seeding), not incremental
+(its SQL runs), or read by another view (registered as a table). Three consumer
+sites were checked first to confirm an absent entry is treated exactly as a
+`None` snapshot already was, so the narrowing could not turn into a silent
+"no previous state".
+
+**It bought nothing.** Measured, delta pinned at 5k, median of 3:
+
+| seed | post-PERF-3 | post-PERF-4 |
+|---|---:|---:|
+| 20 k | 50.6 ms | 57.8 ms |
+| 50 k | 69.9 ms | 74.3 ms |
+| 100 k | 97.9 ms | 95.5 ms |
+
+95.5 vs 97.9 at 100k is inside this machine's spread. The hypothesis is
+refuted: snapshot materialization in Phase 1 is not the residual term. In
+hindsight the corpus bench registers ONE view per query, so the collection was
+only ever materializing a single snapshot per tick — the same order of work the
+tick does elsewhere — and a saving of one materialization should have shown up
+plainly if it were the cost.
+
+**Reverted.** The change is defensible in principle (it skips work nobody
+needs, and a flow with ten incremental views would skip ten materializations
+per tick) but that benefit is unmeasured, and it is exactly the scenario this
+corpus cannot exercise. Keeping an unproven narrowing of which views get
+snapshots — in the tick, where a wrong predicate is a silent wrong answer — is
+the trade this register exists to refuse. It stays available in this entry for
+whoever measures the multi-view case.
+
+**The residual is therefore unattributed**, and task #166 carries the remaining
+candidates rather than a guess: per-tick source MemTable registration whose
+chunk list grows with accumulated state; `SourceState` chunk accounting; and
+the operator's own partition map. The method stands — establish the shape, then
+attribute, then fix — and this entry is what that method looks like when the
+attribution step says no.
+
