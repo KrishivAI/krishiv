@@ -6044,3 +6044,77 @@ failures by a wide margin.
 | `dedup_keeps_two_distinct_rows_that_used_to_collide` | same | RED — view counts 1, not 2 |
 
 All five were written and observed red **before** the fixes, not after.
+
+## §63 — IVM-AUD-PERF-2: three nested loops inside the operator that exists to avoid O(state)
+
+A corpus-tick benchmark (`ivm_corpus_tick`, new) times every NEXMark query's
+delta-batch tick against a `force_diff_based` recompute of the same query. On
+its first run three queries were not slightly slow but **absurd**: q3 6934 ms,
+q8 6266 ms, q20 3591 ms per tick, against 23–30 ms to recompute the whole
+view from scratch. Those are exactly the three two-source joins.
+
+**Measured before diagnosed.** Holding the seed fixed and scaling only the
+delta gave 220 ms / 687 ms / 8040 ms at 1k / 2k / 5k rows — quadratic in the
+DELTA, which rules out accumulated state as the driver and points at a loop
+over both delta sides. `IncrementalJoinOp::join_deltas` was
+`for li { for ri { keys_match } }`: at 5k×5k that is 25 million comparisons
+per tick.
+
+**The same loop was in two more places, and those were worse in kind.** Both
+trace-probe output builders (`build_join_output_left_probe` /
+`…_right_probe`) paired rows the same way. `Trace::probe_by_keys` is
+hash-indexed, so the lookup was already fast — and then the pairing threw the
+win away, at O(delta × MATCHED TRACE ROWS). That term grows with accumulated
+state: an O(state) cost hiding inside the operator whose entire purpose is to
+not have one.
+
+All three now route through one `pair_rows_by_key` helper that hash-indexes
+the right side and probes it once per left row.
+
+**Semantics were pinned before the rewrite, not after.** The key is the same
+`Vec<Option<String>>` encoding `extract_key` builds from `scalar_to_key`,
+which reproduces `scalar_eq` exactly — including its deliberately non-SQL rule
+that **a NULL key matches a NULL key**. Two tests written against the OLD code
+and passing there hold the line: `the_cross_term_still_matches_null_keys_to_null_keys`
+and `the_cross_term_preserves_multiplicity_and_emission_order` (weights
+multiply; emission stays left-major with right rows ascending, which is what
+downstream consolidation and every existing expectation were written against).
+Quietly upgrading NULL handling to SQL semantics under cover of a performance
+fix is the silent behaviour change this register keeps catching.
+
+`keys_match` and `scalar_eq` fell dead and were deleted rather than left as
+documentation of a contract nothing enforces.
+
+**Revert-proof:** `the_same_tick_cross_term_is_not_quadratic_in_the_delta`
+joins 6000×6000 and asserts a 2 s budget. Against the nested loop it took
+**9.996 s** — observed red before the fix, 0.06 s after.
+
+**Result (seed 20k, delta 5k, median of 5 ticks):**
+
+| query | before | after | factor |
+|---|---:|---:|---|
+| q3_local_items | 6934 ms | 46.0 ms | 132× |
+| q8_monitor_new_users | 6266 ms | 53.1 ms | 118× |
+| q20_expand_bid | 3591 ms | 90.5 ms | 40× |
+
+### A claim of mine that the data refuted
+
+The bench's first summary line read "a slower one is a defect, not a
+trade-off — the tick is O(delta)", and it flagged 11 queries. That was wrong,
+and the correction is recorded rather than quietly edited: at the default seed
+the delta is 25% of the state, and incremental maintenance only wins as
+state/delta grows (`ivm_vs_full_recompute` puts the crossover for a simple
+aggregate past 1M rows). Scaling the SEED with the delta pinned shows every
+ratio improving across seeds 20k/50k/100k — q11 0.52→0.50→0.69, q18
+0.50→0.81→**1.02**, q19 0.60→0.90→**1.22**. Two of the four cross over by
+100k. (q3 reads 0.41→0.72→0.56, non-monotonic: its incremental tick moved
+51→39→71 ms, which is inside this laptop's run-to-run spread, so no trend is
+claimed from it.) The honest defect signature is a
+tick that grows with accumulated state, which is what the quadratic term was
+and what the seed axis now exists to detect.
+
+**Open, measured, not fixed:** q18's incremental tick grows 205→260→544 ms
+across seeds 20k/50k/100k with the delta pinned at 5k. Sublinear in state
+(2.6× for 5× state) and it still beats recompute at 100k, but it is not flat,
+so there is a state-proportional term in the keep-last dedup path worth
+finding. Recorded with its numbers rather than fixed by guess.

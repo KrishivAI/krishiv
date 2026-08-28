@@ -35,6 +35,10 @@ name = "ivm_vs_full_recompute"
 harness = false
 
 [[bench]]
+name = "ivm_corpus_tick"
+harness = false
+
+[[bench]]
 name = "all_slots_busy"
 harness = false
 

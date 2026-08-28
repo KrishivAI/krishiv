@@ -268,26 +268,32 @@ impl IncrementalJoinOp {
         let left_key_indices = col_indices(&left_data, &self.left_key_cols)?;
         let right_key_indices = col_indices(&right_data, &self.right_key_cols)?;
 
-        let mut out_left_rows: Vec<usize> = Vec::new();
-        let mut out_right_rows: Vec<usize> = Vec::new();
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        for li in 0..left_data.num_rows() {
-            for ri in 0..right_data.num_rows() {
-                if keys_match(
-                    &left_data,
-                    &left_key_indices,
-                    li,
-                    &right_data,
-                    &right_key_indices,
-                    ri,
-                )? {
-                    out_left_rows.push(li);
-                    out_right_rows.push(ri);
-                    out_weights.push(left_weights.value(li) * right_weights.value(ri));
-                }
-            }
-        }
+        // IVM-AUD-PERF-2: this was `for li { for ri { keys_match } }` — a
+        // nested loop over BOTH deltas, so a tick feeding 5k rows to each side
+        // ran 25 million comparisons and took ~6 s, against ~25 ms for full
+        // recompute of the same query. The three NEXMark two-source joins
+        // (q3, q8, q20) were 200-300x SLOWER incrementally than recomputing
+        // from scratch, which is not a trade-off: an O(delta) plan that loses
+        // to O(state) recompute is a defect. Measured shape before the fix —
+        // seed held fixed, delta scaled 1k/2k/5k -> 220 ms/687 ms/8040 ms:
+        // quadratic in the delta, i.e. the loop, not accumulated state.
+        //
+        // Hashing the right delta once and probing it per left row makes the
+        // term O(|dL| + |dR|). The key is the SAME `Vec<Option<String>>`
+        // encoding `extract_key` builds from `scalar_to_key`, which reproduces
+        // `scalar_eq` exactly, including its deliberately non-SQL rule that a
+        // NULL key MATCHES a NULL key (`None == None`). Emission order is
+        // unchanged — left-major with right rows ascending — because the probe
+        // walks left rows in order and each bucket keeps its rows in insertion
+        // (ascending) order.
+        let (out_left_rows, out_right_rows, out_weights) = pair_rows_by_key(
+            &left_data,
+            &left_key_indices,
+            left_weights,
+            &right_data,
+            &right_key_indices,
+            right_weights,
+        )?;
 
         if out_left_rows.is_empty() {
             return DeltaBatch::empty(self.output_schema.clone());
@@ -350,26 +356,18 @@ impl IncrementalJoinOp {
         let left_key_indices = col_indices(left_data, &self.left_key_cols)?;
         let right_key_indices = col_indices(&right_data, &self.right_key_cols)?;
 
-        let mut out_left_rows: Vec<usize> = Vec::new();
-        let mut out_right_rows: Vec<usize> = Vec::new();
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        for li in 0..left_data.num_rows() {
-            for ri in 0..right_data.num_rows() {
-                if keys_match(
-                    left_data,
-                    &left_key_indices,
-                    li,
-                    &right_data,
-                    &right_key_indices,
-                    ri,
-                )? {
-                    out_left_rows.push(li);
-                    out_right_rows.push(ri);
-                    out_weights.push(left_weights.value(li) * right_weights.value(ri));
-                }
-            }
-        }
+        // IVM-AUD-PERF-2: hash-indexed pairing. This site is where the cost
+        // scaled with ACCUMULATED STATE: `right_data` is the set of trace rows
+        // whose keys matched this delta, so the old nested loop was
+        // O(delta x matched-trace-rows).
+        let (out_left_rows, out_right_rows, out_weights) = pair_rows_by_key(
+            left_data,
+            &left_key_indices,
+            left_weights,
+            &right_data,
+            &right_key_indices,
+            right_weights,
+        )?;
 
         if out_left_rows.is_empty() {
             return DeltaBatch::empty(self.output_schema.clone());
@@ -398,26 +396,16 @@ impl IncrementalJoinOp {
         let left_key_indices = col_indices(&left_data, &self.left_key_cols)?;
         let right_key_indices = col_indices(right_data, &self.right_key_cols)?;
 
-        let mut out_left_rows: Vec<usize> = Vec::new();
-        let mut out_right_rows: Vec<usize> = Vec::new();
-        let mut out_weights: Vec<i64> = Vec::new();
-
-        for li in 0..left_data.num_rows() {
-            for ri in 0..right_data.num_rows() {
-                if keys_match(
-                    &left_data,
-                    &left_key_indices,
-                    li,
-                    right_data,
-                    &right_key_indices,
-                    ri,
-                )? {
-                    out_left_rows.push(li);
-                    out_right_rows.push(ri);
-                    out_weights.push(left_weights.value(li) * right_weights.value(ri));
-                }
-            }
-        }
+        // IVM-AUD-PERF-2: hash-indexed pairing; the mirror of the left probe,
+        // where `left_data` is the matched trace side.
+        let (out_left_rows, out_right_rows, out_weights) = pair_rows_by_key(
+            &left_data,
+            &left_key_indices,
+            left_weights,
+            right_data,
+            &right_key_indices,
+            right_weights,
+        )?;
 
         if out_left_rows.is_empty() {
             return DeltaBatch::empty(self.output_schema.clone());
@@ -1109,6 +1097,54 @@ impl IncrementalJoinOp {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Pair rows from two batches on their key columns, hash-indexed.
+///
+/// IVM-AUD-PERF-2: all three delta-join pairing sites — the same-tick cross
+/// term and both trace-probe output builders — ran `for li { for ri {
+/// keys_match } }`. The cross term was quadratic in the DELTA (5k x 5k = 25M
+/// comparisons, ~6 s per tick); the two probe builders were worse in kind,
+/// quadratic in delta x MATCHED TRACE ROWS, so their cost grew with
+/// accumulated state — the very thing an O(delta) plan exists to avoid.
+///
+/// The key is the `Vec<Option<String>>` encoding `extract_key` builds from
+/// `scalar_to_key`, which reproduces `scalar_eq` exactly, INCLUDING its
+/// deliberately non-SQL rule that a NULL key matches a NULL key (`None ==
+/// None`). Emission order is unchanged — left-major, right rows ascending —
+/// because left rows are walked in order and each bucket holds its rows in
+/// insertion order.
+fn pair_rows_by_key(
+    left: &RecordBatch,
+    left_key_indices: &[usize],
+    left_weights: &Int64Array,
+    right: &RecordBatch,
+    right_key_indices: &[usize],
+    right_weights: &Int64Array,
+) -> DeltaResult<(Vec<usize>, Vec<usize>, Vec<i64>)> {
+    let mut index: AHashMap<Vec<Option<String>>, Vec<usize>> =
+        AHashMap::with_capacity(right.num_rows());
+    for ri in 0..right.num_rows() {
+        index
+            .entry(extract_key(right, ri, right_key_indices)?)
+            .or_default()
+            .push(ri);
+    }
+    let mut out_left: Vec<usize> = Vec::new();
+    let mut out_right: Vec<usize> = Vec::new();
+    let mut out_weights: Vec<i64> = Vec::new();
+    for li in 0..left.num_rows() {
+        let key = extract_key(left, li, left_key_indices)?;
+        let Some(matches) = index.get(&key) else {
+            continue;
+        };
+        for &ri in matches {
+            out_left.push(li);
+            out_right.push(ri);
+            out_weights.push(left_weights.value(li) * right_weights.value(ri));
+        }
+    }
+    Ok((out_left, out_right, out_weights))
+}
+
 /// Extract key column values from a single row as `Vec<Option<String>>`.
 fn extract_key(
     batch: &RecordBatch,
@@ -1285,64 +1321,6 @@ fn project_columns(batch: &RecordBatch, col_names: &[String]) -> DeltaResult<Rec
     )?)
 }
 
-fn keys_match(
-    left: &RecordBatch,
-    left_indices: &[usize],
-    li: usize,
-    right: &RecordBatch,
-    right_indices: &[usize],
-    ri: usize,
-) -> DeltaResult<bool> {
-    for (&lk, &rk) in left_indices.iter().zip(right_indices.iter()) {
-        let la = left.column(lk);
-        let ra = right.column(rk);
-        if !scalar_eq(la, li, ra, ri)? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-fn scalar_eq(a: &dyn Array, ai: usize, b: &dyn Array, bi: usize) -> DeltaResult<bool> {
-    use arrow::array::{Int32Array, Int64Array, StringArray};
-    if a.is_null(ai) && b.is_null(bi) {
-        return Ok(true);
-    }
-    if a.is_null(ai) || b.is_null(bi) {
-        return Ok(false);
-    }
-    if let (Some(av), Some(bv)) = (
-        a.as_any().downcast_ref::<Int64Array>(),
-        b.as_any().downcast_ref::<Int64Array>(),
-    ) {
-        return Ok(av.value(ai) == bv.value(bi));
-    }
-    if let (Some(av), Some(bv)) = (
-        a.as_any().downcast_ref::<Int32Array>(),
-        b.as_any().downcast_ref::<Int32Array>(),
-    ) {
-        return Ok(av.value(ai) == bv.value(bi));
-    }
-    if let (Some(av), Some(bv)) = (
-        a.as_any().downcast_ref::<StringArray>(),
-        b.as_any().downcast_ref::<StringArray>(),
-    ) {
-        return Ok(av.value(ai) == bv.value(bi));
-    }
-    // Crate-13 audit: other key types (Utf8View, Int16, floats, temporals,
-    // binary, …) previously returned `false` unconditionally, so a join keyed
-    // on them silently matched nothing on the delta-probe paths. Fall back to
-    // the shared injective key encoding; genuinely unsupported (nested) types
-    // stay non-matching rather than colliding.
-    // Nulls were handled above, so both sides encode to `Some` here; an
-    // unencodable type is now an `Err` rather than a silent non-match, which
-    // is what made a Decimal/Dictionary join key match nothing (IVM-AUD-1).
-    match (scalar_to_key(a, ai)?, scalar_to_key(b, bi)?) {
-        (Some(x), Some(y)) => Ok(x == y),
-        _ => Ok(false),
-    }
-}
-
 fn build_join_batch(
     left_data: &RecordBatch,
     right_data: &RecordBatch,
@@ -1431,6 +1409,155 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    // ── ΔA ⋈ ΔB cross term (IVM-AUD-PERF-2) ───────────────────────────────
+
+    /// The same-tick cross term was a NESTED LOOP over both deltas: with 5k
+    /// rows on each side it ran 25 million `keys_match` calls and took ~6
+    /// seconds per tick, against ~25 ms for full recompute of the same query.
+    /// Measured shape, not guessed: holding the seed fixed and scaling only
+    /// the delta gave 220 ms / 687 ms / 8040 ms at 1k / 2k / 5k rows —
+    /// quadratic in the delta, which is the loop and not accumulated state.
+    ///
+    /// Revert-proof: restore the `for li { for ri { keys_match } }` loop and
+    /// this test runs for ~9 seconds and fails its budget.
+    #[test]
+    fn the_same_tick_cross_term_is_not_quadratic_in_the_delta() {
+        const N: i32 = 6_000;
+        let mut op = IncrementalJoinOp::new(
+            orders_schema(),
+            customers_schema(),
+            vec!["customer_id".into()],
+            vec!["customer_id".into()],
+            IncrJoinType::Inner,
+        )
+        .unwrap();
+
+        let ids: Vec<i32> = (0..N).collect();
+        let names: Vec<String> = ids.iter().map(|i| format!("c{i}")).collect();
+        let name_refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let left = DeltaBatch::from_inserts(orders_batch(&ids, &ids)).unwrap();
+        let right = DeltaBatch::from_inserts(customers_batch(&ids, &name_refs)).unwrap();
+
+        let t0 = std::time::Instant::now();
+        let out = op.apply(Some(left), Some(right)).unwrap();
+        let elapsed = t0.elapsed();
+
+        // Each key appears once on each side, so the cross term is exactly N
+        // rows — the work is in FINDING them, which is the point.
+        assert_eq!(out.num_rows(), N as usize, "every key must match once");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "cross term took {elapsed:?} for {N}x{N}; the nested loop is back"
+        );
+    }
+
+    /// The rewrite must preserve `scalar_eq`'s exact matching rules, and one
+    /// of them is deliberately NOT SQL: a NULL key matches a NULL key here
+    /// (`scalar_eq` returns true for two nulls). Changing that under cover of
+    /// a performance fix would be a silent semantics change, so it is pinned.
+    #[test]
+    fn the_cross_term_still_matches_null_keys_to_null_keys() {
+        let left_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("order_id", DataType::Int32, false),
+            Field::new("customer_id", DataType::Int32, true),
+        ]));
+        let right_schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Int32, true),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let mut op = IncrementalJoinOp::new(
+            left_schema.clone(),
+            right_schema.clone(),
+            vec!["customer_id".into()],
+            vec!["customer_id".into()],
+            IncrJoinType::Inner,
+        )
+        .unwrap();
+        let left = RecordBatch::try_new(
+            left_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![None, Some(7)])),
+            ],
+        )
+        .unwrap();
+        let right = RecordBatch::try_new(
+            right_schema,
+            vec![
+                Arc::new(Int32Array::from(vec![None, Some(7)])),
+                Arc::new(StringArray::from(vec!["null-keyed", "seven"])),
+            ],
+        )
+        .unwrap();
+
+        let out = op
+            .apply(
+                Some(DeltaBatch::from_inserts(left).unwrap()),
+                Some(DeltaBatch::from_inserts(right).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            out.num_rows(),
+            2,
+            "null-to-null and 7-to-7 must both match (current scalar_eq contract)"
+        );
+    }
+
+    /// Multiplicity and emission order are part of the contract too: weights
+    /// multiply, a key present k times on the left and m times on the right
+    /// produces k*m rows, and rows come out left-major with right rows in
+    /// ascending order — the nested loop's order, which downstream
+    /// consolidation and every existing expectation were written against.
+    #[test]
+    fn the_cross_term_preserves_multiplicity_and_emission_order() {
+        let mut op = IncrementalJoinOp::new(
+            orders_schema(),
+            customers_schema(),
+            vec!["customer_id".into()],
+            vec!["customer_id".into()],
+            IncrJoinType::Inner,
+        )
+        .unwrap();
+
+        // Left: orders 10,11 on key 5; order 12 on key 6.
+        // Right: two customers on key 5, one on key 6.
+        let left = orders_batch(&[10, 11, 12], &[5, 5, 6]);
+        let right = customers_batch(&[5, 5, 6], &["a", "b", "c"]);
+        let out = op
+            .apply(
+                Some(DeltaBatch::from_inserts(left).unwrap()),
+                Some(DeltaBatch::from_deletes(right).unwrap()),
+            )
+            .unwrap();
+
+        // 2 left x 2 right on key 5, plus 1x1 on key 6 = 5 rows.
+        assert_eq!(out.num_rows(), 5);
+        // Retraction on one side flips every product weight to -1.
+        assert!(
+            out.weights().iter().all(|w| w == Some(-1)),
+            "weights must be the product of the two sides"
+        );
+        let data = out.data_batch();
+        let order_ids = data
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let names = data
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let seen: Vec<(i32, &str)> = (0..out.num_rows())
+            .map(|r| (order_ids.value(r), names.value(r)))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![(10, "a"), (10, "b"), (11, "a"), (11, "b"), (12, "c")],
+            "left-major, right-ascending emission order"
+        );
     }
 
     #[test]
@@ -1703,7 +1830,7 @@ mod tests {
         );
     }
 
-    /// Regression (crate-13 audit, A-class): `scalar_eq` returned `false` for
+    /// Regression (crate-13 audit, A-class): the old `scalar_eq` returned `false` for
     /// every key type outside Int64/Int32/Utf8, so a join keyed on e.g.
     /// Utf8View silently emitted no rows from the delta-probe paths.
     #[test]
@@ -1741,7 +1868,8 @@ mod tests {
             ],
         )
         .unwrap();
-        // Same-tick cross term exercises `keys_match`/`scalar_eq` directly.
+        // Same-tick cross term exercises the shared key encoding directly
+        // (IVM-AUD-PERF-2 replaced `keys_match`/`scalar_eq` with it).
         let out = op
             .apply(
                 Some(DeltaBatch::from_inserts(left).unwrap()),

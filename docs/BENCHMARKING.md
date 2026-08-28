@@ -364,6 +364,50 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28b — NEXMark corpus tick: a 132x join defect, found by a new bench
+
+- **Revision**: engine at the IVM-AUD-PERF-2 fix (see register §63).
+- **Hardware**: Intel i7-9750H (6c/12t) laptop — comparable only to the other
+  2026-08-27/28 entries.
+- **New harness**: `ivm_corpus_tick` times every NEXMark corpus query's
+  delta-batch tick against a `force_diff_based` recompute of the same query.
+  It exists because `ivm_vs_full_recompute` measures ONE query shape, so the
+  operators added by the coverage work — HOP, keyed top-N, sessionization, the
+  QUALIFY chain hop — had correctness gates and **no timed measurement at
+  all**. That is how a mechanism that is correct and ruinously slow survives
+  review, and the first run proved the point.
+
+**What it found immediately** (seed 20k/source, delta 5k/source, median of 5):
+
+| query | before | after | factor |
+|---|---:|---:|---|
+| q3_local_items | 6934 ms | 46.0 ms | 132x |
+| q8_monitor_new_users | 6266 ms | 53.1 ms | 118x |
+| q20_expand_bid | 3591 ms | 90.5 ms | 40x |
+
+The three two-source joins were 200–300x SLOWER incrementally than recomputing
+the whole view. Cause and fix in register §63: three nested-loop pairing sites
+in the join operator, one quadratic in the delta and two whose cost grew with
+accumulated state.
+
+**How to read the ratio — a correction to this entry's first draft.** The
+bench originally printed "a slower one is a defect" and flagged 11 queries.
+Wrong: at the default seed the delta is 25% of the state, and incremental
+maintenance only wins as state/delta grows. Scaling the SEED with the delta
+pinned shows the ratios improving across seeds 20k/50k/100k — q11
+0.52→0.50→0.69, q18 0.50→0.81→**1.02**, q19 0.60→0.90→**1.22**, two of them
+crossing over by 100k. (q3's 0.41→0.72→0.56 is non-monotonic and inside this
+laptop's spread; no trend claimed.) The defect signature is a tick that GROWS
+WITH STATE, not a ratio below 1.0.
+
+**Still unmeasured, stated so it is not assumed**: TPC-H. `tpch_fixture` ships
+DDL only and the TPC-H benches read Parquet from an external dataset
+directory (`KRISHIV_TPCH_DATA_DIR_SF1`), which is not present on this machine.
+TPC-H delta-batch tick cost has never been measured.
+
+**Open**: q18's tick grows 205→260→544 ms across seeds 20k/50k/100k with the
+delta pinned — sublinear, but not flat. Tracked as task #165.
+
 ### 2026-08-28 — post-T1 IVM re-bench: a flagged regression that was not one
 
 - **Revision**: engine `2f6c26e` (clean worktree) — TOPNK-2/BATCHEQ-1 plus

@@ -224,6 +224,10 @@ Regenerate with:
 | `KRISHIV_TPCH_DATA_DIR_SF10` | path | `unset` | TPC-H SF10 dataset directory. |
 | `KRISHIV_TPCH_DATA_DIR_SF100` | path | `unset` | TPC-H SF100 dataset directory. |
 | `KRISHIV_BENCH_IVM_ROWS` | text | `unset` | Comma-separated row counts replacing the IVM-vs-full-recompute ladder outright, for pinning a crossover between the fixed rungs. |
+| `KRISHIV_BENCH_CORPUS_SEED` | uint | `20000` | Rows per source seeded before the NEXMark corpus-tick benchmark starts timing. Scaling THIS with the delta pinned is what separates a genuine O(delta) tick from one carrying a state-proportional term. |
+| `KRISHIV_BENCH_CORPUS_DELTA` | uint | `5000` | Rows per source fed before each timed tick of the NEXMark corpus-tick benchmark. Scaling this instead of the seed exposes terms quadratic in the delta (how IVM-AUD-PERF-2 was found). |
+| `KRISHIV_BENCH_CORPUS_TICKS` | uint | `5` | Timed ticks per query per flow in the NEXMark corpus-tick benchmark; the median is reported. |
+| `KRISHIV_BENCH_CORPUS_ONLY` | text | `unset` | Restrict the NEXMark corpus-tick benchmark to queries whose name contains this substring. |
 | `KRISHIV_BENCH_PLANT_REGRESSION_MS` | uint | `unset` | Add this many milliseconds to every timed streaming-latency sample, to verify the regression gate actually fires. |
 
 ## Dynamic namespaces

@@ -1455,6 +1455,30 @@ pub static FLAGS: &[FlagSpec] = &[
         "Comma-separated row counts replacing the IVM-vs-full-recompute ladder outright, for pinning a crossover between the fixed rungs.",
     ),
     bench(
+        "KRISHIV_BENCH_CORPUS_SEED",
+        FlagKind::UInt,
+        "20000",
+        "Rows per source seeded before the NEXMark corpus-tick benchmark starts timing. Scaling THIS with the delta pinned is what separates a genuine O(delta) tick from one carrying a state-proportional term.",
+    ),
+    bench(
+        "KRISHIV_BENCH_CORPUS_DELTA",
+        FlagKind::UInt,
+        "5000",
+        "Rows per source fed before each timed tick of the NEXMark corpus-tick benchmark. Scaling this instead of the seed exposes terms quadratic in the delta (how IVM-AUD-PERF-2 was found).",
+    ),
+    bench(
+        "KRISHIV_BENCH_CORPUS_TICKS",
+        FlagKind::UInt,
+        "5",
+        "Timed ticks per query per flow in the NEXMark corpus-tick benchmark; the median is reported.",
+    ),
+    bench(
+        "KRISHIV_BENCH_CORPUS_ONLY",
+        FlagKind::Text,
+        "unset",
+        "Restrict the NEXMark corpus-tick benchmark to queries whose name contains this substring.",
+    ),
+    bench(
         "KRISHIV_BENCH_PLANT_REGRESSION_MS",
         FlagKind::UInt,
         "unset",
