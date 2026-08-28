@@ -364,6 +364,64 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28 — post-T1 IVM re-bench: a flagged regression that was not one
+
+- **Revision**: engine `2f6c26e` (clean worktree) — TOPNK-2/BATCHEQ-1 plus
+  the IVM T1 fixes (CORE-31 feed-target guard, CORE-32 length-prefixed
+  `hash_row`).
+- **Hardware**: Intel i7-9750H (6c/12t) developer laptop — the same machine
+  as the 2026-08-27 entry, so those two entries compare to each other and
+  neither compares to the EPYC yardstick entries below.
+- **Why this entry exists**: CORE-31 put new work on the **ingestion** path.
+  `validate_feed_target` now walks every registered view on every fed batch
+  instead of short-circuiting on an empty `view_deps`. `ivm_incremental_feed`
+  times feed *and* step, so the cost lands inside the timed region.
+
+**IVM tick vs full recompute** (`ivm_vs_full_recompute`, criterion median,
+ms per tick):
+
+| Accumulated rows | IVM tick | full recompute |
+|------------------|---------:|---------------:|
+| 50 k             | 8.97     | 2.68           |
+| 200 k            | 8.68 †   | 3.26           |
+| 500 k            | 9.93 †   | 4.25           |
+| 1 M              | 13.01    | 8.79           |
+| 10 M             | 50.15    | 75.46          |
+
+† second measurement — see the flag investigation below.
+
+Findings:
+
+1. **The ladder holds its shape.** Flat ~9 ms tick floor below 500 k,
+   crossover just past 1 M, incremental winning 1.5× at 10 M (50.1 vs
+   75.5 ms). That replicates 2026-08-27 (13.9/9.6 at 1 M, 49.9/83.3 at
+   10 M) across TOPNK-2, BATCHEQ-1 and T1.
+2. **Criterion flagged 200 k (+15.2%, p=0.00) and 500 k (+17.1%, p=0.01)
+   as regressed, and both flags were false.** Recorded here rather than
+   quietly re-run, because "we re-ran it and it went away" is exactly how a
+   real regression gets buried. Three pieces of evidence, in the order they
+   were obtained:
+   - **The pattern is wrong for the suspected cause.** A fixed per-feed cost
+     bites hardest where the tick is cheapest. 50 k was clean while 200 k and
+     500 k flagged, and 1 M / 10 M were clean or faster. Fixed cost does not
+     distribute that way.
+   - **Direct causation bound.** A full `feed()` at this view shape —
+     delta construction included — measures **44.6 µs**. Attributing the
+     *entire* feed to the guard still leaves 0.45% of a 10 ms tick; the flags
+     were ~1.3 ms. Two orders of magnitude apart. (The bench view is single-
+     `SELECT`, so the guard takes its cheap path and never tokenizes.)
+   - **Non-reproduction.** Re-running the two sizes gave 8.68 ms at 200 k
+     (−14.7%, now flagged *improved*, undoing the +15.2%) and 9.93 ms at
+     500 k (−2.3%, p=0.78, CI −16%…+14%).
+   Corroborating: the same run flagged `full_recompute/1M` as **improved**
+   by 8.6% — nothing in this window can make a from-scratch recompute
+   faster. Thermal/turbo drift on a laptop, not a code effect.
+3. **Not measured, stated so it is not assumed.** The operators added since
+   the last entry — HOP fan-out, keyed top-N, sessionization, the QUALIFY
+   chain hop — have correctness proofs and coverage gates but **no timed
+   benchmark**. Nothing in this entry measures their tick cost. The corpus
+   queries are exercised as tests, not as timed runs.
+
 ### 2026-08-27 — post-coverage-completion IVM + NEXMark bench
 
 - **Revision**: engine `66d96a8` — the commit completing IVM corpus
