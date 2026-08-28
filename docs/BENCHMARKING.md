@@ -1151,3 +1151,33 @@ same DataFusion 54 core, and on cold single-process invocations that
 costs ~20-35% on heavy aggregations. The DuckDB gap (single-box §
 2026-08-08) remains the real Phase 65/66 target; this entry exists so
 the next optimization round has a committed ClickBench baseline to move.
+
+### 2026-08-28h — the 490ms distributed floor, attributed and removed
+
+`scripts/ivm_partitioning_ab.py`, kind cluster `krishiv-ivmbench`, 1 coordinator
++ 2 executors, identical SQL and data on both arms.
+
+| build | partitioned=true | partitioned=false |
+|---|---|---|
+| `5fa920e` (DIST-1) | 23.79 ms | 496.15 ms |
+| + DIST-2 | 14.67-21.87 ms | 119.76 / 128.05 / 121.86 ms |
+| + DIST-3 | 15.41-20.41 ms | **31.21 / 26.52 / 26.33 ms** |
+
+18.7x on the dispatch path. Cause was not compute: `submit_job` never woke the
+task-launch loop, so every dispatched job waited out that loop's 500ms interval
+tick before its tasks were launched, and nothing fired the notification when a
+job concluded. Register §68.
+
+**Correction to 2026-08-28g.** That entry reports "28.5x on the `partitioned`
+flag alone (17.37 vs 495.36ms)". The A/B was not measuring sharding: a
+Partitioned job computes centrally in-process, while a Single job with live
+executors dispatches through the wait loop. The comparison was central-compute
+vs dispatch-with-polling. With the dispatch cost removed the flag's real effect
+is **~16ms vs ~27ms, 1.7x**. The earlier figure should not be cited as a
+sharding speedup.
+
+**Method note.** The attribution came from a probe, not a hypothesis: cutting the
+wait loop's poll 100ms -> 10ms left the floor at 497.73ms, which proved the cost
+was upstream of the waiter and retired the whole family of wait-loop
+explanations at once. Two prior explanations for this floor were measured and
+refuted (§65 PERF-4, §67 DIST-1) before this one was measured and confirmed.

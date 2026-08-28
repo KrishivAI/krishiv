@@ -6395,3 +6395,90 @@ overturned, including one (PERF-4) implemented, measured, refuted and reverted.
 constructs `IncrementalFlow` directly; there is no coordinator, no job state
 machine, and no wait loop. This defect exists only on the wire, and it took
 deploying HEAD to a real cluster and driving the HTTP API to surface it.
+
+## §68 — IVM-AUD-DIST-2/3: the submit that never woke the loop that runs it
+
+**§67's prediction was falsified.** DIST-1 was committed at `5fa920e` labelled
+unverified, with a falsifiable prediction recorded verbatim: "partitioned=false
+drops from ~495ms toward the sharded ~17ms." Rebuilt, redeployed, re-measured:
+**496.15ms**. Unchanged. The fix is real — tokio's `notified()` snapshots the
+`notify_waiters` counter at *creation*, so registering before the read does close
+that window — but the window was never where the time went.
+
+The arithmetic that should have caught it before the deploy: the loop's fallback
+sleep is 100ms, so a lost wakeup costs *at most* 100ms per iteration. It could
+never produce a 490ms floor. "~5 dropped notifications per step" was a
+coincidence of 5 x 100ms, not a mechanism. **A number that merely divides
+evenly is not an explanation.**
+
+**The probe that ended the guessing.** Rather than reason about a seventh
+candidate, cut the wait loop's poll 100ms -> 10ms and redeploy. If the floor is
+polling, it tracks the interval; if it is work, it does not.
+
+| poll interval | partitioned=false |
+|---|---|
+| 100 ms | 496.15 ms |
+| 10 ms  | 497.73 ms |
+
+Invariant. So the cost is not in the waiter at all — it is upstream, before the
+waiter ever runs. (The first attempt at this probe was itself invalid: `kubectl
+set image` printed `error: unable to find container named "krishiv"` — the
+containers are `coordinator`/`executor` — while `rollout status` reported success
+because there was nothing to roll. **The harness reproduced the exact defect
+class this register exists to catch: a command that failed while the pipeline
+reported success.** Always assert the running image, never the rollout's word.)
+
+**The actual defect, in two halves.** The coordinator's task-launch loop is the
+only thing that drains `launch_dirty_jobs`, and it parks on
+`select! { interval.tick() (500 ms), notify.notified() }`:
+
+- **DIST-2a.** `submit_job` marks the job launch-dirty and returns — it never
+  fires `exec.notify`. A freshly submitted job waited for the next **500 ms**
+  interval tick before its tasks were *launched*. No downstream wait loop can
+  recover that: the work has not started.
+- **DIST-2b.** The loop built its `notified()` *inside* the `select!`, i.e. after
+  `drive_pending_task_launches()` returned, so a submission racing the drain was
+  lost and waited out another full tick. Same shape as DIST-1, one loop over.
+- **DIST-3.** `exec.notify` fired on executor register/deregister, heartbeat,
+  task launch, checkpoint ack/commit and restore — and on **nothing** when a job
+  reached a terminal state. `mark_sink_publish_committed` sets `Succeeded`,
+  persists, calls `on_job_terminal`; neither notifies. Callers waiting for
+  `Succeeded` on that handle subscribed to a signal the event they wait for never
+  sent. **The guard was enforced by nothing: the sleep was load-bearing and the
+  `Notify` decorative.**
+
+The ~495ms was phase-lock, which is why it read as a hard floor rather than a
+uniform 0-500ms spread: each iteration cost ~500ms, so submissions synchronised
+just after a tick and each one waited nearly a full period.
+
+**Measured, on a clean fleet, before commit** (this time in that order):
+
+| build | partitioned=false | vs baseline |
+|---|---|---|
+| `5fa920e` (DIST-1 only) | 496.15 ms | — |
+| + DIST-2 | 119.76 / 128.05 / 121.86 ms | 4.1x |
+| + DIST-3 | 31.21 / 26.52 / 26.33 ms | **18.7x** |
+
+**A reported benchmark number is corrected by this.** §67 and BENCHMARKING
+2026-08-28g claim "28.5x on the `partitioned` flag alone". That A/B was never
+measuring sharding. Per `ivm_http.rs`, `executor_count > 0 && matches!(flow,
+IvmJob::Single(_))` routes to resident dispatch and the wait loop, while a
+Partitioned job takes the `central-partitioned` path that never dispatches a job
+at all. The A/B compared *central in-process compute* against *dispatch through
+a 500ms-quantised launch loop*, and the flag's real effect is now **~16ms vs
+~27ms — 1.7x, not 28.5x**. The rest was dispatch overhead wearing sharding's
+label.
+
+**Tests.** `submitting_a_job_wakes_the_task_launch_loop` and
+`a_job_reaching_a_terminal_state_wakes_its_waiters` both proven RED against the
+single reverted production line; `the_wake_is_tied_to_there_being_launchable_work`
+pins the guard to `!is_queued` so the fix cannot widen into a wake-on-every-submit
+that busies the loop. The assertions are counter-based, not timing-based:
+`notified()` snapshots at creation, so they assert the transition *signalled*,
+not that time passed.
+
+**Not fixed — needs a decision.** DIST-2b (registering before the drain) has no
+independent unit test: the loop is a spawned task inside `start()`. It is the
+identical shape already proven by DIST-1's test and is covered end-to-end by the
+cluster measurement above, but it is not pinned by a unit test and is recorded
+here rather than claimed as tested.

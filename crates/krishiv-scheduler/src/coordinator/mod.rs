@@ -1313,16 +1313,27 @@ impl SharedCoordinator {
                         tokio::time::interval(std::time::Duration::from_millis(500));
                     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     loop {
-                        tokio::select! {
-                            _ = interval.tick() => {}
-                            _ = notify.notified() => {}
-                            _ = rx.changed() => { if *rx.borrow() { return; } }
-                        }
+                        // IVM-AUD-DIST-2: register interest BEFORE draining, not
+                        // after. `Notify::notified()` snapshots the
+                        // `notify_waiters` counter when the future is CREATED,
+                        // so a future created here observes any wake fired from
+                        // this point on — including one that lands while
+                        // `drive_pending_task_launches` below is still running.
+                        // Built inside `select!` instead (the previous shape),
+                        // the snapshot is taken only after the drain returns, so
+                        // a submission racing the drain was lost and waited out
+                        // the full 500 ms interval tick.
+                        let woken = notify.notified();
                         if let Err(error) = coord.drive_pending_task_launches().await {
                             let text = error.to_string();
                             if !text.contains("InactiveCoordinator") {
                                 tracing::warn!(error = %text, "coordinator task launch tick failed");
                             }
+                        }
+                        tokio::select! {
+                            _ = interval.tick() => {}
+                            _ = woken => {}
+                            _ = rx.changed() => { if *rx.borrow() { return; } }
                         }
                     }
                 }

@@ -194,6 +194,29 @@ impl Coordinator {
         // GAP-OB-01: Increment jobs_submitted counter.
         JOBS_SUBMITTED_TOTAL.fetch_add(1, AtomicOrdering::Relaxed);
         krishiv_metrics::global_metrics().inc_tasks_submitted();
+
+        // IVM-AUD-DIST-2: wake the task-launch loop.
+        //
+        // The loop above marked this job launch-dirty, but the only thing that
+        // drains `launch_dirty_jobs` is `drive_pending_task_launches`, whose
+        // loop parks on `select! { interval.tick() (500 ms), notify.notified() }`.
+        // Nothing here fired that `Notify`, so a freshly submitted job waited
+        // for the next 500 ms interval tick before its tasks were even
+        // LAUNCHED — a floor no downstream wait loop can undo, because the work
+        // has not started yet.
+        //
+        // Measured: a non-partitioned IVM tick (which dispatches a job through
+        // this path) sat at ~496 ms against ~17 ms for the central path. That
+        // floor was invariant when the *downstream* wait loop's poll interval
+        // was cut 100 ms -> 10 ms, which is what proved the cost lives here, at
+        // submission, and not in the waiter (BENCHMARKING 2026-08-28h).
+        //
+        // Only non-queued submissions have launchable work: a queued job has no
+        // tasks to launch until `admit_queued_jobs` promotes it, and that path
+        // already fires this same `Notify`.
+        if !is_queued {
+            self.exec.notify.notify_waiters();
+        }
         Ok(outcome)
     }
 
@@ -984,6 +1007,22 @@ impl Coordinator {
         if !is_terminal || self.gc_ready_jobs.contains(job_id) {
             return;
         }
+
+        // IVM-AUD-DIST-3: wake anything waiting for this job to CONCLUDE.
+        //
+        // `exec.notify` was fired on executor register/deregister, heartbeat,
+        // task launch, checkpoint ack/commit and restore — but by nothing on a
+        // terminal transition. Callers that wait for `Succeeded`/`Failed` on
+        // this same handle (the IVM dispatch wait loop; the batch-SQL wait
+        // loop) therefore subscribed to a signal the event they wait for never
+        // sent, and only their fallback poll ever observed the conclusion. The
+        // guard was enforced by nothing: the sleep was load-bearing and the
+        // `Notify` decorative.
+        //
+        // This is the single funnel — every terminal path runs its bookkeeping
+        // here — and the `gc_ready_jobs` check above makes it fire exactly once
+        // per job, on the transition rather than on every re-entry.
+        self.exec.notify.notify_waiters();
         const MAX_GC_JOBS: usize = 1000;
         if self.gc_ready_jobs.len() >= MAX_GC_JOBS
             && let Some(evicted) = self.gc_ready_jobs.pop_front()
@@ -1777,6 +1816,116 @@ mod durable_job_retirement_tests {
             coordinator.store.as_ref().unwrap().inner().jobs().len(),
             1,
             "without an archive, the live record is the only trace of the outcome"
+        );
+    }
+}
+
+#[cfg(test)]
+mod submit_wakes_launch_loop_tests {
+    use super::*;
+    use krishiv_proto::{StageId, StageSpec, TaskId, TaskSpec};
+
+    fn single_task_job(job_id: &JobId) -> JobSpec {
+        JobSpec::new(job_id.clone(), "dist2-test", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new("t0").unwrap(),
+                "sql: select 1",
+            )),
+        )
+    }
+
+    /// IVM-AUD-DIST-2. The task-launch loop parks on
+    /// `select! { interval.tick() (500 ms), notify.notified() }` and is the only
+    /// thing that drains `launch_dirty_jobs`. `submit_job` marked the job dirty
+    /// but never fired that `Notify`, so a freshly submitted job's tasks were
+    /// not launched until the next 500 ms interval tick — a floor that no
+    /// downstream wait loop can recover, because the work has not begun.
+    ///
+    /// The assertion is counter-based, not timing-based: `Notify::notified()`
+    /// snapshots the `notify_waiters` count when the future is CREATED, so a
+    /// future built before the submit completes immediately iff the submit
+    /// fired the notification. The 50 ms bound is only an upper limit on the
+    /// failing case; the passing case resolves without waiting at all.
+    #[tokio::test]
+    async fn submitting_a_job_wakes_the_task_launch_loop() {
+        let mut coordinator = Coordinator::new_active(None).unwrap();
+        let notify = coordinator.exec.notify.clone();
+
+        // Registered BEFORE the submit — this is the launch loop's position.
+        let woken = notify.notified();
+
+        let job_id = JobId::try_new("job-dist2").unwrap();
+        coordinator.submit_job(single_task_job(&job_id)).unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), woken)
+                .await
+                .is_ok(),
+            "submit_job must wake the task-launch loop; without this the job \
+             waits out the loop's 500 ms interval tick before its tasks are \
+             even launched"
+        );
+    }
+
+    /// The queued path must not regress: a job held by admission control has no
+    /// launchable work, and `admit_queued_jobs` fires the notification when it
+    /// promotes one. This pins the guard to `!is_queued` so the fix cannot be
+    /// widened into a wake-on-every-submit that busies the launch loop.
+    #[tokio::test]
+    async fn the_wake_is_tied_to_there_being_launchable_work() {
+        let mut coordinator = Coordinator::new_active(None).unwrap();
+        let job_id = JobId::try_new("job-dist2-live").unwrap();
+        coordinator.submit_job(single_task_job(&job_id)).unwrap();
+
+        // A second, independent waiter sees nothing until the next submit.
+        let notify = coordinator.exec.notify.clone();
+        let quiet = notify.notified();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), quiet)
+                .await
+                .is_err(),
+            "no submit happened, so nothing may wake the launch loop"
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_wakes_waiters_tests {
+    use super::*;
+    use krishiv_proto::{StageId, StageSpec, TaskId, TaskSpec};
+
+    fn single_task_job(job_id: &JobId) -> JobSpec {
+        JobSpec::new(job_id.clone(), "dist3-test", JobKind::Batch).with_stage(
+            StageSpec::new(StageId::try_new("stage-0").unwrap(), "stage").with_task(TaskSpec::new(
+                TaskId::try_new("t0").unwrap(),
+                "sql: select 1",
+            )),
+        )
+    }
+
+    /// IVM-AUD-DIST-3. Wait loops park on `exec.notify` for a job to reach a
+    /// terminal state, but nothing fired that notification when one did, so the
+    /// conclusion was only ever observed by the loop's fallback poll. The
+    /// waiter is registered before the transition, which is the wait loop's own
+    /// position, and `notified()` snapshots the counter at creation — so this
+    /// asserts the transition itself signalled, not that time passed.
+    #[tokio::test]
+    async fn a_job_reaching_a_terminal_state_wakes_its_waiters() {
+        let mut coordinator = Coordinator::new_active(None).unwrap();
+        let job_id = JobId::try_new("job-dist3").unwrap();
+        coordinator.submit_job(single_task_job(&job_id)).unwrap();
+
+        let notify = coordinator.exec.notify.clone();
+        let concluded = notify.notified();
+
+        coordinator.cancel_job(&job_id).unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), concluded)
+                .await
+                .is_ok(),
+            "a terminal transition must wake waiters; without it a caller \
+             waiting for the job to conclude only learns via its fallback poll"
         );
     }
 }
