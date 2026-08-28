@@ -6118,3 +6118,61 @@ across seeds 20k/50k/100k with the delta pinned at 5k. Sublinear in state
 (2.6× for 5× state) and it still beats recompute at 100k, but it is not flat,
 so there is a state-proportional term in the keep-last dedup path worth
 finding. Recorded with its numbers rather than fixed by guess.
+
+## §64 — IVM-AUD-PERF-3 (diagnosed, NOT fixed): the view snapshot is maintained in O(state)
+
+§63 left one measured-but-unexplained item: q18's tick grew 205 → 260 → 544 ms
+across seeds 20k/50k/100k with the delta pinned at 5k. A genuinely O(delta)
+tick is FLAT, so something was proportional to accumulated state. It is now
+diagnosed, and it is not where the query pointed.
+
+**The keyed top-N operator is innocent.** Read end to end: `apply` walks only
+the partitions the delta touched, diffs each against its published slice, and
+builds its output batch from the delta rows alone. O(delta), as designed.
+
+**The term is `operators/stream.rs::apply_delta`** — the materialized-view
+snapshot maintenance that `view.rs` calls from `publish_output` and
+`apply_output_delta`. Measured in isolation, delta pinned at 1001 rows:
+
+| snapshot rows | apply_delta |
+|---|---:|
+| 10,000 | 20.3 ms |
+| 50,000 | 122.4 ms |
+| 100,000 | 253.8 ms |
+
+Linear in accumulated state, ~2.5 µs per snapshot row, per tick.
+
+Mechanism: a delta containing ANY retraction takes the full path, which
+concatenates the entire prior snapshot with the delta and runs
+`consolidate_batch` over the lot, building a `Vec<String>` group key per row.
+The all-`+1` fast path is a plain concat, which is why append-only views look
+fine while keep-last, top-N, session and aggregate-update views do not. **This
+is IVM-AUD-PERF-1's shape** — the defect fixed for `SourceState` by chunking —
+still live for VIEW snapshots, and it applies to every materialized view whose
+output carries retractions, not merely to q18.
+
+### Why this is recorded rather than fixed in the same pass
+
+The fix must be stateful: a retraction cannot be netted against a bare
+`RecordBatch` without an index, so every approach starting from the current
+representation is O(state) by construction. And the assumption reaches past
+`view.rs` — `flow.rs:1411` clones EVERY view's snapshot at the start of EVERY
+tick, which is an `Arc` bump today and becomes O(state) the moment the snapshot
+is lazily materialized. So the change touches the tick pipeline and the
+checkpoint paths (`flow.rs:3166`/`3267`), which is exactly the territory this
+register documents repeated silent-corruption incidents in. Landing a 132×
+join win and then paying it back with a corrupted checkpoint is not a trade
+worth making at the end of a session.
+
+Tracked as task #165 with the plan: back the snapshot with the chunked
+multiset `SourceState` already uses; stop `prev_outputs` materializing per
+tick; migrate checkpoint/restore, whose format currently carries a
+materialized `RecordBatch`. The revert-proof is the seed-scaling axis — a
+fixed delta against a growing seed must produce a flat tick.
+
+A contained interim, separately decidable: replace `consolidate_batch`'s
+per-row `Vec<String>` keys with Arrow's `RowConverter` (already used by
+`keyed_topn` and `differentiate`) to cut the constant without changing the
+shape. One thing to pin with a test FIRST: the string encoding folds NaN
+variants together and the row encoding would not — a semantics decision, not
+an optimization detail.

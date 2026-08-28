@@ -364,6 +364,40 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28c — ladder re-measured at the IVM-AUD-PERF-2 fix (81c4e94)
+
+- **Hardware**: same i7-9750H laptop; comparable to the other 08-27/28 entries
+  only.
+- **Method note that changed the numbers**: the first re-run of this ladder was
+  taken while other measurements were running on the same machine and read
+  15–18 ms where it should read ~9 ms. It was NOT recorded. Re-run with the
+  machine quiet, `ivm_incremental_feed/50000` fell 46.7% (17.4 → 9.1 ms) with
+  no code change in between — contention, and a reminder that a benchmark run
+  alongside other benchmark runs measures the scheduler.
+
+| Accumulated rows | IVM tick | full recompute |
+|------------------|---------:|---------------:|
+| 50 k             | 9.11     | 2.56           |
+| 200 k            | 12.73    | 3.23           |
+| 500 k            | 13.14    | 4.28           |
+| 1 M              | 12.76    | 9.35           |
+| 10 M             | 49.62    | 90.10          |
+
+Findings:
+
+1. **The crossover claim holds and improves**: incremental wins **1.82x** at
+   10 M (49.6 vs 90.1 ms), against 1.5x in the 08-28 entry. The 10 M
+   incremental point is the stable one across every run today (49.6 / 50.1 /
+   49.9 ms); the recompute side is the noisy one (75–90 ms).
+2. **The mid-range is not precise on this machine and should not be read as
+   a trend.** `ivm_incremental_feed/200000` has produced 10.17, 8.68 and
+   12.73 ms across today's runs, with no code change between some of them.
+   Treat sub-2x movements here as noise unless a seed/delta scaling axis backs
+   them.
+3. No regression attributable to IVM-AUD-PERF-2 or the T1 guards: the feed
+   guard measures 44.6 µs against a ~9 ms tick, and the join fix does not
+   touch this single-source `GROUP BY SUM` query at all.
+
 ### 2026-08-28b — NEXMark corpus tick: a 132x join defect, found by a new bench
 
 - **Revision**: engine at the IVM-AUD-PERF-2 fix (see register §63).
