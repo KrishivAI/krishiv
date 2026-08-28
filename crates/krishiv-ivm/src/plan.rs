@@ -240,16 +240,17 @@ pub(crate) fn apply_chain_hop(
         ViewPlan::FlatMap { ops, .. } => apply_flatmap(ops, delta),
         ViewPlan::Sessionize { op, .. } => op.apply(delta),
         ViewPlan::TopN { op, .. } => op.apply(delta),
+        // TOPNK-2: the fused QUALIFY triple as a chain hop (q9's per-window
+        // top-1 above a band join).
+        ViewPlan::KeyedTopN { pre, op, post, .. } => apply_keyed_topn(pre, op, post, delta),
         // Unreachable by construction (the decomposer refuses joins and never
-        // nests chains, and a keyed top-N is only ever built whole-view),
-        // written out so a future variant cannot slide through a `_` arm and
-        // silently drop a delta.
-        ViewPlan::Join { .. }
-        | ViewPlan::KeyedTopN { .. }
-        | ViewPlan::Chain { .. }
-        | ViewPlan::DiffBased => Err(krishiv_delta::DeltaError::Operator(
-            "a chain hop must be a single-input incremental operator".into(),
-        )),
+        // nests chains), written out so a future variant cannot slide through
+        // a `_` arm and silently drop a delta.
+        ViewPlan::Join { .. } | ViewPlan::Chain { .. } | ViewPlan::DiffBased => {
+            Err(krishiv_delta::DeltaError::Operator(
+                "a chain hop must be a single-input incremental operator".into(),
+            ))
+        }
     }
 }
 

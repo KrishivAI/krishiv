@@ -38,7 +38,7 @@ use ahash::AHashMap;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::prelude::SessionContext;
-use krishiv_bench::nexmark::{NexmarkGenerator, SUPPORTED_QUERIES};
+use krishiv_bench::nexmark::{BATCH_DIALECT_EQUIVALENTS, NexmarkGenerator, SUPPORTED_QUERIES};
 use krishiv_bench::tpch_fixture::fixture_ddl;
 use krishiv_bench::tpch_queries::TPCH_QUERIES;
 use krishiv_ivm::{ViewPlanKind, build_view_plan};
@@ -304,12 +304,13 @@ const TPCH_DECOMPOSED: usize = 22;
 /// counted them Incremental: an under-measurement, corrected when the gate
 /// started mirroring the FULL rewrite chain), and q5 (HOP-1's union fans as
 /// a FlatMap chain leaf), q13 (KEYEXPR-1's key-bearing hop under the
-/// mid-chain join), and q11 (SESSION-1's cascade as a Sessionize chain
-/// leaf under the aggregate). q18/q19 maintain WHOLE (the keyed top-N is one
-/// operator with its pre/post maps riding it — nothing to cut), and the
-/// remaining single-table queries are single-operator or q8 (output repeats
-/// `id`).
-const NEXMARK_DECOMPOSED: usize = 12;
+/// mid-chain join), q11 (SESSION-1's cascade as a Sessionize chain
+/// leaf under the aggregate), and q18/q19 (TOPNK-2: the QUALIFY triple
+/// fuses into a keyed-top-N chain hop, so the tumble map + ranking now
+/// also cut — registration still takes them whole-view first; this gate
+/// measures the decomposer directly). The remaining single-table queries
+/// are single-operator or q8 (output repeats `id`).
+const NEXMARK_DECOMPOSED: usize = 14;
 
 /// How many queries the engine can cut into a chain where EVERY hop maintains
 /// incrementally. `decompose` verifies each hop's plan itself and refuses
@@ -385,5 +386,27 @@ async fn standard_benchmark_queries_that_decompose_into_incremental_chains() {
         (TPCH_DECOMPOSED, NEXMARK_DECOMPOSED),
         "IVM decomposition coverage moved. Re-bless deliberately, with the \
          constants updated in the same commit as the change that moved them."
+    );
+}
+
+/// The two batch-dialect equivalents (q4/q9) are measured SEPARATELY from
+/// the 44-query verbatim corpus: their corpus forms are streaming pipeline
+/// specs whose implicit schema exists in no batch reading (measured — the
+/// register's SESSION-1 row), so these variants demonstrate that the
+/// SEMANTICS maintain on delta-batch without ever mixing the two
+/// measurements. Exact count, same re-bless discipline.
+const BATCH_EQUIVALENTS_INCREMENTAL: usize = 2;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_dialect_equivalents_maintain_incrementally() {
+    let (ctx, schemas) = nexmark_env().await;
+    let queries: Vec<(String, String)> = BATCH_DIALECT_EQUIVALENTS
+        .iter()
+        .map(|q| (q.name.to_owned(), q.sql.to_owned()))
+        .collect();
+    let n = measure("NEXMark batch-dialect equivalents", queries, &ctx, &schemas).await;
+    assert_eq!(
+        n, BATCH_EQUIVALENTS_INCREMENTAL,
+        "batch-dialect equivalent coverage moved; re-bless deliberately"
     );
 }

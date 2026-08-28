@@ -179,11 +179,17 @@ fn linear_chain(plan: &LogicalPlan) -> Option<Vec<LogicalPlan>> {
                 chain.reverse();
                 return Some(chain);
             }
+            // TOPNK-2: a WindowAggr rides the chain ONLY as the middle of
+            // the QUALIFY triple — Projection(Filter(WindowAggr)) — which
+            // the operator collection fuses into one keyed-top-N cut. A
+            // window in any other position is refused there, not here: the
+            // descent just walks through it.
             LogicalPlan::Projection(_)
             | LogicalPlan::Filter(_)
             | LogicalPlan::Aggregate(_)
             | LogicalPlan::Distinct(_)
             | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Window(_)
             | LogicalPlan::Sort(_)
             | LogicalPlan::Limit(_) => {
                 let inputs = node.inputs();
@@ -959,6 +965,77 @@ fn hoist_computed_join_keys(plan: &LogicalPlan) -> Option<LogicalPlan> {
     transformed.transformed.then_some(transformed.data)
 }
 
+/// TOPNK-2: is this node the fused QUALIFY triple —
+/// `Projection(Filter(WindowAggr(…)))`?
+fn is_qualify_triple(node: &LogicalPlan) -> bool {
+    matches!(node, LogicalPlan::Projection(p)
+        if matches!(p.input.as_ref(), LogicalPlan::Filter(f)
+            if matches!(f.input.as_ref(), LogicalPlan::Window(_))))
+}
+
+/// TOPNK-2: re-root the fused QUALIFY triple onto `scan`, layer by layer.
+/// `unqualify` carries the bare convention's (keep, renames) sets; `None`
+/// keeps the aliased convention's original qualified references. The rank
+/// column's NAME is the window expression's display, so unqualifying the
+/// window expressions RENAMES it — the filter's reference is rewritten to
+/// the rebuilt window's actual last field, the same rule the aggregate
+/// re-root applies to derived names (output names are contract).
+fn reroot_qualify_triple(
+    node: &LogicalPlan,
+    scan: LogicalPlan,
+    unqualify: Option<(&ahash::AHashSet<String>, &ahash::AHashSet<String>)>,
+) -> Option<LogicalPlan> {
+    let LogicalPlan::Projection(proj) = node else {
+        return None;
+    };
+    let LogicalPlan::Filter(filter) = proj.input.as_ref() else {
+        return None;
+    };
+    let LogicalPlan::Window(window) = filter.input.as_ref() else {
+        return None;
+    };
+    let old_rn = window.schema.fields().last()?.name().clone();
+    let w_exprs = match unqualify {
+        Some((keep, renames)) => unqualify_exprs_keeping(&window.window_expr, keep, renames)?,
+        None => window.window_expr.clone(),
+    };
+    let new_window = LogicalPlan::Window(window.clone())
+        .with_new_exprs(w_exprs, vec![scan])
+        .ok()?;
+    let new_rn = new_window.schema().fields().last()?.name().clone();
+    let pred = match unqualify {
+        Some((keep, renames)) => {
+            unqualify_exprs_keeping(std::slice::from_ref(&filter.predicate), keep, renames)?
+                .pop()?
+        }
+        None => filter.predicate.clone(),
+    };
+    let pred = pred
+        .transform(|e| {
+            Ok(match e {
+                Expr::Column(c) if c.name == old_rn => Transformed::yes(Expr::Column(
+                    datafusion::common::Column::new_unqualified(new_rn.clone()),
+                )),
+                other => Transformed::no(other),
+            })
+        })
+        .ok()?
+        .data;
+    let new_filter = LogicalPlan::Filter(LogicalFilter::try_new(pred, Arc::new(new_window)).ok()?);
+    let mut p_exprs = match unqualify {
+        Some((keep, renames)) => unqualify_exprs_keeping(&proj.expr, keep, renames)?,
+        None => proj.expr.clone(),
+    };
+    if node.schema().fields().len() == p_exprs.len() {
+        p_exprs = p_exprs
+            .into_iter()
+            .zip(node.schema().fields().iter())
+            .map(|(e, f)| e.alias(f.name().clone()))
+            .collect();
+    }
+    node.with_new_exprs(p_exprs, vec![new_filter]).ok()
+}
+
 fn decompose_plan(
     view_name: &str,
     plan: &LogicalPlan,
@@ -1142,14 +1219,34 @@ fn decompose_plan(
     // unresolvable. Track, per operator, the alias that took effect below it.
     let mut op_alias_below: Vec<Option<String>> = Vec::new();
     let mut pending_alias: Option<String> = None;
-    for n in &chain {
+    let mut idx = 0usize;
+    while let Some(n) = chain.get(idx) {
         if let LogicalPlan::SubqueryAlias(sa) = n {
             pending_alias = Some(sa.alias.table().to_string());
+        }
+        // TOPNK-2: the QUALIFY triple — WindowAggr, the rank Filter above
+        // it, the SELECT-list Projection above that — is ONE keyed-top-N
+        // operator, so the chain's Projection node (which CONTAINS the two
+        // below it) becomes the single cut and the two inner nodes are
+        // consumed. A window in any other arrangement has no incremental
+        // operator and refuses the whole chain rather than becoming a cut
+        // that silently drops the ranking.
+        if matches!(n, LogicalPlan::Window(_)) {
+            let (Some(LogicalPlan::Filter(_)), Some(fused @ LogicalPlan::Projection(_))) =
+                (chain.get(idx + 1), chain.get(idx + 2))
+            else {
+                return None;
+            };
+            operator_nodes.push(fused);
+            op_alias_below.push(pending_alias.take());
+            idx += 3;
+            continue;
         }
         if !is_passthrough(n) && !is_read_time(n) {
             operator_nodes.push(n);
             op_alias_below.push(pending_alias.take());
         }
+        idx += 1;
     }
     let mut cuts: Vec<LogicalPlan> = Vec::new();
     let mut cut_alias_below: Vec<Option<String>> = Vec::new();
@@ -1584,7 +1681,15 @@ fn decompose_plan(
             match (bare_relation, cut_is_join) {
                 (false, false) => {
                     let scan = aliased_hop_scan(&prev.name, &prev.schema, &prev_alias)?;
-                    node.with_new_exprs(node.expressions(), vec![scan]).ok()?
+                    // TOPNK-2: the fused QUALIFY triple re-roots layer by
+                    // layer — a naive `with_new_exprs` on the Projection
+                    // would replace its INPUT (the Filter+Window) with the
+                    // scan and silently DROP the ranking.
+                    if is_qualify_triple(node) {
+                        reroot_qualify_triple(node, scan, None)?
+                    } else {
+                        node.with_new_exprs(node.expressions(), vec![scan]).ok()?
+                    }
                 }
 
                 // The hop below carries flat bare names (collision-refused
@@ -1643,6 +1748,11 @@ fn decompose_plan(
                             LogicalPlan::Filter(
                                 LogicalFilter::try_new(pred, Arc::new(new_join)).ok()?,
                             )
+                        }
+                        LogicalPlan::Projection(_) if is_qualify_triple(node) => {
+                            // TOPNK-2, bare convention: rebuild all three
+                            // layers with references unqualified.
+                            reroot_qualify_triple(node, scan, Some((&keep, &active_renames)))?
                         }
                         _ => {
                             let mut exprs = unqualify_exprs_keeping(

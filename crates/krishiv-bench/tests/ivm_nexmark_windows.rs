@@ -17,7 +17,7 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
 use datafusion::prelude::SessionContext;
-use krishiv_bench::nexmark::{NexmarkGenerator, SUPPORTED_QUERIES};
+use krishiv_bench::nexmark::{BATCH_DIALECT_EQUIVALENTS, NexmarkGenerator, SUPPORTED_QUERIES};
 use krishiv_delta::{DeltaBatch, IncrementalViewSpec};
 use krishiv_ivm::IncrementalFlow;
 
@@ -236,4 +236,107 @@ async fn nexmark_q13_registered_verbatim_maintains_incrementally() {
 #[tokio::test(flavor = "multi_thread")]
 async fn nexmark_q11_registered_verbatim_maintains_incrementally() {
     corpus_verbatim_matches_recompute("q11_user_sessions", "chain").await;
+}
+
+/// TOPNK-2 + the batch-dialect equivalents: q9/q4 as standard SQL over TWO
+/// sources — the band join feeds a keyed top-1 (q9) or a two-stage
+/// MAX-then-AVG aggregate pipeline (q4), the whole thing one chain. Bids
+/// and auctions feed across ticks and the third tick retracts half the
+/// first bid batch; every tick compares against the DiffBased oracle.
+async fn batch_equivalent_matches_recompute(name: &str) {
+    let sql = BATCH_DIALECT_EQUIVALENTS
+        .iter()
+        .find(|q| q.name == name)
+        .unwrap_or_else(|| panic!("{name} not in the equivalents list"))
+        .sql
+        .to_owned();
+    let mut g = NexmarkGenerator::new(42, 1_000, 0, 0);
+    let bid_batches: Vec<RecordBatch> = (0..3).map(|_| g.next_bid_batch(200).unwrap()).collect();
+    let auctions = g.next_auction_batch(100).unwrap();
+
+    // The declared contract comes from the REGISTRATION-REWRITTEN SQL, the
+    // same chain register_view applies (the raw TVF plans nowhere).
+    let mut rewritten = sql.clone();
+    for rewrite in [
+        krishiv_ivm::window_rewrite::rewrite_tumble_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_hop_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_session_tvfs,
+        krishiv_ivm::window_rewrite::rewrite_streaming_topn,
+    ] {
+        if let Some(r) = rewrite(&rewritten) {
+            rewritten = r;
+        }
+    }
+    let ctx = SessionContext::new();
+    ctx.register_batch("bid", RecordBatch::new_empty(bid_batches[0].schema()))
+        .unwrap();
+    ctx.register_batch("auction", RecordBatch::new_empty(auctions.schema()))
+        .unwrap();
+    let declared: SchemaRef = Arc::new(
+        ctx.sql(&rewritten)
+            .await
+            .unwrap()
+            .schema()
+            .as_arrow()
+            .clone(),
+    );
+
+    let spec = |out: SchemaRef| IncrementalViewSpec {
+        name: "v".into(),
+        body_sql: sql.clone(),
+        output_schema: out,
+        is_materialized: true,
+        is_recursive: false,
+        lateness: Vec::new(),
+    };
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(declared.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(declared)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let d = DeltaBatch::from_inserts(auctions).unwrap();
+    subject.feed("auction", d.clone()).unwrap();
+    oracle.feed("auction", d).unwrap();
+    for (i, batch) in bid_batches.iter().enumerate() {
+        let d = DeltaBatch::from_inserts(batch.clone()).unwrap();
+        subject.feed("bid", d.clone()).unwrap();
+        oracle.feed("bid", d).unwrap();
+        if i == 2 {
+            let half = bid_batches[0].slice(0, bid_batches[0].num_rows() / 2);
+            let d = DeltaBatch::from_deletes(half).unwrap();
+            subject.feed("bid", d.clone()).unwrap();
+            oracle.feed("bid", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(
+            s.errored_views.is_empty(),
+            "{name} tick {i}: {:?}",
+            s.errored_views
+                .iter()
+                .map(|e| e.message.clone())
+                .collect::<Vec<_>>()
+        );
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "{name} tick {i}: disagreed with recompute");
+        assert!(!got.is_empty(), "{name} tick {i}: rows expected");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc, "{name}: fell back to DiffBased: {why}");
+    assert!(why.contains("chain"), "{name}: not via the chain: {why}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nexmark_q9_batch_equivalent_maintains_incrementally() {
+    batch_equivalent_matches_recompute("q9_batch_winning_bids").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nexmark_q4_batch_equivalent_maintains_incrementally() {
+    batch_equivalent_matches_recompute("q4_batch_avg_winning_price").await;
 }

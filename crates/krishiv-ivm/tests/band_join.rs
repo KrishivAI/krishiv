@@ -1590,3 +1590,74 @@ async fn a_computed_join_key_hoists_and_maintains() {
         .expect("registered");
     assert!(inc && why.contains("chain"), "not a chain: {why}");
 }
+
+/// TOPNK-2: a keyed top-1 as a CHAIN HOP above a join — QUALIFY over the
+/// joined relation, the q9-batch shape in miniature. Tick 2 inserts a
+/// higher bid and the published winner is DISPLACED; tick 3 retracts it
+/// and the old winner is PROMOTED back — through the join hop's emitted
+/// delta, not a source.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_keyed_top1_above_a_join_maintains_as_a_chain() {
+    let sql = "WITH j AS (SELECT a.id, a.ts, p.city FROM auction a \
+               JOIN person p ON a.seller = p.pid) \
+               SELECT city, id, ts FROM j \
+               QUALIFY ROW_NUMBER() OVER (PARTITION BY city ORDER BY ts DESC) <= 1";
+    let out = Arc::new(Schema::new(vec![
+        Field::new("city", DataType::Int64, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("ts", DataType::Int64, false),
+    ]));
+    let subject = IncrementalFlow::new();
+    subject.register_view(spec(sql, out.clone())).unwrap();
+    let oracle = IncrementalFlow::new();
+    oracle.register_view(spec(sql, out)).unwrap();
+    oracle.force_diff_based().unwrap();
+
+    let expectations: [&[(i64, i64, i64)]; 3] = [
+        // City 50's best is auction 2 (ts 20); city 70's is auction 3.
+        &[(50, 2, 20), (70, 3, 5)],
+        // Auction 4 (ts 90) displaces auction 2 in city 50.
+        &[(50, 4, 90), (70, 3, 5)],
+        // Retracting it promotes auction 2 back.
+        &[(50, 2, 20), (70, 3, 5)],
+    ];
+    for (i, (a, retract)) in [
+        (Some(auctions(&[(1, 5, 10), (2, 5, 20), (3, 7, 5)])), false),
+        (Some(auctions(&[(4, 5, 90)])), false),
+        (Some(auctions(&[(4, 5, 90)])), true),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i == 0 {
+            let d = DeltaBatch::from_inserts(persons(&[(5, 50, 0), (7, 70, 0)])).unwrap();
+            subject.feed("person", d.clone()).unwrap();
+            oracle.feed("person", d).unwrap();
+        }
+        if let Some(a) = a {
+            let d = if retract {
+                DeltaBatch::from_deletes(a).unwrap()
+            } else {
+                DeltaBatch::from_inserts(a).unwrap()
+            };
+            subject.feed("auction", d.clone()).unwrap();
+            oracle.feed("auction", d).unwrap();
+        }
+        let s = subject.step_datafusion().await.unwrap();
+        oracle.step_datafusion().await.unwrap();
+        assert!(s.errored_views.is_empty(), "{:?}", s.errored_views);
+        let got = canonical(&subject.snapshot("v").unwrap().expect("published"));
+        let want = canonical(&oracle.snapshot("v").unwrap().expect("published"));
+        assert_eq!(got, want, "tick {i}: top-1 over the join disagreed");
+        let expect: Vec<Vec<Option<i64>>> = expectations[i]
+            .iter()
+            .map(|(c, id, t)| vec![Some(*c), Some(*id), Some(*t)])
+            .collect();
+        assert_eq!(got, expect, "tick {i}");
+    }
+    let (inc, why) = subject
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+}

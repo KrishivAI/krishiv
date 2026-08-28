@@ -396,6 +396,47 @@ pub struct BenchQuery {
 /// partitioned file sink; Q14's bid-time classification is a price-band CASE
 /// (the reference classifies by hour of day); Q21 maps channel names by CASE
 /// rather than regex-extracting from the URL.
+/// BATCH-DIALECT EQUIVALENTS of the two queries whose corpus form is a
+/// streaming pipeline spec in SQL clothing (q4, q9): the streaming executor
+/// IGNORES their CTEs' SELECT lists — its join emits `left_*`/`right_*` of
+/// ALL columns and its window stages emit `window_start_ms` — so the
+/// verbatim text is not standard SQL and never will be. These variants
+/// state every column the pipeline made implicit, and are measured
+/// SEPARATELY from the 44-query verbatim corpus: they demonstrate the
+/// delta-batch semantics of q4/q9, they do not move the verbatim count.
+pub const BATCH_DIALECT_EQUIVALENTS: &[BenchQuery] = &[
+    BenchQuery {
+        // Q9: winning bids — the band join feeding a per-auction top-1 by
+        // price per window. The batch dialect writes the ranking as QUALIFY
+        // directly (standard SQL needs no idiom rewrite).
+        name: "q9_batch_winning_bids",
+        sql: "WITH joined AS (SELECT b.auction, b.bidder, b.price, b.\"dateTime\" AS ts \
+              FROM bid b JOIN auction a ON b.auction = a.id \
+              AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000) \
+              SELECT auction, bidder, price FROM TUMBLE(TABLE joined, DESCRIPTOR(ts), 10000) \
+              QUALIFY ROW_NUMBER() OVER (PARTITION BY auction, window_start, window_end \
+              ORDER BY price DESC) <= 1",
+        expect: RowsOut::NonZero,
+    },
+    BenchQuery {
+        // Q4: average winning-bid price per category — MAX per
+        // (auction, category, window), then AVG per (category, window). The
+        // second stage groups by the FIRST window's start, which the batch
+        // dialect carries as an explicit column instead of re-windowing over
+        // the streaming stage's implicit `window_start_ms`.
+        name: "q4_batch_avg_winning_price",
+        sql: "WITH joined AS (SELECT b.auction, b.price, a.category, b.\"dateTime\" AS ts \
+              FROM bid b JOIN auction a ON b.auction = a.id \
+              AND b.\"dateTime\" BETWEEN a.\"dateTime\" - 10000 AND a.\"dateTime\" + 10000), \
+              winning AS (SELECT auction, category, window_start, MAX(price) AS final \
+              FROM TUMBLE(TABLE joined, DESCRIPTOR(ts), 10000) \
+              GROUP BY auction, category, window_start, window_end) \
+              SELECT category, window_start, AVG(final) AS avg_final \
+              FROM winning GROUP BY category, window_start",
+        expect: RowsOut::NonZero,
+    },
+];
+
 pub const SUPPORTED_QUERIES: &[BenchQuery] = &[
     BenchQuery {
         // Q1: currency conversion. Aggregates an EXPRESSION, which needs the
