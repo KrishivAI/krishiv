@@ -44,6 +44,7 @@ pub mod delta_batch;
 pub mod error;
 pub mod lateness;
 pub mod operators;
+pub mod snapshot_index;
 pub mod source_state;
 pub mod trace;
 pub mod view;

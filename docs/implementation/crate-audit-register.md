@@ -6119,7 +6119,7 @@ across seeds 20k/50k/100k with the delta pinned at 5k. Sublinear in state
 so there is a state-proportional term in the keep-last dedup path worth
 finding. Recorded with its numbers rather than fixed by guess.
 
-## §64 — IVM-AUD-PERF-3 (diagnosed, NOT fixed): the view snapshot is maintained in O(state)
+## §64 — IVM-AUD-PERF-3: the view snapshot was maintained in O(state) — diagnosed, then fixed
 
 §63 left one measured-but-unexplained item: q18's tick grew 205 → 260 → 544 ms
 across seeds 20k/50k/100k with the delta pinned at 5k. A genuinely O(delta)
@@ -6170,9 +6170,67 @@ tick; migrate checkpoint/restore, whose format currently carries a
 materialized `RecordBatch`. The revert-proof is the seed-scaling axis — a
 fixed delta against a growing seed must produce a flat tick.
 
-A contained interim, separately decidable: replace `consolidate_batch`'s
-per-row `Vec<String>` keys with Arrow's `RowConverter` (already used by
-`keyed_topn` and `differentiate`) to cut the constant without changing the
-shape. One thing to pin with a test FIRST: the string encoding folds NaN
-variants together and the row encoding would not — a semantics decision, not
-an optimization detail.
+### The fix (same session, at the user's direction)
+
+A view's accumulated rows are now a multiset keyed by Arrow's byte-comparable
+row encoding — the same `RowConverter` `keyed_topn` and `differentiate` already
+use (`snapshot_index.rs`). Applying a delta is a hash update per DELTA row;
+accumulated rows are untouched. Materialization moved to whoever reads the
+snapshot (checkpoint, console, DiffBased baseline) and is cached until the next
+apply. **The checkpoint format is unchanged** — `snapshot()`/`restore_state()`
+still speak `RecordBatch` — so there is no migration and no window where an old
+checkpoint reads wrong, which is what made this safe to do at all.
+
+**Semantics were pinned BEFORE the rewrite, by a test that passes against the
+OLD implementation** (`view_snapshot_shape::the_snapshot_contents_are_unchanged_by_the_representation`):
+multiset materialization (weight `k` → `k` copies), retraction netting, and the
+CLAMP — a retraction with nothing left to cancel is dropped and *forgotten*,
+not banked as a debt against a future insert. One subtlety the rewrite had to
+handle: `apply_delta` consolidated prev ++ delta TOGETHER, so a delta carrying
+`-1` then `+1` for one row nets to zero; applying row-by-row without first
+netting the delta against itself would clamp at the intermediate `-1` and then
+re-add the row. Aggregates emit that churn routinely.
+
+**Revert-proof:** `a_view_tick_does_not_grow_with_the_accumulated_snapshot`
+asserts the SHAPE (10x the snapshot must not cost ~10x the tick) rather than a
+wall-clock constant, so it stays meaningful on slower hardware. Against the old
+code it measured **10.8x** and failed; it passes now.
+
+**Two things I nearly broke, both caught by existing tests, both recorded
+because they were behaviour changes smuggled inside a performance fix:**
+
+1. I added schema pre-validation to `apply_output_delta`. A gap test publishes
+   a delta whose schema differs from the view's declared schema — legal on the
+   old path — and my "improvement" made it a hard error. Removed: a mismatched
+   schema now FALLS BACK to the whole-snapshot path and keeps its old answer.
+2. `publish_output` (the DiffBased path) cannot apply the delta to the
+   baseline, because `diff_and_update` has already advanced it — that would
+   double-count. It sets the baseline from the snapshot instead.
+
+**A regression I caused, found by watching the wrong column move.** After the
+first cut, the DiffBased arm went 553 → 697 ms at seed 100k. Nothing in this
+change can make full recompute slower, which is the same tell as the contention
+artefact in the 08-28c entry. Cause: `publish_output` materialized the snapshot
+and handed it to `set()`, which RE-ENCODED every row into a fresh index — work
+the old code never did, on a path that gains nothing from indexing. Fixed with
+`set_raw` (store as-is; the next apply promotes it once). Had it shipped, the
+headline would have read **7.80x** at seed 100k, with a chunk of that being my
+own inflated baseline.
+
+**Result** (q18, delta pinned at 5k, median of 3):
+
+| seed | incr before | incr after | ratio before | ratio after |
+|---|---:|---:|---:|---:|
+| 20 k | 205 ms | **50.6 ms** | 0.50x | **2.27x** |
+| 50 k | 260 ms | **69.9 ms** | 0.81x | **2.97x** |
+| 100 k | 544 ms | **97.9 ms** | 1.02x | **4.72x** |
+
+Corpus-wide (NEXMark + TPC-H, seed 20k): incremental beats recompute on
+**27 queries, down from 18**, with 16 still below crossover at this seed/delta.
+
+**Not fully closed, stated rather than rounded off:** the tick is near-flat, not
+flat. Across 5x the state q18 still grows ~1.9x (50.6 → 97.9 ms), against 2.66x
+before. Something state-proportional remains — most likely `flow.rs:1411`,
+which materializes every view's snapshot into `prev_outputs` each tick and now
+pays a decode when the state is indexed and the cache was just invalidated.
+That is the next thing to measure, and it is NOT claimed as fixed here.

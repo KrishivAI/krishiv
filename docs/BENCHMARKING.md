@@ -364,6 +364,41 @@ Findings tracked from this entry:
    4.5–8.9× session tax). Tracked as input to the Phase 53 scheduler-v2
    work (task #175/#199).
 
+### 2026-08-28e — IVM-AUD-PERF-3 fixed: view snapshots maintained in O(delta)
+
+The O(state) snapshot maintenance diagnosed in the 08-28c entry (and register
+§64) is fixed: a view's rows are now a row-encoded multiset, applying a delta
+touches only the delta's rows, and materialization is deferred to whoever reads
+the snapshot. Checkpoint format unchanged.
+
+**q18_last_bid_dedup** — the query that exposed it (delta pinned at 5k, median
+of 3 ticks):
+
+| seed | incr before | incr after | ratio before | ratio after |
+|---|---:|---:|---:|---:|
+| 20 k | 205 ms | **50.6 ms** | 0.50x | **2.27x** |
+| 50 k | 260 ms | **69.9 ms** | 0.81x | **2.97x** |
+| 100 k | 544 ms | **97.9 ms** | 1.02x | **4.72x** |
+
+**Corpus-wide** (NEXMark 24 entries + TPC-H 22, seed 20k/source, delta
+5k/source): incremental now beats full recompute on **27 queries, up from 18**.
+Biggest movers on NEXMark: q18 0.69 → 2.11x, q19 0.75 → 1.84x, q5 0.77 →
+1.90x, q13 1.44 → 2.71x, q22 2.75 → 3.74x.
+
+**A regression this run caught in my own change, recorded because the reported
+speedup would otherwise have been inflated.** The first cut also made the
+DiffBased arm slower — 553 → 697 ms at seed 100k. Nothing in the change can
+make full recompute slower; that is the same tell as the contention artefact in
+08-28c. Cause: the DiffBased publish path re-encoded every row into a fresh
+index each tick. Fixed by storing the batch as-is and letting the next apply
+promote it. Reported ratios use the corrected baseline; had it shipped, q18 at
+seed 100k would have read **7.80x** instead of the honest 4.72x.
+
+**Still open**: the tick is near-flat, not flat — q18 grows ~1.9x across 5x the
+state (down from 2.66x). The residue is most likely the tick's Phase-1
+collection of every view's snapshot, which now pays a decode when the state is
+indexed. Measured, not fixed, not claimed.
+
 ### 2026-08-28d — TPC-H on delta-batch, measured for the first time
 
 Every prior entry said TPC-H delta-batch tick cost was unmeasured. It no longer

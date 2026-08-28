@@ -27,6 +27,7 @@ use crate::delta_batch::DeltaBatch;
 use crate::error::{DeltaError, DeltaResult};
 use crate::lateness::LatenessSpec;
 use crate::operators::stream::differentiate;
+use crate::snapshot_index::ViewState;
 
 /// Specification of one incremental view as registered from SQL DDL.
 #[derive(Debug, Clone)]
@@ -54,10 +55,15 @@ pub struct IncrementalView {
     /// no error anywhere. See [`VIEW_DELTA_STREAM_CAPACITY`].
     delta_tx: broadcast::Sender<DeltaBatch>,
     /// Snapshot accumulation for materialized views.
-    snapshot: Arc<Mutex<Option<RecordBatch>>>,
+    ///
+    /// IVM-AUD-PERF-3: held as a row-indexed multiset, not a `RecordBatch`, so
+    /// applying a delta costs O(|delta|) instead of re-consolidating the whole
+    /// accumulated snapshot every tick. Materialization is deferred to
+    /// `snapshot()` and cached.
+    snapshot: Arc<Mutex<ViewState>>,
     /// Previous full materialized output used for diff-based IVM.
     /// `differentiate(full_output_prev, new_full)` produces the true delta.
-    full_output: Arc<Mutex<Option<RecordBatch>>>,
+    full_output: Arc<Mutex<ViewState>>,
     /// Retraction rows this view's integration had to clamp away
     /// (IVM-AUD-CORE-2b). See [`Self::clamped_retraction_rows`].
     clamped_retractions: Arc<AtomicU64>,
@@ -72,8 +78,8 @@ impl IncrementalView {
             last_output: Arc::new(Mutex::new(None)),
             sender,
             delta_tx,
-            snapshot: Arc::new(Mutex::new(None)),
-            full_output: Arc::new(Mutex::new(None)),
+            snapshot: Arc::new(Mutex::new(ViewState::default())),
+            full_output: Arc::new(Mutex::new(ViewState::default())),
             clamped_retractions: Arc::new(AtomicU64::new(0)),
         };
         (view, receiver)
@@ -109,17 +115,12 @@ impl IncrementalView {
     /// answer has `Σ max(0, net)` rows. The difference is exactly the owed
     /// multiplicity that was clamped away, and computing it costs one pass over
     /// the delta's weights — no second consolidate.
-    fn record_clamped(
-        &self,
-        prev: Option<&RecordBatch>,
-        delta: &DeltaBatch,
-        updated: &RecordBatch,
-    ) {
-        let mut expected: i64 = prev.map_or(0, |p| p.num_rows() as i64);
-        for w in delta.weights().iter().flatten() {
-            expected = expected.saturating_add(w);
-        }
-        let clamped = (updated.num_rows() as i64).saturating_sub(expected).max(0);
+    /// Report retraction rows that had nothing to cancel (IVM-AUD-CORE-2b).
+    ///
+    /// The count now comes from the state itself — the indexed path knows
+    /// exactly how much of a retraction it could not honour — instead of being
+    /// inferred from row-count arithmetic over the whole snapshot.
+    fn note_clamped(&self, clamped: u64) {
         if clamped > 0 {
             tracing::warn!(
                 view = %self.spec.name,
@@ -128,7 +129,7 @@ impl IncrementalView {
                  state is not the Z-set the delta describes (IVM-AUD-CORE-2b)"
             );
             self.clamped_retractions
-                .fetch_add(clamped as u64, Ordering::Relaxed);
+                .fetch_add(clamped, Ordering::Relaxed);
         }
     }
 
@@ -156,57 +157,43 @@ impl IncrementalView {
         // Apply the delta to the prior full snapshot — don't replace it with
         // just the delta's positive rows (that would lose prior state).
         if self.spec.is_materialized {
-            let updated = {
-                let snap = self
-                    .snapshot
-                    .lock()
-                    .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-                // IVM-AUD-CORE-14: clone, do NOT `take()`, before the
-                // fallible apply. Taking left the guard holding `None` on the
-                // error path, so the log line "snapshot not updated" was
-                // false — the entire materialized snapshot was destroyed and
-                // the next tick rebuilt the view from one delta, silently
-                // losing all history. `RecordBatch` clones share Arc'd
-                // buffers, so this costs a refcount bump.
-                let current = snap.clone();
-                match crate::operators::stream::apply_delta(current.clone(), &output) {
-                    Ok(rb) => {
-                        self.record_clamped(current.as_ref(), &output, &rb);
-                        rb
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            view = %self.spec.name,
-                            error = %e,
-                            output_rows = output.num_rows(),
-                            "apply_delta failed in publish_output — snapshot left intact"
-                        );
-                        return Err(e);
-                    }
-                }
-            };
-            tracing::debug!(
-                view = %self.spec.name,
-                rows = updated.num_rows(),
-                "snapshot updated"
-            );
-            {
+            // IVM-AUD-CORE-14 still holds: nothing is destroyed before the
+            // fallible step succeeds. `ViewState::apply` mutates in place and
+            // returns Err without having changed the state on the index path;
+            // the Raw arm computes the replacement before assigning.
+            let clamped = {
                 let mut snap = self
                     .snapshot
                     .lock()
                     .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-                *snap = Some(updated.clone());
-            }
-            // Keep the diff baseline in lockstep with the materialized snapshot.
-            // The incremental path (O(Δ) operators) never calls `diff_and_update`,
-            // so without this `full_output` would stay `None` and a later
-            // DiffBased step (e.g. on a remote executor restored from a
-            // checkpoint) would treat the entire output as new insertions.
+                snap.apply(&self.spec.output_schema, &output)?
+            };
+            self.note_clamped(clamped);
+            // Keep the diff baseline in lockstep with the materialized
+            // snapshot. This is the DiffBased path — `diff_and_update` has
+            // already advanced `full_output` to the fresh full result — so the
+            // baseline is SET from the snapshot rather than re-applying the
+            // delta, which would double-count it. Materializing here is O(state)
+            // and deliberately so: this path just re-ran the whole view SQL,
+            // which is O(state) already. The O(delta) path is
+            // `apply_output_delta`.
+            let updated = {
+                let mut snap = self
+                    .snapshot
+                    .lock()
+                    .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+                snap.batch()?
+            };
+            tracing::debug!(
+                view = %self.spec.name,
+                rows = updated.as_ref().map_or(0, RecordBatch::num_rows),
+                "snapshot updated"
+            );
             let mut fo = self
                 .full_output
                 .lock()
                 .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            *fo = Some(updated);
+            fo.set_raw(updated);
         } else {
             tracing::debug!(
                 view = %self.spec.name,
@@ -237,10 +224,11 @@ impl IncrementalView {
 
     /// Return the current materialized snapshot (only for materialized views).
     pub fn snapshot(&self) -> DeltaResult<Option<arrow::array::RecordBatch>> {
-        self.snapshot
+        let mut guard = self
+            .snapshot
             .lock()
-            .map(|g| g.clone())
-            .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))
+            .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
+        guard.batch()
     }
 
     /// Return the previous full output used as the diff-based IVM baseline.
@@ -248,10 +236,11 @@ impl IncrementalView {
     /// Exposed so a coordinator-authoritative checkpoint can capture view
     /// baselines and ship them to a stateless executor.
     pub fn full_output_baseline(&self) -> DeltaResult<Option<arrow::array::RecordBatch>> {
-        self.full_output
+        let mut guard = self
+            .full_output
             .lock()
-            .map(|g| g.clone())
-            .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))
+            .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
+        guard.batch()
     }
 
     /// Subscribe to the *latest* output delta (coalescing).
@@ -283,8 +272,9 @@ impl IncrementalView {
             .full_output
             .lock()
             .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-        let delta = differentiate(&self.spec.output_schema, guard.as_ref(), &new_full)?;
-        *guard = Some(new_full);
+        let prev = guard.batch()?;
+        let delta = differentiate(&self.spec.output_schema, prev.as_ref(), &new_full)?;
+        guard.set(&self.spec.output_schema, Some(new_full));
         Ok(delta)
     }
 
@@ -296,7 +286,7 @@ impl IncrementalView {
             .full_output
             .lock()
             .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-        *guard = None;
+        guard.set(&self.spec.output_schema, None);
         Ok(())
     }
 
@@ -315,13 +305,13 @@ impl IncrementalView {
                 .full_output
                 .lock()
                 .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            *guard = None;
+            guard.set(&self.spec.output_schema, None);
         }
         let mut snap = self
             .snapshot
             .lock()
             .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-        *snap = None;
+        snap.set(&self.spec.output_schema, None);
         Ok(())
     }
 
@@ -342,8 +332,9 @@ impl IncrementalView {
                 .full_output
                 .lock()
                 .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            let delta = differentiate(&self.spec.output_schema, guard.as_ref(), &new_full)?;
-            *guard = Some(new_full.clone());
+            let prev = guard.batch()?;
+            let delta = differentiate(&self.spec.output_schema, prev.as_ref(), &new_full)?;
+            guard.set(&self.spec.output_schema, Some(new_full.clone()));
             delta
         };
         if self.spec.is_materialized {
@@ -351,7 +342,7 @@ impl IncrementalView {
                 .snapshot
                 .lock()
                 .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            *snap = Some(new_full);
+            snap.set(&self.spec.output_schema, Some(new_full));
         }
         {
             let mut lo = self
@@ -384,41 +375,35 @@ impl IncrementalView {
         // counter had already advanced. Compute both updates from clones
         // first, and only commit them once BOTH have succeeded, so a partial
         // failure cannot leave the two halves inconsistent either.
-        let updated_full = {
-            let fo = self
-                .full_output
-                .lock()
-                .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            let prev = fo.clone();
-            let updated = crate::operators::stream::apply_delta(prev.clone(), delta)?;
-            // Counted on the baseline only, not again on the snapshot: for a
-            // materialized view the two integrate the same delta, so counting
-            // both would double every loss.
-            self.record_clamped(prev.as_ref(), delta, &updated);
-            updated
-        };
-        let updated_snapshot = if self.spec.is_materialized {
-            let snap = self
-                .snapshot
-                .lock()
-                .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            Some(crate::operators::stream::apply_delta(snap.clone(), delta)?)
-        } else {
-            None
-        };
+        // IVM-AUD-PERF-3: this is the O(delta) path — the one every
+        // incremental operator publishes through — so neither state is
+        // re-materialized here. `ViewState::apply` updates a row-indexed
+        // multiset in place at O(|delta|).
+        //
+        // IVM-AUD-CORE-15's guarantee still holds: `apply`'s fallible steps
+        // (consolidating the delta, encoding its rows) run BEFORE any mutation
+        // and are pure functions of the delta, which is the same for both
+        // states — so they cannot succeed for one and fail for the other and
+        // leave the two halves inconsistent. No new failure mode is introduced
+        // here: a delta whose schema differs from the accumulated state falls
+        // back to the old whole-snapshot path rather than erroring.
         {
             let mut fo = self
                 .full_output
                 .lock()
                 .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-            *fo = Some(updated_full);
+            // Counted on the baseline only, not again on the snapshot: for a
+            // materialized view the two integrate the same delta, so counting
+            // both would double every loss.
+            let clamped = fo.apply(&self.spec.output_schema, delta)?;
+            self.note_clamped(clamped);
         }
-        if let Some(updated) = updated_snapshot {
+        if self.spec.is_materialized {
             let mut snap = self
                 .snapshot
                 .lock()
                 .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            *snap = Some(updated);
+            snap.apply(&self.spec.output_schema, delta)?;
         }
         {
             let mut lo = self
@@ -446,13 +431,13 @@ impl IncrementalView {
                 .snapshot
                 .lock()
                 .map_err(|_| DeltaError::Operator("snapshot lock poisoned".into()))?;
-            *snap = snapshot;
+            snap.set(&self.spec.output_schema, snapshot);
         }
         let mut fo = self
             .full_output
             .lock()
             .map_err(|_| DeltaError::Operator("full_output lock poisoned".into()))?;
-        *fo = full_output;
+        fo.set(&self.spec.output_schema, full_output);
         Ok(())
     }
 }
