@@ -404,9 +404,13 @@ idle, delta pinned at 5k:
 | 200 k | 251.9 ms | — |
 | 400 k | 468.3 ms | 1.86x for 2x |
 | 800 k | **7,932.7 ms** | **16.9x for 2x** |
-| 1 M | 13,660 ms | — |
+| 1 M | 9,990.9 ms | 1.26x for 1.25x |
 
-Linear to 400k, then it explodes. **A correction to a correction, both recorded:**
+**Linear, then a CLIFF between 400k and 800k, then linear again.** That is a
+regime change, not smooth superlinearity, and it is the sharpest diagnostic clue
+in this entry: whatever switches, switches in that band. (The 1M point is 9,991
+ms measured idle against 13,660 ms measured while the SF10 generation ran — so
+contention inflated it ~37%, and the defect is ~10 s regardless.) **A correction to a correction, both recorded:**
 the 13,660 ms at 1M was first reported as a 72x superlinear blow-up; I then
 noticed the SF10 dataset generation had been running concurrently and called the
 figure contaminated. The idle re-run refutes THAT: 800k alone reaches 7.9 s, so
@@ -418,6 +422,8 @@ Partially attributed (task #167): `Trace::probe_by_keys` is O(entire trace), and
 the SEMI-3 residual membership path calls it ONCE PER DELTA ROW — O(delta x
 state). That explains the LINEAR segment. It does not explain a 17x jump for 2x
 state, so a second compounding factor remains unidentified and is NOT claimed.
+The cliff's location — between seeds 400k and 800k, with linear behaviour on
+both sides — is where to look first.
 
 Also visible in the same run, on the other side: NEXMark's q21_channel_id is
 where IVM wins biggest — 79 -> 201 ms incremental against 880 -> 4049 ms
