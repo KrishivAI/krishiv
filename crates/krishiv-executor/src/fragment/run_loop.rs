@@ -1332,6 +1332,7 @@ impl ExecutorTaskRunner {
         // drop counter a false alarm.
         let has_durable_sink = Self::has_durable_sink_contract(assignment.output_contract())?;
 
+        let mut needs_backpressure = false;
         {
             let mut egress = self
                 .continuous_outputs
@@ -1347,7 +1348,16 @@ impl ExecutorTaskRunner {
             // budget shared by every co-located subtask, so effective headroom
             // is cap/parallelism — which is why it needs an override.
             let cap = rloop_egress_cap();
-            if egress.len() > cap {
+            if egress.len() > cap && !has_durable_sink {
+                // ADR §73: this ring is the job's ONLY way out, so trimming it
+                // is silent data loss. Stall instead — but NOT inside this
+                // scope, which holds a `continuous_outputs` entry guard while
+                // `drain_continuous_output` takes `get_mut` on the same key.
+                // Waiting here would deadlock against the one operation that
+                // can relieve the wait. Flag it; the wait runs after the
+                // guard's closing brace, where release is compiler-proven.
+                needs_backpressure = true;
+            } else if egress.len() > cap {
                 let overflow = egress.len() - cap;
                 egress.drain(..overflow);
                 // Count BATCHES, not overflow events. This used to add 1 per
@@ -1389,6 +1399,44 @@ impl ExecutorTaskRunner {
                          durable sink, so nothing was lost"
                     );
                 }
+            }
+        }
+
+        // ── egress backpressure (ADR §73) ────────────────────────────────
+        // The guard is released. `drain_continuous_output` can now run, which
+        // is the only way this loop makes progress. Bounded: an unbounded wait
+        // wedges a job nobody drains, and a fault is visible and recoverable
+        // where a silent hole in a result set is neither.
+        if needs_backpressure {
+            let cap = rloop_egress_cap();
+            let budget = self.egress_backpressure_budget;
+            let started = std::time::Instant::now();
+            loop {
+                let len = self
+                    .continuous_outputs
+                    .get(job_id)
+                    .map(|e| e.len())
+                    .unwrap_or(0);
+                if len <= cap {
+                    break;
+                }
+                if started.elapsed() >= budget {
+                    // The staged output is still in the buffer, so a consumer
+                    // that returns after this fault finds it intact. Refusing
+                    // to compute more is the point.
+                    return Err(ExecutorError::LocalExecution {
+                        message: format!(
+                            "run-loop egress full for job {job_id}: {len} batches against a cap \
+                             of {cap} with no durable sink, and no consumer drained within \
+                             {}ms. Output is the buffer's only delivery path, so it is held \
+                             rather than dropped. Drain the job, raise {}, or attach a durable \
+                             sink.",
+                            budget.as_millis(),
+                            krishiv_common::streaming_dials::RLOOP_EGRESS_CAP_ENV,
+                        ),
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         }
 

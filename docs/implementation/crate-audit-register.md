@@ -6993,3 +6993,51 @@ row to a `u64` and keeping the bytes only in the batch. Both are real designs
 with correctness surface — duplicate rows must still collapse, and multiplicity
 must survive — and picking one belongs to the session that measures them, not
 to this one.
+
+
+## §76 — IVM-AUD-STREAM-2: the egress backpressure mechanism, now tested
+
+§73 decided the contract and shipped only the dial; the mechanism was built,
+refuted by the workspace gate, and reverted. Both blockers it named are cleared
+and the mechanism lands.
+
+**The test-speed blocker.** `ExecutorTaskRunner` gains
+`egress_backpressure_budget: Duration`, defaulted from the dial, with
+`with_egress_backpressure_budget` for tests — the `eos_quiesce_deadline`
+precedent, for the same reason: the dial is process-global and this crate
+forbids `unsafe`, so `std::env::set_var` cannot narrow it from a test.
+
+**The conformance blocker.** `the_egress_cap_drops_oldest_and_counts_every_lost_batch`
+encoded the OLD contract for a SINKLESS job. Rewritten as a SET, not edited into
+agreement — the distinction §38 drew when it refused to "fix" tests by rewriting
+them around the thing that changed:
+
+- `a_sinkless_egress_overflow_faults_and_holds_the_output` — the ring is the
+  only way out, so overflow FAULTS and the staged output stays in the buffer.
+  Asserts `held > cap` and `dropped == 0`: held rather than trimmed is the point.
+- `a_drain_inside_the_budget_releases_the_egress_stall` — a consumer arriving
+  inside the budget lets the loop proceed losslessly. This is what makes the
+  fault a backpressure signal rather than a hair trigger, and it is the half §73
+  could not write.
+- `a_durable_sink_job_does_not_report_its_staging_trims_as_lost_output` —
+  unchanged, still asserting drop-oldest. The rows are in the sink.
+
+**Revert-proof, which fails two ways.** Replacing `!has_durable_sink` with
+`true` — the policy no longer distinguishing the cases — turns the durable-sink
+test RED and takes the executor suite from **45s to 180s**, because
+sink-attached jobs then stall for a budget they should never reach.
+
+**Correction to §73.** That entry cited "the failing run took 45s" as the cost
+of an un-narrowable budget. Wrong: `cargo test` runs in parallel, the executor
+suite takes ~45s either way, and a 30s stall hides inside it. The 45s -> 180s
+figure above is the real evidence. The conclusion held; the number offered for
+it did not.
+
+**Guard release is compiler-proven.** The wait sits after the closing brace of
+the scope holding the `continuous_outputs` entry guard, so no path can wait
+while holding it against `drain_continuous_output`'s `get_mut` on the same key.
+Structural, not a matter of care.
+
+**Still refusable, not survivable.** A sinkless ring's overflow is held and the
+job faults; nothing is persisted, and a job nobody drains still fails. That is
+the decided contract (§73), not a shortfall of it.

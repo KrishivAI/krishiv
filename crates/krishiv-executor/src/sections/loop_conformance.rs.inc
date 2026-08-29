@@ -460,64 +460,109 @@ fn marked_batch(marker: i64) -> RecordBatch {
 /// `egress.truncate(cap)` keeps the surviving COUNT identical and flips the
 /// surviving markers to the oldest, failing on identity alone.
 #[tokio::test]
-async fn the_egress_cap_drops_oldest_and_counts_every_lost_batch() {
+async fn a_sinkless_egress_overflow_faults_and_holds_the_output() {
+    // ADR §73. This buffer is the job's ONLY delivery path, so trimming it is
+    // silent data loss. The contract changed: overflow now stalls for a
+    // consumer and faults at the budget, and the staged output is HELD rather
+    // than dropped so a consumer returning after the fault finds it intact.
+    //
+    // This test previously asserted the opposite — drop-oldest, counting the
+    // loss — and it is what caught the mechanism when §73 first tried to land
+    // it. Rewritten deliberately, not "fixed": the sink-attached case below
+    // still asserts drop-oldest, because there the rows are safe in the sink.
     let cap = krishiv_common::streaming_dials::rloop_egress_cap();
     let overflow_by = 6_i64;
     let total = cap as i64 + overflow_by;
 
     let job_id = "egress-cap-job";
-    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
-    // No sink contract: this buffer IS the delivery path, so drops are real
-    // loss and must be counted.
+    // A narrow budget: the production default is 30s and this crate forbids
+    // `unsafe`, so the process-global dial cannot be narrowed from a test.
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+        .with_egress_backpressure_budget(std::time::Duration::from_millis(50));
+    // No sink contract: this buffer IS the delivery path.
     let assignment = make_loop_assignment("stream:loop:egress-cap|noop");
 
+    let mut fault = None;
     for marker in 0..total {
+        if let Err(error) = runner
+            .stage_rloop_outputs(job_id, &assignment, &[marked_batch(marker)])
+            .await
+        {
+            fault = Some(error.to_string());
+            break;
+        }
+    }
+    let fault = fault.expect(
+        "staging past the cap with no durable sink must FAULT; completing every stage \
+         means output was silently dropped",
+    );
+    assert!(
+        fault.contains("egress full") && fault.contains("no durable sink"),
+        "the fault must name the condition and the remedy: {fault}"
+    );
+
+    // Held, not dropped. This is the whole point of the contract change.
+    let held = runner
+        .continuous_outputs
+        .get(job_id)
+        .map(|e| e.value().len())
+        .unwrap_or(0);
+    assert!(
+        held > cap,
+        "the staged output must still be in the buffer ({held} batches); \
+         trimming it to {cap} would be the silent loss this fault exists to refuse"
+    );
+    let dropped = runner
+        .continuous_egress_dropped
+        .get(job_id)
+        .map(|e| *e.value())
+        .unwrap_or(0);
+    assert_eq!(dropped, 0, "nothing may be counted as dropped: nothing was dropped");
+}
+
+/// A consumer that drains inside the budget lets the loop proceed losslessly —
+/// the other half of ADR §73, and the half that makes the fault above a
+/// backpressure signal rather than a hair trigger.
+#[tokio::test]
+async fn a_drain_inside_the_budget_releases_the_egress_stall() {
+    let cap = krishiv_common::streaming_dials::rloop_egress_cap();
+    let job_id = "egress-drain-job";
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new())
+        .with_egress_backpressure_budget(std::time::Duration::from_secs(10));
+    let assignment = make_loop_assignment("stream:loop:egress-drain|noop");
+
+    // Fill to exactly the cap without tripping the stall.
+    for marker in 0..cap as i64 {
         runner
             .stage_rloop_outputs(job_id, &assignment, &[marked_batch(marker)])
             .await
-            .expect("stage");
+            .expect("staging up to the cap must not stall");
     }
 
-    let survivors: Vec<i64> = runner
-        .continuous_outputs
-        .get(job_id)
-        .map(|e| {
-            e.value()
-                .iter()
-                .filter_map(|b| {
-                    b.column(2)
-                        .as_any()
-                        .downcast_ref::<arrow::array::Int64Array>()
-                        .map(|a| a.value(0))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    // A consumer arrives shortly after the next stage begins waiting. The
+    // handle is the same `Arc<DashMap>` a real drain serves from.
+    let outputs = std::sync::Arc::clone(&runner.continuous_outputs);
+    let drainer = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        if let Some(mut entry) = outputs.get_mut("egress-drain-job") {
+            entry.clear();
+        }
+    });
 
-    assert_eq!(survivors.len(), cap, "the buffer must stay at its cap");
-    assert_eq!(
-        survivors.first().copied(),
-        Some(overflow_by),
-        "the cap must keep the NEWEST batches; a drop-newest policy would leave the \
-         same COUNT starting at marker 0, which is why this asserts identity"
-    );
-    assert_eq!(
-        survivors.last().copied(),
-        Some(total - 1),
-        "the most recent batch must always survive"
-    );
+    runner
+        .stage_rloop_outputs(job_id, &assignment, &[marked_batch(cap as i64)])
+        .await
+        .expect("a drain inside the budget must release the stall, not fault");
+    drainer.await.unwrap();
 
     let dropped = runner
         .continuous_egress_dropped
         .get(job_id)
         .map(|e| *e.value())
         .unwrap_or(0);
-    assert_eq!(
-        dropped, overflow_by as u64,
-        "every dropped BATCH must be counted, not one per overflow event — \
-         under-counting is worst exactly when the loss is largest"
-    );
+    assert_eq!(dropped, 0, "a released stall drops nothing");
 }
+
 
 /// A job delivering through a durable sink does NOT report dropped output.
 ///

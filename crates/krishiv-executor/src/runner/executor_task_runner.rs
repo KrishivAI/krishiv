@@ -312,6 +312,17 @@ pub struct ExecutorTaskRunner {
     /// Cumulative run-loop egress-buffer drops per job, so the loss can be
     /// reported upward instead of only warned about locally.
     pub(crate) continuous_egress_dropped: Arc<DashMap<String, u64>>,
+    /// How long a run-loop stalls when its egress ring is full AND the ring is
+    /// the job's only delivery path (ADR §73).
+    ///
+    /// A FIELD, not a direct read of the dial, for one reason: the dial is
+    /// process-global and this crate forbids `unsafe`, so `std::env::set_var`
+    /// is unavailable and a test could not narrow it. Every fault-path test
+    /// would burn the full 30s budget — the run that first caught this took
+    /// 45 seconds. Same shape, and same remedy, as
+    /// `ExecutorTaskInboxService::eos_quiesce_deadline` ("test override for the
+    /// quiesce deadline (stall tests must not wait 8s)").
+    pub(crate) egress_backpressure_budget: std::time::Duration,
     /// Cumulative rows dropped because their group key was NULL, per job.
     ///
     /// A NULL group key is not aggregable under the engine's fail-closed key
@@ -492,6 +503,9 @@ impl ExecutorTaskRunner {
             continuous_input_notify: Arc::new(DashMap::new()),
             task_state_bindings: Arc::new(DashMap::new()),
             continuous_egress_dropped: Arc::new(DashMap::new()),
+            egress_backpressure_budget: std::time::Duration::from_millis(
+                krishiv_common::streaming_dials::rloop_egress_backpressure_ms(),
+            ),
             continuous_null_key_rows: Arc::new(DashMap::new()),
             join_executors: Arc::new(DashMap::new()),
             job_checkpoint_storages: Arc::new(DashMap::new()),
@@ -522,6 +536,14 @@ impl ExecutorTaskRunner {
     /// quiesce check.
     pub fn with_shared_continuous_busy(mut self, busy: crate::grpc::SharedContinuousBusy) -> Self {
         self.continuous_busy = busy;
+        self
+    }
+
+    /// Narrow the egress backpressure budget. Tests only — a stall test must
+    /// not wait out the production budget.
+    #[must_use]
+    pub fn with_egress_backpressure_budget(mut self, budget: std::time::Duration) -> Self {
+        self.egress_backpressure_budget = budget;
         self
     }
 
