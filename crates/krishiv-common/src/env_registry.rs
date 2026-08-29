@@ -1145,6 +1145,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Run-loop egress buffer cap in batches. The buffer drops its OLDEST batch on overflow, so this bounds how much computed output a slow drain consumer may lose before catching up; it is a per-JOB budget shared by co-located subtasks. 0 and unparseable values fall back to the default (a 0 cap would discard every batch).",
     ),
     rt(
+        "KRISHIV_RLOOP_EGRESS_BACKPRESSURE_MS",
+        FlagKind::UInt,
+        "30000",
+        "How long a run-loop stalls when its egress ring is full AND the ring is the job's ONLY delivery path (no durable sink). ADR §73: dropping there is silent data loss, so the loop waits for a consumer instead; the wait is bounded because an unbounded one wedges a job nobody drains, and the job faults at the deadline. Ignored when a durable sink is attached — that buffer's overflow is not loss and is still trimmed. 0 is MEANINGFUL and preserved: never wait, fault immediately. Only unparseable values fall back to the default.",
+    ),
+    rt(
         "KRISHIV_RLOOP_INPUT_BUFFER_CAP",
         FlagKind::UInt,
         "64",

@@ -6825,8 +6825,44 @@ production hang. Writing it at the end of a context window with no capacity to
 prove the guard is released on every path would be the same bet.
 
 **So the decision is recorded and the mechanism is left to a session that can
-test it.** The next step is precise: restructure the buffer block in
-`stage_rloop_outputs` so the entry guard is released before any wait, gate the
-wait on `!has_durable_sink`, and add two tests — one where a drain arrives
-inside the deadline and the loop proceeds losslessly, one where none does and
-the job faults instead of hanging or dropping.
+test it.** The dial ships now — `KRISHIV_RLOOP_EGRESS_BACKPRESSURE_MS`,
+registered and documented, with `0` preserved as a meaningful "fault
+immediately" rather than filtered out the way `rloop_egress_cap` filters a zero
+cap. Copying that filter would have silently turned an operator's explicit
+fail-fast into a 30-second stall; both halves are unit-tested.
+
+### The mechanism was built, measured against the suite, and reverted
+
+Written exactly as specified above — flag inside the guarded scope, wait after
+it — and the guard-release is compiler-proven rather than discipline-proven,
+because the block's closing brace precedes the wait. It compiled and
+`krishiv-common` went green. Then the workspace gate found what a `--include='*.rs'`
+grep for a fixture had not:
+
+**`the_egress_cap_drops_oldest_and_counts_every_lost_batch` already exists**, in
+`crates/krishiv-executor/src/sections/loop_conformance.rs.inc`. A `.rs.inc`
+file — the blind spot this register's own checklist warns about (*"a reachability
+grep must pass both `--include='*.rs'` and `--include='*.rs.inc'` … 441 hidden
+tests"*). I searched only `*.rs`, concluded no fixture existed, and reported the
+behavioural tests as unwritable. They were always writable.
+
+That test stages `cap + 6` batches against a SINKLESS job and asserts
+drop-oldest. Under the new mechanism it faulted instead — which is the change
+working, and is also a real contract break in a conformance test.
+
+**Reverted, for two reasons.** First, updating a conformance test to match new
+behaviour is the move §38 refused when it rejected candidate 2 for "fixing" tests
+by rewriting them around the thing that changed; doing it needs the sink-attached
+case kept, the sinkless case re-asserted as a fault, and a drains-in-time case
+added — a test SET, not an edited assertion. Second, the fault path cannot be
+tested at a sane speed yet: the suite forbids `unsafe`, so `std::env::set_var` is
+unavailable and every fault test would burn the full 30s budget (the failing run
+took 45s). It needs a runner-level override following the `eos_quiesce_deadline`
+precedent already in `ExecutorTaskInboxService` — *"test override for the quiesce
+deadline (stall tests must not wait 8s)"*.
+
+**The next session's step list, now concrete:** add
+`egress_backpressure_budget: Duration` to the runner defaulted from the dial with
+a test override; reinstate the flag-and-wait (the diff is in this commit's
+parent); rewrite the `.rs.inc` conformance test as three — sink-attached still
+trims, sinkless faults, sinkless-with-a-drain proceeds losslessly.

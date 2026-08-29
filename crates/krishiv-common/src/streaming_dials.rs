@@ -67,6 +67,38 @@ pub fn rloop_egress_cap() -> usize {
     parse_rloop_egress_cap(std::env::var(RLOOP_EGRESS_CAP_ENV).ok().as_deref())
 }
 
+/// Env var naming how long a run-loop stalls when its egress ring is full and
+/// the ring is the job's ONLY delivery path (no durable sink).
+pub const RLOOP_EGRESS_BACKPRESSURE_MS_ENV: &str = "KRISHIV_RLOOP_EGRESS_BACKPRESSURE_MS";
+
+/// Default egress backpressure budget, in milliseconds.
+///
+/// ADR §73: when the ring is the sole way out, dropping computed output is
+/// silent data loss, so the loop waits for a consumer instead. The wait is
+/// BOUNDED because an unbounded one wedges a job nobody ever drains — after
+/// the budget the job faults, which is visible and recoverable where a silent
+/// hole in a result set is neither. 30s is long enough to ride out a slow or
+/// briefly-disconnected consumer and short enough that an abandoned job is
+/// reported inside a scrape interval.
+pub const DEFAULT_RLOOP_EGRESS_BACKPRESSURE_MS: u64 = 30_000;
+
+/// Parse the egress backpressure budget. `0` is meaningful and preserved: it
+/// means "never wait, fault immediately", which is how an operator asks for
+/// fail-fast. Only garbage falls back to the default.
+pub fn parse_rloop_egress_backpressure_ms(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_RLOOP_EGRESS_BACKPRESSURE_MS)
+}
+
+/// The configured egress backpressure budget.
+pub fn rloop_egress_backpressure_ms() -> u64 {
+    parse_rloop_egress_backpressure_ms(
+        std::env::var(RLOOP_EGRESS_BACKPRESSURE_MS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Env var naming the per-buffer continuous INPUT cap (pending pushed
 /// batches per `{job}#{task}` key before pushes are refused with
 /// backpressure).
@@ -416,6 +448,35 @@ impl EgressLoss {
     #[must_use]
     pub const fn drop_lost_output(has_durable_sink: bool) -> bool {
         !has_durable_sink
+    }
+}
+
+#[cfg(test)]
+mod egress_backpressure_tests {
+    use super::*;
+
+    /// ADR §73. `0` is a MEANINGFUL budget — "never wait, fault immediately",
+    /// how an operator asks for fail-fast — so it must survive parsing. The
+    /// egress CAP dial filters `0` out because a zero cap is a job-killing
+    /// no-op nobody means; copying that filter here would silently convert an
+    /// explicit fail-fast request into a 30-second stall.
+    #[test]
+    fn a_zero_backpressure_budget_means_fail_fast_not_the_default() {
+        assert_eq!(parse_rloop_egress_backpressure_ms(Some("0")), 0);
+        assert_eq!(parse_rloop_egress_backpressure_ms(Some("500")), 500);
+    }
+
+    /// Garbage and absence fall back; an unparseable dial must not become 0
+    /// and turn every slow consumer into an instant job failure.
+    #[test]
+    fn garbage_falls_back_to_the_default_rather_than_fail_fast() {
+        for raw in [None, Some(""), Some("  "), Some("soon"), Some("-1")] {
+            assert_eq!(
+                parse_rloop_egress_backpressure_ms(raw),
+                DEFAULT_RLOOP_EGRESS_BACKPRESSURE_MS,
+                "raw={raw:?} must fall back, not fail fast"
+            );
+        }
     }
 }
 
