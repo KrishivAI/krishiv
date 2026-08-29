@@ -6866,3 +6866,75 @@ deadline (stall tests must not wait 8s)"*.
 a test override; reinstate the flag-and-wait (the diff is in this commit's
 parent); rewrite the `.rs.inc` conformance test as three — sink-attached still
 trims, sinkless faults, sinkless-with-a-drain proceeds losslessly.
+
+## §74 — IVM-AUD-SCHED-1: the failed-launch wedge, and a diagnosis that was wrong
+
+§34 recorded it, §38 built two candidate fixes and reverted both. The defect is
+now fixed by **one call to a function that already existed**, and the interesting
+part is why two sessions missed that.
+
+### The real mechanism
+
+`launch_assigned_task_assignments` does NOT move tasks out of `Assigned`. It
+leaves them `Assigned` and sets `launch_in_flight`, and the launchable predicate
+is `state == Assigned && !launch_in_flight` (`job/record.rs:478`). So a launch
+that fails after that point leaves the FLAG set. Registration is a deliberate
+no-op for an unchanged spec, so nothing ever clears it: the next attempt finds
+nothing launchable, reports *"produced no launchable assignments"*, and the job
+id is wedged permanently.
+
+`launch_run_loop_job` has **six** failure returns after the launch. It called
+`clear_launch_in_flight_for_job` on none of them — while `placement.rs.inc` had
+been asserting the same discipline for resolution failure all along:
+*"resolution failure must clear launch_in_flight so the task can retry"*. One
+pattern, several call sites, one that did not follow it. The same shape as §67's
+four wait loops, three correct and one not.
+
+### Why §38 built the wrong things
+
+§38 concluded this needed *"a coordinator primitive that returns a job's tasks
+to Assigned"*, and treated that as unbuilt work. Two errors:
+
+- **The tasks never left `Assigned`.** §38 read the symptom — "produced no
+  launchable assignments" — as evidence of a lost state transition, and never
+  checked the predicate that produces that message.
+- **The primitive already existed.** `clear_launch_in_flight_for_job`,
+  `task_assignment.rs:1182`. Nothing needed building.
+
+Both of §38's candidates were therefore unnecessary. Candidate 1 (track
+"actually launched") addressed a no-op that was not the blocker; candidate 2
+(roll the registration back) destroyed the job record and with it the only
+coverage of run-loop shape-building and convergence — an objection §38 raised
+correctly, against a fix it did not need.
+
+**This is a distinct failure mode from the ones this register usually collects.**
+Not a guard enforced by nothing, not a test that cannot fail: a plausible
+mechanism inferred from an error message and never checked against the code that
+emits it. It cost a session of building and reverting. The check that would have
+caught it takes one grep — read the predicate, not the message.
+
+### Scope, deliberately limited
+
+Clears go on the four failure paths that dispatched **nothing**: launch error,
+empty assignments, resolution error, in-process-endpoint rejection, plus the
+wholesale delivery failure. The two paths AFTER responses come back — duplicate
+task identity, and `accepted != target_count` — deliberately do **not** clear.
+Some subtasks may already be live there, and handing every task back would let a
+retry launch a second copy: a wedged job id traded for duplicated compute and
+duplicated output, which is worse. Both errors already tell the operator to
+re-register under a fresh id. Recorded as a decision, at the site.
+
+### Test
+
+`a_failed_run_loop_launch_leaves_the_job_relaunchable` registers against
+`make_coordinator_with_executor`, whose only executor has an in-process task
+endpoint — so the launch *cannot* succeed, which is exactly the shape that
+wedged the id. It then asks the coordinator for launchable assignments, which is
+the retry the wedge made impossible. Proven RED against removing the clear on
+the in-process path: `left: 0, right: 2`.
+
+No rollback, so the job record survives and
+`run_loop_registration_builds_parallel_subtasks` /
+`run_loop_reregistration_is_convergent` keep their coverage — the thing §38
+refused to give up. The stale in-code note at the registration site is corrected
+rather than left describing work that is no longer needed.

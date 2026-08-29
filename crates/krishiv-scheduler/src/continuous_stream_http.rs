@@ -2086,12 +2086,19 @@ pub async fn register_continuous_task_with_options(
     // they read, so it trades a rare recorded wedge for permanently losing
     // that coverage.
     //
-    // What this actually needs is one of: a coordinator primitive that returns
-    // a job's tasks to Assigned so a retry can re-dispatch them (candidate 1
-    // then works and the record survives), or a test fixture with a
-    // dispatchable executor so a launch can succeed and the coverage stops
-    // depending on the failure path. Both are real work; neither is a patch to
-    // this function.
+    // RESOLVED (IVM-AUD-SCHED-1), and §38's diagnosis was half wrong. It called
+    // for "a coordinator primitive that returns a job's tasks to Assigned".
+    // That primitive already existed — `clear_launch_in_flight_for_job` — and
+    // the tasks never left Assigned in the first place: a failed launch leaves
+    // them `Assigned` with `launch_in_flight` SET, and the launchable filter is
+    // `Assigned && !launch_in_flight`. Nothing needed building; the launch path
+    // in `launch_run_loop_job` simply never called it, while
+    // `placement.rs.inc` had been asserting the same discipline for resolution
+    // failure all along. The clears are on every failure path that dispatched
+    // NOTHING; the two post-response paths deliberately do not clear, because
+    // some subtasks may be live and relaunching them would duplicate output.
+    // Neither candidate from §38 was needed, and the record survives, so the
+    // two tests below keep their coverage.
     if mode == ContinuousJobMode::RunLoop && freshly_submitted {
         launch_run_loop_job(coordinator, &job_id_typed, &options.sources).await?;
     }
@@ -2257,17 +2264,44 @@ async fn launch_run_loop_job(
             .job_task_input_partitions
             .insert(job_id.clone(), per_task);
 
-        let assignments = coord
-            .launch_assigned_task_assignments(job_id)
-            .map_err(ContinuousStreamError::Scheduler)?;
+        // §38 / IVM-AUD-SCHED-1: every failure path from here to dispatch must
+        // hand the tasks back, or the job id is wedged for good.
+        //
+        // `launch_assigned_task_assignments` leaves each task `Assigned` and
+        // sets `launch_in_flight`; the launchable filter is
+        // `state == Assigned && !launch_in_flight`. So a failed launch does not
+        // move tasks out of Assigned — it leaves the FLAG set, and the next
+        // attempt finds nothing launchable and reports "produced no launchable
+        // assignments". Registration is a deliberate no-op for an unchanged
+        // spec, so that state is permanent: the job can never launch again.
+        //
+        // §38 concluded this needed "a coordinator primitive returning a job's
+        // tasks to Assigned". That primitive already exists —
+        // `clear_launch_in_flight_for_job` — and the tasks never left Assigned.
+        // This path simply never called it. `placement.rs.inc` already asserts
+        // the same discipline for resolution failure ("resolution failure must
+        // clear launch_in_flight so the task can retry"); the run-loop
+        // registration path was the copy that did not.
+        let assignments = match coord.launch_assigned_task_assignments(job_id) {
+            Ok(assignments) => assignments,
+            Err(error) => {
+                coord.clear_launch_in_flight_for_job(job_id);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
         if assignments.is_empty() {
+            coord.clear_launch_in_flight_for_job(job_id);
             return Err(ContinuousStreamError::Unavailable(format!(
                 "run-loop job {job_id} produced no launchable assignments"
             )));
         }
-        let targets = coord
-            .resolve_assignment_targets(assignments)
-            .map_err(ContinuousStreamError::Scheduler)?;
+        let targets = match coord.resolve_assignment_targets(assignments) {
+            Ok(targets) => targets,
+            Err(error) => {
+                coord.clear_launch_in_flight_for_job(job_id);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
         // An in-process endpoint cannot host a run-loop subtask: the push and
         // drain paths both fail closed on one, so a job launched here would be
         // permanently unreachable. Reject at launch, exactly as the cycle-push
@@ -2276,6 +2310,7 @@ async fn launch_run_loop_job(
             .iter()
             .any(|(endpoint, _)| crate::is_in_process_task_endpoint(endpoint))
         {
+            coord.clear_launch_in_flight_for_job(job_id);
             return Err(ContinuousStreamError::Unavailable(format!(
                 "run-loop job {job_id} was assigned an in-process executor endpoint, \
                  which cannot receive continuous push or serve drain; register a \
@@ -2286,9 +2321,19 @@ async fn launch_run_loop_job(
         (targets, coord.executor_channels.clone(), count)
     };
 
-    let responses = Coordinator::deliver_assignment_targets_with_channels(channels, targets)
-        .await
-        .map_err(ContinuousStreamError::Scheduler)?;
+    let responses =
+        match Coordinator::deliver_assignment_targets_with_channels(channels, targets).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                // Nothing reached an executor, so handing every task back cannot
+                // double-launch anything.
+                coordinator
+                    .write()
+                    .await
+                    .clear_launch_in_flight_for_job(job_id);
+                return Err(ContinuousStreamError::Scheduler(error));
+            }
+        };
     // A `Duplicate` disposition on a run-loop LAUNCH is never idempotence: a
     // fresh incarnation's attempts start at 1, so the executor's dedupe entry
     // can only be a leftover identity from a prior incarnation whose
@@ -2298,6 +2343,12 @@ async fn launch_run_loop_job(
     // job stalls or fails. (Batch retries redeliver the SAME attempt, which is
     // why the shared accounting in `apply_assignment_dispatch_responses`
     // counts Duplicate as accepted; that reasoning does not transfer here.)
+    // NOT cleared from here down, deliberately. Both remaining failure paths
+    // run AFTER responses came back, so some subtasks may have been accepted
+    // and be running. Handing every task back would let a retry launch a
+    // second copy of an already-live subtask — trading a wedged job id for
+    // duplicated compute and duplicated output, which is worse. Both errors
+    // already tell the operator to re-register under a fresh id.
     if let Some(task_id) = duplicate_run_loop_launch(&responses) {
         return Err(ContinuousStreamError::Unavailable(format!(
             "run-loop job {job_id}: the executor already holds task identity {task_id} for \
@@ -3243,6 +3294,53 @@ mod tests {
     /// Phase 55: run-loop registration produces N `stream:rloop:` subtasks
     /// whose fragment identity round-trips through the shape decoder, and the
     /// delivery metadata labels the model honestly.
+    #[tokio::test]
+    async fn a_failed_run_loop_launch_leaves_the_job_relaunchable() {
+        // §38 / IVM-AUD-SCHED-1. `make_coordinator_with_executor` registers
+        // only an in-process task endpoint, so the launch below CANNOT succeed
+        // — which is exactly the shape that wedged the job id.
+        //
+        // `launch_assigned_task_assignments` leaves tasks `Assigned` and sets
+        // `launch_in_flight`, and the launchable filter is
+        // `Assigned && !launch_in_flight`. Before this fix the failing launch
+        // left that flag set forever: registration is a deliberate no-op for an
+        // unchanged spec, so nothing ever cleared it and the job could never
+        // launch again on any retry.
+        //
+        // Revert-proof: drop the `clear_launch_in_flight_for_job` call on the
+        // in-process rejection path and the second launch below returns empty.
+        let coordinator = make_coordinator_with_executor("rloop-wedge").await;
+        let options = ContinuousRegistrationOptions {
+            parallelism: Some(2),
+            mode: Some(String::from("run-loop")),
+            ..Default::default()
+        };
+        register_continuous_stream_with_options(
+            &coordinator,
+            "rloop-wedge-job",
+            &tumbling_spec(),
+            &options,
+        )
+        .await
+        .expect_err("an in-process endpoint cannot host a run-loop subtask");
+
+        // The tasks must be handed back, not stranded mid-launch. Asking the
+        // coordinator for launchable assignments IS the retry the wedge used to
+        // make impossible.
+        let job_id = krishiv_proto::JobId::try_new("rloop-wedge-job").unwrap();
+        let relaunchable = coordinator
+            .write()
+            .await
+            .launch_assigned_task_assignments(&job_id)
+            .expect("relaunch must not error");
+        assert_eq!(
+            relaunchable.len(),
+            2,
+            "both subtasks must be launchable again after a failed launch; \
+             0 means launch_in_flight was never cleared and the job id is wedged"
+        );
+    }
+
     #[tokio::test]
     async fn run_loop_registration_builds_parallel_subtasks() {
         let coordinator = make_coordinator_with_executor("rloop-reg").await;
