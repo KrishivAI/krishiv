@@ -6482,3 +6482,93 @@ independent unit test: the loop is a spawned task inside `start()`. It is the
 identical shape already proven by DIST-1's test and is covered end-to-end by the
 cluster measurement above, but it is not pinned by a unit test and is recorded
 here rather than claimed as tested.
+
+## §69 — IVM-AUD-PERF-6: the probe that rebuilt the world to answer "is this key here?"
+
+§66 fixed the SEMI-3 ΔA branch and closed by naming what it had *not* fixed:
+"the ΔB branch and `probe_by_keys` being O(state) even when called once",
+recording a hash index on `Trace` as the next step. This is that step.
+
+**Reproduced first** (HEAD `29bdeca`, TPC-H SF1, delta pinned 5k, 3 ticks,
+machine idle):
+
+| seed | incr tick | recompute | ratio |
+|---|---:|---:|---:|
+| 200 k | 228.04 ms | 77.99 ms | 0.34x |
+| 400 k | 275.33 ms | 67.77 ms | 0.25x |
+| 800 k | 1058.88 ms | 107.82 ms | 0.10x |
+
+4x the state, 4.6x the tick, with the delta held fixed — the defect signature
+`ivm_corpus_tick` documents.
+
+**Attribution by measurement, not by reading.** `perf_event_paranoid` is 4 on
+this box, so user-level `perf` is unavailable and a temporary counter was
+compiled into `probe_by_keys` instead (nanos, calls, and summed `total_rows`),
+printed per arm by the bench and removed before commit.
+
+| seed | probe total | calls | rows/call | us/call | median tick |
+|---|---:|---:|---:|---:|---:|
+| 200 k | 1347.9 ms | 103,043 | 36 | 13.1 | 243.16 ms |
+| 800 k | 9550.5 ms | 390,303 | 93 | 24.5 | 1591.36 ms |
+
+Probe time *is* the tick. But the shape corrected the hypothesis that came out
+of reading. At ~93 rows per call, row-scanning can account for at most ~5 us of
+the 24.5 us. **The dominant term was per-call fixed overhead**: the probe looped
+over every batch of every level and, for each, built a `data_batch()` (a
+validating `RecordBatch::try_new`), allocated a full-length boolean mask, and
+ran the filter kernel — whether or not that batch held a single matching key.
+Times 390k calls. "`probe_by_keys` is O(state)" was half the story; it is also
+O(batches) times a large constant, and that half is what the money was in.
+
+**The fix.** Each trace batch carries a lazily-built `KeyIndex`: parallel
+`hashes: Vec<u64>` / `rows: Vec<u32>` sorted by key hash, so a probe binary-
+searches to candidates. A batch with no candidate now costs two binary searches
+and nothing else — no `data_batch()`, no mask, no kernel. Built on first probe,
+so a trace that is only snapshotted or checkpointed never pays for one.
+
+Deliberately **not** an `AHashMap<KeyTuple, Vec<u32>>`, which would give O(1)
+lookup instead of O(log n). That map costs ~60 bytes and two allocations per
+distinct key; the parallel vectors cost 12 bytes per row flat. Task #166
+measures ~1.2 KB resident per seeded row and names memory as the barrier that
+caps every large run, so buying a log factor with per-key allocation would trade
+one defect for another. Recorded as a decision, not an oversight.
+
+Candidates are still confirmed against the real key set before they are
+returned, so a hash collision cannot become a false match.
+
+**Result** (same harness, both arms instrumented so the comparison is fair):
+
+| seed | before | after |
+|---|---:|---:|
+| 200 k | 243.16 ms | 187.70 ms |
+| 400 k | 275.33 ms | 237.97 ms |
+| 800 k | **1591.36 ms** | **386.94 ms** (4.1x) |
+
+Growth across 4x state fell from **6.5x to 2.06x**.
+
+**Tests, and why they had to be counter-based.** Under a revert that makes the
+probe treat every row as a candidate — exactly the pre-fix mask scan — *all five
+pre-existing correctness tests stay green*. A round-trip assertion cannot tell
+an index from a full scan. So the claim is pinned by a `#[cfg(test)]` counter of
+per-row key extractions performed inside a probe:
+`a_probe_does_not_scan_the_whole_trace` builds a 50k-row trace, probes twice
+(the first probe builds the index; the second is the steady state) and asserts
+the second touched under 100 rows. Proven RED: "a one-key probe against 50000
+rows touched 50000 of them". `the_index_survives_a_spine_merge` makes the same
+assertion across a `MERGE_THRESHOLD` cascade.
+
+`gc_invalidates_the_index_so_probes_do_not_read_stale_rows` covers the one place
+this fix could produce a silent wrong answer: `gc_below_watermark` renumbers a
+batch's rows in place, so an index built beforehand maps key hashes to positions
+that now hold different rows. Proven RED against the removed invalidation line,
+and it fails loudly — "Trying to access an element at index 3 from a
+PrimitiveArray of length 1" — rather than returning the wrong row quietly.
+
+**What is NOT claimed.** q21 still loses to recompute at 800k (0.27x, up from
+0.10x), and 2.06x for 4x state is still superlinear. The call count is
+**untouched** — 390,280 probes per run before and after — because the index makes
+each probe cheap without making the caller ask fewer times. The ΔB branch
+(`join.rs:715`/`:724`) still issues two probes per distinct right-delta key,
+which is where those calls come from, and batching it the way §66 batched ΔA is
+the named next step. This entry fixes the per-probe cost and leaves the
+per-probe *count* measured and unfixed rather than declaring the query healthy.

@@ -1181,3 +1181,48 @@ wait loop's poll 100ms -> 10ms left the floor at 497.73ms, which proved the cost
 was upstream of the waiter and retired the whole family of wait-loop
 explanations at once. Two prior explanations for this floor were measured and
 refuted (§65 PERF-4, §67 DIST-1) before this one was measured and confirmed.
+
+### 2026-08-29 — TPC-H q21: the probe was the tick (IVM-AUD-PERF-6)
+
+`cargo bench -p krishiv-bench --bench ivm_corpus_tick`,
+`KRISHIV_BENCH_CORPUS_ONLY=q21`, TPC-H SF1 slices, delta pinned at 5,000/source,
+median of 3 timed ticks, single node, machine idle. Commit `29bdeca` -> HEAD.
+
+Scaling the seed with the delta FIXED is the axis that separates an O(delta)
+tick from one carrying a state-proportional term. q21 failed it:
+
+| seed | before | after | recompute | ratio after |
+|---|---:|---:|---:|---:|
+| 200 k | 243.16 ms | **187.70 ms** | 68.65 ms | 0.37x |
+| 400 k | 275.33 ms | **237.97 ms** | 63.29 ms | 0.27x |
+| 800 k | 1591.36 ms | **386.94 ms** | 105.40 ms | 0.27x |
+
+**4.1x at 800k, and growth across 4x state fell from 6.5x to 2.06x.** Both
+columns are measured with the attribution counter compiled in, so the before/
+after comparison is like-for-like; the counter was removed before commit.
+
+Cause was `Trace::probe_by_keys`. A counter compiled into it (user-level `perf`
+is unavailable here — `perf_event_paranoid` is 4) showed 9,550 ms of probe
+across **390,303 calls** at seed 800k against a 1,591 ms median tick. At ~93
+rows per call, scanning rows was at most ~5 us of the 24.5 us per call: the real
+cost was per-call fixed overhead, because the probe walked every batch of every
+Spine level and built a validating `data_batch()`, a full-length boolean mask
+and a filter kernel for each one, matches or no matches. Each batch now carries
+a lazily-built key index (sorted `Vec<u64>` hashes + `Vec<u32>` rows, 12 bytes
+per row), so a batch with no candidate costs two binary searches. Register §69.
+
+**What this does not fix.** q21 still loses to recompute (0.27x at 800k, up from
+0.10x) and 2.06x for 4x state is still superlinear. The probe *count* is
+unchanged — 390,280 calls after vs 390,303 before — because the index makes each
+probe cheap without making the caller ask fewer times. The semi/anti ΔB branch
+issues two probes per distinct right-delta key; batching it as §66 batched ΔA is
+the named next step and is not claimed here.
+
+**Scale ceiling, same session.** A separate ladder on `q15_bidding_statistics`
+under `systemd-run --user --scope -p MemoryMax=14G -p MemorySwapMax=0` puts the
+single-node limit at **~10M seed rows** on this 61 GB box: 10M completed at
+12.17 GB peak RSS (incr 4126.08 ms vs recompute 3309.27 ms = 0.80x), while 25M
+and 100M were OOM-killed at the 14 GB cap. That is ~1.2 KB resident per seeded
+row against a 50-100 byte source row — a 10-20x blowup, extrapolating to ~120 GB
+at 100M and ~1.2 TB at 1B. **A 1B-row single-node run is out by ~60x on memory**,
+and the per-row cost, not the hardware, is the barrier. Task #166.
