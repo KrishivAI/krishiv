@@ -6761,3 +6761,72 @@ not survivable, and the three-way contract decision §35 declined to make
 unilaterally is still open and still the user's. A consumer should compare
 successive reads — the counter is cumulative and monotonic, so a non-zero value
 is not by itself new loss.
+
+## §73 — ADR: the egress-overflow contract. Decision made, mechanism not built.
+
+§35 refused to choose between backpressure, fail-closed and persist because
+each is a contract change. The choice is now made. **The implementation is
+NOT in this entry**, and the last section says why in detail rather than
+leaving it as a to-do.
+
+### The decision
+
+**There is no single right policy, because the ring is two different things
+depending on the job.** The codebase already encodes the distinction —
+`EgressLoss::drop_lost_output(has_durable_sink) == !has_durable_sink` — it just
+does not yet act on it. Completing that is the architecture:
+
+| the ring is | today | decided |
+|---|---|---|
+| a staging copy beside a durable sink | drop oldest, debug-log, not counted | **unchanged — dropping is correct** |
+| the job's ONLY delivery path | drop oldest, warn, counted (§72) | **bounded backpressure, then fault** |
+
+**Why dropping stays right for the sink case.** The buffer is filled
+unconditionally, before sink dispatch, so a job writing to Iceberg or Kafka
+fills it whether or not anyone drains. Its overflow is not loss — the rows are
+in the sink. Blocking the loop on a buffer nobody is obliged to drain would
+wedge a healthy job, which is exactly the objection §35 raised against
+backpressure. That objection is correct **for this case only**, and generalising
+it to both cases is what left silent loss in place for the other.
+
+**Why backpressure is right when the ring is the only way out.** Computing
+results that are then discarded is worse than not computing them: it burns CPU
+to manufacture a wrong answer. A stalled loop is visible, bounded and
+recoverable; a silent hole in a result set is none of those.
+
+**Bounded, then fault** answers the wedge objection without reintroducing loss.
+Wait up to a deadline for a drain; if none comes, fail the job with an explicit
+"egress full, no consumer" fault. A sinkless job nobody drains is abandoned, and
+saying so is better than either stalling forever (an executor slot held by a job
+nobody wants) or discarding silently (the current behaviour).
+
+**Rejected: persist.** §34 already rejected it for DUR-5 on store-size grounds —
+a single un-chunked etcd value against a ~1.5 MiB ceiling while the drain budget
+is 48 MiB. Nothing has changed.
+
+**Rejected: fail-closed for both cases.** It turns a documented best-effort API
+into a hard error for jobs whose output is provably complete. That is the false
+alarm §72's `else` branch exists to prevent, promoted to a job failure.
+
+### Why the mechanism is not in this commit
+
+`stage_rloop_outputs` holds a **DashMap entry guard** on `continuous_outputs`
+for the whole buffer block (`run_loop.rs:1336`), and `drain_continuous_output`
+takes `get_mut` on the same key. **Waiting for a drain while holding that guard
+deadlocks against the only operation that can relieve the wait.** So
+backpressure is not a few lines at the drop site: it needs the guard dropped
+before the wait, a re-check after re-acquiring, a deadline, a fault path, and
+tests for both the drains-in-time and the nobody-ever-drains cases.
+
+That is a load-bearing concurrency change to a live streaming data path. This
+register's own history says what happens when one is made without room to verify
+it — §67's four copies of a wait loop, three correct and one not, cost a 300s
+production hang. Writing it at the end of a context window with no capacity to
+prove the guard is released on every path would be the same bet.
+
+**So the decision is recorded and the mechanism is left to a session that can
+test it.** The next step is precise: restructure the buffer block in
+`stage_rloop_outputs` so the entry guard is released before any wait, gate the
+wait on `!has_durable_sink`, and add two tests — one where a drain arrives
+inside the deadline and the loop proceeds losslessly, one where none does and
+the job faults instead of hanging or dropping.
