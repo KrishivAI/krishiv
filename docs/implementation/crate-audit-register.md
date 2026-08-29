@@ -6938,3 +6938,58 @@ No rollback, so the job record survives and
 `run_loop_reregistration_is_convergent` keep their coverage — the thing §38
 refused to give up. The stale in-code note at the registration site is corrected
 rather than left describing work that is no longer needed.
+
+## §75 — IVM-AUD-MEM-1: the ~1.2 KB row, attributed
+
+Task #166 recorded the scale ceiling as measured but unexplained: 10M seeded
+rows against 12.17 GB resident is **~1218 bytes per row** for a NEXMark bid row
+of 50-100 bytes, and that 10-20x blowup — not the hardware — is what caps every
+large run (~120 GB at 100M, ~1.2 TB at 1B). It listed three suspects and said,
+in capitals, do not fix before attributing.
+
+Attributed. `crates/krishiv-delta/tests/memory_attribution.rs` builds each
+suspect ALONE at 2M rows and reads RSS deltas — RSS because that is what the
+OOM killer counts and what the ladder measured; a `#[global_allocator]` shim
+would report requested bytes and miss the slack and fragmentation that actually
+filled the 14 GB cap. `#[ignore]`d, so it costs CI nothing.
+
+| structure | resident | per row |
+|---|---:|---:|
+| arrow source batch (the payload) | 99.5 MB | **52.2 B** |
+| + `Trace` (indexed, probed) | 0.9 MB | 0.5 B |
+| + **`SnapshotIndex` counts map** | **1053.6 MB** | **552.4 B** |
+| + `SnapshotIndex::batch()` cache | 0.1 MB | 0.0 B |
+| TOTAL | 1154.1 MB | 605.1 B |
+
+**#166's prime suspect is confirmed and the other two are cleared.**
+`SnapshotIndex` is **91% of the measured total** — 552 bytes to hold a 52-byte
+row. Its `counts: AHashMap<Vec<u8>, (i64, u64)>` is one separate heap `Vec` per
+distinct row, holding the Arrow row-format encoding of that row duplicated out
+of the batch: a 24-byte `Vec` header, an individually-malloc'd key buffer with
+its own allocator header and size-class rounding, a 16-byte value, and hash-map
+slack on top. Arrow's row format pads variable-length columns into 32-byte
+blocks, so a short string costs a full block.
+
+**The Trace is innocent**, which refutes the second suspect outright: it clones
+`DeltaBatch`es whose Arrow buffers are `Arc`-shared, so accumulating state adds
+essentially nothing on top of the payload. The `batch()` materialization cache
+is likewise not a second copy at rest.
+
+**Two honest limits on these numbers.**
+- The 0.5 B/row for `Trace` is *too good*, and the likely cause is RSS reuse:
+  the PERF-6 key index is ~12 B/row by construction (`Vec<u64>` + `Vec<u32>`),
+  and building it allocates and frees a larger temporary, so the retained index
+  fits in heap already mapped. Read it as "small", not as "free".
+- 605 B/row here versus the ladder's 1218 B/row is not a contradiction: this
+  harness measures three structures in isolation, while the ladder ran a whole
+  flow — retained source chunks, per-view snapshots, DataFusion execution. The
+  attribution is the SHARE, and the share is unambiguous.
+
+**Not fixed, deliberately** — this entry is the attribution step #166 demanded
+before any change. The direction it points is clear enough to state: the counts
+map should stop storing an owned per-row `Vec<u8>`. Options worth measuring are
+a single arena of encoded rows with `(offset, len)` keys, or hashing the encoded
+row to a `u64` and keeping the bytes only in the batch. Both are real designs
+with correctness surface — duplicate rows must still collapse, and multiplicity
+must survive — and picking one belongs to the session that measures them, not
+to this one.
