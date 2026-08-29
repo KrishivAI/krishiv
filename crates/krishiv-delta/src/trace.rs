@@ -36,14 +36,45 @@ const NUM_LEVELS: usize = 8;
 /// When a level reaches this many batches, they are merged and promoted.
 const MERGE_THRESHOLD: usize = 4;
 
-/// Counts per-row key extractions performed inside `probe_by_keys` (NOT those
-/// performed while building an index). The asymptotic claim of
-/// IVM-AUD-PERF-6 — a probe costs O(matches), not O(the trace) — is otherwise
-/// untestable from a unit test: a timing assertion would be flaky and a
-/// correctness assertion passes just as well against the O(state) scan it
-/// replaced.
 #[cfg(test)]
-static PROBE_KEY_EXTRACTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    /// Counts per-row key extractions performed inside `probe_by_keys` (NOT
+    /// those performed while building an index). The asymptotic claim of
+    /// IVM-AUD-PERF-6 — a probe costs O(matches), not O(the trace) — is
+    /// otherwise untestable from a unit test: a timing assertion would be flaky
+    /// and a correctness assertion passes just as well against the O(state)
+    /// scan it replaced.
+    pub(crate) static PROBE_KEY_EXTRACTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Counts `probe_by_keys` CALLS. IVM-AUD-PERF-7's claim is about how often
+    /// a caller asks, not how much each ask costs, so it needs a different
+    /// counter from `PROBE_KEY_EXTRACTS` — the key index made each probe cheap
+    /// while leaving the call count untouched at 390,280 per q21 run.
+    pub(crate) static PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Reset and read the per-thread probe counters. `cargo test` runs tests on
+/// separate threads, so a thread-local keeps one test's probes out of another
+/// test's budget; a process-global static made these assertions depend on which
+/// tests happened to run alongside them.
+#[cfg(test)]
+pub(crate) fn reset_probe_counters() {
+    PROBE_CALLS.with(|c| c.set(0));
+    PROBE_KEY_EXTRACTS.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn probe_calls() -> usize {
+    PROBE_CALLS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) fn probe_key_extracts() -> usize {
+    PROBE_KEY_EXTRACTS.with(std::cell::Cell::get)
+}
 
 /// Fixed seeds so index-build and probe hash a key identically. `ahash`'s
 /// default `RandomState` is seeded per instance, which would make the two
@@ -285,6 +316,8 @@ impl Trace {
     /// The output schema is the Trace's data schema + `_weight`.
     /// If a Trace row has accumulated weight 0, it is excluded (dropped zeros).
     pub fn probe_by_keys(&self, keys: &RecordBatch) -> DeltaResult<DeltaBatch> {
+        #[cfg(test)]
+        PROBE_CALLS.with(|c| c.set(c.get() + 1));
         if keys.num_rows() == 0 {
             return DeltaBatch::empty(self.data_schema.clone());
         }
@@ -330,8 +363,7 @@ impl Trace {
                 let data = slot.batch.data_batch();
                 let mut matched: Vec<u32> = Vec::with_capacity(candidates.len());
                 #[cfg(test)]
-                PROBE_KEY_EXTRACTS
-                    .fetch_add(candidates.len(), std::sync::atomic::Ordering::Relaxed);
+                PROBE_KEY_EXTRACTS.with(|c| c.set(c.get() + candidates.len()));
                 for &row in &candidates {
                     let key = extract_key(&data, &self.key_col_indices, row as usize)?;
                     if key_set.contains(&key) {
@@ -703,7 +735,6 @@ mod tests {
     /// this measures the SECOND probe, which is the steady state.
     #[test]
     fn a_probe_does_not_scan_the_whole_trace() {
-        use std::sync::atomic::Ordering::Relaxed;
         const ROWS: i32 = 50_000;
         let mut trace = Trace::new(id_schema(), &["id"]).unwrap();
         let all: Vec<i32> = (0..ROWS).collect();
@@ -713,9 +744,9 @@ mod tests {
         // life, so it is deliberately not the thing under test.
         let _ = trace.probe_by_keys(&id_batch(&[7])).unwrap();
 
-        PROBE_KEY_EXTRACTS.store(0, Relaxed);
+        reset_probe_counters();
         let hit = trace.probe_by_keys(&id_batch(&[7])).unwrap();
-        let touched = PROBE_KEY_EXTRACTS.load(Relaxed);
+        let touched = probe_key_extracts();
 
         assert_eq!(hit.num_rows(), 1, "the probe must still find its row");
         assert!(
@@ -730,7 +761,6 @@ mod tests {
     /// index or the probe silently reverts to scanning.
     #[test]
     fn the_index_survives_a_spine_merge() {
-        use std::sync::atomic::Ordering::Relaxed;
         let mut trace = Trace::new(id_schema(), &["id"]).unwrap();
         for chunk in 0..(MERGE_THRESHOLD + 1) {
             let base = (chunk as i32) * 10_000;
@@ -739,9 +769,9 @@ mod tests {
         }
         let _ = trace.probe_by_keys(&id_batch(&[25_000])).unwrap();
 
-        PROBE_KEY_EXTRACTS.store(0, Relaxed);
+        reset_probe_counters();
         let hit = trace.probe_by_keys(&id_batch(&[25_000])).unwrap();
-        let touched = PROBE_KEY_EXTRACTS.load(Relaxed);
+        let touched = probe_key_extracts();
 
         assert_eq!(
             hit.num_rows(),

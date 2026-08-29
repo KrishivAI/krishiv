@@ -601,7 +601,34 @@ impl IncrementalJoinOp {
         }
         Ok(total)
     }
+}
 
+/// Partition probe results into per-key groups.
+///
+/// Shared by both the ΔA and ΔB branches of the residual semi/anti path so the
+/// two cannot drift into grouping differently — they must agree, because ΔA's
+/// post-tick membership and ΔB's pre-tick membership are two readings of the
+/// same right state.
+fn group_matches_by_key(
+    matches: &DeltaBatch,
+    key_cols: &[String],
+) -> DeltaResult<AHashMap<Vec<Option<String>>, DeltaBatch>> {
+    let data = matches.data_batch();
+    let ki = col_indices(&data, key_cols)?;
+    let mut rows_by_key: AHashMap<Vec<Option<String>>, Vec<usize>> = AHashMap::new();
+    for ri in 0..data.num_rows() {
+        rows_by_key
+            .entry(extract_key(&data, ri, &ki)?)
+            .or_default()
+            .push(ri);
+    }
+    rows_by_key
+        .into_iter()
+        .map(|(k, rows)| select_rows(matches, &rows).map(|b| (k, b)))
+        .collect()
+}
+
+impl IncrementalJoinOp {
     /// SEMI-3: semi/anti with a non-equi membership condition. Membership is
     /// per LEFT ROW — `∃ right: key match AND residual(left, right)` — so
     /// the per-key crossing shortcut does not apply; each affected left row
@@ -670,19 +697,7 @@ impl IncrementalJoinOp {
                 let probe =
                     keys_to_probe_batch(&distinct, &self.right_key_cols, &self.right_schema)?;
                 let all = self.right_trace.probe_by_keys(&probe)?;
-                let ad = all.data_batch();
-                let arki = col_indices(&ad, &self.right_key_cols)?;
-                let mut rows_by_key: AHashMap<Vec<Option<String>>, Vec<usize>> = AHashMap::new();
-                for ri in 0..ad.num_rows() {
-                    rows_by_key
-                        .entry(extract_key(&ad, ri, &arki)?)
-                        .or_default()
-                        .push(ri);
-                }
-                rows_by_key
-                    .into_iter()
-                    .map(|(k, rows)| select_rows(&all, &rows).map(|b| (k, b)))
-                    .collect::<DeltaResult<AHashMap<_, _>>>()?
+                group_matches_by_key(&all, &self.right_key_cols)?
             };
             let empty_right = DeltaBatch::empty(self.right_schema.clone())?;
 
@@ -706,29 +721,68 @@ impl IncrementalJoinOp {
 
         // ΔB: per affected key, each PRE-insert left-trace row's membership
         // may flip between the pre-tick and post-tick right states.
-        for key in dr_by_key.keys() {
-            let probe = keys_to_probe_batch(
-                std::slice::from_ref(key),
-                &self.left_key_cols,
-                &self.left_schema,
-            )?;
-            let left_matches = self.left_trace.probe_by_keys(&probe)?;
+        //
+        // IVM-AUD-PERF-7: probe each trace ONCE for every affected key, not
+        // twice per key. This is the transformation §66 applied to ΔA, applied
+        // to the branch that entry deliberately left alone. `probe_by_keys` is
+        // O(the batches it must consider) even with the PERF-6 key index, so
+        // 1,250 distinct right-delta keys meant 2,500 probes per tick where two
+        // suffice. Measured on TPC-H q21 at seed 800k, PERF-6 alone left the
+        // call count untouched at 390,280 per run — the index made each probe
+        // cheap without making this loop ask fewer times.
+        //
+        // Probing {k1,k2} and partitioning the result by key gives the same
+        // per-key groups as probing k1 and k2 separately: `probe_by_keys`
+        // filters by key-set membership and preserves trace order, so each
+        // group is row-for-row what the per-key probe returned.
+        let affected: Vec<Vec<Option<String>>> = dr_by_key.keys().cloned().collect();
+        let (left_by_key, right_by_key) = if affected.is_empty() {
+            (AHashMap::new(), AHashMap::new())
+        } else {
+            let lprobe = keys_to_probe_batch(&affected, &self.left_key_cols, &self.left_schema)?;
+            let all_left = self.left_trace.probe_by_keys(&lprobe)?;
+            let left_by_key = group_matches_by_key(&all_left, &self.left_key_cols)?;
+            // Only a key with left-trace rows can produce a flip. The per-key
+            // loop got this narrowing for free — `if left_matches.is_empty()
+            // { continue }` ran BEFORE it touched the right trace — and a naive
+            // batching loses it, probing and grouping right-side rows for keys
+            // that are about to be skipped. Measured: without this, q21 at seed
+            // 400k ran at 0.83x of the per-key version even while 800k gained.
+            let live: Vec<Vec<Option<String>>> = affected
+                .iter()
+                .filter(|k| left_by_key.contains_key(*k))
+                .cloned()
+                .collect();
+            let right_by_key = if live.is_empty() {
+                AHashMap::new()
+            } else {
+                let rprobe = keys_to_probe_batch(&live, &self.right_key_cols, &self.right_schema)?;
+                let all_right = self.right_trace.probe_by_keys(&rprobe)?;
+                group_matches_by_key(&all_right, &self.right_key_cols)?
+            };
+            (left_by_key, right_by_key)
+        };
+        // A key with no rows in the right TRACE must still evaluate its
+        // residual against an EMPTY right side. Skipping it would make an
+        // anti-join's `pre_w == 0 => member` silently never fire, so a row that
+        // should be retracted stays in the relation forever.
+        let empty_right_trace = DeltaBatch::empty(self.right_schema.clone())?;
+
+        for key in &affected {
+            let Some(left_matches) = left_by_key.get(key) else {
+                continue;
+            };
             if left_matches.is_empty() {
                 continue;
             }
-            let rprobe = keys_to_probe_batch(
-                std::slice::from_ref(key),
-                &self.right_key_cols,
-                &self.right_schema,
-            )?;
-            let trace_rights = self.right_trace.probe_by_keys(&rprobe)?;
+            let trace_rights = right_by_key.get(key).unwrap_or(&empty_right_trace);
             let db = dr_rows_for(key)?;
             let lm = left_matches.data_batch();
             let lmw = left_matches.weights();
             let mut flip_idx: Vec<usize> = Vec::new();
             let mut flip_sign: Vec<i64> = Vec::new();
             for li in 0..lm.num_rows() {
-                let pre_w = self.residual_pass_weight(&lm, li, &trace_rights)?;
+                let pre_w = self.residual_pass_weight(&lm, li, trace_rights)?;
                 let delta_w = match &db {
                     Some(d) => self.residual_pass_weight(&lm, li, d)?,
                     None => 0,
@@ -2013,6 +2067,149 @@ mod tests {
             (i, r)
         };
         assert_eq!((ins, ret), (0, 2), "last copy leaving retracts both orders");
+    }
+
+    // ── SEMI-3 residual membership (IVM-AUD-PERF-7) ───────────────────────
+
+    /// An anti-join whose membership carries a non-equi residual: a right row
+    /// only counts if its name differs from the left row's label. This is the
+    /// shape TPC-H q21 takes (`l2.l_suppkey <> l1.l_suppkey`), reduced to two
+    /// columns.
+    fn anti_with_residual() -> IncrementalJoinOp {
+        let mut op = IncrementalJoinOp::new(
+            orders_schema(),
+            customers_schema(),
+            vec!["customer_id".into()],
+            vec!["customer_id".into()],
+            IncrJoinType::LeftAnti,
+        )
+        .unwrap();
+        // Pair batch is (order_id, customer_id, customer_id, name); the right
+        // row counts when its name is not "self".
+        op.set_membership_residual(Arc::new(|pair: &RecordBatch| {
+            let names = pair
+                .column(3)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| DeltaError::Operator("residual: name column".into()))?;
+            Ok((0..names.len())
+                .map(|i| Some(names.value(i) != "self"))
+                .collect())
+        }));
+        op
+    }
+
+    /// IVM-AUD-PERF-7, and the reason the batched ΔB probe needs an
+    /// `empty_right_trace` fallback rather than a `continue`.
+    ///
+    /// A key whose right TRACE holds nothing still has to evaluate its residual
+    /// against an empty right side, because an anti-join reads `pre_w == 0` as
+    /// "this row IS in the relation". Skip the key and the flip to non-member
+    /// never fires, so a row that should be retracted stays in the anti
+    /// relation forever — a silent wrong answer, not an error.
+    ///
+    /// Revert-proof: replace `right_by_key.get(key).unwrap_or(&empty_right_trace)`
+    /// with a `let ... else { continue }` and the retraction below disappears.
+    #[test]
+    fn a_key_absent_from_the_right_trace_still_evaluates_its_residual() {
+        let mut op = anti_with_residual();
+
+        // Tick 1: two orders for customer 1, no customers at all. Unmatched, so
+        // both are IN the anti relation.
+        let d = op
+            .apply(
+                Some(DeltaBatch::from_inserts(orders_batch(&[10, 11], &[1, 1])).unwrap()),
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            d.filter_positive().unwrap().num_rows(),
+            2,
+            "unmatched orders enter the anti relation"
+        );
+
+        // Tick 2: customer 1 arrives and PASSES the residual. The right trace
+        // still holds nothing for key 1 — this is the first right row ever, and
+        // traces are updated only after all probes — so ΔB must fall back to an
+        // empty right side to see pre_w = 0 (member) flip to post_w > 0.
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_inserts(customers_batch(&[1], &["other"])).unwrap()),
+            )
+            .unwrap();
+        let w = d.weights();
+        let total: i64 = (0..w.len()).map(|i| w.value(i)).sum();
+        assert_eq!(
+            total, -2,
+            "gaining a residual-passing match must retract BOTH anti rows; \
+             got {total} (0 means the key was skipped entirely)"
+        );
+    }
+
+    /// A right row that FAILS the residual must not change membership — the
+    /// guard that stops the test above from passing for the wrong reason (any
+    /// right row at all retracting the anti rows).
+    #[test]
+    fn a_right_row_failing_the_residual_does_not_flip_membership() {
+        let mut op = anti_with_residual();
+        op.apply(
+            Some(DeltaBatch::from_inserts(orders_batch(&[10, 11], &[1, 1])).unwrap()),
+            None,
+        )
+        .unwrap();
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_inserts(customers_batch(&[1], &["self"])).unwrap()),
+            )
+            .unwrap();
+        assert!(
+            d.is_empty(),
+            "a match that fails the residual is not a match"
+        );
+    }
+
+    /// IVM-AUD-PERF-7. The ΔB branch probed BOTH traces once per distinct
+    /// right-delta key: 2 x K probes per tick. IVM-AUD-PERF-6 made each probe
+    /// cheap but left K untouched (measured: 390,280 calls per q21 run before
+    /// and after), so the count is its own defect and needs its own assertion.
+    ///
+    /// Revert-proof: restore the per-key `for key in dr_by_key.keys()` probes
+    /// and this reports ~400 calls against a budget of 8.
+    #[test]
+    fn delta_b_probes_the_traces_once_not_once_per_key() {
+        const KEYS: i32 = 200;
+        let mut op = anti_with_residual();
+
+        let ids: Vec<i32> = (0..KEYS).collect();
+        op.apply(
+            Some(DeltaBatch::from_inserts(orders_batch(&ids, &ids)).unwrap()),
+            None,
+        )
+        .unwrap();
+
+        // Only a right delta, so ΔA does not run and every probe counted here
+        // belongs to ΔB.
+        let names: Vec<&str> = (0..KEYS).map(|_| "other").collect();
+        crate::trace::reset_probe_counters();
+        let d = op
+            .apply(
+                None,
+                Some(DeltaBatch::from_inserts(customers_batch(&ids, &names)).unwrap()),
+            )
+            .unwrap();
+        let calls = crate::trace::probe_calls();
+
+        let w = d.weights();
+        let total: i64 = (0..w.len()).map(|i| w.value(i)).sum();
+        assert_eq!(total, -(KEYS as i64), "every anti row must be retracted");
+        assert!(
+            calls <= 8,
+            "ΔB issued {calls} trace probes for {KEYS} distinct keys; \
+             it should probe each trace once (pre-fix this was {})",
+            2 * KEYS
+        );
     }
 
     /// SEMI-1: ANTI is the mirror — rows live in the relation while UNMATCHED.
