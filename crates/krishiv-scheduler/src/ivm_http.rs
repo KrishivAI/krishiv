@@ -295,6 +295,14 @@ pub struct CreateJobRequest {
     /// output). Absent / `Some(true)` keeps the default auto-partitioning.
     #[serde(default)]
     pub partitioned: Option<bool>,
+    /// IVM-AUD-DIST-4: pin this job to the O(state) DiffBased path — the
+    /// recompute arm of a delta-vs-batch comparison. Absent / `Some(false)`
+    /// keeps incremental planning. Set at creation only: a flow that has
+    /// already accumulated incremental state must not silently change mode
+    /// under a running job, so this is deliberately NOT applied on rehydrate
+    /// (unlike `delta_checkpoints`, which is monotone and cheap to re-assert).
+    #[serde(default)]
+    pub force_diff_based: Option<bool>,
     /// Accumulate every fed delta so `POST .../checkpoint-delta` returns a real
     /// incremental backup.
     ///
@@ -357,7 +365,9 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
     job_id: &str,
     partitioned: Option<bool>,
     delta_checkpoints: bool,
+    force_diff_based: bool,
 ) -> Result<(), StatusCode> {
+    let freshly_created = registry.get(job_id).is_none();
     if registry.get(job_id).is_none() {
         if let Some(snapshot) = coordinator.load_ivm_snapshot(job_id).await {
             registry
@@ -388,6 +398,24 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
     if delta_checkpoints {
         registry.enable_delta_checkpoints(job_id).map_err(ivm_err)?;
     }
+    // Creation-time only, and only for a Single flow: a Partitioned job routes
+    // to `central-partitioned` and never dispatches, so honouring the flag
+    // there would silently compare two different ROUTES as if they were two
+    // modes — the error that produced the retracted 28.5x claim (register §68).
+    if force_diff_based && freshly_created {
+        match registry.get(job_id) {
+            Some(crate::ivm::IvmJob::Single(flow)) => {
+                flow.force_diff_based().map_err(ivm_err)?;
+            }
+            _ => {
+                tracing::warn!(
+                    job_id,
+                    "IVM create refused: force_diff_based needs a single (non-partitioned)                      flow, so the recompute arm runs the same route as the incremental arm"
+                );
+                return Err(StatusCode::BAD_REQUEST);
+            }
+        }
+    }
     persist_ivm_job(registry, coordinator, job_id).await
 }
 
@@ -406,6 +434,7 @@ pub async fn api_ivm_create_job(
         &job_id,
         body.partitioned,
         body.delta_checkpoints,
+        body.force_diff_based.unwrap_or(false),
     )
     .await?;
     let durable = ivm_writes_are_durable(&coordinator).await;
@@ -1216,9 +1245,15 @@ async fn submit_resident_ivm_step(
             .checkpoint_full()
             .map_err(|e| refeed(format!("checkpoint_full: {e}")))?;
         let specs = flow.view_specs().map_err(|e| refeed(e.to_string()))?;
-        let attach =
-            krishiv_ivm::encode_ivm_attach_fragment(ivm_job_id, &specs, &state_bytes, disp.fence)
-                .map_err(|e| refeed(e.to_string()))?;
+        let attach = krishiv_ivm::encode_ivm_attach_fragment(
+            ivm_job_id,
+            &specs,
+            &state_bytes,
+            disp.fence,
+            flow.is_force_diff_based()
+                .map_err(|e| refeed(e.to_string()))?,
+        )
+        .map_err(|e| refeed(e.to_string()))?;
         let echo = run_ivm_fragment_job(coordinator, attach, "ivm-attach")
             .await
             .map_err(refeed)?;
@@ -2137,6 +2172,7 @@ mod tests {
             "job-list-views",
             Some(false),
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2282,6 +2318,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some(job_id.to_owned()),
                 partitioned: None,
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )
@@ -2330,6 +2367,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: None,
                 partitioned: None,
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )
@@ -2351,6 +2389,7 @@ mod tests {
                 Json(CreateJobRequest {
                     job_id: Some("job-a".into()),
                     partitioned: None,
+                    force_diff_based: None,
                     delta_checkpoints: false,
                 }),
             )
@@ -2417,6 +2456,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("agg".to_owned()),
                 partitioned: Some(false),
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )
@@ -2443,6 +2483,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("fresh".to_owned()),
                 partitioned: Some(false),
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )
@@ -2759,6 +2800,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("j2".into()),
                 partitioned: None,
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )
@@ -3175,6 +3217,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("mat-flag".into()),
                 partitioned: Some(false),
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )
@@ -3578,6 +3621,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("j".to_owned()),
                 partitioned: None,
+                force_diff_based: None,
                 delta_checkpoints: true,
             }),
         )
@@ -4832,6 +4876,7 @@ mod tests {
             Json(CreateJobRequest {
                 job_id: Some("nostore".into()),
                 partitioned: None,
+                force_diff_based: None,
                 delta_checkpoints: false,
             }),
         )

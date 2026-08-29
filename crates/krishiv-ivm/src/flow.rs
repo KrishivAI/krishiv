@@ -5213,7 +5213,7 @@ pub fn decode_tick_result(bytes: &[u8]) -> IvmResult<TickResult> {
 // its state mirror. This makes placement drift self-healing without hard
 // executor pinning.
 
-fn encode_specs_b64(specs: &[IncrementalViewSpec]) -> IvmResult<String> {
+fn encode_specs_b64(specs: &[IncrementalViewSpec], force_diff_based: bool) -> IvmResult<String> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
     let spec_entries: Vec<serde_json::Value> = specs
@@ -5238,6 +5238,13 @@ fn encode_specs_b64(specs: &[IncrementalViewSpec]) -> IvmResult<String> {
                 "is_materialized": s.is_materialized,
                 "is_recursive": s.is_recursive,
                 "lateness": s.lateness,
+                // IVM-AUD-DIST-4: flow-level, emitted per spec because the
+                // `delta:attach:` frame is positional (`{job}|{specs}|{state}|
+                // {fence}`) and destructured at exact arity — a fifth part
+                // would break version skew in both directions. The spec blob is
+                // JSON, so `#[serde(default)]` absorbs it on older executors,
+                // which is the same seam `lateness` already uses.
+                "force_diff_based": force_diff_based,
             })
         })
         .collect();
@@ -5365,10 +5372,11 @@ pub fn encode_ivm_attach_fragment(
     specs: &[IncrementalViewSpec],
     state_bytes: &[u8],
     fence: u64,
+    force_diff_based: bool,
 ) -> IvmResult<String> {
     use base64::Engine;
     let b64 = base64::engine::general_purpose::STANDARD;
-    let specs_b64 = encode_specs_b64(specs)?;
+    let specs_b64 = encode_specs_b64(specs, force_diff_based)?;
     let state_b64 = b64.encode(state_bytes);
     Ok(format!(
         "delta:attach:{job_id}|{specs_b64}|{state_b64}|{fence}"

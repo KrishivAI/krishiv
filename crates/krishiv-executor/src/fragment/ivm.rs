@@ -80,6 +80,12 @@ pub struct ViewSpecJson {
     /// backward-compatible fragments produced before this field existed.
     #[serde(default)]
     pub lateness: Vec<krishiv_ivm::LatenessSpec>,
+    /// IVM-AUD-DIST-4: run this flow on the O(state) DiffBased path instead of
+    /// an incremental plan. Flow-level despite living per spec — see
+    /// `encode_specs_b64`. Defaults false, so a fragment produced before this
+    /// field existed keeps the incremental behaviour it had.
+    #[serde(default)]
+    pub force_diff_based: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,9 +338,21 @@ pub async fn execute_resident_ivm_fragment(
             .map_err(|e| format!("state b64: {e}"))?;
 
         // A resident flow uses cached incremental plans across ticks — this is
-        // the point of residency, so `force_diff_based` is deliberately NOT set
-        // (the accumulators live here and never need to transfer per tick).
+        // the point of residency (the accumulators live here and never need to
+        // transfer per tick), so incremental is the DEFAULT and stays the
+        // default when the wire says nothing. IVM-AUD-DIST-4 added the one
+        // exception below: an explicit request for the O(state) recompute arm,
+        // which exists so a distributed A/B can vary the mode without also
+        // varying the route.
         let flow = IncrementalFlow::new();
+        // IVM-AUD-DIST-4: the recompute arm of a distributed A/B. Without this
+        // the wire could only express the incremental path, so "delta vs batch
+        // on the cluster" had no batch side to measure and any comparison had
+        // to change the ROUTE as well as the mode — which is exactly how the
+        // retracted 28.5x sharding claim happened (register §68).
+        if view_specs.iter().any(|vs| vs.force_diff_based) {
+            flow.force_diff_based().map_err(|e| e.to_string())?;
+        }
         register_specs_on_flow(&flow, &view_specs)?;
         if !state_bytes.is_empty() {
             flow.restore_full(&state_bytes)
@@ -523,7 +541,7 @@ mod tests {
 
         let flows: super::ResidentIvmFlows = Arc::new(dashmap::DashMap::new());
         let specs = vec![group_spec];
-        let attach = encode_ivm_attach_fragment("job-g", &specs, &[], 0).unwrap();
+        let attach = encode_ivm_attach_fragment("job-g", &specs, &[], 0, false).unwrap();
         super::execute_resident_ivm_fragment(&flows, &attach)
             .await
             .unwrap();
@@ -554,6 +572,80 @@ mod tests {
         assert!(
             out.weights().iter().flatten().any(|w| w > 0),
             "first tick GROUP BY output must contain insertions; got {out:?}"
+        );
+    }
+
+    /// IVM-AUD-DIST-4. The wire had no way to ask for the O(state) recompute
+    /// path, so a distributed "delta vs batch" comparison had no batch arm and
+    /// could only be faked by changing the ROUTE (central vs resident) — which
+    /// is how the retracted 28.5x sharding claim happened (register §68).
+    ///
+    /// Two things must hold, and the second is the one that makes the A/B mean
+    /// anything: the flag must ARRIVE, and the recompute arm must produce the
+    /// SAME ANSWER as the incremental arm. A batch arm that is merely faster
+    /// because it computes something else is not a baseline.
+    #[tokio::test]
+    async fn the_wire_can_ask_for_the_recompute_arm_and_it_agrees_with_incremental() {
+        async fn run(force_diff_based: bool) -> (bool, f64) {
+            let flows: super::ResidentIvmFlows = Arc::new(dashmap::DashMap::new());
+            let specs = vec![sum_view_spec()];
+            let attach =
+                encode_ivm_attach_fragment("job-fdb", &specs, &[], 0, force_diff_based).unwrap();
+            super::execute_resident_ivm_fragment(&flows, &attach)
+                .await
+                .unwrap();
+
+            let entry = flows
+                .get("job-fdb")
+                .expect("attach must register the flow")
+                .value()
+                .clone();
+            let observed = entry.lock().await.flow.is_force_diff_based().unwrap();
+
+            // Two ticks, so the incremental arm is genuinely maintaining state
+            // across a tick rather than computing a single batch once.
+            let mut total = f64::NAN;
+            for (fence, amounts) in [(1u64, vec![100.0, 50.0]), (2, vec![25.0])] {
+                let mut pending = std::collections::HashMap::new();
+                pending.insert(
+                    "sales".to_string(),
+                    DeltaBatch::from_inserts(sales_batch(&amounts)).unwrap(),
+                );
+                let tick = encode_ivm_tick_fragment("job-fdb", &pending, fence, true).unwrap();
+                let (_summary, blob) = super::execute_resident_ivm_fragment(&flows, &tick)
+                    .await
+                    .unwrap();
+                if let Some(d) = decode_tick_result(blob.as_ref().unwrap())
+                    .unwrap()
+                    .view_deltas
+                    .get("total_sales")
+                {
+                    total = total_from_delta(d);
+                }
+            }
+            (observed, total)
+        }
+
+        let (incremental_flag, incremental_total) = run(false).await;
+        let (recompute_flag, recompute_total) = run(true).await;
+
+        assert!(
+            !incremental_flag,
+            "absent/false on the wire must leave the resident flow incremental"
+        );
+        assert!(
+            recompute_flag,
+            "force_diff_based on the wire must reach the resident flow; without \
+             it the cluster has no batch arm to measure against"
+        );
+        assert_eq!(
+            incremental_total, 175.0,
+            "incremental arm must total 100+50+25"
+        );
+        assert_eq!(
+            recompute_total, incremental_total,
+            "the recompute arm must agree with the incremental arm — a batch \
+             baseline that computes a different answer measures nothing"
         );
     }
 
@@ -592,7 +684,7 @@ mod tests {
         let specs = vec![sum_view_spec()];
 
         // Attach with EMPTY state (fresh job promotion) at fence 0.
-        let attach = encode_ivm_attach_fragment("job-r", &specs, &[], 0).unwrap();
+        let attach = encode_ivm_attach_fragment("job-r", &specs, &[], 0, false).unwrap();
         super::execute_resident_ivm_fragment(&flows, &attach)
             .await
             .unwrap();
@@ -684,7 +776,7 @@ mod tests {
 
     async fn attach(flows: &super::ResidentIvmFlows, job: &str, state: &[u8]) -> Option<Vec<u8>> {
         let specs = vec![sum_view_spec()];
-        let frag = encode_ivm_attach_fragment(job, &specs, state, 0).unwrap();
+        let frag = encode_ivm_attach_fragment(job, &specs, state, 0, false).unwrap();
         super::execute_resident_ivm_fragment(flows, &frag)
             .await
             .unwrap()
@@ -873,7 +965,7 @@ mod tests {
         };
         let flows: super::ResidentIvmFlows = Arc::new(dashmap::DashMap::new());
         let specs = vec![sum_view_spec(), broken];
-        let frag = encode_ivm_attach_fragment("job-h", &specs, &[], 0).unwrap();
+        let frag = encode_ivm_attach_fragment("job-h", &specs, &[], 0, false).unwrap();
         super::execute_resident_ivm_fragment(&flows, &frag)
             .await
             .unwrap();
