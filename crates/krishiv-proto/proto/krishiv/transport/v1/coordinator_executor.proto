@@ -707,4 +707,18 @@ message DrainContinuousOutputResponse {
   TransportVersion version = 1;
   TransportDisposition disposition = 2;
   bytes ipc_bytes = 3;
+  // Cumulative batches this job's egress ring has DROPPED on overflow.
+  //
+  // The ring evicts its oldest batch when a slow consumer lets it fill, so a
+  // drain can return a sequence with a hole in it and look exactly like one
+  // with no hole. The count was already tracked per job and reported on the
+  // coordinator-facing progress snapshot, but never reached the consumer that
+  // actually receives the gap. A caller that sees this rise between drains
+  // knows its stream is incomplete; monotonic, so compare successive reads
+  // rather than treating any non-zero as new loss.
+  //
+  // Additive field: an old server leaves it 0, which is also the "no loss"
+  // value, so a new client cannot mistake an old server for a lossy one --
+  // it simply learns nothing, exactly as before.
+  uint64 egress_dropped_batches = 4;
 }

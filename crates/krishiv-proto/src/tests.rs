@@ -1450,11 +1450,13 @@ mod wire_fuzz {
             version in arb_version(),
             disposition in any::<i32>(),
             payload in arb_string(),
+            egress_dropped_batches in any::<u64>(),
         ) {
             let wire = v1::DrainContinuousOutputResponse {
                 version,
                 disposition,
                 ipc_bytes: payload.into_bytes(),
+                egress_dropped_batches,
             };
             let _ = drain_continuous_output_response_from_wire(wire);
         }

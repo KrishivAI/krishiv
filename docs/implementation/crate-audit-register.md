@@ -6719,3 +6719,45 @@ on a piped `cargo test`. The same shape bit twice more this session — a `just`
 invocation from a reset cwd reported `LINT_RC=1` / "no justfile found" and was
 briefly taken for a lint pass. **Gate on the tool's own exit code, from a known
 directory.**
+
+## §72 — IVM-AUD-STREAM-1: the drop counter that never reached the consumer
+
+§35 recorded the run-loop egress ring's drop-oldest overflow as the worst shape
+in this register — a streaming operator silently discarding computed output —
+and refused to pick between backpressure, fail-closed and persist because each
+is a contract change. It also named the cheap strictly-better step that needs no
+such decision: *"track a cumulative dropped-batch count per job and return it on
+drain, so a consumer can DETECT the gap instead of silently receiving one."*
+
+**Half of that was already done, and the half that mattered was not.** The count
+exists (`continuous_egress_dropped`, per job), counts BATCHES rather than
+overflow events, is gated by `EgressLoss` so a durable sink is not reported as
+loss, and is surfaced on `StreamingProgressSnapshot`. But that snapshot goes to
+the COORDINATOR. `DrainContinuousOutputResponse` carried `version`,
+`disposition`, `ipc_bytes` and nothing else — so the consumer actually receiving
+the truncated stream had no way to know. A drain returning a page with a hole in
+it was byte-indistinguishable from a complete one.
+
+Fixed by adding `egress_dropped_batches` to the drain response (proto field 4,
+additive: an old server leaves it 0, which is also the no-loss value, so a new
+client learns nothing rather than being misled) and populating it from the
+runner's counter.
+
+**The part that could have shipped as a lie.** The gRPC service did not hold
+that counter at all; the runner did. Adding the field and reading
+`self.continuous_egress_dropped` compiles perfectly against a service-local map
+that nothing ever increments, and reports 0 drops forever — a loss signal
+enforced by nothing, which is this register's opening rule almost verbatim. The
+map is now created once in `cli.rs` and handed to BOTH the runner (via
+`with_shared_egress_dropped`) and the service (via `with_egress_dropped`).
+
+`a_drain_reports_batches_the_egress_ring_dropped` writes through the handle the
+RUNNER holds and reads back through the RPC, so it fails if the two ever stop
+being the same map. Proven RED against a `with_egress_dropped` that accepts the
+argument and drops it: `left: 0, right: 7`.
+
+**What is NOT fixed.** Output is still dropped. This makes the loss DETECTABLE,
+not survivable, and the three-way contract decision §35 declined to make
+unilaterally is still open and still the user's. A consumer should compare
+successive reads — the counter is cumulative and monotonic, so a non-zero value
+is not by itself new loss.

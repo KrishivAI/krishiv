@@ -525,6 +525,19 @@ impl ExecutorTaskRunner {
         self
     }
 
+    /// Share the per-job egress drop counters with the gRPC service, so
+    /// `drain_continuous_output` can report a hole to the consumer that
+    /// receives it. Without a SHARED map the service holds its own empty one
+    /// and reports 0 drops forever.
+    #[must_use]
+    pub fn with_shared_egress_dropped(
+        mut self,
+        dropped: std::sync::Arc<dashmap::DashMap<String, u64>>,
+    ) -> Self {
+        self.continuous_egress_dropped = dropped;
+        self
+    }
+
     /// RAII marker for one run-loop iteration that took pushed input: holds
     /// the job's busy count up while the input is applied, releases on drop
     /// (including error unwinds). See `continuous_busy` for the protocol.

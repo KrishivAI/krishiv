@@ -97,6 +97,7 @@ async fn start_rig(name: &str) -> Rig {
                 class_executors,
                 egress_notify,
                 continuous_busy,
+                std::sync::Arc::new(dashmap::DashMap::new()),
             )
             .await;
         });

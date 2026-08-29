@@ -2197,4 +2197,7 @@ pub struct DrainContinuousOutputResponse {
     pub version: TransportVersion,
     pub disposition: TransportDisposition,
     pub ipc_bytes: Vec<u8>,
+    /// Cumulative batches this job's egress ring has dropped on overflow.
+    /// Lets a consumer DETECT a hole in its stream; it does not prevent one.
+    pub egress_dropped_batches: u64,
 }

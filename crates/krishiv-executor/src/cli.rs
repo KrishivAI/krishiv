@@ -614,6 +614,9 @@ async fn heartbeat_loop(
     // gRPC service samples it (after the buffers) to prove pushed data was
     // APPLIED before an end-of-stream flush.
     let shared_continuous_busy: crate::grpc::SharedContinuousBusy = Arc::new(DashMap::new());
+    // One map, shared by the runner that increments it and the gRPC service
+    // that reports it on drain. Two maps would make the drain field a lie.
+    let shared_egress_dropped: Arc<DashMap<String, u64>> = Arc::new(DashMap::new());
 
     // Now spawn the task and barrier servers.  No more re-registers required.
     if let Some(listener) = task_listener {
@@ -626,6 +629,9 @@ async fn heartbeat_loop(
         let grpc_class_executors = shared_class_executors.clone();
         let grpc_egress_notify = Arc::clone(&shared_egress_notify);
         let grpc_continuous_busy = Arc::clone(&shared_continuous_busy);
+        // Share the RUNNER's counter, not a fresh map: an unshared map reports
+        // 0 drops forever and turns the loss signal into a field that lies.
+        let grpc_egress_dropped = Arc::clone(&shared_egress_dropped);
         tokio::spawn(async move {
             use crate::transport::serve_executor_task_grpc_with_run_loop;
             if let Err(e) = serve_executor_task_grpc_with_run_loop(
@@ -639,6 +645,7 @@ async fn heartbeat_loop(
                 grpc_class_executors,
                 grpc_egress_notify,
                 grpc_continuous_busy,
+                grpc_egress_dropped,
             )
             .await
             {
@@ -693,7 +700,8 @@ async fn heartbeat_loop(
         .with_shared_continuous_connector_sources(shared_connector_sources)
         .with_shared_class_executors(shared_class_executors)
         .with_shared_egress_notify(shared_egress_notify)
-        .with_shared_continuous_busy(Arc::clone(&shared_continuous_busy));
+        .with_shared_continuous_busy(Arc::clone(&shared_continuous_busy))
+        .with_shared_egress_dropped(Arc::clone(&shared_egress_dropped));
     // The run-loop short-circuits exchange deliveries to co-located peers by
     // matching the advertised task endpoint.
     if let Some(endpoint) = runtime.config().task_endpoint() {

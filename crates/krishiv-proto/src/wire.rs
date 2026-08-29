@@ -1938,6 +1938,7 @@ pub fn drain_continuous_output_response_to_wire(
         version: Some(transport_version_to_wire(value.version)),
         disposition: transport_disposition_to_wire(value.disposition) as i32,
         ipc_bytes: value.ipc_bytes,
+        egress_dropped_batches: value.egress_dropped_batches,
     }
 }
 
@@ -1948,6 +1949,7 @@ pub fn drain_continuous_output_response_from_wire(
         version: transport_version_from_wire(required(value.version, "version")?)?,
         disposition: transport_disposition_from_wire(value.disposition)?,
         ipc_bytes: value.ipc_bytes,
+        egress_dropped_batches: value.egress_dropped_batches,
     })
 }
 

@@ -124,6 +124,7 @@ async fn start_rig_with_loops(name: &str, loops: usize) -> Rig {
                 class_executors,
                 egress_notify,
                 continuous_busy,
+                std::sync::Arc::new(dashmap::DashMap::new()),
             )
             .await;
         });

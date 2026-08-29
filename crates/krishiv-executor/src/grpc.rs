@@ -135,6 +135,11 @@ pub struct ExecutorTaskInboxService {
     /// the EOS quiesce check can prove pushed input was applied, not merely
     /// dequeued.
     pub(crate) continuous_busy: SharedContinuousBusy,
+    /// Per-job cumulative egress-ring drop counts — shared with the runner
+    /// that increments them, so `drain_continuous_output` can tell a consumer
+    /// its stream has a hole. Tracked since S8 but, until IVM-AUD-STREAM-1,
+    /// visible only on the coordinator-facing progress snapshot.
+    pub(crate) continuous_egress_dropped: Arc<DashMap<String, u64>>,
     /// Test override for the quiesce deadline (stall tests must not wait 8s).
     pub(crate) eos_quiesce_deadline: Duration,
 }
@@ -168,6 +173,7 @@ impl ExecutorTaskInboxService {
             class_executors: SharedClassExecutors::default(),
             egress_notify: Arc::new(DashMap::new()),
             continuous_busy: Arc::new(DashMap::new()),
+            continuous_egress_dropped: Arc::new(DashMap::new()),
             eos_quiesce_deadline: EOS_QUIESCE_DEADLINE,
         }
     }
@@ -188,6 +194,7 @@ impl ExecutorTaskInboxService {
             class_executors: SharedClassExecutors::default(),
             egress_notify: Arc::new(DashMap::new()),
             continuous_busy: Arc::new(DashMap::new()),
+            continuous_egress_dropped: Arc::new(DashMap::new()),
             eos_quiesce_deadline: EOS_QUIESCE_DEADLINE,
         }
     }
@@ -202,6 +209,23 @@ impl ExecutorTaskInboxService {
     ) -> Self {
         self.continuous_outputs = continuous_outputs;
         self.input_notify = input_notify;
+        self
+    }
+
+    /// Share the runner's per-job egress drop counters, so a drain can tell a
+    /// consumer its stream has a hole.
+    ///
+    /// Without this the service holds its OWN empty map and
+    /// `egress_dropped_batches` reports 0 forever — a field that looks like a
+    /// loss signal and is enforced by nothing. That is the exact shape this
+    /// crate's audit register keeps finding, so the sharing is the fix, not
+    /// the field.
+    #[must_use]
+    pub fn with_egress_dropped(
+        mut self,
+        continuous_egress_dropped: Arc<DashMap<String, u64>>,
+    ) -> Self {
+        self.continuous_egress_dropped = continuous_egress_dropped;
         self
     }
 
@@ -840,6 +864,17 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
                     version: krishiv_proto::TransportVersion::CURRENT,
                     disposition: TransportDisposition::Accepted,
                     ipc_bytes,
+                    // The ring drops its OLDEST batch when a slow consumer
+                    // lets it fill, so the page above can have a hole in it
+                    // and be indistinguishable from a complete one. The count
+                    // was tracked per job and surfaced on the progress
+                    // snapshot, but never on the path the consumer actually
+                    // reads — so the gap was undetectable from here.
+                    egress_dropped_batches: self
+                        .continuous_egress_dropped
+                        .get(job_id)
+                        .map(|e| *e.value())
+                        .unwrap_or(0),
                 },
             ));
         }
@@ -853,6 +888,8 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
                         version: krishiv_proto::TransportVersion::CURRENT,
                         disposition: TransportDisposition::UnknownTask,
                         ipc_bytes: vec![],
+                        // Unknown job: no egress state, so nothing to report.
+                        egress_dropped_batches: 0,
                     },
                 ));
             }
@@ -884,6 +921,10 @@ impl ExecutorTaskService for ExecutorTaskInboxService {
                 version: krishiv_proto::TransportVersion::CURRENT,
                 disposition: TransportDisposition::Accepted,
                 ipc_bytes,
+                // The cycle-model path drains a window executor directly and
+                // never goes through the run-loop egress ring, so it has no
+                // drop-oldest overflow to report.
+                egress_dropped_batches: 0,
             },
         ))
     }
@@ -1106,6 +1147,9 @@ pub fn executor_task_grpc_server_with_continuous(
         SharedClassExecutors::default(),
         Arc::new(DashMap::new()),
         Arc::new(DashMap::new()),
+        // No runner shares state with this constructor, so there is no egress
+        // ring to drop from and nothing to report.
+        Arc::new(DashMap::new()),
         auth,
     )
 }
@@ -1124,6 +1168,7 @@ pub fn executor_task_grpc_server_with_run_loop(
     class_executors: SharedClassExecutors,
     egress_notify: crate::runner::SharedContinuousNotify,
     continuous_busy: SharedContinuousBusy,
+    continuous_egress_dropped: Arc<DashMap<String, u64>>,
     auth: Option<ExecutorTaskAuthConfig>,
 ) -> wire::v1::executor_task_server::ExecutorTaskServer<ExecutorTaskGrpcService> {
     let inner =
@@ -1132,7 +1177,8 @@ pub fn executor_task_grpc_server_with_run_loop(
             .with_continuous_connector_sources(continuous_connector_sources)
             .with_class_executors(class_executors)
             .with_egress_notify(egress_notify)
-            .with_continuous_busy(continuous_busy);
+            .with_continuous_busy(continuous_busy)
+            .with_egress_dropped(continuous_egress_dropped);
     let auth = auth.unwrap_or_else(ExecutorTaskAuthConfig::from_env);
     let auth_misconfiguration = (auth.require_auth() && !auth.has_bearer_token()).then(|| {
         format!(
@@ -1184,8 +1230,61 @@ mod tests {
         .expect("batch")
     }
 
+    /// IVM-AUD-STREAM-1. The run-loop egress ring drops its OLDEST batch when
+    /// a slow consumer lets it fill, so a drain can hand back a page with a
+    /// hole in it that is byte-indistinguishable from a complete one. The
+    /// drop count was already tracked per job and surfaced on the
+    /// coordinator-facing progress snapshot, but never on the drain — the one
+    /// path the consumer that receives the gap actually reads.
+    ///
+    /// Two things must hold and BOTH can fail silently: the response has to
+    /// carry the count, and the service has to read the RUNNER's map rather
+    /// than a private one. An unshared map compiles, reports 0 forever, and
+    /// turns a loss signal into a field that lies — the "guard enforced by
+    /// nothing" shape this crate's register keeps finding. The test writes
+    /// through the shared handle and reads back through the RPC, so replacing
+    /// `with_egress_dropped` with a fresh map fails it.
+    #[tokio::test]
+    async fn a_drain_reports_batches_the_egress_ring_dropped() {
+        use krishiv_proto::task::DrainContinuousOutputRequest;
+        use krishiv_proto::{JobId, TaskId, TransportVersion};
+
+        let shared: std::sync::Arc<DashMap<String, u64>> = std::sync::Arc::new(DashMap::new());
+        let service = ExecutorTaskInboxService::new(ExecutorAssignmentInbox::new_unbounded())
+            .with_egress_dropped(std::sync::Arc::clone(&shared));
+        // Some output survived; some was evicted before this consumer arrived.
+        service
+            .continuous_outputs
+            .entry("gap-job".into())
+            .or_default()
+            .push(kv_batch(&[1]));
+        // Written through the handle the RUNNER holds, not through the service.
+        shared.insert("gap-job".into(), 7);
+
+        let resp = service
+            .drain_continuous_output(tonic::Request::new(DrainContinuousOutputRequest {
+                version: TransportVersion::CURRENT,
+                job_id: JobId::try_new("gap-job").expect("job id"),
+                task_id: TaskId::try_new("t0").expect("task id"),
+                wait_ms: 0,
+            }))
+            .await
+            .expect("drain")
+            .into_inner();
+
+        assert!(
+            !resp.ipc_bytes.is_empty(),
+            "the surviving batch still drains"
+        );
+        assert_eq!(
+            resp.egress_dropped_batches, 7,
+            "the drain must report the 7 dropped batches; 0 means the service \
+             is reading its own map instead of the runner's"
+        );
+    }
+
     /// A drain with a wait budget must PARK on an empty egress and return
-    /// data that arrives during the wait — the pre-fix behavior returned
+    /// data that arrives during the wait"" — the pre-fix behavior returned
     /// empty immediately and every consumer busy-polled (task #149 fix 12).
     #[tokio::test]
     async fn drain_long_poll_returns_data_arriving_mid_wait() {
