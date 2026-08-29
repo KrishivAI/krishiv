@@ -73,7 +73,14 @@ def run(name, sql, fields, force_diff_based):
         t0 = time.perf_counter()
         s = req("POST", f"/api/v1/ivm/jobs/{job}/step")
         samples.append(time.perf_counter() - t0)
-        out_rows = s.get("total_output_rows", out_rows)
+        # IVM-AUD-DIST-5: compare the LOGICAL multiset, not the physical
+        # encoding. `total_output_rows` counts physical delta rows, and the
+        # incremental arm consolidates duplicates into weighted rows while a
+        # full recompute does not — so this harness previously reported the
+        # `filtered` view's arms disagreeing 989 vs 4945 (a clean 5x) when both
+        # held the same Z-set. `total_inserted_rows` sums positive weights and
+        # is invariant across encodings.
+        out_rows = s.get("total_inserted_rows", out_rows)
     req("DELETE", f"/api/v1/ivm/jobs/{job}")
     return statistics.median(samples) * 1e3, out_rows
 
@@ -93,5 +100,9 @@ print("-" * 69)
 print("Own axis: includes Arrow-IPC-base64 encode/decode + HTTP per tick. Measures")
 print("the DISPATCH path, not incremental maintenance. NOT comparable to the")
 print("in-process single-node corpus numbers.")
-print("'agree' compares output-row counts across arms; a NO means the two arms")
-print("disagree and the speedup on that row is meaningless.")
+print("'agree' compares LOGICAL inserted-row counts (sum of positive Z-set")
+print("weights) across arms; a NO means the two arms computed different answers")
+print("and the speedup on that row is meaningless. It deliberately does NOT")
+print("compare total_output_rows: that counts physical delta rows, and the")
+print("incremental arm consolidates duplicates while a recompute does not, so")
+print("identical answers can differ there by the duplicate factor.")

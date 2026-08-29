@@ -4257,7 +4257,13 @@ into Cycle/1 (HTTP client, Flight action, `unified_jobs_http.rs:217`), not one.
 - [ ] **Two run-loop dial divergences.** `run_loop.rs` computes
       `idle_floor.max(fallback_tick)` where the floor is 50 µs and the tick 5 ms,
       so the max is *always* 5 ms and `RLOOP_IDLE_FLOOR_US` has no other use,
-      while the module doc claims a microsecond floor. And the idle tick fires
+      while the module doc claims a microsecond floor. **This half is FIXED**
+      (verified 2026-08-29): `run_loop.rs:1056` now sleeps `idle_floor` directly
+      and carries a comment recording the old `.max()` and why the fallback
+      cannot apply to a run-loop subtask, which always has both notifies. The
+      register kept listing it as open — the same "doc says X, code does Y"
+      shape this file exists to catch, turned on the file itself. The SECOND
+      half below is still open. And the idle tick fires
       only when the *combined* input is empty, so a subtask with one chatty and
       one silent split never ticks — the embedded loop ticks whenever its reader
       yields `None`.
@@ -6572,3 +6578,119 @@ each probe cheap without making the caller ask fewer times. The ΔB branch
 which is where those calls come from, and batching it the way §66 batched ΔA is
 the named next step. This entry fixes the per-probe cost and leaves the
 per-probe *count* measured and unfixed rather than declaring the query healthy.
+
+## §70 — IVM-AUD-DIST-5: the metric that made a correct engine look broken
+
+§68's mode A/B shipped with an `agree` column, and on its first run it fired:
+the `filtered` view reported **989 rows incremental vs 4945 recompute** — a
+clean 5x. Task #170 recorded it as a possible silent wrong answer and blocked
+every distributed stateless-view number behind it. It is not a wrong answer.
+
+**Reproduced in miniature** rather than argued from the cluster. Feeding the
+same `(k, v)` pair five times through `SELECT k, v FROM orders WHERE v > 10` on
+both arms:
+
+```
+PHYS incr=2  diff=10   |   LOGICAL incr=10  diff=10
+```
+
+A `DeltaBatch` is a Z-SET. Five copies of a row are representable either as
+five weight-1 rows or as one weight-5 row, and the two encodings denote the
+same multiset. The incremental path consolidates; a full recompute does not.
+The cluster's 989 is the number of DISTINCT matching pairs the A/B's generator
+produced (`amount = i % 1000` over a 5,000-row delta repeats each pair exactly
+five times), and 4945 = 989 x 5 is the same Z-set unconsolidated.
+
+**`total_output_rows` counts PHYSICAL delta rows and is therefore
+representation-dependent.** It is the wrong field to compare two flows with,
+and `StepSummary` has carried the right ones — `total_inserted_rows` /
+`total_retracted_rows`, sums of signed weights — since #94.
+
+**The real defect was on the wire.** `StepResponse` exposed only
+`total_output_rows`, so a distributed caller had NO representation-independent
+number available: the harness compared the only field it was given. Both
+logical counters are now on the response, `scripts/ivm_mode_ab.py` compares
+`total_inserted_rows`, and the field that misled it carries a doc comment
+saying why it must not be used for cross-arm comparison.
+
+**Tests.** `the_two_arms_agree_on_the_multiset_even_when_the_encoding_differs`
+(krishiv-ivm) asserts the arms agree on the logical multiset AND that the
+physical counts genuinely differ here — a strict `<`, so the test fails if it
+stops reproducing the discrepancy it exists to explain rather than passing
+vacuously. `the_step_wire_carries_logical_row_counts_not_just_physical_ones`
+(krishiv-scheduler) pins the wire on a tick where physical and logical diverge
+(updating one group is 2 physical rows but 1 logical insert + 1 logical
+retraction); proven RED against wiring the field from `total_output_rows`,
+failing `left: (2, 1)` vs `right: (1, 1)`.
+
+**What this unblocks and what it does not.** #170 finding (a) is closed and the
+stateless-view distributed numbers are usable. Finding (b) — the incremental
+arm is not flat in the seed (32 ms -> 127 ms for a 10x seed at fixed delta) —
+is untouched and remains the #166 residual.
+
+**Method note.** The A/B harness was right to flag this and right to make the
+number uninterpretable until it was explained: a comparison harness that
+reports "these differ" without knowing why is doing its job. What it got wrong
+was comparing the only metric the wire offered, which is a defect in the wire,
+not in the harness's caution.
+
+## §71 — IVM-AUD-PERF-7: the ΔB batching, and a speedup that is NOT established
+
+§69 named the ΔB branch as the next step: it probed BOTH traces once per
+distinct right-delta key, and §69's key index left that call count untouched at
+390,280 per q21 run. This batches those probes — probe each trace once with
+every affected key, partition by key — the transformation §66 applied to ΔA.
+
+**The performance claim is not established, and this entry says so.**
+
+Paired A/B, both binaries interleaved under identical load. Pairing is not
+optional here: load average moved between 5 and 15 during the session, and one
+unpaired sweep produced a 400k reading HIGHER than its own 800k reading.
+
+| seed | per-key (§69) | batched | ratio | batched wins |
+|---|---:|---:|---:|---:|
+| 400 k | 144.89 ms | 174.84 ms | **0.83x** | 4/10 |
+| 800 k | 367.31 ms | 318.02 ms | 1.15x | 7/10 |
+
+Faster where state is large, **slower at 400k**. An earlier n=7 sample read
+1.29x / 6-of-7 at 800k and was reported as a clean win; the fuller sample walked
+it back to 1.15x and surfaced the regression. The error was calling it off a
+partial sample, not the number that followed.
+
+**Chasing the 400k regression found a defect in the batching itself.** The
+per-key loop skipped a key the moment its LEFT probe came back empty —
+`if left_matches.is_empty() { continue }` ran BEFORE it touched the right trace.
+Batching both sides up front loses that narrowing, probing and grouping
+right-side rows for keys about to be discarded. Fixed by probing left, narrowing
+to keys that have left rows, then probing right for those only. **The
+re-measurement after that fix did not complete** — two samples, taken against a
+concurrent test gate, worthless — so whether the narrowing removes the 400k
+regression is OPEN. Re-run the paired A/B on an idle box before quoting any
+speedup from this change.
+
+**What IS established, and why this is kept rather than reverted:**
+
+- Three tests on a path that had **none**. `apply_left_semi_anti_residual` had
+  no unit coverage at all; it was reachable only through the q21 end-to-end test.
+- `a_key_absent_from_the_right_trace_still_evaluates_its_residual` guards the
+  silent wrong answer §66 warned about: a key with no right-TRACE rows must
+  still evaluate against an EMPTY right side, because an anti-join reads
+  `pre_w == 0` as "in the relation". Skip it and the flip to non-member never
+  fires — a row that should be retracted stays forever. RED against a
+  `continue`: "got 0 (0 means the key was skipped entirely)".
+- `a_right_row_failing_the_residual_does_not_flip_membership` stops that test
+  passing for the wrong reason (any right row retracting, residual ignored).
+- `delta_b_probes_the_traces_once_not_once_per_key` pins the call count. RED at
+  202 probes for 200 keys.
+
+**A flaky test shipped in `aad67e4` and is fixed here.** §69's counters were
+process-global statics while `cargo test` runs in parallel, so another test's
+probes landed in this one's budget. It surfaced as a real failure that a
+`cargo test | grep` pipeline masked — the pipeline's exit code is grep's, so
+"144 passed; 1 failed" scrolled past as success. Both counters are now
+`thread_local!`; 145/145 across five consecutive runs. Two lessons: a budget
+assertion an unrelated test can break is not a regression test, and never gate
+on a piped `cargo test`. The same shape bit twice more this session — a `just`
+invocation from a reset cwd reported `LINT_RC=1` / "no justfile found" and was
+briefly taken for a lint pass. **Gate on the tool's own exit code, from a known
+directory.**

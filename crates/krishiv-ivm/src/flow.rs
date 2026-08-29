@@ -7910,6 +7910,87 @@ mod integration_tests {
             }
         }
 
+        /// IVM-AUD-DIST-5. The distributed mode A/B reported the `filtered`
+        /// view's two arms disagreeing 989 vs 4945 — exactly 5x — and that was
+        /// recorded as a possible silent wrong answer blocking every
+        /// stateless-view number (task #170, finding (a)).
+        ///
+        /// It is not a wrong answer. A `DeltaBatch` is a Z-SET, so five copies
+        /// of one row are representable either as five weight-1 rows or as one
+        /// weight-5 row. The incremental arm consolidates; the recompute arm
+        /// does not. `total_output_rows` counts PHYSICAL delta rows and is
+        /// therefore representation-dependent — it is the wrong field to
+        /// compare two arms with. `total_inserted_rows` sums positive weights
+        /// and is the invariant.
+        ///
+        /// This pins that: the two arms must agree on the logical multiset
+        /// while being allowed to disagree on the physical encoding.
+        #[tokio::test]
+        async fn the_two_arms_agree_on_the_multiset_even_when_the_encoding_differs() {
+            fn filtered_spec() -> IncrementalViewSpec {
+                IncrementalViewSpec {
+                    name: "filtered".into(),
+                    body_sql: "SELECT k, v FROM orders WHERE v > 10".into(),
+                    output_schema: Arc::new(Schema::new(vec![
+                        Field::new("k", DataType::Utf8, false),
+                        Field::new("v", DataType::Int64, false),
+                    ])),
+                    is_materialized: true,
+                    is_recursive: false,
+                    lateness: vec![],
+                }
+            }
+            // The same (k, v) pair five times, exactly as the A/B's generator
+            // produced it: `amount = i % 1000` over a 5000-row delta repeats
+            // every distinct pair five times.
+            let ks = ["a", "a", "a", "a", "a", "b", "b", "b", "b", "b"];
+            let vs = [50i64, 50, 50, 50, 50, 60, 60, 60, 60, 60];
+
+            let mut summaries = Vec::new();
+            for diff_based in [false, true] {
+                let flow = IncrementalFlow::new();
+                flow.register_view(filtered_spec()).unwrap();
+                if diff_based {
+                    flow.force_diff_based().unwrap();
+                }
+                flow.feed(
+                    "orders",
+                    DeltaBatch::from_inserts(orders(&ks, &vs)).unwrap(),
+                )
+                .unwrap();
+                let s = flow.step_datafusion().await.unwrap();
+                assert!(
+                    s.errored_views.is_empty(),
+                    "arm diff_based={diff_based} errored"
+                );
+                summaries.push(s);
+            }
+            let (incr, diff) = (&summaries[0], &summaries[1]);
+
+            assert_eq!(
+                incr.total_inserted_rows, diff.total_inserted_rows,
+                "the two arms must agree on the LOGICAL multiset: incremental \
+                 inserted {} vs recompute {}",
+                incr.total_inserted_rows, diff.total_inserted_rows
+            );
+            assert_eq!(
+                incr.total_inserted_rows, 10,
+                "ten rows pass `v > 10`, however they are encoded"
+            );
+            // And the physical counts are what misled the harness. This is an
+            // assertion about the ENCODING, not the answer: if a later change
+            // makes both arms consolidate, update it deliberately rather than
+            // reading the equality as a bug.
+            assert!(
+                incr.total_output_rows < diff.total_output_rows,
+                "this scenario must actually EXERCISE the encoding difference \
+                 (measured 2 vs 10); equal counts mean the test no longer \
+                 reproduces what misled the A/B harness — got {} vs {}",
+                incr.total_output_rows,
+                diff.total_output_rows
+            );
+        }
+
         /// IVM-AUD-CORE-18: `publish_output` advanced the diff baseline only for
         /// materialized views, so a NON-materialized view maintained by an O(Δ)
         /// operator kept `full_output = None`. The first full recompute then

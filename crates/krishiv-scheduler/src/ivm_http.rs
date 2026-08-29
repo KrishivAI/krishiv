@@ -739,7 +739,22 @@ pub async fn api_ivm_feed_stream_delta(
 #[derive(Debug, Serialize)]
 pub struct StepResponse {
     pub active_views: usize,
+    /// PHYSICAL delta rows emitted this tick. A `DeltaBatch` is a Z-set, so
+    /// five copies of a row are representable either as five weight-1 rows or
+    /// as one weight-5 row — the incremental path consolidates, a full
+    /// recompute does not. **This number is therefore representation-dependent
+    /// and must not be used to compare two flows.** IVM-AUD-DIST-5: the
+    /// distributed mode A/B did exactly that and reported a stateless view's
+    /// arms disagreeing 989 vs 4945 (a clean 5x), which read as a silent wrong
+    /// answer and blocked every stateless-view number. Both arms held the same
+    /// Z-set. Compare `total_inserted_rows` / `total_retracted_rows` instead.
     pub total_output_rows: usize,
+    /// LOGICAL rows inserted this tick — the sum of positive delta weights.
+    /// Invariant across encodings, so this is the field two arms must agree on.
+    pub total_inserted_rows: u64,
+    /// LOGICAL rows retracted this tick — the sum of negative delta weight
+    /// magnitudes.
+    pub total_retracted_rows: u64,
     pub tick: u64,
     /// IVM-AUD-API-A5. Per-view health for this tick.
     ///
@@ -1013,6 +1028,8 @@ pub async fn api_ivm_step(
     Ok(Json(StepResponse {
         active_views: summary.active_views,
         total_output_rows: summary.total_output_rows,
+        total_inserted_rows: summary.total_inserted_rows,
+        total_retracted_rows: summary.total_retracted_rows,
         tick,
         view_health: health,
     }))
@@ -2912,6 +2929,72 @@ mod tests {
         assert_eq!(err, StatusCode::BAD_REQUEST);
     }
 
+    /// IVM-AUD-DIST-5. `total_output_rows` counts PHYSICAL delta rows, so a
+    /// consolidating incremental arm and a non-consolidating recompute report
+    /// different numbers for the SAME answer. `scripts/ivm_mode_ab.py` compared
+    /// that field and reported a stateless view's arms disagreeing 989 vs 4945
+    /// — a clean 5x — which read as a silent wrong answer and blocked every
+    /// distributed stateless-view number until it was explained.
+    ///
+    /// The logical counters are the invariant, and before this they never
+    /// reached the wire at all: a distributed caller had no representation-
+    /// independent number to compare. This pins them to a tick where physical
+    /// and logical DIVERGE, so wiring either from `total_output_rows` fails.
+    #[tokio::test]
+    async fn the_step_wire_carries_logical_row_counts_not_just_physical_ones() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        create_revenue_job(&registry, &coordinator, "logical").await;
+
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("logical".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+            }),
+        )
+        .await
+        .expect("feed 1");
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("logical".into()),
+        )
+        .await
+        .expect("step 1");
+
+        // Updating an EXISTING group emits two physical rows (retract the old
+        // total, insert the new) but exactly one logical retraction.
+        let _ = api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("logical".into(), "orders".into())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(orders(&["US"], &[7])),
+            }),
+        )
+        .await
+        .expect("feed 2");
+        let step = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("logical".into()),
+        )
+        .await
+        .expect("step 2");
+
+        assert_eq!(
+            (step.total_inserted_rows, step.total_retracted_rows),
+            (1, 1),
+            "one group changed: one logical insert and one logical retraction"
+        );
+        assert_eq!(
+            step.total_output_rows, 2,
+            "the same change is TWO physical delta rows — this gap is what made \
+             a correct engine look like it disagreed with itself"
+        );
+    }
+
     #[tokio::test]
     async fn feed_step_and_snapshot_end_to_end() {
         let (registry, coordinator) = test_deps_with_shards(1);
@@ -2941,6 +3024,21 @@ mod tests {
         assert_eq!(step.active_views, 1);
         assert_eq!(step.tick, 1);
         assert!(step.total_output_rows > 0);
+        // IVM-AUD-DIST-5: the logical counters must reach the wire. Without
+        // them a distributed caller can only see `total_output_rows`, which
+        // counts PHYSICAL delta rows and so differs between a consolidating
+        // incremental arm and a non-consolidating recompute for the SAME
+        // answer. `scripts/ivm_mode_ab.py` read that as the arms disagreeing
+        // 989 vs 4945 and treated a correct engine as broken. Six input rows
+        // over three regions collapse to three aggregate rows, each an insert.
+        assert_eq!(
+            step.total_inserted_rows, 3,
+            "one insert per aggregate group must be visible on the wire"
+        );
+        assert_eq!(
+            step.total_retracted_rows, 0,
+            "nothing is retracted on tick 1"
+        );
 
         let snap = api_ivm_snapshot(
             State(registry.clone()),
