@@ -6662,11 +6662,36 @@ per-key loop skipped a key the moment its LEFT probe came back empty —
 `if left_matches.is_empty() { continue }` ran BEFORE it touched the right trace.
 Batching both sides up front loses that narrowing, probing and grouping
 right-side rows for keys about to be discarded. Fixed by probing left, narrowing
-to keys that have left rows, then probing right for those only. **The
-re-measurement after that fix did not complete** — two samples, taken against a
-concurrent test gate, worthless — so whether the narrowing removes the 400k
-regression is OPEN. Re-run the paired A/B on an idle box before quoting any
-speedup from this change.
+to keys that have left rows, then probing right for those only.
+
+**RESOLVED, and the answer is that this change buys nothing measurable.**
+Re-run paired on an idle box (load average 1.2–1.5, nothing else running):
+
+| seed | per-key (§69) | batched + narrowing | ratio | batched wins |
+|---|---:|---:|---:|---:|
+| 400 k | 153.38 ms | 156.69 ms | 0.98x | 3/6 |
+| 800 k | 289.85 ms | 285.83 ms | 1.01x | 4/6 |
+
+**7 of 12 paired wins — a coin flip.** Every earlier signal from this change
+(1.29x, 1.15x, 1.47x, and the 0.83x regression) was load artifact. Three
+separate sweeps on a box carrying load average 5–15 produced three different
+stories, and the only one that survived an idle re-run is "no difference".
+
+**And the mechanism says it could not have been otherwise.** Before §69 a
+per-key probe was O(state), so 2xK of them was O(K x state) and worth killing.
+After the key index a probe is O(log n + matches) and K is bounded by the DELTA,
+not by accumulated state — so K per-key probes and one batched probe over K keys
+are the same order. §69 removed the term this entry was written to attack. The
+call-count reduction is real (402 -> 2 in the unit test) and the wall-clock
+effect of removing it is nil.
+
+**Kept, not reverted, but on the tests' merit alone.** §65/PERF-4 reverted an
+unmeasured narrowing on exactly this reasoning, and the same logic would revert
+this if the code were all it carried. What it carries instead is the first unit
+coverage `apply_left_semi_anti_residual` has ever had, including a guard on a
+silent wrong answer (below). Whoever next touches this should know the batching
+earns its place as a test fixture and a duplication fix, **not as a speedup**,
+and should feel free to revert the batching if it ever obstructs a real one.
 
 **What IS established, and why this is kept rather than reverted:**
 

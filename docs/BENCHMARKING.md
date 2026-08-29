@@ -1226,3 +1226,28 @@ and 100M were OOM-killed at the 14 GB cap. That is ~1.2 KB resident per seeded
 row against a 50-100 byte source row — a 10-20x blowup, extrapolating to ~120 GB
 at 100M and ~1.2 TB at 1B. **A 1B-row single-node run is out by ~60x on memory**,
 and the per-row cost, not the hardware, is the barrier. Task #166.
+
+### 2026-08-29b — the ΔB batching measures as nothing (IVM-AUD-PERF-7)
+
+Same harness as 2026-08-29. `ca50113` batches the semi/anti ΔB branch's trace
+probes (two per distinct right-delta key -> two per tick). Paired A/B, both
+binaries interleaved, idle box (load average 1.2–1.5):
+
+| seed | per-key | batched | ratio | batched wins |
+|---|---:|---:|---:|---:|
+| 400 k | 153.38 ms | 156.69 ms | 0.98x | 3/6 |
+| 800 k | 289.85 ms | 285.83 ms | 1.01x | 4/6 |
+
+**7 of 12 paired wins. No effect.** The call count really does fall (402 -> 2
+in the unit test) and the wall clock does not move, because the 2026-08-29 key
+index already made each probe O(log n + matches) and the key count is bounded by
+the delta rather than by accumulated state.
+
+**Methodology, the part worth keeping.** Three earlier sweeps of this same
+comparison produced 1.29x, 1.15x, 1.47x and a 0.83x REGRESSION — all on a box
+whose load average moved between 5 and 15, twice while a `just test` or
+`just lint` ran concurrently. One unpaired sweep reported a 400k tick SLOWER
+than its own 800k tick, which is impossible and was the tell. On this hardware:
+interleave the arms, take at least 6 paired rounds, confirm the box is idle
+first, and treat any non-monotonic seed curve as proof the run is contaminated
+rather than as a finding. A single unpaired sweep here is worth nothing.
