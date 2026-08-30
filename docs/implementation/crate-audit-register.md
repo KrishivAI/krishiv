@@ -7197,3 +7197,88 @@ pass it for the wrong reason.
 comparator's own comments warn that Spark's default `spark.local.dir` is a
 tmpfs. The trap was documented for the *external baseline* and never applied to
 the engine's own paths, twice: spill location (§77) and now log destination.
+
+## §79 — IVM-AUD-PERF-8: the engine is 5.3x slower than the engine it embeds
+
+Asked to close the TPC-H gap against DuckDB. The gap is not spread across the
+corpus: **q21 alone is 227.9 s of the 499.4 s SF100 gap (46%)**, and four
+queries are 75% of it.
+
+**The finding.** `datafusion-cli 54.1.0` — the *same DataFusion version krishiv
+embeds* — runs q21 on the same files with the same 24 GB pool in **45 s**.
+Krishiv takes **273 s**. Bypassing krishiv's own optimizer rules brings it to
+**51 s**, i.e. back to the embedded engine's own number.
+
+| q21 @ SF100 | wall | CPU | peak RSS |
+|---|---|---|---|
+| DuckDB | 25.7 s | — | 5.0 GB |
+| datafusion-cli | 45.4 s | 893% | 4.2 GB |
+| krishiv | 273.3 s | 404% | 2.2 GB |
+| krishiv, krishiv rules bypassed | 51.2 s | 405% | 3.6 GB |
+| krishiv, spill-join rewrite off only | 91.4 s | 391% | 33.5 GB |
+
+Corpus-level, SF100, 22 queries:
+
+| rule set | total | status |
+|---|---|---|
+| none | 369.1 s | **q18 FAILS** |
+| all (today's default) | 702.2 s | 22/22 |
+| all except `spill` | 552.7 s | 22/22 |
+| `pushdown` only | 560.8 s | 22/22 |
+| `spill` + `pushdown` only | 898.3 s | 22/22 |
+| all, `spill` threshold sized from whole pool | 588.6 s | 22/22 |
+
+**What is NOT the cause** — each measured, not reasoned about: fair-vs-greedy
+memory pool (datafusion-cli with `--mem-pool-type fair` is 45.0 s, identical to
+greedy); the spill-join threshold at 4 or 8 GiB (no change — q21's build side
+estimate exceeds both); runtime filters (`KRISHIV_RUNTIME_FILTERS=off`, no
+change); `target_partitions` (verified 12 via `information_schema.df_settings`);
+per-query process and registration overhead (0.19 s for all 8 SF100 tables).
+
+**The tempting wrong conclusion.** "Krishiv's rules are single-node overhead" is
+false. Disabling four of them (`coop`, `aggred`, `dimred`, `latemat`) makes the
+corpus *slower* — 898.3 s against 702.2 s — so they earn their place even
+in-process. The cost is concentrated in the spill-join rewrite, and the rules
+INTERACT: no configuration can be predicted by adding up per-rule deltas.
+
+**Why the obvious fix is wrong, measured.** `spillable_join::from_capacity`
+sizes its threshold from `min_task_memory_share_bytes()` (`pool / slots`), which
+is fiction when one query owns the process — and
+`query_memory_share_bytes()`, which returns the whole pool for a declared
+single-query process, exists with **zero callers**. Wiring it up gives 588.6 s,
+22/22, at a 24 GB pool. It also reproduces the failure the earlier entry
+recorded, at the pool size that entry used:
+
+| pool | threshold | q8 | q18 |
+|---|---|---|---|
+| 2.6 GB | 108 MB (per-slot) | OK | OK |
+| 2.6 GB | 1.3 GB (whole-pool) | **FAIL** | **FAIL** |
+| 2.6 GB | 614 MB | OK | **FAIL** |
+| 3 GB | 1024 MB | OK | **FAIL** |
+| 4 GB | 2048 MB | OK | OK |
+| 4–16 GB | 50% of pool | OK | OK |
+
+Safety is **non-monotonic in the threshold**: at 2.6 GB a 614 MB threshold fails
+where 108 MB succeeds, yet at 4 GB a 2048 MB threshold is fine. So it is not a
+function of the threshold alone, nor of the ratio — three candidate formulas
+(whole pool, a pool-size cliff, and "keep 2 GiB of headroom") were each refuted
+by measurement. The per-slot divisor is doing real work as a proxy for
+"leave room for the rest of the plan".
+
+**Not fixed — needs a decision, and more than two queries of evidence.** The win
+is real and large (702 → 588 s with all rules retained, or → 553 s without the
+rewrite). But this is a memory-safety rule, and calibrating it from q8 and q18
+at one scale factor is how a green benchmark becomes a broken executor. The
+honest fix is to size the threshold from the *concurrent memory-hungry
+operators in this plan* rather than from a fictional slot count — real work, not
+a constant.
+
+**Three observability defects found while looking, and they are why this hid.**
+`EXPLAIN ANALYZE` does not execute: it returns krishiv's plan IR and the text
+"call `DataFrame::explain_with(Analyze)` for runtime statistics".
+`explain --mode physical` is rejected although the command's own help advertises
+physical plans and the Python stub declares the mode. SQL-level `EXPLAIN` is
+intercepted and returns the same IR. **The engine offers no way to see the
+DataFusion plan it actually runs** — which is precisely how a 5.3x regression
+against its own embedded engine went unnoticed. Fixing that is the prerequisite
+for fixing the plan.
