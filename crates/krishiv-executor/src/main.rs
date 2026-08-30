@@ -48,7 +48,7 @@ fn main() {
         });
 
     let exit = rt.block_on(async {
-        // Install the tracing subscriber (fmt to stdout + the log ring the
+        // Install the tracing subscriber (fmt to stderr + the log ring the
         // /logs endpoint serves). Without this the standalone executor binary
         // dropped every tracing event on the floor — only eprintln! reached
         // the operator.

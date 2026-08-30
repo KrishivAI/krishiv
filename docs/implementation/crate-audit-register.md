@@ -7115,3 +7115,68 @@ raises it.
 never bound. That does not invalidate them — but "the engine runs TPC-H" was
 only ever established below the point where its own spill limit engages, and
 SF1000 is the first run to cross it.
+
+## §78 — IVM-AUD-CLI-1: the logs were on the data channel
+
+Found by running the cross-engine comparison, which reported that **all 22**
+TPC-H queries disagreed between Krishiv and both DuckDB and Spark — while
+DuckDB and Spark agreed with each other byte for byte.
+
+That shape is the whole finding. Two independent engines agreeing and the third
+differing on *every* query is not a query bug; a query bug is selective.
+
+**The defect.** `krishiv-metrics/src/init.rs` built its fmt layer with
+`tracing_subscriber::fmt::layer()`, which defaults to **stdout**, in all three
+`KRISHIV_LOG_FORMAT` branches. stdout is the CLI's *data* channel:
+`krishiv sql --format json` writes NDJSON there. So one INFO event — 
+
+```
+{"timestamp":…,"level":"INFO","fields":{"message":"query memory: one shared
+ FairSpillPool for this process",…},"target":"krishiv_sql"}
+```
+
+— parsed as a result row. The row counts show it exactly: q1 4+1=5, q2 100+2=102,
+q21 100+10=110, the increment being however many log events fired.
+
+**Why it stayed hidden.** The line is emitted only when a query pool is
+configured, and `tpch_compare_engines.py` sets no memory limit, so the committed
+2026-07-26 comparison never triggered it. It is *not* an exotic condition
+though: `query_memory_limit_from_env` derives the pool from the cgroup, so every
+containerised deployment emits it, and every containerised consumer of
+`--format json` has been reading a corrupted stream.
+
+**The comment said stderr.** Directly above the code: "KRISHIV_LOG_FORMAT=
+pretty|compact gives local CLI use human-readable **stderr**". `.pretty()` and
+`.compact()` change the *format*, never the writer. Same shape as §77 — a
+comment describing an intent the code did not implement — and found the same
+way, by running something that binds the behaviour rather than by reading.
+
+**The fix.** `.with_writer(std::io::stderr)` on all three branches. Nothing is
+lost: `kubectl logs` and `docker logs` capture stderr as well as stdout.
+
+**Revert-proof.** `json_output_keeps_log_lines_off_stdout` spawns the real
+binary via `CARGO_BIN_EXE_krishiv` with `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` set
+and asserts no `"level":`/`"target":` line reaches stdout. It is an integration
+test rather than a unit test because the defect is *which file descriptor a
+globally-installed subscriber writes to*, which is only observable from outside
+the process. Reverted, it fails with the offending line quoted. It also asserts
+the result is still on stdout, so a subscriber that silenced everything cannot
+pass it for the wrong reason.
+
+**What the check then found, once it worked.** 21/22 agree Krishiv↔DuckDB,
+20/22 Krishiv↔Spark, 20/22 DuckDB↔Spark. Two residuals, different in kind:
+
+- **q1 — Krishiv truncates `AVG` over DECIMAL where Spark rounds.** Exact
+  `avg_qty` is 25.522005853…; Spark returns 25.522006, Krishiv 25.522005. Same
+  on `avg_price`. A real, reproducible precision difference against both other
+  engines, and the one genuine engine finding this check produced. **Not fixed —
+  needs a decision** on whether DECIMAL `AVG` should round half-up.
+- **q1/q8 DuckDB↔Spark** — an artifact of the harness canonicalising to 6
+  *significant* digits, which on `avg_disc` (~0.05) reaches the 7th decimal:
+  0.0499853 (double) vs 0.049985 (6-dp decimal). Not an engine disagreement.
+  On q8 Krishiv and DuckDB are byte-identical and Spark is the outlier.
+
+**The lesson worth keeping.** This repo already knew the general shape — the
+comparator's own comments warn that Spark's default `spark.local.dir` is a
+tmpfs. The trap was documented for the *external baseline* and never applied to
+the engine's own paths, twice: spill location (§77) and now log destination.

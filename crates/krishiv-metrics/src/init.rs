@@ -183,16 +183,43 @@ pub fn init(config: MetricsConfig) -> Result<MetricsHandle, MetricsError> {
 
     // Log output format: JSON stays the daemon default (structured ingestion),
     // but KRISHIV_LOG_FORMAT=pretty|compact gives local CLI use human-readable
-    // stderr instead of one JSON object per event (Phase 51, audit §11).
+    // output instead of one JSON object per event (Phase 51, audit §11).
+    //
+    // # Every branch writes to stderr, and that is load-bearing
+    //
+    // `fmt::layer()` defaults to **stdout**, and this comment used to claim
+    // "stderr" while all three branches wrote to stdout — a comment that told
+    // the truth about an intent the code did not implement.
+    //
+    // stdout is the CLI's DATA channel. `krishiv sql --format json` emits
+    // NDJSON there, so a single log event on stdout is an extra "row" to
+    // every machine consumer. It is not hypothetical: the engine logs
+    // "query memory: one shared FairSpillPool" at INFO whenever a query pool
+    // is configured, which in any cgroup-limited container is always. That
+    // line parsed as a result row and made all 22 TPC-H queries disagree with
+    // DuckDB and Spark in the cross-engine comparison, while those two agreed
+    // exactly with each other.
+    //
+    // Nothing is lost by moving: `kubectl logs` and `docker logs` capture
+    // stderr as well as stdout, so structured ingestion is unaffected.
     let fmt_layer = match std::env::var("KRISHIV_LOG_FORMAT")
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase()
         .as_str()
     {
-        "pretty" => tracing_subscriber::fmt::layer().pretty().boxed(),
-        "compact" => tracing_subscriber::fmt::layer().compact().boxed(),
-        _ => tracing_subscriber::fmt::layer().json().boxed(),
+        "pretty" => tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_writer(std::io::stderr)
+            .boxed(),
+        "compact" => tracing_subscriber::fmt::layer()
+            .compact()
+            .with_writer(std::io::stderr)
+            .boxed(),
+        _ => tracing_subscriber::fmt::layer()
+            .json()
+            .with_writer(std::io::stderr)
+            .boxed(),
     };
 
     // try_init is safe to call multiple times; it returns Err when a subscriber is

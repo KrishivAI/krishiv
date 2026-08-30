@@ -189,3 +189,51 @@ fn write_people_parquet(path: &std::path::Path) {
 fn normalize(value: &str) -> String {
     value.replace("\r\n", "\n")
 }
+
+/// stdout is the data channel; logs belong on stderr (IVM-AUD-CLI-1).
+///
+/// `tracing_subscriber::fmt::layer()` defaults to stdout, and every branch of
+/// the format match in `krishiv-metrics/src/init.rs` used it. The engine logs
+/// "query memory: one shared FairSpillPool" at INFO whenever a query pool is
+/// configured — set explicitly here, and derived from the cgroup in any real
+/// container — so that JSON log line landed in the middle of `--format json`
+/// NDJSON output and every machine consumer read it as a result row.
+///
+/// It is asserted through the real binary rather than a unit test because the
+/// defect is in which file descriptor a globally-installed subscriber writes
+/// to, which is only observable from outside the process.
+#[test]
+fn json_output_keeps_log_lines_off_stdout() {
+    let out = Command::new(env!("CARGO_BIN_EXE_krishiv"))
+        .args([
+            "sql",
+            "--local",
+            "--format",
+            "json",
+            "--query",
+            "select 1 as value",
+        ])
+        // Forces `process_query_pool` to build, which emits the INFO line.
+        .env("KRISHIV_QUERY_MEMORY_LIMIT_BYTES", "1073741824")
+        .output()
+        .expect("failed to run krishiv binary");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+
+    let offenders: Vec<&str> = stdout
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| line.contains("\"level\":") || line.contains("\"target\":"))
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "log lines reached stdout and would parse as result rows: {offenders:?}\n\
+         full stdout:\n{stdout}"
+    );
+
+    // The result itself must still be there — a subscriber that silenced all
+    // output would pass the assertion above for the wrong reason.
+    assert!(
+        stdout.contains("\"value\""),
+        "expected the query result on stdout, got:\n{stdout}"
+    );
+}

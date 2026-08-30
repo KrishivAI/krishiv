@@ -1355,3 +1355,75 @@ predicted after indexing the trace.
 **Caveats.** SF1000 is one pass per query; the corpus was not repeated at that
 scale because a single pass already costs 2.83 h. Nothing here is a
 cross-engine comparison — no DuckDB or Spark arm was run at SF1000.
+
+### 2026-08-30b — three engines at SF100, and the answer-check that was broken
+
+The companion to the SF1000 run above: Krishiv, DuckDB and Spark on the **same
+box, same local Parquet, same corpus SQL**, run serially via
+`scripts/bench/tpch_compare_engines.py`, which compares *answers* as well as
+times.
+
+**Setup.** 12 cores / 61 GiB. Krishiv 24 GiB query pool; Spark 3.5.3 in local
+mode with 36 GiB driver heap (the script's 0.6xRAM policy) and `spark.local.dir`
+on NVMe; DuckDB 1.5.5 default. Both asymmetries — more memory, and one warm JVM
+with tables registered once versus a fresh Krishiv process per query — favour
+Spark. Spark ran through `scripts/bench/spark_local_tpch.sh`; the existing
+`spark_submit_tpch*.sh` scripts submit to Kubernetes over s3a and would have
+measured the object store instead of the engine.
+
+| query | Krishiv (s) | DuckDB (s) | Spark (s) | K/D | S/K |
+|---|---|---|---|---|---|
+| suppliers_who_kept_orders_waiting | 254.64 | 26.69 | 284.28 | 9.5x | 1.1x |
+| large_volume_customer | 86.10 | 14.81 | 239.72 | 5.8x | 2.8x |
+| product_type_profit_measure | 57.11 | 22.41 | 237.63 | 2.5x | 4.2x |
+| volume_shipping | 50.62 | 9.41 | 76.72 | 5.4x | 1.5x |
+| returned_item_reporting | 27.77 | 9.92 | 65.16 | 2.8x | 2.3x |
+| potential_part_promotion | 24.16 | 8.22 | 43.48 | 2.9x | 1.8x |
+| pricing_summary | 24.01 | 11.61 | 281.22 | 2.1x | 11.7x |
+| shipping_modes_and_order_priority | 22.49 | 5.31 | 45.88 | 4.2x | 2.0x |
+| national_market_share | 21.05 | 11.69 | 121.24 | 1.8x | 5.8x |
+| local_supplier_volume | 19.60 | 9.72 | 180.94 | 2.0x | 9.2x |
+| small_quantity_order_revenue | 18.32 | 9.49 | 259.84 | 1.9x | 14.2x |
+| customer_distribution | 17.91 | 13.53 | 77.13 | 1.3x | 4.3x |
+| top_supplier | 15.81 | 6.04 | 55.99 | 2.6x | 3.5x |
+| shipping_priority | 13.09 | 8.64 | 82.64 | 1.5x | 6.3x |
+| discounted_revenue | 12.43 | 9.01 | 28.35 | 1.4x | 2.3x |
+| promotion_effect | 8.01 | 6.56 | 24.51 | 1.2x | 3.1x |
+| forecasting_revenue_change | 7.80 | 3.77 | 14.91 | 2.1x | 1.9x |
+| order_priority_checking | 6.84 | 6.22 | 62.69 | 1.1x | 9.2x |
+| important_stock_identification | 4.58 | 1.93 | 34.57 | 2.4x | 7.5x |
+| parts_supplier_relationship | 3.62 | 2.61 | 20.96 | 1.4x | 5.8x |
+| minimum_cost_supplier | 3.33 | 1.95 | 37.90 | 1.7x | 11.4x |
+| global_sales_opportunity | 2.92 | 3.32 | 29.18 | 0.9x | 10.0x |
+| **total** | **702.2** | **202.9** | **2304.9** | **3.5x** | **3.3x** |
+
+**DuckDB is 3.5x faster than Krishiv; Krishiv is 3.3x faster than Spark.**
+Krishiv's worst relative showing is q21 (9.5x DuckDB) and its best is q22, where
+it edges DuckDB. Spark completed **22/22** here, against 9/22 in the 2026-07-26
+entry — that run's Spark column was never comparable and this one is.
+
+**The answer-check was broken, and fixing it was the main result.** The first
+run reported all 22 queries disagreeing between Krishiv and both others, while
+DuckDB and Spark agreed byte for byte. Cause: the CLI wrote tracing logs to
+**stdout**, its own NDJSON data channel, so a `level=INFO` line parsed as a
+result row (register §78). Krishiv's answers were never wrong — the direct CLI
+already returned the correct 4 rows for q1 and 100 for q2. After the fix:
+
+| pair | agree |
+|---|---|
+| Krishiv ↔ DuckDB | 21/22 |
+| Krishiv ↔ Spark | 20/22 |
+| DuckDB ↔ Spark | 20/22 |
+
+**One genuine engine difference survives.** On q1 Krishiv **truncates** `AVG`
+over DECIMAL where Spark rounds half-up: exact `avg_qty` 25.522005853… returns
+as 25.522006 from Spark and 25.522005 from Krishiv, likewise `avg_price`. Open;
+see §78. The remaining DuckDB↔Spark difference is a harness artifact (6
+*significant* digits reaching the 7th decimal of `avg_disc`), not a
+disagreement — and on q8 Krishiv and DuckDB are byte-identical with Spark the
+outlier.
+
+**Caveats.** Single pass per engine at SF100 (the noise floor measured in the
+2026-08-30 entry is 0.3-7.5% per query). No SF1000 arm for DuckDB or Spark:
+Spark's q1 alone runs ~271 s at SF100, so a 22-query 1 TB sweep is plausibly
+10-30 h and was not attempted. Nothing here is tuned on any side.
