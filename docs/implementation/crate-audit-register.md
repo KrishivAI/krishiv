@@ -7265,6 +7265,45 @@ function of the threshold alone, nor of the ratio — three candidate formulas
 by measurement. The per-slot divisor is doing real work as a proxy for
 "leave room for the rest of the plan".
 
+**ATTRIBUTED (added after §80 made `explain --analyze` usable).** The
+operator-level cause, which five corpus bisections could not name and one
+command did:
+
+| q21 @ SF100 | joins | SortExec | spills | wall | peak RSS |
+|---|---|---|---|---|---|
+| krishiv | 5x `SortMergeJoinExec` | 10 | **369** | 273 s | 2.2 GB |
+| datafusion-cli | 5x `HashJoinExec` | 1 | **0** | 45 s | 4.2 GB |
+
+Krishiv's three hottest operators are sorts: 93.6 s / 144 spills, 56.6 s / 96,
+56.4 s / 84 — ~207 s of the 273 s, in sorts that exist only because the joins
+were converted. (`elapsed_compute` aggregates across partitions and is not wall
+time; the load-bearing facts here are the operator types, 369-vs-0 spills, and
+the separately measured wall and RSS.)
+
+**So the rewrite is self-defeating on this query.** `spillable_join` converts a
+join whose build side estimate exceeds the threshold, on the reasoning that hash
+join cannot spill and would fail. DataFusion's hash plan for the same query
+*never spills* and peaks at 4.2 GB — inside the same 24 GB pool by a factor of
+five. The conversion trades a bounded hash build for an unbounded sort spill,
+and here the sort is what does not fit.
+
+This also explains two results that looked contradictory:
+
+- `spill` + `pushdown` alone (898 s) being SLOWER than all six rules (702 s) —
+  the other four shrink the inputs before they reach those sorts, so removing
+  them hands the sorts more rows to spill.
+- The non-monotonic safety table. It was never a property of the threshold
+  value. Sort-merge substitutes sort-spill for hash-build, and which of the two
+  survives depends jointly on pool size and how much the upstream rules reduced
+  the input — which is exactly why no formula over the threshold alone fitted.
+
+**Direction for the fix, now specific.** The rule weighs only the hash build it
+avoids and never the sort it creates. A correct version compares both against
+what is actually available, and declines the conversion when the hash side fits
+— which on this query it does, five times over. That is a change to
+`spillable_join`'s decision, not a constant to re-tune, and it must still be
+validated across pool sizes and both modes.
+
 **Not fixed — needs a decision, and more than two queries of evidence.** The win
 is real and large (702 → 588 s with all rules retained, or → 553 s without the
 rewrite). But this is a memory-safety rule, and calibrating it from q8 and q18
