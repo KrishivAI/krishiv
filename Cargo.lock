@@ -5348,6 +5348,7 @@ dependencies = [
  "serde_json",
  "sqlparser",
  "sqlx",
+ "sysinfo",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",

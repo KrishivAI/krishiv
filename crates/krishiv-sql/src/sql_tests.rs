@@ -2038,3 +2038,111 @@ fn parquet_scan_output_rows(
     );
     total
 }
+
+/// The batch spill ceiling and directory (IVM-AUD-BATCH-1).
+///
+/// DataFusion's `DiskManager` defaults to `std::env::temp_dir()` and a fixed
+/// 100 GiB ceiling, and `SqlEngine` used to configure neither. Both defaults
+/// are wrong at scale on a real host: TPC-H SF1000 q3 died with `Resources
+/// exhausted … exceeded the allowable limit of 100.0 GB` on a box with 600 GB
+/// free, and on any host where `/tmp` is a tmpfs the spill files written to
+/// relieve memory pressure are themselves held in RAM.
+#[cfg(test)]
+mod query_spill_tests {
+    use crate::{
+        FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES, resolve_query_spill_dir,
+        resolve_query_spill_disk_limit_bytes,
+    };
+
+    /// An operator-supplied ceiling wins outright — including one *below* the
+    /// fallback, because "cap this box hard" is a legitimate instruction.
+    #[test]
+    fn an_explicit_ceiling_is_used_verbatim() {
+        assert_eq!(
+            resolve_query_spill_disk_limit_bytes(Some("4096"), Some(u64::MAX)),
+            4096
+        );
+        assert_eq!(
+            resolve_query_spill_disk_limit_bytes(Some("  4096  "), None),
+            4096
+        );
+    }
+
+    /// Unset/blank/zero/garbage all mean "derive it"; none of them may be
+    /// mistaken for a ceiling of zero, which would refuse every spill.
+    #[test]
+    fn a_missing_or_unusable_ceiling_falls_back_to_the_derived_one() {
+        let free = 1_000 * FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES;
+        let derived = free / 100 * 80;
+        for raw in [None, Some(""), Some("   "), Some("0"), Some("banana")] {
+            assert_eq!(
+                resolve_query_spill_disk_limit_bytes(raw, Some(free)),
+                derived,
+                "raw {raw:?} should derive from free space"
+            );
+        }
+    }
+
+    /// The derived ceiling never drops below what the engine already
+    /// tolerated. Deriving outright would turn a small disk into a *lower*
+    /// ceiling than today's, converting queries that pass into failures.
+    #[test]
+    fn a_cramped_filesystem_never_lowers_the_ceiling_below_the_old_default() {
+        for free in [0, 1024, FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES] {
+            assert_eq!(
+                resolve_query_spill_disk_limit_bytes(None, Some(free)),
+                FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES,
+                "free={free} must not lower the ceiling"
+            );
+        }
+        assert_eq!(
+            resolve_query_spill_disk_limit_bytes(None, None),
+            FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES
+        );
+    }
+
+    /// A roomy filesystem raises it, which is the whole point.
+    #[test]
+    fn a_roomy_filesystem_raises_the_ceiling_above_the_old_default() {
+        let free = 10 * FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES;
+        assert!(
+            resolve_query_spill_disk_limit_bytes(None, Some(free))
+                > FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES
+        );
+    }
+
+    /// An exported-but-empty variable means "unset", not "spill to `.`".
+    #[test]
+    fn a_blank_spill_dir_is_not_a_path() {
+        assert_eq!(resolve_query_spill_dir(None), None);
+        assert_eq!(resolve_query_spill_dir(Some("")), None);
+        assert_eq!(resolve_query_spill_dir(Some("   ")), None);
+        assert_eq!(
+            resolve_query_spill_dir(Some(" /var/spill ")),
+            Some(std::path::PathBuf::from("/var/spill"))
+        );
+    }
+
+    /// The engine's runtime actually carries the resolved ceiling.
+    ///
+    /// This is the call-site guard: the four tests above prove the resolver,
+    /// but the defect was that nothing *called* it — the builder set an object
+    /// store and a memory pool and left the disk manager at its defaults. Any
+    /// host with more than ~125 GiB free on the spill filesystem resolves to
+    /// something other than DataFusion's constant, so dropping the
+    /// `with_max_temp_directory_size` call turns this red.
+    #[test]
+    fn the_engine_runtime_carries_the_resolved_spill_ceiling() {
+        let engine = crate::SqlEngine::new();
+        let resolved = crate::query_spill_disk_limit_bytes(&std::env::temp_dir());
+        assert_eq!(
+            engine
+                .session_context()
+                .runtime_env()
+                .disk_manager
+                .max_temp_directory_size(),
+            resolved,
+            "engine runtime ignored the resolved spill ceiling"
+        );
+    }
+}

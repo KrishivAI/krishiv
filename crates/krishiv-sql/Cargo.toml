@@ -33,6 +33,10 @@ datafusion-functions-nested = { workspace = true }
 # `iceberg-datafusion` / `*-catalog` features so lean builds (embedded) omit it.
 krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "lakehouse"] }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
+# Free space on the spill filesystem, so the batch spill ceiling adapts to
+# the host the way the memory pool already does instead of being a fixed
+# constant that a large dataset silently exceeds.
+sysinfo = { workspace = true }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 # Cross-stage runtime filters (`runtime_filter_exec`) build on the split-block
 # bloom filter in this crate rather than re-deriving one. Note the direction:

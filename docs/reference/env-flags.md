@@ -112,6 +112,8 @@ Regenerate with:
 | `KRISHIV_PRODUCTION` | bool | `false` | Production mode: tightens defaults (fail-closed metadata, auth requirements, connector restrictions). |
 | `KRISHIV_PYTHON_UDF_TIMEOUT_MS` | uint | `30000` | Per-call timeout for sandboxed Python UDF execution. |
 | `KRISHIV_QUERY_MEMORY_LIMIT_BYTES` | uint | `cgroup-derived` | Total FairSpillPool budget SHARED by every engine in the process (task slots, Flight SQL, IVM); 0 disables the limit. |
+| `KRISHIV_QUERY_SPILL_DIR` | text | `OS temp directory` | Directory batch SQL spill files are written to. The OS default is a tmpfs on some hosts, where spilling consumes the memory it relieves. |
+| `KRISHIV_QUERY_SPILL_MAX_DISK_BYTES` | uint | `max(80% of spill filesystem free space, 100 GiB)` | Ceiling on the total size of the batch SQL spill directory. |
 | `KRISHIV_RACK_ID` | text | `unset` | Rack identifier the executor advertises for RACK_LOCAL placement (Phase 53). Node identity is the executor host. |
 | `KRISHIV_REMOTE_EXEC` | bool | `mode-dependent` | Force remote (coordinator) execution on or off for API sessions. |
 | `KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH` | bool | `profile-dependent` | Require bearer auth on executor task gRPC even in dev profiles. |

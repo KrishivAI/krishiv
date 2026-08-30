@@ -450,6 +450,87 @@ pub fn query_memory_limit_from_env() -> Option<usize> {
     }
 }
 
+/// Ceiling on the batch spill directory used when the filesystem's free space
+/// cannot be read. This is DataFusion's own default, so an unreadable
+/// filesystem leaves behaviour exactly as it was.
+pub const FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES: u64 = 100 * 1024 * 1024 * 1024;
+
+/// Percentage of the spill filesystem's free space the ceiling may claim.
+const QUERY_SPILL_FREE_SPACE_PERCENT: u64 = 80;
+
+/// Resolve the batch spill directory from a raw env value. Blank is not a
+/// path: an exported-but-empty variable means "unset", not "spill to `.`".
+pub fn resolve_query_spill_dir(raw: Option<&str>) -> Option<std::path::PathBuf> {
+    raw.map(str::trim)
+        .filter(|raw| !raw.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Resolve the ceiling on the batch spill directory's total size.
+///
+/// An explicit `raw` wins outright. Otherwise the ceiling is the larger of
+/// [`FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES`] and
+/// [`QUERY_SPILL_FREE_SPACE_PERCENT`] of the filesystem's free bytes.
+///
+/// # Why `max` and not the derived value alone
+///
+/// Deriving it outright would let a small disk produce a ceiling *below* the
+/// one the engine has always used, turning queries that pass today into
+/// `Resources exhausted` failures on the next deploy. Taking the larger of the
+/// two can only ever raise the ceiling, so a host with room stops refusing
+/// work it can do (TPC-H SF1000 q3 exhausts the fixed 100 GiB on a box with
+/// 600 GB free) while a cramped host keeps exactly today's behaviour.
+#[must_use]
+pub fn resolve_query_spill_disk_limit_bytes(raw: Option<&str>, free_bytes: Option<u64>) -> u64 {
+    if let Some(explicit) = raw
+        .map(str::trim)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|&bytes| bytes > 0)
+    {
+        return explicit;
+    }
+    // `free / 100 * percent`, not `free * percent / 100`: the second overflows
+    // u64 on a filesystem past ~184 EB, and the precision lost by dividing
+    // first is at most 99 bytes of a multi-gigabyte ceiling.
+    let derived = free_bytes.map_or(0, |free| free / 100 * QUERY_SPILL_FREE_SPACE_PERCENT);
+    derived.max(FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES)
+}
+
+/// Free bytes on the filesystem holding `dir`.
+///
+/// Picks the longest matching mount point, because `/` matches every path and
+/// would report the root filesystem's free space for a spill directory that
+/// actually lives on a separate mount.
+fn spill_filesystem_free_bytes(dir: &std::path::Path) -> Option<u64> {
+    let disks = sysinfo::Disks::new_with_refreshed_list();
+    disks
+        .iter()
+        .filter(|disk| dir.starts_with(disk.mount_point()))
+        .max_by_key(|disk| disk.mount_point().as_os_str().len())
+        .map(sysinfo::Disk::available_space)
+}
+
+/// The batch spill directory, or `None` to leave DataFusion's default.
+///
+/// That default is `std::env::temp_dir()`, which is a trap wherever `/tmp` is
+/// a tmpfs: the spill files an operator writes to *relieve* memory pressure
+/// are themselves held in RAM, so spilling makes worse the problem it exists
+/// to solve. Naming a directory on real disk is the only way out.
+fn query_spill_dir_from_env() -> Option<std::path::PathBuf> {
+    resolve_query_spill_dir(std::env::var("KRISHIV_QUERY_SPILL_DIR").ok().as_deref())
+}
+
+/// The ceiling on the batch spill directory for `dir`, from the environment
+/// and that filesystem's free space.
+fn query_spill_disk_limit_bytes(dir: &std::path::Path) -> u64 {
+    resolve_query_spill_disk_limit_bytes(
+        std::env::var("KRISHIV_QUERY_SPILL_MAX_DISK_BYTES")
+            .ok()
+            .as_deref(),
+        spill_filesystem_free_bytes(dir),
+    )
+}
+
 pub use krishiv_common::cgroup_memory_limit_bytes;
 
 /// DataFusion's memory-pool trait, re-exported so crates that only build
@@ -1315,10 +1396,19 @@ impl SqlEngine {
             // fragment discovers which buckets the plan touches only by
             // decoding it, and the decode is what needs the store — so there
             // is no earlier point at which the bucket could be registered.
+            let spill_dir = query_spill_dir_from_env();
+            // Probe the directory the spill files will actually land in: the
+            // ceiling has to describe that filesystem's free space, not the
+            // root filesystem's, when the two differ.
+            let spill_probe_dir = spill_dir.clone().unwrap_or_else(std::env::temp_dir);
             let mut runtime_builder = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                 .with_object_store_registry(Arc::new(
                     crate::object_store_registry::LazyCloudObjectStoreRegistry::new(),
-                ));
+                ))
+                .with_max_temp_directory_size(query_spill_disk_limit_bytes(&spill_probe_dir));
+            if let Some(dir) = spill_dir {
+                runtime_builder = runtime_builder.with_temp_file_path(dir);
+            }
             if let Some(pool) = engine_memory.pool() {
                 // A FairSpillPool divides its capacity across concurrently
                 // running consumers and lets spill-capable operators (sort,

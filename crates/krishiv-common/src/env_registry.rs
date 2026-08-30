@@ -771,6 +771,19 @@ pub static FLAGS: &[FlagSpec] = &[
          (task slots, Flight SQL, IVM); 0 disables the limit.",
     ),
     rt(
+        "KRISHIV_QUERY_SPILL_DIR",
+        FlagKind::Text,
+        "OS temp directory",
+        "Directory batch SQL spill files are written to. The OS default is a \
+         tmpfs on some hosts, where spilling consumes the memory it relieves.",
+    ),
+    rt(
+        "KRISHIV_QUERY_SPILL_MAX_DISK_BYTES",
+        FlagKind::UInt,
+        "max(80% of spill filesystem free space, 100 GiB)",
+        "Ceiling on the total size of the batch SQL spill directory.",
+    ),
+    rt(
         "KRISHIV_RACK_ID",
         FlagKind::Text,
         "unset",

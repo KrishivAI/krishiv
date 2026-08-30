@@ -1251,3 +1251,107 @@ than its own 800k tick, which is impossible and was the tell. On this hardware:
 interleave the arms, take at least 6 paired rounds, confirm the box is idle
 first, and treat any non-monotonic seed curve as proof the run is contaminated
 rather than as a finding. A single unpaired sweep here is worth nothing.
+
+### 2026-08-30 — TPC-H SF1000 (1 TB) in batch mode: 22/22, and the ceiling that had to be raised first
+
+The first TPC-H run on this engine at 1 TB. It is a **batch** result, and that
+distinction is the whole reason it exists: the 2026-08-28f entry established
+that SF1000 is impossible for *delta-batch* because IVM state is RAM-resident
+(SF1000 lineitem alone is ~1.8 TB of state against 25 GB). Batch SQL spills, so
+batch is the axis where 1 TB is answerable on one box.
+
+**Setup.** Bare metal, 12 cores / 61 GiB, single NVMe. TPC-H SF1000 generated
+with `tpchgen-cli` 3.0.0 as **396 GiB of parquet** (`scripts/bench/gen_tpch.sh`,
+part counts scaled from the SF100 recipe so each part stays ~700 MB: lineitem
+320 parts, orders 160, partsupp 80). Row counts verified against the spec at
+SF100 (lineitem 600,037,902 / orders 150,000,000 / customer 15,000,000). Query
+pool 24 GiB (`KRISHIV_QUERY_MEMORY_LIMIT_BYTES`), spill on NVMe via
+`KRISHIV_QUERY_SPILL_DIR`. Runner `scripts/bench/tpch_batch_sweep.sh`, one
+`krishiv sql --local` process per query, single pass at SF1000.
+
+**It did not run at first, and the reason was an engine defect.** q3 died with
+`Resources exhausted: … exceeded the allowable limit of 100.0 GB` on a box with
+600 GB free. `SqlEngine` never configured DataFusion's disk manager, so batch
+inherited both its defaults: spill into `std::env::temp_dir()` — a *tmpfs* here,
+so spilling to relieve memory pressure consumed memory — and a fixed 100 GiB
+ceiling. See register §77. Same binary, changing only the dial:
+
+| q3 @ SF1000 | ceiling | result |
+|---|---|---|
+| old default, pinned via the dial | 100 GiB | **FAIL** — `Resources exhausted` |
+| derived default | ~571 GiB | **501.19 s** |
+
+q3 was the only query gated by it; q21 never crossed 100 GiB.
+
+**Results.** SF100 column is the **median of 3 back-to-back passes** with its
+measured spread; SF1000 is a single pass.
+
+| query | SF100 median (s) | SF100 spread | SF1000 (s) | ratio |
+|---|---|---|---|---|
+| q21 suppliers_who_kept_orders_waiting | 256.31 | 1.2% | 2702.64 | 10.5x |
+| q5 local_supplier_volume | 19.28 | 3.5% | 1061.83 | 55.1x |
+| q18 large_volume_customer | 87.71 | 1.8% | 1053.00 | 12.0x |
+| q7 volume_shipping | 50.42 | 2.0% | 959.63 | 19.0x |
+| q9 product_type_profit_measure | 56.62 | 1.9% | 693.62 | 12.3x |
+| q3 shipping_priority | 12.16 | 7.5% | 501.19 | 41.2x |
+| q20 potential_part_promotion | 23.79 | 3.7% | 342.90 | 14.4x |
+| q4 order_priority_checking | 6.96 | 5.7% | 306.52 | 44.0x |
+| q10 returned_item_reporting | 11.77 | 4.4% | 301.04 | 25.6x |
+| q13 customer_distribution | 17.66 | 5.2% | 287.33 | 16.3x |
+| q8 national_market_share | 20.63 | 1.7% | 263.66 | 12.8x |
+| q12 shipping_modes_and_order_priority | 22.31 | 0.3% | 246.84 | 11.1x |
+| q1 pricing_summary | 23.21 | 0.8% | 243.41 | 10.5x |
+| q17 small_quantity_order_revenue | 18.70 | 2.5% | 193.99 | 10.4x |
+| q22 global_sales_opportunity | 2.69 | 6.1% | 186.74 | 69.4x |
+| q15 top_supplier | 15.47 | 2.4% | 170.75 | 11.0x |
+| q19 discounted_revenue | 12.74 | 5.1% | 154.83 | 12.2x |
+| q16 parts_supplier_relationship | 3.62 | 3.9% | 150.20 | 41.5x |
+| q14 promotion_effect | 7.70 | 2.2% | 113.57 | 14.7x |
+| q2 minimum_cost_supplier | 3.77 | 5.1% | 112.29 | 29.8x |
+| q6 forecasting_revenue_change | 7.69 | 5.5% | 80.94 | 10.5x |
+| q11 important_stock_identification | 4.61 | 2.6% | 57.33 | 12.4x |
+| **total (22/22)** | **685.8** | | **10184.2** | **14.8x** |
+
+**The noise floor, measured rather than assumed.** Three back-to-back SF100
+passes on the quiet box spread **0.3%–7.5%** per query (~3% on the corpus
+total). Treat any SF1000 ratio difference inside that band as nothing.
+
+**A 17% drift that was not a code change.** An earlier SF100 sweep totalled
+850.7 s against 707.3 s for the next one, and the tempting reading — the spill
+fix made it faster — is wrong. The speedup was uniform across **all 22
+queries** (0.58x–0.99x), including queries that never spill (q22 3.00 → 2.97).
+A spill-ceiling change moves only spilling queries. The first sweep started
+seconds after generation wrote 396 GB, with page cache and writeback still
+draining. Recorded rather than discarded: the run that disagrees is how a
+benchmark quietly becomes a story.
+
+**What to look at next.** The corpus totals **14.8x for 10x data** — superlinear
+overall. Most queries sit at 10–14x, but six are far outside that band:
+q22 69.4x, q5 55.1x, q4 44.0x, q16 41.5x, q3 41.2x, q2 29.8x.
+
+**The likely cause is a cache-residency cliff, and it is a caveat on comparing
+these two scales at all.** SF100 is 39 GiB against 61 GiB of RAM, so a large
+part of it is served from page cache; SF1000 is 396 GiB and cannot be. The
+SF100 column is therefore partly a warm-cache measurement and the SF1000 column
+is I/O-bound, which inflates every ratio and inflates the small-footprint
+queries most.
+
+An earlier draft of this entry explained the q22/q16/q2 ratios as artifacts of
+tiny SF100 baselines where fixed overhead dominates. **That reasoning is
+backwards** and is recorded here because it is an easy mistake to repeat: fixed
+overhead inflates the *denominator*, which makes a ratio smaller. Subtracting a
+~0.5 s startup from q22 moves it from 69.4x to ~85x. These queries are more
+superlinear than they look, not less.
+
+None of this is attributed. Attributing it needs the working-set measurement
+(bytes actually read per query per scale) that this run did not collect —
+the same instrument-then-measure method PERF-6 used, rather than a hypothesis
+promoted to a finding.
+
+q21 remains the single most expensive query (2702.64 s, 27% of the corpus) but
+scales at 10.5x — it is large, not superlinear, which is what IVM-AUD-PERF-6
+predicted after indexing the trace.
+
+**Caveats.** SF1000 is one pass per query; the corpus was not repeated at that
+scale because a single pass already costs 2.83 h. Nothing here is a
+cross-engine comparison — no DuckDB or Spark arm was run at SF1000.

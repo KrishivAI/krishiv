@@ -7041,3 +7041,77 @@ Structural, not a matter of care.
 **Still refusable, not survivable.** A sinkless ring's overflow is held and the
 job faults; nothing is persisted, and a job nobody drains still fails. That is
 the decided contract (§73), not a shortfall of it.
+
+## §77 — IVM-AUD-BATCH-1: batch SQL never configured its disk manager
+
+Found by running, not by reading. TPC-H SF1000 q3 died with
+
+```
+Resources exhausted: The used disk space during the spilling process has
+exceeded the allowable limit of 100.0 GB.
+```
+
+on a box with 600 GB free and 1.1 TB of dataset on it.
+
+**The defect.** `SqlEngine`'s `RuntimeEnvBuilder` (`krishiv-sql/src/lib.rs`)
+installed an object-store registry and, when one existed, a memory pool — and
+never touched the disk manager. So every batch query inherited both DataFusion
+defaults: spill files into `std::env::temp_dir()`, and a fixed **100 GiB**
+ceiling on the spill directory. `krishiv-ivm/src/spill.rs` configures both
+(`with_temp_file_path`, `with_max_temp_directory_size`); the batch path, which
+is the one that actually spills for large SQL, configured neither.
+
+Both defaults are wrong on a real host, in different ways:
+
+- **The directory.** Wherever `/tmp` is a tmpfs — this box, and most systemd
+  hosts — the spill files an operator writes to *relieve* memory pressure are
+  themselves held in RAM. Spilling makes worse the exact problem it exists to
+  solve, and nothing says so.
+- **The ceiling.** 100 GiB is a constant chosen by DataFusion with no knowledge
+  of the host. It is simultaneously too small on a 1.8 TB NVMe box and too
+  large on a small container.
+
+**Why it survived every prior audit.** The register's Tier-1 pass read this
+crate. The comment at the site is *accurate* — it says spill-capable operators
+"write to the default disk manager's temp files". It names the default
+correctly; nobody asked whether the default was right. This is category E
+inverted: the usual failure is a comment that lies about the code, and this is a
+comment that tells the truth about a value that was never chosen. Reading finds
+the first kind. Only running at a scale that binds the limit finds the second —
+SF100's largest spill never approached 100 GiB, so every number in the committed
+history was taken below the threshold.
+
+**The fix.** Two dials, mirroring the IVM pair that already existed:
+`KRISHIV_QUERY_SPILL_DIR` and `KRISHIV_QUERY_SPILL_MAX_DISK_BYTES`. The ceiling
+defaults to `max(80% of the spill filesystem's free space, 100 GiB)`.
+
+The `max` is the load-bearing decision, not a hedge. Deriving from free space
+outright would let a small disk compute a ceiling *below* the one the engine has
+always used, turning queries that pass today into `Resources exhausted` failures
+on the next deploy — a silent regression introduced by a fix. Taking the larger
+of the two can only ever raise the ceiling: a host with room stops refusing work
+it can do, a cramped host keeps exactly today's behaviour.
+
+**The revert-proof, and the trap it avoids.** The obvious test — build an engine,
+assert the disk manager reports the configured ceiling — is one this register
+would otherwise have shipped as a test that cannot fail: DataFusion's default
+*is* our fallback constant, so with the wiring deleted the assertion still
+passes. Deriving the default from free space is what makes the call site
+observable. Deleting the one production line:
+
+```
+left:  107374182400   (DataFusion's 100 GiB — wiring gone)
+right: 612958237440   (~571 GiB — what the resolver returns here)
+```
+
+Five further tests cover the resolver itself: explicit wins verbatim (including
+below the fallback — "cap this box hard" is a legitimate instruction);
+blank/zero/garbage all mean *derive*, none of them a ceiling of zero that would
+refuse every spill; a cramped filesystem never lowers the ceiling; a roomy one
+raises it.
+
+**What this says about the benchmark history.** Every TPC-H number in
+`BENCHMARKING.md` before this entry was measured at a scale where the ceiling
+never bound. That does not invalidate them — but "the engine runs TPC-H" was
+only ever established below the point where its own spill limit engages, and
+SF1000 is the first run to cross it.
