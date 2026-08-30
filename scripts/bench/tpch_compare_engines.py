@@ -101,6 +101,17 @@ def parquet_glob(data_root: str, table: str) -> str:
 
 SIGNIFICANT_DIGITS = 6
 
+# Floor on how many decimal places a rounded value keeps. Significant digits
+# alone are not enough: engines return the same average at different
+# *precisions*, and for a small magnitude 6 significant digits reaches deeper
+# than the coarser engine has digits at all. TPC-H q1's `avg_disc` is ~0.05, so
+# DuckDB's double rounds to 0.0499853 while Spark's and DataFusion's DECIMAL(_,6)
+# hold only 0.049985 — the same number, reported as a disagreement on every row.
+# Rounding to whichever is COARSER (fewer digits) normalises that without
+# blunting large values: a 12-digit sum still keeps 6 significant digits, so an
+# error of billions cannot hide inside the tolerance.
+DECIMAL_PLACES = 6
+
 
 def canonical_value(value) -> str:
     """Render a cell so that equal values compare equal across engines.
@@ -135,6 +146,14 @@ def canonical_value(value) -> str:
         if number == number.to_integral_value():
             return str(int(number))
         rounded = decimal.Context(prec=SIGNIFICANT_DIGITS).create_decimal(number)
+        # Take the coarser of the two roundings. `exponent` is the power of ten
+        # of the last kept digit, so the larger exponent is the blunter value.
+        exponent = rounded.as_tuple().exponent
+        if isinstance(exponent, int) and exponent < -DECIMAL_PLACES:
+            rounded = rounded.quantize(
+                decimal.Decimal(1).scaleb(-DECIMAL_PLACES),
+                context=decimal.Context(prec=99),
+            )
         return format(rounded.normalize(), "f")
     if isinstance(value, datetime.datetime):
         return value.isoformat(sep=" ").replace(".000000", "")

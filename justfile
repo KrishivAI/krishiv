@@ -292,7 +292,10 @@ test-sql:
     {{ sccache_env }} {{ cargo }} test -p krishiv-sql --lib
 
 # Line-coverage measurement (audit §14 TEST-4) over the same scope as the
-# required test gate: lib + integration tests, python/chaos/bench excluded
+# required test gate, which is TWO recipes: `just test` (--lib) and
+# `just test-integration` (--tests). Reading this as one is how a new
+# integration test was once believed covered by a green `just test` that never
+# ran it. python/chaos/bench excluded
 # (see docs/implementation/ci-tiers.md). Prints the per-crate summary table;
 # coverage.yml runs this nightly and publishes the number to the job summary.
 # Install: cargo binstall cargo-llvm-cov

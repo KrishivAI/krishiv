@@ -98,9 +98,60 @@ class ApiSurfaceTests(unittest.TestCase):
         self.assertIn("def collect(", stub)
         self.assertIn("async def collect_async(self) -> QueryResult: ...", stub)
         self.assertIn("async def sql_async(self, query: str) -> DataFrame: ...", stub)
-        self.assertNotIn("from typing import Any", stub)
-        self.assertNotIn("-> Any", stub)
         self.assertIn("class Relation:", stub)
+
+    # Surfaces whose value genuinely is a foreign or dynamic object: pandas and
+    # pyarrow types krishiv does not own, and the PySpark-parity shims. `Any` is
+    # honest for these; inventing a precise krishiv type would be a lie.
+    ANY_ALLOWED = frozenset(
+        {
+            "from typing import",  # the import the aliases below need
+            "BatchLike",  # "Batch | Any" — krishiv Batch or pyarrow RecordBatch
+            "builder",
+            "catalog",
+            "createDataFrame",
+            "cube",
+            "fillna",
+            "first",
+            "head",
+            "na",
+            "read",
+            "register_arrow_stream",
+            "register_record_batches",
+            "rollup",
+            "stat",
+            "toLocalIterator",
+            "toPandas",
+            "udf",
+            "write",
+        }
+    )
+
+    def test_any_appears_only_on_deliberately_foreign_typed_surfaces(self):
+        """`Any` must stay confined to surfaces that really are untyped.
+
+        This replaces a blanket `assertNotIn("-> Any", stub)` that dated from
+        the first commit and had been RED since 2026-08-23, when 1350145 added
+        the PySpark-parity shims. Deleting the assertion would have removed the
+        guard; asserting the current output would have been a golden file that
+        blesses whatever regressed. So the property is the one actually worth
+        protecting: a *new* `Any` on a core method — `collect`, `sql`, `join` —
+        still fails, because it is not on this list.
+        """
+        inventory = api_surface.python_inventory(ROOT)
+        stub = api_surface.render_python_stub(inventory)
+        offenders = [
+            line.strip()
+            for line in stub.splitlines()
+            if "Any" in line
+            and not any(name in line for name in self.ANY_ALLOWED)
+        ]
+        self.assertEqual(
+            offenders,
+            [],
+            "`Any` leaked onto a surface krishiv owns; type it, or add it to "
+            "ANY_ALLOWED with a reason:\n" + "\n".join(offenders),
+        )
 
     def test_compare_classifies_additive_breaking_and_semantic(self):
         baseline = {"items": [{"id": "one", "signature": "old"}, {"id": "gone"}]}
@@ -113,3 +164,75 @@ class ApiSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def load_bench_script(name: str):
+    """Load a script from `scripts/bench/`, whose modules import their siblings."""
+    import sys
+
+    bench = ROOT / "scripts" / "bench"
+    if str(bench) not in sys.path:
+        sys.path.insert(0, str(bench))
+    spec = importlib.util.spec_from_file_location(name, bench / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
+compare_engines = load_bench_script("tpch_compare_engines")
+
+
+class CrossEngineCanonicalisationTests(unittest.TestCase):
+    """Comparing answers across engines must survive differing *precisions*.
+
+    The cross-engine check exists to catch a fast wrong answer. It reported all
+    of TPC-H q1's rows as disagreements between DuckDB and the other two, for a
+    number every engine computed identically: `avg_disc` is ~0.05, so six
+    SIGNIFICANT digits reach the 7th decimal, where DuckDB's double has a digit
+    (0.0499853) and a DECIMAL(_,6) simply does not (0.049985).
+    """
+
+    def test_double_and_fixed_scale_decimal_agree_on_the_same_small_value(self):
+        import decimal
+
+        self.assertEqual(
+            compare_engines.canonical_value(0.049985295838397614),
+            compare_engines.canonical_value(decimal.Decimal("0.049985")),
+        )
+
+    def test_a_real_last_digit_difference_still_shows(self):
+        """The rounding must not become a tolerance that hides disagreement.
+
+        TPC-H q1 row 2: DataFusion truncates to 0.049996 where Spark rounds to
+        0.049997, and DuckDB's exact 0.0499966 sides with Spark. If this ever
+        passes, the check has stopped checking.
+        """
+        import decimal
+
+        truncated = compare_engines.canonical_value(decimal.Decimal("0.049996"))
+        rounded = compare_engines.canonical_value(decimal.Decimal("0.049997"))
+        exact = compare_engines.canonical_value(0.0499966)
+        self.assertNotEqual(truncated, rounded)
+        self.assertEqual(rounded, exact)
+
+    def test_large_sums_keep_significant_digits_so_big_errors_cannot_hide(self):
+        """Rounding to decimal places alone would keep every digit of a 12-digit
+        sum, re-admitting the float summation-order noise the significant-digit
+        rounding exists to absorb — and rounding too coarsely would swallow a
+        real error. A billion off a 5.4e10 sum must still register."""
+        import decimal
+
+        self.assertEqual(
+            compare_engines.canonical_value(decimal.Decimal("53758257134.8700")),
+            compare_engines.canonical_value(53758257134.87),
+        )
+        self.assertNotEqual(
+            compare_engines.canonical_value(decimal.Decimal("53758257134.87")),
+            compare_engines.canonical_value(decimal.Decimal("54758257134.87")),
+        )
+
+    def test_exact_integers_keep_every_digit(self):
+        """count(*) at SF100 runs to nine digits; rounding one would hide
+        exactly the kind of bug this check exists to catch."""
+        self.assertEqual(compare_engines.canonical_value(148047881), "148047881")

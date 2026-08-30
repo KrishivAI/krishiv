@@ -1415,13 +1415,28 @@ already returned the correct 4 rows for q1 and 100 for q2. After the fix:
 | Krishiv ↔ Spark | 20/22 |
 | DuckDB ↔ Spark | 20/22 |
 
-**One genuine engine difference survives.** On q1 Krishiv **truncates** `AVG`
-over DECIMAL where Spark rounds half-up: exact `avg_qty` 25.522005853… returns
-as 25.522006 from Spark and 25.522005 from Krishiv, likewise `avg_price`. Open;
-see §78. The remaining DuckDB↔Spark difference is a harness artifact (6
-*significant* digits reaching the 7th decimal of `avg_disc`), not a
-disagreement — and on q8 Krishiv and DuckDB are byte-identical with Spark the
-outlier.
+**One genuine engine difference survives, and it is upstream.** On q1's third
+group `avg_disc` is exactly 0.0499966; Spark returns 0.049997, the engine
+0.049996, and DuckDB's double sides with Spark. DECIMAL `AVG` truncates rather
+than rounding half-up — and `datafusion-cli 54.1.0` reproduces it exactly, so
+this is inherited DataFusion behaviour, not a krishiv choice. Open; see §78.
+
+The other differences were a defect in the *harness*, since fixed: it
+canonicalised to 6 significant digits, which on a ~0.05 value reaches a 7th
+decimal that a `DECIMAL(_,6)` does not have. The agreement table above was
+measured before that fix and understates agreement. Re-running q1 and q8
+through all three engines afterwards:
+
+| pair | q1 | q8 |
+|---|---|---|
+| DuckDB ↔ Spark | agree | agree |
+| Krishiv ↔ DuckDB | differ | agree |
+| Krishiv ↔ Spark | differ | agree |
+
+DuckDB's q1 digest becomes byte-identical to Spark's. So **q8 agrees across all
+three** — an earlier draft of this entry called Spark the q8 outlier, which was
+the harness, not Spark — and q1 is the single genuine disagreement in the
+corpus, with Krishiv alone on one side of the DECIMAL `AVG` rounding.
 
 **Caveats.** Single pass per engine at SF100 (the noise floor measured in the
 2026-08-30 entry is 0.3-7.5% per query). No SF1000 arm for DuckDB or Spark:

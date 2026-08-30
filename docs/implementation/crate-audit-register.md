@@ -7166,15 +7166,32 @@ pass it for the wrong reason.
 **What the check then found, once it worked.** 21/22 agree Krishiv↔DuckDB,
 20/22 Krishiv↔Spark, 20/22 DuckDB↔Spark. Two residuals, different in kind:
 
-- **q1 — Krishiv truncates `AVG` over DECIMAL where Spark rounds.** Exact
-  `avg_qty` is 25.522005853…; Spark returns 25.522006, Krishiv 25.522005. Same
-  on `avg_price`. A real, reproducible precision difference against both other
-  engines, and the one genuine engine finding this check produced. **Not fixed —
-  needs a decision** on whether DECIMAL `AVG` should round half-up.
-- **q1/q8 DuckDB↔Spark** — an artifact of the harness canonicalising to 6
-  *significant* digits, which on `avg_disc` (~0.05) reaches the 7th decimal:
-  0.0499853 (double) vs 0.049985 (6-dp decimal). Not an engine disagreement.
-  On q8 Krishiv and DuckDB are byte-identical and Spark is the outlier.
+- **q1 — DECIMAL `AVG` truncates where Spark rounds half-up.** The visible
+  instance is `avg_disc` on the third group: exact 0.0499966, Spark 0.049997,
+  the engine 0.049996 — and DuckDB's double sides with Spark. **This is
+  upstream DataFusion, not a krishiv choice**: `datafusion-cli 54.1.0` returns
+  the identical truncated value for `avg(l_quantity)` on the same file. **Not
+  fixed — needs a decision.** Overriding it would mean diverging from the
+  embedded engine's decimal division in one aggregate, leaving `sum/count`
+  written by hand to disagree with `AVG` inside the same engine; that is a
+  product call, not a bug fix.
+
+  Two corrections to the first draft of this entry, both from asserting a
+  mechanism instead of reproducing it. It cited `avg_qty` (25.522005 vs
+  25.522006) as the cause — but at 6 significant digits both canonicalise to
+  25.5220, so that difference is invisible to the check and cannot have caused
+  the mismatch. And it read as though Krishiv were the odd one out by its own
+  design, when the behaviour is inherited.
+- **q1/q8 DuckDB↔Spark — a harness defect, now fixed.** Canonicalising to 6
+  *significant* digits reaches the 7th decimal of `avg_disc` (~0.05), where a
+  double has a digit (0.0499853) and a `DECIMAL(_,6)` has none (0.049985) — the
+  same number reported as a disagreement on every row. `canonical_value` now
+  rounds to whichever of 6 significant digits or 6 decimal places is *coarser*,
+  which normalises representation without blunting large values: a 12-digit sum
+  still keeps 6 significant digits, so an error of billions cannot hide. Four
+  unit tests in `scripts/tests/`, including one asserting the real
+  0.049996/0.049997 difference still shows — if that ever passes, the check has
+  stopped checking.
 
 **The lesson worth keeping.** This repo already knew the general shape — the
 comparator's own comments warn that Spark's default `spark.local.dir` is a
