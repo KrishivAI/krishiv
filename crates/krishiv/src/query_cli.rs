@@ -117,7 +117,14 @@ pub fn explain_help() -> String {
            krishiv explain --query <SQL> [OPTIONS]\n\
          \n\
          Options:\n\
-           Same as `krishiv sql` (--local, --remote, --api-key, --mode, --parquet).\n\
+           --analyze   Execute the query and report the physical plan with\n\
+                       per-operator runtime metrics (rows, time, spills, peak\n\
+                       memory). Without it, the plan is shown but not run.\n\
+                       Not available with --remote: a distributed plan's\n\
+                       metrics live on the executors that ran its fragments.\n\
+           Otherwise as `krishiv sql` (--local, --remote, --api-key, --mode,\n\
+           --parquet). Note `--mode` is the EXECUTION mode\n\
+           (embedded|single-node|distributed), not a plan format.\n\
          \n\
          For continuous window jobs see `krishiv stream submit --help`.\n",
     )
@@ -365,12 +372,48 @@ pub fn run_explain(command: &QueryCommand) -> CliResponse {
             let df = analyze_dataframe(&session, command).await?;
             df.explain_analyze_async().await
         } else {
-            let df = query_dataframe(&session, command).await?;
+            let df = explain_dataframe(&session, command).await?;
             df.explain_async().await
         }
     })) {
         Ok(output) => CliResponse::ok(format!("{output}\n")),
         Err(error) => CliResponse::err(format!("{error}\n"), 1),
+    }
+}
+
+/// Build the handle `explain` needs: one that still HAS its plan.
+///
+/// The same defect `analyze_dataframe` documents, one path over and left
+/// unfixed. `explain` used `query_dataframe`, whose `--local` arm calls
+/// `execute_local_async` — that RUNS the query and returns its results, so the
+/// planned DataFrame is gone and `explain_async` falls through to the Krishiv
+/// plan IR, printing
+///
+/// ```text
+/// logical plan: policy-enforced-query
+/// kind: batch
+/// nodes: <empty>
+/// ```
+///
+/// for every `explain --local`. An empty node list is not a plan, and it is
+/// what hid a 5.3x single-node regression against our own embedded DataFusion
+/// (register §79) — the profile was one flag away the whole time.
+///
+/// Routing `--local` through the SQL planning path keeps the plan and does not
+/// execute: `sql_async` returns a lazy handle, so EXPLAIN stays EXPLAIN.
+/// `--remote` keeps its own path — explaining a distributed query is a
+/// legitimate thing to ask, unlike ANALYZE, whose metrics live on executors.
+async fn explain_dataframe(
+    session: &Session,
+    command: &QueryCommand,
+) -> Result<DataFrame, KrishivError> {
+    if let Some(api_key) = &command.api_key {
+        return session.sql_as_async(api_key, &command.query).await;
+    }
+    match command.execution {
+        QueryExecution::Remote => session.execute_remote_async(&command.query).await,
+        // Default *and* Local: plan here, keep the plan, execute nothing.
+        QueryExecution::Default | QueryExecution::Local => session.sql_async(&command.query).await,
     }
 }
 

@@ -216,7 +216,7 @@ undeploy-k8s:
 # `test` + `test-integration` + `test-doc`; the tier map with a named
 # rationale per exclusion lives in docs/implementation/ci-tiers.md):
 test:
-    {{ sccache_env }} {{ cargo_test }} --workspace --lib \
+    {{ sccache_env }} {{ cargo_test }} --workspace --lib --bins \
         --exclude krishiv-python \
         --exclude krishiv-chaos
 
@@ -292,7 +292,7 @@ test-sql:
     {{ sccache_env }} {{ cargo }} test -p krishiv-sql --lib
 
 # Line-coverage measurement (audit §14 TEST-4) over the same scope as the
-# required test gate, which is TWO recipes: `just test` (--lib) and
+# required test gate, which is TWO recipes: `just test` (--lib --bins) and
 # `just test-integration` (--tests). Reading this as one is how a new
 # integration test was once believed covered by a green `just test` that never
 # ran it. python/chaos/bench excluded

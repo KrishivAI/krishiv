@@ -7273,12 +7273,87 @@ honest fix is to size the threshold from the *concurrent memory-hungry
 operators in this plan* rather than from a fictional slot count — real work, not
 a constant.
 
-**Three observability defects found while looking, and they are why this hid.**
-`EXPLAIN ANALYZE` does not execute: it returns krishiv's plan IR and the text
-"call `DataFrame::explain_with(Analyze)` for runtime statistics".
-`explain --mode physical` is rejected although the command's own help advertises
-physical plans and the Python stub declares the mode. SQL-level `EXPLAIN` is
-intercepted and returns the same IR. **The engine offers no way to see the
-DataFusion plan it actually runs** — which is precisely how a 5.3x regression
-against its own embedded engine went unnoticed. Fixing that is the prerequisite
-for fixing the plan.
+**Observability: the paragraph that was here was wrong, and the correction
+matters more than the original claim.**
+
+It said the engine offers no way to see the DataFusion plan it runs, citing
+three defects. That is false. **`krishiv explain --analyze` works**, and returns
+the full physical plan with per-operator metrics — `output_rows`,
+`elapsed_compute`, `spill_count`, `peak_mem_used`, `scan_efficiency_ratio`.
+The tool needed to attribute this regression existed the whole time.
+
+What was actually wrong was the *invocation*, mine:
+
+- `krishiv sql --query "EXPLAIN ANALYZE …"` returns the plan IR and the text
+  "call `DataFrame::explain_with(Analyze)` for runtime statistics" — so the
+  SQL-level spelling does not reach the working implementation. **A real gap**,
+  because SQL is the spelling a SQL user reaches for first.
+- `explain --mode physical` is rejected because `--mode` is the *execution*
+  mode (`embedded|single-node|distributed`), not an explain mode. **Not a
+  defect** — operator error, recorded so the next reader does not repeat it.
+- `explain_help()` does not mention `--analyze` at all. **A real gap**, and the
+  reason the working flag was never found: the help lists only the flags shared
+  with `krishiv sql`.
+
+The lesson is the expensive one. Hours of bisecting rule combinations bought an
+attribution that one `explain --analyze` would have given directly, and the
+reason the tool was not used is that its help does not mention it. An
+undocumented flag is, in practice, a missing feature.
+
+## §80 — IVM-AUD-CLI-2: `explain` returned an empty plan, and no gate ran the test that would have said so
+
+Three defects, one enabling the next, found while trying to profile §79.
+
+**1. `explain` printed nothing.** Every `krishiv explain --local` returned
+
+```text
+logical plan: policy-enforced-query
+kind: batch
+nodes: <empty>
+```
+
+`run_explain`'s non-analyze arm used `query_dataframe`, whose `--local` case
+calls `execute_local_async` — which RUNS the query and hands back results, so
+the planned DataFrame is gone and `explain_async` falls through to the Krishiv
+plan IR. This is the *same defect the file already documents*: the doc comment
+on `analyze_dataframe` explains it exactly, for `--analyze`, and the sibling
+path was never fixed. Routing `--local` through the SQL planning path keeps the
+plan and executes nothing (`sql_async` is lazy). `--remote` keeps its own path;
+explaining a distributed query is legitimate, unlike ANALYZE.
+
+**2. `--analyze` was undocumented, which made a working feature invisible.**
+`explain --analyze` was never broken — it returns the full DataFusion physical
+plan with per-operator metrics (`output_rows`, `elapsed_compute`, `spill_count`,
+`peak_mem_used`, `scan_efficiency_ratio`). `explain_help()` listed only the flags
+shared with `krishiv sql`, so it was never found. **§79's attribution cost hours
+of bisecting optimizer-rule combinations to derive what one `explain --analyze`
+would have printed.** An undocumented flag is a missing feature.
+
+**3. No gate ran the tests that would have caught #1.** `just test` was
+`--workspace --lib`; `just test-integration` is `--workspace --tests`. Neither
+is `--bins`, and no workflow runs one — so the **88 tests in
+`crates/krishiv/src/cli.rs`, the whole CLI contract suite, executed in no gate
+at all**. `coverage` uses `--lib --tests`, so the published coverage number was
+computed over a scope that excludes them too.
+
+That is why the empty plan survived: `explain_command_returns_plan` exists,
+passes, and asserts `stdout.contains("logical plan:")` — a substring the BROKEN
+IR output also contains. A test that never runs, checking a string the bug
+satisfies. `just test` is now `--lib --bins`: 5459 → 5553 passing.
+
+**Revert-proof.** Restoring `query_dataframe` in the explain arm fails
+`explain_local_shows_the_datafusion_plan_not_an_empty_node_list` with "explain
+returned an empty plan". The help test is deliberately independent and stays
+green under that revert — it guards a different failure.
+
+**Correction to §79.** That entry claimed the engine offers no way to see the
+DataFusion plan it runs, citing three defects. Wrong: `explain --analyze` works.
+The errors were mine — the SQL spelling `sql --query "EXPLAIN ANALYZE …"` does
+not reach it, and `--mode` is the *execution* mode
+(`embedded|single-node|distributed`), not a plan format. §79 now records that.
+
+**The pattern, fourth instance tonight.** A green signal that is not measuring
+the thing: a piped `grep` returning grep's status; `$(date)` inside an `echo`
+clobbering `$?`; `just test` being `--lib` when the new test was in `tests/`;
+and now a gate with no `--bins` at all. Exit codes are not evidence. Grep the
+log for the test's own name.

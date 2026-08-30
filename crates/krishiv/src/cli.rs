@@ -1345,6 +1345,44 @@ mod tests {
         );
     }
 
+    /// `explain --local` must show the DataFusion plan, not an empty IR node
+    /// list (register §79).
+    ///
+    /// The non-analyze path used `execute_local_async`, which runs the query
+    /// and discards the planned DataFrame, so `explain_async` fell through to
+    /// the Krishiv plan IR and printed `nodes: <empty>`. That is not a plan,
+    /// and it is why a 5.3x regression against our own embedded DataFusion was
+    /// invisible: the profiling output looked like output.
+    #[test]
+    fn explain_local_shows_the_datafusion_plan_not_an_empty_node_list() {
+        let response = dispatch(&["explain", "--local", "--query", "select 1 as value"]);
+        assert_eq!(response.exit_code, 0, "{}", response.stderr);
+        assert!(
+            !response.stdout.contains("nodes: <empty>"),
+            "explain returned an empty plan:\n{}",
+            response.stdout
+        );
+        assert!(
+            response.stdout.contains("physical_plan") || response.stdout.contains("Exec"),
+            "explain showed no physical plan:\n{}",
+            response.stdout
+        );
+    }
+
+    /// The help must name `--analyze`. An undocumented flag is a missing
+    /// feature: `explain --analyze` already produced full per-operator metrics,
+    /// and it went unused through an entire performance investigation because
+    /// the help listed only the flags shared with `krishiv sql`.
+    #[test]
+    fn explain_help_documents_the_analyze_flag() {
+        let response = dispatch(&["explain", "--help"]);
+        assert!(
+            response.stdout.contains("--analyze"),
+            "explain help hides --analyze:\n{}",
+            response.stdout
+        );
+    }
+
     #[test]
     fn jobs_command_reports_empty_local_process() {
         let response = dispatch(&["jobs"]);
