@@ -7396,3 +7396,93 @@ the thing: a piped `grep` returning grep's status; `$(date)` inside an `echo`
 clobbering `$?`; `just test` being `--lib` when the new test was in `tests/`;
 and now a gate with no `--bins` at all. Exit codes are not evidence. Grep the
 log for the test's own name.
+
+## §81 — IVM-AUD-SHUF-1: a container budget that reached nothing
+
+Found by running the TPC-H corpus through the distributed path: 20 of 22
+queries died on `shuffle memory limit exceeded: max 134217728 bytes`, one of
+them (q19) while trying to add **33 KB**.
+
+**The defect.** `ExecutorCapacity` derives `shuffle_store_bytes` from the
+container allowance and the executor prints it at startup as
+`shuffle_store=<MiB>`. The env reference states the contract: "carved from the
+same container budget as the query pool **so the two cannot together exceed the
+container**". But every production construction site —
+`krishiv-runtime/src/in_process.rs:197` and `krishiv-executor/src/fragment/
+batch.rs:2469/2555/2585` — calls `InMemoryShuffleStore::new()`, which read only
+`KRISHIV_SHUFFLE_MEMORY_BYTES` and otherwise pinned `DEFAULT_SHUFFLE_MEMORY_BYTES`
+(128 MiB). `with_max_bytes`, the seam that would carry the derived value, is
+called from ONE place: a test.
+
+So `KRISHIV_SHUFFLE_STORE_BYTES` was derived, logged, and ignored. Two
+consequences, the second worse than the first:
+
+1. An operator raising it gets a startup line confirming the new budget and no
+   behaviour change whatsoever.
+2. **The container-safety property the reference claims is not enforced.** The
+   store's ceiling is a constant with no relationship to the container, so
+   "the two cannot together exceed the container" is false by construction.
+
+**Two dials for one thing, and the guard could not see it.** Both
+`KRISHIV_SHUFFLE_STORE_BYTES` and `KRISHIV_SHUFFLE_MEMORY_BYTES` are declared,
+so `every_flag_read_in_source_is_declared` passes. That guard proves a flag that
+is READ is DECLARED; it cannot prove a flag that is DECLARED is EFFECTIVE. The
+same shape as the rest of tonight's findings: a green check measuring something
+adjacent to what matters.
+
+**The fix.** `resolve_shuffle_memory_bytes(override, derived)` — explicit
+override wins, else the derived container budget, else the constant. Four tests:
+the override still wins; the derived budget is used AND asserted not to collapse
+back to the constant; an underived budget keeps the constant rather than going
+unbounded (this is a ceiling — removing it trades a clear error for an OOM
+kill); zero and garbage fall through instead of producing a ceiling of zero that
+would refuse every write. Reverting the derived branch fails exactly
+`the_derived_container_budget_is_used_when_no_override_is_set`.
+
+**What it does NOT fix.** SF100 distributed on a single 4-slot executor still
+fails at 8 GiB — 3/22. That is not a mis-set limit: the 3-node runs in
+BENCHMARKING.md shuffled through MinIO, and holding SF100 shuffle output in one
+process's memory is not a supported shape. Raising the number until the corpus
+goes green would be fitting the environment to the desired answer.
+
+## §82 — IVM-AUD-PERF-9: the join threshold, sized from a fiction
+
+`spillable_join::from_capacity` sized the hash-join build threshold from
+`min_task_memory_share_bytes()` (`pool / slots`) in every process. On an
+executor running `slots` fragments that is the truth. In a process running ONE
+query it is fiction, and §79 showed what it costs: q21's five joins converted to
+sort-merge, whose sorts then spilled 369 times for ~207 s of a 273 s query,
+while DataFusion's hash plan for the same SQL never spilled and peaked at 4.2 GB
+— inside the same 24 GB pool five times over.
+
+**The fix.** `build_sizing_bytes(capacity, single_query)` takes
+`query_memory_share_bytes_when(single_query)` — the whole pool for a declared
+single-query process — floored at 8 GiB.
+
+**The floor is measured, not chosen.** Whole-pool sizing passes at 4 GiB and
+above and FAILS below: at 2.6 GiB both q8 and q18 die with `Resources
+exhausted` where per-slot sizing completes. The floor sits at twice the observed
+boundary because that boundary came from two queries at one scale factor.
+
+**Distributed is unchanged by construction.** An executor passes
+`single_query = false`, and `query_memory_share_bytes_when(false)` IS
+`min_task_memory_share_bytes()` — the same call it made before. A test asserts
+byte-identical sizing across four pool sizes; another proves the policy can only
+ever RAISE a threshold, so no configuration becomes more willing to keep an
+unspillable hash join than it is today. Observed too: the local executor logs
+`slots=4 … query_pool=24576 MiB`, a 6 GiB share, below the floor.
+
+**What it buys, measured honestly.** q18 is **2.5x faster** — 38.6 s vs 95.4 s
+median, paired and interleaved, three rounds, spreads of 4% and 3% with no
+overlap. The **corpus does not move**: 696 s vs 707 s, inside the noise floor.
+
+**A number in §79 that does not reproduce.** That entry reported 588.6 s for
+whole-pool sizing. Re-measured, the same 12 GiB threshold gives q21 239 s where
+it gave 196 s, and the corpus lands at 696 s. The "17% win" was a single
+unrepeated sample, and the prediction built on it was wrong. This is the
+repo's own rule — paired interleaved or the numbers lie — applied to itself.
+
+**Not verified distributed, and that gap is real.** The corpus cannot run
+through the distributed path on this box (§81). The argument that distributed is
+unaffected is structural and tested, not empirical. A run on the 3-node rig with
+the object-store shuffle path would close it.

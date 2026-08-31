@@ -12,7 +12,10 @@ set -euo pipefail
 SLOTS=${SLOTS:-4}
 PROFILE=${PROFILE:-release}
 BINDIR="target/$PROFILE"
-RUNDIR="/tmp/krishiv-bare-metal"
+# NOT under /tmp: it is a tmpfs on many hosts, so the coordinator's metadata
+# store and every log would live in RAM — and a tmp reaper can delete the
+# directory out from under a running coordinator, which happened here.
+RUNDIR=${RUNDIR:-"$HOME/.krishiv/bare-metal"}
 
 mkdir -p "$RUNDIR"
 
@@ -30,6 +33,13 @@ if [[ ! -x "$KRISHIV" ]]; then
     exit 1
 fi
 
+# The coordinator rejects `--metadata-backend json` together with
+# `--metadata-path`: json is the in-memory backend and a path implies
+# durability. The script shipped that exact combination, so the coordinator
+# exited on startup and the executor retried registration against nothing —
+# i.e. this launcher could not launch a cluster. rocksdb is what the error
+# message itself recommends for durable single-node metadata.
+
 # ── Coordinator ────────────────────────────────────────────────────────────────
 export KRISHIV_COORDINATOR_HTTP="http://127.0.0.1:18081"
 export KRISHIV_FLIGHT_ADDR="127.0.0.1:50052"
@@ -39,8 +49,8 @@ echo "Starting coordinator (gRPC :9091, HTTP :18081)..."
 "$KRISHIV" coordinator \
     --grpc-addr 0.0.0.0:9091 \
     --http-addr 0.0.0.0:18081 \
-    --metadata-backend json \
-    --metadata-path "$RUNDIR/meta.json" \
+    --metadata-backend rocksdb \
+    --metadata-path "$RUNDIR/meta.db" \
     --insecure \
     >"$RUNDIR/coordinator.log" 2>&1 &
 COORD_PID=$!

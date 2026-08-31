@@ -90,6 +90,51 @@ pub const SPILL_JOIN_BUILD_BYTES_ENV: &str = "KRISHIV_SPILL_JOIN_BUILD_BYTES";
 /// algorithm when it fits.
 const BUILD_FRACTION_OF_TASK_SHARE: f64 = 0.5;
 
+/// Below this pool size, keep sizing the threshold from the per-slot share even
+/// in a single-query process.
+///
+/// Whole-pool sizing is measured safe at 4 GiB and above, and measured to FAIL
+/// below it: at a 2.6 GiB pool both q8 and q18 die with `Resources exhausted`
+/// where per-slot sizing completes (register §79). The floor sits at 8 GiB,
+/// twice the observed boundary, because the boundary was found with two queries
+/// at one scale factor and does not deserve to be trusted to its last byte.
+const WHOLE_POOL_MIN_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The memory a hash-join build side is sized against.
+///
+/// Pure so the policy can be tested without the process-global single-query
+/// latch, which has no reset.
+///
+/// # Why the whole pool, and why only sometimes
+///
+/// `min_task_memory_share_bytes` divides the pool by `slots`, which is the
+/// truth on an executor running `slots` fragments and fiction in a process
+/// running one query. Sizing q21's joins against 1 GiB (= 24 GiB / 12 / 2)
+/// converted all five to sort-merge; the sorts that conversion requires then
+/// spilled 369 times for ~207 s of a 273 s query, while DataFusion's hash plan
+/// for the same SQL never spilled and peaked at 4.2 GB — inside the same pool
+/// five times over.
+///
+/// It is gated rather than unconditional because the opposite failure is real:
+/// at a small pool the hash build genuinely does not fit, and converting is
+/// what makes q8 and q18 complete at all.
+#[must_use]
+pub fn build_sizing_bytes(
+    capacity: &krishiv_common::executor_capacity::ExecutorCapacity,
+    single_query: bool,
+) -> Option<u64> {
+    let per_slot = capacity.min_task_memory_share_bytes()?;
+    let share = capacity.query_memory_share_bytes_when(single_query)?;
+    // `>=` against the floor, and never below what the per-slot share would
+    // have given: this can only ever RAISE the threshold, so no configuration
+    // becomes more eager to keep an unspillable hash join than it is today.
+    if share >= WHOLE_POOL_MIN_BYTES {
+        Some(share.max(per_slot))
+    } else {
+        Some(per_slot)
+    }
+}
+
 /// Bytes assumed for a column whose type carries no fixed width.
 ///
 /// Varlen columns (`Utf8`, `Binary`, and their `View`/`Large` forms) have no
@@ -580,13 +625,18 @@ impl SpillableJoinSelection {
             .and_then(|v| v.trim().parse::<u64>().ok())
             .filter(|n| *n > 0)
             .or_else(|| {
-                // Deliberately the per-slot share, in every process. Giving an
-                // embedded query the whole pool to size joins against was
-                // measured faster and wrong — see
-                // `executor_capacity::declare_single_query_process`. The flag
-                // below controls the broadcast rescue and nothing else.
-                let share = krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
-                    .min_task_memory_share_bytes()?;
+                // The per-slot share is the truth on an executor and fiction
+                // in a single-query process; `build_sizing_bytes` picks, with a
+                // floor so a small pool keeps today's conservative sizing. An
+                // executor takes the per-slot branch by construction
+                // (`query_memory_share_bytes_when(false)` IS the per-slot
+                // share), so the distributed path is unchanged by definition,
+                // not by measurement.
+                let capacity = krishiv_common::executor_capacity::ExecutorCapacity::detect_cached();
+                let share = build_sizing_bytes(
+                    &capacity,
+                    krishiv_common::executor_capacity::is_single_query_process(),
+                )?;
                 #[expect(
                     clippy::cast_precision_loss,
                     clippy::cast_possible_truncation,
@@ -3528,6 +3578,120 @@ mod degenerate_sentinel_budget_tests {
         assert!(
             decisions[1] || decisions[2],
             "900 + 800 cannot both be retained under a 1000 budget: {decisions:?}"
+        );
+    }
+}
+
+/// Sizing policy for the hash-join build threshold (register §79).
+#[cfg(test)]
+mod build_sizing_tests {
+    use super::{BUILD_FRACTION_OF_TASK_SHARE, WHOLE_POOL_MIN_BYTES, build_sizing_bytes};
+    use krishiv_common::executor_capacity::ExecutorCapacity;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn capacity(pool: u64, cores: usize) -> ExecutorCapacity {
+        ExecutorCapacity::derive(cores, Some(pool), None, None, None, None, None)
+    }
+
+    /// THE distributed guarantee. An executor divides one pool across `slots`
+    /// fragments, so its sizing must be byte-identical to before this policy
+    /// existed — not "close", identical.
+    #[test]
+    fn an_executor_sizes_exactly_as_it_did_before() {
+        for pool in [2 * GIB, 8 * GIB, 24 * GIB, 256 * GIB] {
+            let cap = capacity(pool, 12);
+            assert_eq!(
+                build_sizing_bytes(&cap, false),
+                cap.min_task_memory_share_bytes(),
+                "pool {pool}: a task executor must keep the per-slot division"
+            );
+        }
+    }
+
+    /// A single query with room owns the pool: the per-slot divisor is fiction
+    /// when there is one query, and sizing q21's joins against it converted all
+    /// five to sort-merge for ~207 s of spilling sorts.
+    #[test]
+    fn a_single_query_with_a_large_pool_sizes_against_the_whole_pool() {
+        // `derive` takes the machine's memory and derives the query pool from
+        // it, so the expectation is `query_pool_bytes` — not the argument. An
+        // earlier version of this test asserted the raw 24 GiB and failed
+        // against the real 14.1 GiB pool, which is the test being wrong rather
+        // than the policy.
+        let cap = capacity(24 * GIB, 12);
+        let pool = cap.query_pool_bytes.expect("bounded");
+        assert!(
+            pool >= WHOLE_POOL_MIN_BYTES,
+            "fixture pool {pool} must clear the floor or this tests nothing"
+        );
+        assert_eq!(build_sizing_bytes(&cap, true), Some(pool));
+        assert!(
+            build_sizing_bytes(&cap, true) > cap.min_task_memory_share_bytes(),
+            "the whole pool must exceed one slot's share, or this policy is a no-op"
+        );
+    }
+
+    /// The measured failure boundary. Whole-pool sizing at a 2.6 GiB pool makes
+    /// q8 and q18 die with `Resources exhausted` where per-slot sizing
+    /// completes, so below the floor the old, conservative number stands even
+    /// for a single query.
+    #[test]
+    fn a_single_query_with_a_small_pool_keeps_the_conservative_sizing() {
+        for memory in [2 * GIB, 3 * GIB, 4 * GIB, 8 * GIB] {
+            let cap = capacity(memory, 12);
+            let pool = cap.query_pool_bytes.expect("bounded");
+            if pool >= WHOLE_POOL_MIN_BYTES {
+                continue; // covered by the large-pool test
+            }
+            assert_eq!(
+                build_sizing_bytes(&cap, true),
+                cap.min_task_memory_share_bytes(),
+                "derived pool {pool} is below the floor and must not be relaxed"
+            );
+        }
+    }
+
+    /// The policy may only ever RAISE the threshold. If it could lower one,
+    /// some configuration would become more eager to keep an unspillable hash
+    /// join than it is today — the exact failure the rule exists to prevent.
+    #[test]
+    fn the_policy_never_lowers_the_threshold() {
+        for pool in [GIB, 3 * GIB, 8 * GIB, 24 * GIB, 64 * GIB] {
+            for cores in [1, 4, 12, 64] {
+                let cap = capacity(pool, cores);
+                let Some(per_slot) = cap.min_task_memory_share_bytes() else {
+                    continue;
+                };
+                for single in [true, false] {
+                    let sized = build_sizing_bytes(&cap, single).expect("bounded");
+                    assert!(
+                        sized >= per_slot,
+                        "pool {pool} cores {cores} single={single}: sizing {sized} \
+                         fell BELOW the per-slot share {per_slot}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fraction is applied to whatever this returns; pin that the two
+    /// compose into a threshold below the pool, so a join can never be sized
+    /// against more memory than exists.
+    #[test]
+    fn the_threshold_stays_inside_the_pool() {
+        let cap = capacity(24 * GIB, 12);
+        let sized = build_sizing_bytes(&cap, true).expect("bounded");
+        #[expect(
+            clippy::cast_precision_loss,
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "byte counts are exact in f64 here"
+        )]
+        let threshold = (sized as f64 * BUILD_FRACTION_OF_TASK_SHARE) as u64;
+        assert!(
+            threshold < 24 * GIB,
+            "threshold {threshold} exceeds the pool"
         );
     }
 }

@@ -58,12 +58,54 @@ impl Default for InMemoryShuffleStore {
     }
 }
 
+/// Resolve the in-memory shuffle ceiling: explicit override, else the budget
+/// the process actually derived, else the default.
+///
+/// # The derived budget used to reach nothing
+///
+/// `ExecutorCapacity` carves `shuffle_store_bytes` out of the same container
+/// allowance as the query pool — the env reference says so: "carved from the
+/// same container budget as the query pool so the two cannot together exceed
+/// the container" — and the executor prints it at startup as
+/// `shuffle_store=<MiB>`. But every production construction site calls
+/// [`InMemoryShuffleStore::new`], which read only `KRISHIV_SHUFFLE_MEMORY_BYTES`
+/// and otherwise pinned 128 MiB. So `KRISHIV_SHUFFLE_STORE_BYTES` was derived,
+/// logged, and ignored: raising it produced a confirming log line and no
+/// behaviour change, and the container-safety property was not enforced —
+/// the ceiling was a constant unrelated to the container.
+///
+/// Found at SF100 on a single executor, where 20 of 22 TPC-H queries died on
+/// the 128 MiB constant, one of them while trying to add 33 KB.
+///
+/// `KRISHIV_SHUFFLE_MEMORY_BYTES` still wins when set: it is the per-store
+/// override, and an operator naming a number should get that number.
+#[must_use]
+pub fn resolve_shuffle_memory_bytes(
+    override_bytes: Option<&str>,
+    derived_bytes: Option<u64>,
+) -> usize {
+    if let Some(explicit) = override_bytes
+        .map(str::trim)
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|&bytes| bytes > 0)
+    {
+        return explicit;
+    }
+    derived_bytes
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .filter(|&bytes| bytes > 0)
+        .unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES)
+}
+
 impl InMemoryShuffleStore {
     pub fn new() -> Self {
-        let max_bytes = std::env::var("KRISHIV_SHUFFLE_MEMORY_BYTES")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_SHUFFLE_MEMORY_BYTES);
+        let max_bytes = resolve_shuffle_memory_bytes(
+            std::env::var("KRISHIV_SHUFFLE_MEMORY_BYTES")
+                .ok()
+                .as_deref(),
+            krishiv_common::executor_capacity::ExecutorCapacity::detect_cached()
+                .shuffle_store_bytes,
+        );
         Self {
             state: Mutex::new(InMemoryState::default()),
             max_bytes: Some(max_bytes),
@@ -416,5 +458,62 @@ mod declared_default_guard {
             Some(super::DEFAULT_SHUFFLE_MEMORY_BYTES as u64),
             "KRISHIV_SHUFFLE_MEMORY_BYTES: docs and code disagree"
         );
+    }
+}
+
+/// The in-memory shuffle ceiling must come from the container budget, not a
+/// constant (register §81).
+#[cfg(test)]
+mod shuffle_ceiling_tests {
+    use super::{DEFAULT_SHUFFLE_MEMORY_BYTES, resolve_shuffle_memory_bytes};
+
+    /// An operator naming a number gets that number, derived budget or not.
+    #[test]
+    fn an_explicit_override_wins() {
+        assert_eq!(resolve_shuffle_memory_bytes(Some("4096"), Some(999)), 4096);
+        assert_eq!(resolve_shuffle_memory_bytes(Some(" 4096 "), None), 4096);
+    }
+
+    /// THE defect. `KRISHIV_SHUFFLE_STORE_BYTES` was derived from the container,
+    /// logged at startup as `shuffle_store=`, and then ignored — the store
+    /// pinned 128 MiB regardless. Twenty of 22 TPC-H queries died on that
+    /// constant at SF100, one while trying to add 33 KB.
+    #[test]
+    fn the_derived_container_budget_is_used_when_no_override_is_set() {
+        let derived = 8 * 1024 * 1024 * 1024_u64;
+        assert_eq!(
+            resolve_shuffle_memory_bytes(None, Some(derived)),
+            usize::try_from(derived).expect("fits"),
+        );
+        assert_ne!(
+            resolve_shuffle_memory_bytes(None, Some(derived)),
+            DEFAULT_SHUFFLE_MEMORY_BYTES,
+            "the derived budget must not collapse back to the constant"
+        );
+    }
+
+    /// Unbounded processes (no cgroup, bare metal) keep the old constant rather
+    /// than becoming unbounded: this is a *ceiling*, and removing it entirely
+    /// would trade a clear error for an OOM kill.
+    #[test]
+    fn an_underived_budget_falls_back_to_the_default() {
+        assert_eq!(
+            resolve_shuffle_memory_bytes(None, None),
+            DEFAULT_SHUFFLE_MEMORY_BYTES
+        );
+    }
+
+    /// Zero and garbage mean "unset", never "a ceiling of zero" — which would
+    /// refuse every shuffle write.
+    #[test]
+    fn zero_and_garbage_never_produce_a_zero_ceiling() {
+        for raw in [Some("0"), Some(""), Some("   "), Some("banana"), None] {
+            assert_eq!(
+                resolve_shuffle_memory_bytes(raw, None),
+                DEFAULT_SHUFFLE_MEMORY_BYTES,
+                "raw {raw:?} must fall through, not zero the ceiling"
+            );
+            assert!(resolve_shuffle_memory_bytes(raw, Some(0)) > 0);
+        }
     }
 }
