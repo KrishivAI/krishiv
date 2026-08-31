@@ -11,9 +11,9 @@ forwarders.
 
 ```
 leaf flags (krishiv-connectors)
-        │  parquet · s3 · kafka · avro · iceberg · delta · hudi · vortex
-        │  schema-registry · kinesis · pulsar-source · elasticsearch
-        │  cassandra · hbase · jdbc · vector-sinks · qdrant · pgvector · cloud
+        │  kafka · avro · schema-registry · iceberg · lakehouse · vortex
+        │  kinesis · pulsar-source · elasticsearch · cassandra · hbase · jdbc
+        │  vector-sinks · qdrant · pgvector · cloud · state · two-phase
         ▼
 forwarders (krishiv-sql, krishiv-api, krishiv-runtime, krishiv-flight-sql,
             krishiv-executor, krishiv-python)
@@ -21,10 +21,18 @@ forwarders (krishiv-sql, krishiv-api, krishiv-runtime, krishiv-flight-sql,
         │  krishiv-api/kafka → krishiv-connectors/kafka
         ▼
 deployment presets (krishiv binary)
-           minimal · local(=embedded+single-node) · full · extended
-           embedded · single-node · distributed · bare-metal(=distributed)
-           cluster(=distributed) · k8s
+           local (default) · prod (what ships) · full
+           embedded · single-node · distributed · bare-metal(=distributed) · k8s
 ```
+
+Parquet and CSV are the unconditional base — there is no `parquet` flag, and no
+`s3` flag (object stores are `cloud`). Delta Lake and Hudi ship with
+`lakehouse`; they had flags that gated no module and no dependency, so the
+formats were always compiled while only their certification suites were
+switched off. Deployment presets exist **only** on the binary: `local` / `full`
+/ `extended` used to be declared on `krishiv-connectors` as well, with different
+contents and no consumer, so `--features full` meant two different capability
+sets one level apart.
 
 A leaf flag should be **defined once** in `krishiv-connectors` and forwarded
 upward. When you add a connector, add the leaf flag there, then forward it only
@@ -37,8 +45,10 @@ The heavyweight Iceberg tree (`iceberg`, `iceberg-datafusion`,
 embedded build:
 
 - `krishiv-sql` `default = []` — it does **not** enable Iceberg by default.
-- `krishiv-sql`'s dependency on `krishiv-connectors` enables only
-  `parquet` (default) + `kafka` + `s3`, **not** `iceberg`.
+- `krishiv-sql`'s dependency on `krishiv-connectors` enables only `lakehouse`,
+  **not** `iceberg` and **not** `kafka`. It used to pin `kafka` too, which put
+  librdkafka in every build including `embedded` (see "Where features must not
+  be declared" below).
 - The DataFusion catalog DML interception is gated on
   `cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))`, and the
   `iceberg-datafusion` feature pulls `krishiv-connectors/iceberg`.
@@ -50,40 +60,74 @@ Validate with:
 ```sh
 cargo tree -p krishiv --no-default-features --features embedded | grep -c iceberg   # → 0
 cargo tree -p krishiv --no-default-features --features full     | grep -c iceberg   # → >0
+cargo tree -p krishiv --no-default-features --features embedded | grep -c rdkafka   # → 0
+cargo tree -p krishiv --no-default-features --features prod     | grep -c rdkafka   # → 1
 ```
+
+## Where features must not be declared
+
+A leaf flag enabled in a `[dependencies]` entry is on for every build, and no
+preset can switch it off:
+
+```toml
+# wrong — the `kafka` feature above this line can no longer gate anything
+krishiv-connectors = { path = "…", features = ["kafka"] }
+```
+
+Six crates did this (`krishiv-sql`, `-api`, `-mcp`, `-python`, `-dataflow`,
+`-executor`), which is why `--features embedded` built rdkafka, rocksdb and
+reqwest while advertising "no optional deps". Two shapes make it tempting, and
+both are the actual bug:
+
+- **A module gated on its own feature.** `pub mod kafka` was `#[cfg(feature =
+  "kafka")]`, so the module vanished entirely without the flag — even though the
+  file already carried complete `#[cfg(not(feature = "kafka"))]` stubs, which had
+  therefore never compiled and had silently drifted out of API parity. Gate the
+  *backend*, not the module, and let the stub arm keep the API stable.
+- **A feature-gated enum variant.** `ConnectorRole::VectorSink` changed the
+  shape of a public enum, so every downstream `match` needed the feature too.
+  Keep the tag; gate the driver behind it.
+
+`just lint-features` sweeps `--each-feature` over the leaf crates, the forwarder
+tier and the binary, so a flag that stops gating what it claims to gate fails
+there.
 
 ## Deployment presets (krishiv binary)
 
 | Preset        | Enables                                              | Notes |
 |---------------|------------------------------------------------------|-------|
-| `embedded`    | (none)                                               | baseline; in-process, no optional deps |
+| `embedded`    | (none)                                               | explicit empty marker for `--no-default-features` |
 | `single-node` | `flight-sql`, `shuffle`                              | local daemon + RocksDB metadata |
-| `distributed` | `flight-sql`, `shuffle`, `etcd`                     | remote cluster + etcd metadata |
-| `bare-metal`  | = `distributed`                                      | alias |
-| `cluster`     | = `distributed`                                      | alias (preferred name) |
+| `distributed` | `flight-sql`, `shuffle`, `etcd`                      | remote cluster + etcd metadata |
+| `bare-metal`  | = `distributed`                                      | alias, for `run_bare_metal.sh` and the justfile |
 | `k8s`         | `distributed` + operator CRD/reconciler              | |
-| `local`       | `embedded` + `single-node`                           | default |
-| `full`        | `single-node` + `distributed` + `k8s` + `kafka` + `iceberg` | |
-| `extended` (connectors) | `full` + `delta` + `hudi` + vector sinks   | experimental |
+| `local`       | `embedded` + `single-node` + jemalloc + rest-catalog + iceberg + ui | the `default` |
+| `prod`        | `distributed` + rest-catalog + kafka + iceberg + cloud + jemalloc + jdbc + elasticsearch + ui | **what `build-fast-engine.sh` ships** |
+| `full`        | `single-node` + `distributed` + `k8s` + kafka + iceberg + cloud + jdbc + elasticsearch + ui | widest build |
 
-`bare-metal` and `cluster` are exact aliases of `distributed`; prefer
-`cluster`. They exist for operator ergonomics and are kept deliberately.
+`embedded` gates nothing by design — it is the name for the baseline so
+`check-embedded` / `test-embedded` / release.yml can say which build they mean.
+`bare-metal` is an exact alias of `distributed`, kept for operator ergonomics.
+There is no `cluster`, `minimal` or `extended` preset on the binary.
 
 ## Connector leaf flags
 
 | Flag | Pulls |
 |------|-------|
-| `parquet` (default) | local Parquet I/O |
-| `s3`, `cloud` | object-store backends (AWS / GCS / Azure) |
+| (none — base) | local Parquet and CSV I/O |
+| `cloud` | object-store backends (AWS / GCS / Azure) |
 | `kafka` | `rdkafka` (librdkafka C lib) |
-| `schema-registry` | kafka + Avro + reqwest |
+| `schema-registry` | kafka + Avro + reqwest + prost |
 | `avro` | `apache-avro` |
-| `iceberg` | `iceberg` + `iceberg-datafusion` |
-| `delta`, `hudi` | lakehouse table formats (thin today) |
+| `lakehouse` | rocksdb + chrono + url; Delta Lake and Hudi ship here |
+| `iceberg` | `lakehouse` + `iceberg` + datafusion + typetag |
+| `state` | `krishiv-state` (durable keyed state) |
+| `two-phase` | two-phase-commit Parquet/S3 sink |
 | `vortex` | Vortex columnar format |
 | `kinesis`, `pulsar-source` | cloud streaming sources |
 | `elasticsearch`, `cassandra`, `hbase`, `jdbc` | external sinks |
 | `vector-sinks` → `qdrant` / `pgvector` | AI/vector sinks |
+| `exactly-once-integration` | gates one test target, not a capability |
 
 ## Previously quarantined features (all fixed, now guard-enforced)
 
@@ -135,7 +179,13 @@ fixed** — it is in the guarded surface.
 ## Adding a feature — checklist
 
 1. Define the leaf flag in `krishiv-connectors` (or the owning crate).
-2. Forward it **only** through crates that reference its gated symbols.
-3. If it pulls a heavy tree, keep it out of any crate's `default`.
-4. Add it to a preset only if it belongs in that deployment surface.
-5. Run the feature guard: `just lint-features` (cargo-hack `--each-feature`).
+2. Forward it **only** through crates that reference its gated symbols, in
+   `[features]` — never as `features = [...]` on a `[dependencies]` entry.
+3. Check it gates a **dependency**. A flag that is only `= ["other-feature"]`
+   cannot make any build leaner; it will end up gating test coverage instead,
+   which is how `delta` and `hudi` came to switch off their own certification
+   suites while shipping 4.2k lines unconditionally.
+4. If it pulls a heavy tree, keep it out of any crate's `default`.
+5. Add it to a preset only if it belongs in that deployment surface — and if it
+   is in no preset, `lint-features` is the only thing that will ever build it.
+6. Run the feature guard: `just lint-features` (cargo-hack `--each-feature`).

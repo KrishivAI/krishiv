@@ -236,6 +236,10 @@ impl ConnectorRegistry {
             ConnectorRole::TwoPhaseSink => self.two_phase_sinks.contains_key(&kind),
             #[cfg(feature = "vector-sinks")]
             ConnectorRole::VectorSink => self.vector_sinks.contains_key(&kind),
+            // No vector-sink driver can be registered without the feature, so
+            // the answer is a flat no rather than a compile error.
+            #[cfg(not(feature = "vector-sinks"))]
+            ConnectorRole::VectorSink => false,
         }
     }
 }
@@ -245,7 +249,6 @@ fn role_rank(role: ConnectorRole) -> u8 {
         ConnectorRole::Source => 0,
         ConnectorRole::Sink => 1,
         ConnectorRole::TwoPhaseSink => 2,
-        #[cfg(feature = "vector-sinks")]
         ConnectorRole::VectorSink => 3,
     }
 }

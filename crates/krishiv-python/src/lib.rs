@@ -40,6 +40,7 @@ mod stream_write_py;
 mod streaming_dataframe;
 mod udf;
 
+#[cfg(feature = "vector-sinks")]
 mod vector_sinks;
 
 pub use agg::PyAggExpr;
@@ -70,6 +71,7 @@ pub use sinks::{
 pub use stream_bridges::PyBroadcastContext;
 pub use streaming_dataframe::{PyDataStreamReader, PyStreamingDataFrame, interval_join};
 pub use udf::call_python_udf;
+#[cfg(feature = "vector-sinks")]
 pub use vector_sinks::{
     PyInMemoryVectorSink, PyLanceDbSink, PyPgvectorSink, PyPineconeSink, PyQdrantSink,
     PyScoredChunk, PyWeaviateSink,
@@ -181,8 +183,10 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(lakehouse::read_hudi, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::write_hudi_append, m)?)?;
     m.add_function(wrap_pyfunction!(lakehouse::write_hudi_upsert, m)?)?;
+    #[cfg(feature = "schema-registry")]
     m.add_function(wrap_pyfunction!(lakehouse::schema_registry_confluent, m)?)?;
     m.add_class::<lakehouse::PyHudiWriteResult>()?;
+    #[cfg(feature = "schema-registry")]
     m.add_class::<lakehouse::PySchemaRegistryConfig>()?;
     m.add_class::<lakehouse::PyIcebergRestCatalog>()?;
     m.add_class::<lakehouse::PyMemoryLakehouseTable>()?;
@@ -215,6 +219,7 @@ fn krishiv(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     sinks::register_sinks_module(m.py(), m)?;
     agg::register_agg_module(m.py(), m)?;
+    #[cfg(feature = "vector-sinks")]
     vector_sinks::register_ai_module(m.py(), m)?;
     metrics_api::register_metrics_module(m.py(), m)?;
 

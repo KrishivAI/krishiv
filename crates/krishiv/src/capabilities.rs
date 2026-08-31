@@ -46,10 +46,20 @@ pub fn all() -> Vec<Capability> {
             enabled: cfg!(feature = "iceberg"),
             description: "Apache Iceberg table format (read/write/streaming sink)",
         },
+        // Always on. These ship with the lakehouse layer, which is a base
+        // dependency of the SQL crate — there is no build without them. They
+        // used to read `cfg!(feature = "delta")` against a feature no preset
+        // enabled, so this operator-facing manifest reported Delta Lake as
+        // disabled in every shipped binary while it worked fine.
         Capability {
             name: "delta",
-            enabled: cfg!(feature = "delta"),
+            enabled: true,
             description: "Delta Lake table format",
+        },
+        Capability {
+            name: "hudi",
+            enabled: true,
+            description: "Apache Hudi copy-on-write table format",
         },
         Capability {
             name: "jdbc",
@@ -95,7 +105,7 @@ pub fn all() -> Vec<Capability> {
 }
 
 /// One-line capability summary for a startup log line, e.g.
-/// `kafka=off cloud=off iceberg=on delta=off … jemalloc=on`.
+/// `kafka=off cloud=off iceberg=on delta=on … jemalloc=on`.
 pub fn summary() -> String {
     all()
         .iter()

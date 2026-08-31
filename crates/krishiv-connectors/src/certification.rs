@@ -534,7 +534,7 @@ mod tests {
 
     // ── Delta Lake certification (delta feature) ──────────────────────────────
 
-    #[cfg(feature = "delta")]
+    #[cfg(feature = "lakehouse")]
     mod delta_certification {
         use crate::lakehouse::{
             DeltaTableHandle, DeltaWriteMode, LocalDeltaTwoPhaseCommitSink, merge_delta,
@@ -827,7 +827,7 @@ mod tests {
 
     // ── Hudi certification (hudi feature) ────────────────────────────────────
 
-    #[cfg(feature = "hudi")]
+    #[cfg(feature = "lakehouse")]
     mod hudi_certification {
         use crate::lakehouse::{HudiCowWriter, HudiSnapshotReader, HudiTwoPhaseCommitSink};
         use crate::two_phase::TwoPhaseCommitSink;

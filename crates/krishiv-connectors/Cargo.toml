@@ -14,14 +14,14 @@ readme = "README.md"
 path = "src/lib.rs"
 
 [features]
-# Lean embedded baseline: local Parquet only. Apache Iceberg is the primary
-# lakehouse format; enable `iceberg` or the `full` engine preset when needed.
-default = ["parquet"]
+# Parquet and CSV are the unconditional base: every build has them, there is
+# no code behind a `parquet` flag to switch off. It used to be declared and
+# sat in `default`, gating zero `#[cfg]` sites — so `--no-default-features`
+# removed nothing while reading as a lean-baseline switch. Object-store
+# backends (S3/GCS/Azure) are gated by `cloud`; there is no `s3` feature.
+default = []
 
-# Core batch/object-store connectors. Object-store backends (S3/GCS/Azure) are
-# gated by `cloud`; there is no separate `s3` feature (it gated no code).
-parquet = []
-two-phase = ["parquet"]
+two-phase = []
 # E6.1: Avro file source and sink
 avro = ["dep:apache-avro"]
 
@@ -41,8 +41,11 @@ state = ["dep:krishiv-state"]
 # Lakehouse table formats (implementation in `crate::lakehouse`)
 lakehouse = ["dep:async-trait", "dep:chrono", "dep:rocksdb", "dep:serde", "dep:tempfile", "dep:url"]
 iceberg = ["lakehouse", "dep:iceberg", "dep:uuid", "dep:datafusion", "dep:typetag"]
-delta = ["lakehouse"]
-hudi = ["lakehouse"]
+# There is no `delta` or `hudi` feature. Both were `= ["lakehouse"]`, adding no
+# dependency of their own, and `mod delta_lake` / `mod local_delta` / `mod hudi`
+# were never gated — so 4.2k lines shipped in every `lakehouse` build while the
+# flags gated only their certification suites, which therefore never ran. The
+# formats now ship with `lakehouse` and are certified with it.
 
 # Vector sinks (migrated from `krishiv-ai::vector_sinks`)
 vector-sinks = [
@@ -55,19 +58,13 @@ vector-sinks = [
 qdrant = ["vector-sinks", "dep:qdrant-client"]
 pgvector = ["vector-sinks", "dep:sqlx"]
 
-# Convenience presets
-local = ["parquet", "kafka", "two-phase"]
-# Standard full compute-engine build. AI/vector and secondary lakehouse formats
-# remain opt-in and are intentionally excluded.
-full = [
-    "local",
-    "avro",
-    "iceberg",
-    "schema-registry",
-    "state",
-]
-# Broader compatibility build for optional/experimental integrations.
-extended = ["full", "delta", "hudi", "vector-sinks", "qdrant", "pgvector"]
+# Deployment presets live on the `krishiv` binary and nowhere else. This crate
+# used to carry `local` / `full` / `extended` too — same words, different
+# capability sets, neither a superset of the binary's — so `--features full`
+# meant one thing here and another one level up. Nothing referenced them.
+#
+# Gates the `exactly_once_integration` test target only (see [[test]] below),
+# which is why it is named for a test rather than a capability.
 exactly-once-integration = ["iceberg"]
 # E6.4: AWS Kinesis streaming source
 kinesis = ["dep:aws-sdk-kinesis", "dep:aws-config"]

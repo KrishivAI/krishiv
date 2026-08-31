@@ -45,7 +45,13 @@ full    = ["single-node", "distributed", "k8s", "kafka", "iceberg", "cloud", "je
 prod    = ["distributed", "rest-catalog", "kafka", "iceberg", "cloud", "jemalloc", "jdbc", "elasticsearch", "ui"]
 
 # Deployment capability surfaces (gate optional dep families)
-embedded    = []                                                 # baseline; no optional deps
+#
+# `embedded` is an explicit empty marker, not an oversight: it is exactly
+# `--no-default-features`, and it is named so that `check-embedded`,
+# `test-embedded` and release.yml say which build they mean. Nothing is gated
+# on it, and nothing should be — the baseline is defined by what the other
+# flags leave out.
+embedded    = []
 single-node = ["flight-sql", "shuffle"]                        # local daemon + RocksDB metadata
 distributed = ["flight-sql", "shuffle", "etcd"]                 # remote cluster + etcd metadata
 bare-metal  = ["distributed"]                                    # alias: process-managed cluster (run_bare_metal.sh, justfile)
@@ -62,7 +68,22 @@ flight-sql = ["dep:krishiv-flight-sql"]
 rest-catalog = ["flight-sql", "krishiv-flight-sql/rest-catalog", "krishiv-executor/rest-catalog", "iceberg"]
 shuffle = ["dep:krishiv-shuffle"]
 etcd = ["krishiv-scheduler/etcd"]
-kafka = ["krishiv-connectors/kafka"]
+# Forward to every crate that gates Kafka wiring, not just the leaf. This used
+# to be `["krishiv-connectors/kafka"]` alone, which linked librdkafka into the
+# shipped `prod` image while leaving krishiv-executor/kafka (21 cfg sites),
+# krishiv-api/kafka (5), krishiv-runtime/kafka (3) and krishiv-flight-sql/kafka
+# (3) OFF — so `stage_rloop_kafka` in the deployed binary was the
+# `cfg(not(feature = "kafka"))` arm returning InvalidAssignment. The `iceberg`
+# line below always had this right. `?` on the optional flight-sql dep so this
+# does not force it on.
+kafka = [
+    "krishiv-connectors/kafka",
+    "krishiv-sql/kafka",
+    "krishiv-api/kafka",
+    "krishiv-executor/kafka",
+    "krishiv-runtime/kafka",
+    "krishiv-flight-sql?/kafka",
+]
 # jdbc: Postgres pull source/sink (sqlx) + the `STORED AS JDBC` SQL factory
 # with incremental keyset cursors — Phase 31 ingest breadth. In prod/full so
 # shipped images can serve governed JDBC pulls.
@@ -80,7 +101,6 @@ cloud = ["krishiv-connectors/cloud"]
 # krishiv-sql no longer enables Iceberg by default, so the binary's iceberg
 # preset must re-enable it on the SQL layer to keep full/k8s builds unchanged.
 iceberg = ["krishiv-connectors/iceberg", "krishiv-sql/iceberg", "krishiv-executor/iceberg", "krishiv-api/iceberg-sink"]
-delta = ["krishiv-connectors/delta"]
 # jemalloc: replace the system allocator with jemalloc for lower contention and
 # smaller RSS on multi-threaded workloads. Enabled in all non-minimal presets.
 # Disable for WASM or environments where jemalloc fails to link.

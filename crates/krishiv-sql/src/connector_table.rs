@@ -738,6 +738,31 @@ mod tests {
         );
     }
 
+    /// Without the `kafka` feature no driver is registered for the kind, so the
+    /// DDL must be refused *at CREATE* with a message naming what to rebuild —
+    /// not accepted and then failed at delivery. Before krishiv-sql stopped
+    /// pinning `krishiv-connectors/kafka` unconditionally there was no lean
+    /// build for this to describe.
+    #[cfg(not(feature = "kafka"))]
+    #[tokio::test]
+    async fn kafka_sink_ddl_is_refused_at_create_without_the_feature() {
+        let engine = crate::SqlEngine::new();
+        let err = engine
+            .sql(
+                "CREATE EXTERNAL TABLE k_out (id BIGINT, name VARCHAR) \
+                 STORED AS KAFKA_SINK LOCATION 'orders-topic' \
+                 OPTIONS ('bootstrap.servers' '127.0.0.1:1')",
+            )
+            .await
+            .expect_err("a build without the kafka driver must refuse the DDL");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`kafka` feature"),
+            "the refusal must name the feature to rebuild with, got: {msg}"
+        );
+    }
+
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn kafka_sink_external_table_is_a_distinct_batch_door() {
         let engine = crate::SqlEngine::new();

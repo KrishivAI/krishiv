@@ -31,7 +31,7 @@ datafusion-functions-nested = { workspace = true }
 # The heavyweight Iceberg tree (iceberg, iceberg-catalog-rest)
 # is NOT pulled here; it is enabled on demand by this crate's `iceberg` /
 # `iceberg-datafusion` / `*-catalog` features so lean builds (embedded) omit it.
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "lakehouse"] }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 # Free space on the spill filesystem, so the batch spill ceiling adapts to
 # the host the way the memory pool already does instead of being a fixed
@@ -69,9 +69,11 @@ sqlx = { workspace = true, optional = true }
 # below so embedded builds stay lean. Enable `iceberg` (or a `*-catalog`
 # backend) to compile the lakehouse + DataFusion catalog integration.
 default = []
+# The Kafka table provider compiles against `krishiv_connectors::kafka` either
+# way — the module ships feature-absent stubs. This flag selects the rdkafka
+# backend, and is what makes the `STORED AS KAFKA*` DDL resolve a driver.
+kafka = ["krishiv-connectors/kafka"]
 iceberg = ["krishiv-connectors/iceberg", "dep:iceberg"]
-delta = ["krishiv-connectors/delta"]
-hudi = ["krishiv-connectors/hudi"]
 # JDBC pull source: `CREATE EXTERNAL TABLE … STORED AS JDBC` over the
 # registry's JdbcSourceDriver (Postgres via sqlx), incl. incremental keyset
 # cursors (`cursor.column` / `cursor.after`). Phase 31 ingest breadth.
@@ -99,7 +101,10 @@ iceberg-datafusion = [
     "local-catalog",
     "krishiv-connectors/iceberg",
 ]
-# Unity Catalog backend (uses UC's built-in Iceberg REST endpoint).
+# Unity Catalog and Glue each speak the Iceberg REST protocol, so both build on
+# `rest-catalog` — but each also gates its own backend file (`unity_catalog.rs`,
+# `glue_catalog.rs`) with provider-specific auth and reference handling. They
+# are not aliases.
 unity-catalog = ["rest-catalog"]
 # AWS Glue catalog backend (uses Glue's built-in Iceberg REST endpoint).
 glue-catalog = ["rest-catalog"]

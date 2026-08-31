@@ -274,10 +274,42 @@ test-etcd:
 test-embedded:
     {{ sccache_env }} {{ cargo }} test -p krishiv --no-default-features --features embedded --lib
 
-# Single-node scheduler and runtime tests
+# Single-node scheduler and runtime tests.
+#
+# This used to pass `--no-default-features --features sqlite`, and had done for
+# long enough that nobody noticed: krishiv-scheduler declares only `etcd` and
+# `jemalloc`, so cargo exited 101 with "does not contain this feature: sqlite"
+# every time. The recipe was in no CI job, so the failure was never seen.
+# There is no sqlite metadata backend either — the choices are
+# `memory | rocksdb | etcd`, and they are runtime flags, not Cargo features.
+# Single-node is therefore the *default* feature set: no etcd.
 test-single-node:
-    {{ sccache_env }} {{ cargo }} test -p krishiv-scheduler --lib --no-default-features --features sqlite
+    {{ sccache_env }} {{ cargo }} test -p krishiv-scheduler --lib
     {{ sccache_env }} {{ cargo }} test -p krishiv-runtime --lib
+
+# The feature arms that used to ride into `just test` on an unconditional
+# `[dependencies]` pin, and would otherwise have gone dark when those pins were
+# removed. Measured on krishiv-connectors --lib: default 177, +kafka 194 (+17),
+# +vector-sinks 256 (+79). Those 96 tests were only ever running because
+# krishiv-sql pinned `kafka` and krishiv-mcp pinned `vector-sinks`; this recipe
+# is where they live now. `lint-features` only *checks* these crates — checking
+# is not running.
+#
+# schema-registry was already dark: only krishiv-python pinned it, and that
+# crate is excluded from the workspace test. Included here for the same reason.
+test-feature-arms:
+    {{ sccache_env }} {{ cargo }} test -p krishiv-sql --lib --features kafka
+    {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib --features kafka
+    {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib --features vector-sinks
+    {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib --features schema-registry
+
+# R10 chaos acceptance gate (fault injection, fencing, leader election, DLQ).
+#
+# `krishiv-chaos` is not a default-member and is excluded from every workspace
+# recipe, so its 25 tests — and `krishiv-common`'s `chaos` module, which only
+# this crate enables — were compiled by nothing. They pass; they were just dark.
+test-chaos:
+    {{ sccache_env }} {{ cargo }} test -p krishiv-chaos
 
 # Kubernetes operator unit tests
 test-k8s:
@@ -371,6 +403,13 @@ lint:
         --all-features \
         --all-targets \
         -- -D warnings
+    # krishiv-chaos is the other crate excluded from the workspace pass. It is
+    # a test-only crate, so `--all-targets` is the whole of it; without this it
+    # was linted by nothing at all.
+    {{ cargo }} clippy \
+        -p krishiv-chaos \
+        --all-targets \
+        -- -D warnings
 
 # Verify each optional feature compiles on its own — catches forwarding-flag
 # rot and "doesn't build with --no-default-features" breakage in the crates
@@ -392,6 +431,18 @@ lint-features:
     # fix the feature or delete it.
     {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-connectors
     {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-sql
+    # The forwarder tier and the binary. The sweep above covered only the two
+    # leaf-owning crates, so a forwarding flag that stopped propagating — or a
+    # binary feature outside every preset, which `state` and `delta` both were —
+    # was compiled by nothing. `check-full` already carried a hand-written guard
+    # for exactly one of these (krishiv-executor/iceberg); this generalises it.
+    {{ cargo }} hack check --each-feature --no-dev-deps \
+        -p krishiv-api -p krishiv-executor -p krishiv-runtime -p krishiv-flight-sql
+    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv
+    # krishiv-python is linted with --all-features below, which cannot see a
+    # flag that only breaks *alone*. Its kinesis/pulsar arms shipped
+    # never-compiled once already.
+    {{ cargo }} hack check --each-feature --no-dev-deps -p krishiv-python
     # `--no-dev-deps` above is what makes the per-feature sweep fast, but it
     # also means it never builds a *test* target — so `#[cfg(test)]` code behind
     # an optional feature was checked by nothing. That is not hypothetical: the

@@ -24,7 +24,10 @@ krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse", "hudi"] }
+# `hudi` was pinned here as well, but it gates no module: `mod hudi` inside
+# `lakehouse` is unconditional, so the flag only ever selected a certification
+# arm. Pinning it advertised a dependency edge that does not exist.
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 # A-4: needed to re-export `LiveJobView` for `Session::list_jobs_remote` /
 # `Session::get_job_remote`. The runtime already depends on it transitively,

@@ -17,7 +17,11 @@ krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["kafka", "lakehouse", "schema-registry", "iceberg", "hudi", "vector-sinks"] }
+# Only `lakehouse` is a base dependency of the bindings. kafka / iceberg /
+# schema-registry / vector-sinks were pinned here too, which made the `kafka`,
+# `iceberg` and `vector-sinks` features below no-ops for the dependency they
+# claim to gate — every wheel built librdkafka whether or not it was asked for.
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
 krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
@@ -46,6 +50,10 @@ tracing = { workspace = true }
 default = []
 extension-module = ["pyo3/extension-module"]
 kafka = ["krishiv-connectors/kafka", "krishiv-api/kafka"]
+# Confluent Schema Registry config objects. Pulls apache-avro + prost + reqwest,
+# so it is opt-in: the wheel used to build all three unconditionally for a
+# config struct the docs describe as not yet consumed by any source or sink.
+schema-registry = ["krishiv-connectors/schema-registry"]
 iceberg = ["krishiv-connectors/iceberg", "krishiv-api/iceberg-sink"]
 # Cloud object-store backends (S3/MinIO, GCS, Azure) — required for Iceberg
 # tables and other sinks whose `path` is an `s3://` URI.
@@ -56,8 +64,10 @@ pulsar = ["krishiv-connectors/pulsar-source"]
 cassandra = ["krishiv-connectors/cassandra"]
 elasticsearch = ["krishiv-connectors/elasticsearch"]
 hbase = ["krishiv-connectors/hbase"]
-ai = ["krishiv-connectors/vector-sinks"]
-vector-sinks = ["ai", "krishiv-connectors/vector-sinks"]
+# `vector-sinks` is the flag; `ai` is the name the Python extra uses for it.
+# They previously each named the leaf edge, so the pair read as two features.
+vector-sinks = ["krishiv-connectors/vector-sinks"]
+ai = ["vector-sinks"]
 qdrant = ["vector-sinks", "krishiv-connectors/qdrant"]
 pgvector = ["vector-sinks", "krishiv-connectors/pgvector"]
 

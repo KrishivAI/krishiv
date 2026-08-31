@@ -141,6 +141,14 @@ jobs:
       # guards for the Phase 58 coordinator wedge and the IVM snapshot size
       # cliffs. No live etcd needed (docs/implementation/ci-tiers.md).
       - run: just test-etcd
+      # These three existed but no job ran them, so nothing noticed that
+      # `test-single-node` had been exiting 101 on a feature krishiv-scheduler
+      # does not declare. A recipe outside CI is a recipe nobody is running.
+      - run: just test-embedded
+      - run: just test-single-node
+      - run: just test-k8s
+      - run: just test-chaos
+      - run: just test-feature-arms
 
   # ── External-service tests (audit §14 TEST-6) ────────────────────────────────
   # Runs the `#[ignore = "requires …"]` tests against real provisioned services

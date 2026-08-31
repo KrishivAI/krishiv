@@ -7486,3 +7486,145 @@ repo's own rule — paired interleaved or the numbers lie — applied to itself.
 through the distributed path on this box (§81). The argument that distributed is
 unaffected is structural and tested, not empirical. A run on the 3-node rig with
 the object-store shuffle path would close it.
+
+## §83 — FEAT-1: the feature graph did not control the build
+
+Krishiv's stated rule is that Cargo features gate **optional dependency
+families**, never runtime behaviour — which is why one binary serves embedded,
+single-node and distributed. The rule is right. The implementation had inverted
+itself in three places, and the inversions were load-bearing.
+
+**A leaf enabled in `[dependencies]` is on for every build.** Seven crates did
+it: `krishiv-python` pinned `kafka, lakehouse, schema-registry, iceberg, hudi,
+vector-sinks`; `krishiv-sql` pinned `kafka, lakehouse`; `krishiv-api`
+`lakehouse, hudi`; `krishiv-mcp` `lakehouse, vector-sinks`; `krishiv`,
+`-dataflow` and `-executor` `lakehouse`. No preset could switch any of them off.
+Ground truth before the fix: `krishiv --no-default-features --features embedded`
+pulled **rdkafka, rocksdb and reqwest**, and resolved to 424 crates against
+`prod`'s 524 — 19% leaner than the full production build, for a flag documented
+as "baseline; no optional deps".
+
+**Why krishiv-sql had no choice.** `pub mod kafka;` in krishiv-connectors was
+itself `#[cfg(feature = "kafka")]`, so the module *vanished* without the flag —
+even though `kafka.rs` already carried complete `#[cfg(not(feature = "kafka"))]`
+stubs for `KafkaSource` and `KafkaSink`, written precisely so dependents could
+compile against one API either way. Those **13 stub arms had never compiled**,
+and had silently drifted out of parity: the stub `new()` returned `Self` where
+the rdkafka arm returned `ConnectorResult<Self>`, and `commit_current_offset`,
+`all_current_offsets`, the two `Source` checkpoint methods and the whole
+`CheckpointSource` impl were missing. Gate the *backend*, not the module: with
+`pub mod kafka` ungated and the stubs brought back to parity, **krishiv-sql
+compiles without the kafka leaf with no change to krishiv-sql at all**.
+
+**A feature-gated enum variant makes the feature viral.**
+`ConnectorRole::VectorSink` was `#[cfg(feature = "vector-sinks")]`, so
+`ConnectorRole` changed shape with the flag and every downstream `match` needed
+it too — which is why krishiv-mcp pinned the feature and pulled reqwest into
+builds that never touch a vector sink. The role is a tag; only the driver needs
+the feature. Ungated, with `has_driver` returning a flat `false` when no driver
+can be registered.
+
+**Flags that gated no dependency ended up gating test coverage.** `delta` and
+`hudi` were `= ["lakehouse"]` — no dependency of their own — and `mod
+delta_lake` / `mod local_delta` / `mod hudi` were never gated. So 4,221 lines
+shipped in every `lakehouse` build while the flags switched off the **Delta and
+Hudi certification suites**, which therefore ran in no build. Gating the modules
+would have touched the public API of six crates for zero dependency saving; the
+features are deleted instead, the formats ship with `lakehouse`, and both
+certification suites now run. `krishiv-sql/delta`, `krishiv-sql/hudi` and
+`krishiv/delta` were pure forwarders to them and are gone with them.
+
+**The operator-facing manifest was reporting the consequence.**
+`capabilities.rs` read `enabled: cfg!(feature = "delta")` against a feature no
+preset enabled, so every shipped binary reported **`delta=off`** while Delta
+Lake worked. Now `true`, with `hudi` alongside it.
+
+**Two more flags that gated nothing.** `krishiv-connectors/parquet` was the
+default feature with zero `#[cfg]` sites — `--no-default-features` removed
+nothing while reading as a lean-baseline switch; parquet and CSV are now the
+declared base. And `krishiv-connectors` carried `local` / `full` / `extended`
+presets whose names collided with the binary's and whose contents differed in
+both directions (`krishiv --features full` gave connectors {cloud,
+elasticsearch, hudi, iceberg, jdbc, kafka, lakehouse, vector-sinks};
+`krishiv-connectors --features full` gave {avro, iceberg, kafka, lakehouse,
+schema-registry, state, two-phase} — neither a superset). Nothing in the tree
+referenced them; deleted.
+
+**Gates that were not running.** `just test-single-node` passed
+`--no-default-features --features sqlite` to krishiv-scheduler, which declares
+only `etcd` and `jemalloc`: `error: the package 'krishiv-scheduler' does not
+contain this feature: sqlite`, **rc=101**, on every invocation. No CI job ran it
+— nor `test-embedded` or `test-k8s`. There is no sqlite metadata backend either
+(`memory | rocksdb | etcd`, and those are runtime flags), so single-node is the
+default feature set. All three are now in `ci.yml`. `krishiv-chaos` was worse: a
+non-default-member excluded from every workspace recipe, so its **25 R10
+acceptance tests** — and `krishiv-common`'s `chaos` module, which only that
+crate enables — were compiled by nothing. They pass; they were dark. Now
+`just test-chaos` in CI, plus a clippy pass, since it was also outside the lint
+sweep.
+
+**And the thing that guard would have caught, found while building it.** The
+binary's `kafka` preset was `["krishiv-connectors/kafka"]` and nothing else. It
+therefore linked librdkafka into the shipped `prod` image while leaving
+`krishiv-executor/kafka` (21 `#[cfg]` sites), `krishiv-api/kafka` (5),
+`krishiv-runtime/kafka` (3) and `krishiv-flight-sql/kafka` (3) **off**. Concretely,
+`ExecutorTaskRunner::stage_rloop_kafka` in the deployed binary is the
+`#[cfg(not(feature = "kafka"))]` arm, which returns
+`ExecutorError::InvalidAssignment` — the distributed run-loop could not stage
+Kafka output, in an image carrying the Kafka client and reporting `kafka=on` in
+its capability manifest. The `iceberg` preset one line below had the propagation
+right (`krishiv-executor/iceberg`, `krishiv-api/iceberg-sink`), and `check-full`
+even carries a hand-written guard asserting it; `kafka` never got the same
+treatment. Now forwards to all four, with `krishiv-flight-sql?/kafka` so the
+optional dep is not force-enabled.
+
+**The per-feature guard stopped below the leaf tier.** `lint-features` swept
+`krishiv-connectors` and `krishiv-sql` only, so a forwarding flag that stopped
+propagating was compiled by nothing — the failure `check-full` already carries a
+hand-written guard for (`cargo check -p krishiv-executor --features iceberg`).
+Extended to the forwarder tier, the binary (where `state` and `delta` sat
+outside every preset and every CI job), and `krishiv-python`, which had only an
+`--all-features` lint and so could not see a flag that breaks alone.
+
+**Removing the pins moved 96 tests out of the default build, and that had to
+be accounted for rather than noticed later.** `just test` went 5562 -> 5475.
+The arithmetic: krishiv-connectors `--lib` is 177 tests on default features,
+194 with `kafka` (+17), 256 with `vector-sinks` (+79). Those 96 were running
+only because krishiv-sql pinned `kafka` and krishiv-mcp pinned `vector-sinks` —
+they rode into the workspace build on the pins, not on any recipe. Against that,
+`delta_certification` (~9 tests) had never run at all and now does. 96 out, 9
+in, 5562 - 87 = 5475: the ledger closes.
+
+The 96 now live in `just test-feature-arms` (in `ci.yml`), which also picks up
+`schema-registry` (+39) — dark before, since only krishiv-python pinned it and
+that crate is excluded from the workspace test. Runs clean: 824 / 194 / 256 /
+216. Adding `just test-chaos`'s 25, CI now runs strictly more than it did.
+
+**One test had to be split, and the split is the point.**
+`kafka_sink_external_table_is_a_distinct_batch_door` asserted that
+`STORED AS KAFKA_SINK` DDL succeeds and dispatch reaches the driver. With
+krishiv-sql no longer pinning the leaf, `just test` (default features) has no
+driver, and the DDL is correctly refused at CREATE. The driver-dispatch arm is
+now `#[cfg(feature = "kafka")]` and a new ungated test asserts the lean
+contract: refused at CREATE, with the message naming what to rebuild. Gating a
+test would normally just make it dark, so `just test-kafka` runs the featured
+arm of krishiv-sql and krishiv-connectors and is in `ci.yml` — `lint-features`
+only *checks* those crates, it does not test them.
+
+**Verification.** `embedded` now resolves to **414 crates with rdkafka=0**;
+`prod` is unchanged at **524 with rdkafka=1, iceberg=3, sqlx=1**. The revert
+proof for the kafka stubs is unusually strong: reverting the `pub mod kafka`
+ungating deletes the five new tests outright (they live in the arm that never
+compiled), and reverting the stub signatures alone fails the build in
+krishiv-sql. `stub_constructors_have_the_same_signature_as_the_rdkafka_arm`
+binds both constructors to one `fn` type so the drift that started this can only
+recur as a compile error.
+
+**Checked and left alone.** `krishiv-sql`'s `unity-catalog` and `glue-catalog`
+look like aliases of `rest-catalog` but each gates its own backend file with
+provider-specific auth — not aliases. `embedded = []` is an explicit empty
+marker, documented as such: it is exactly `--no-default-features`, named so
+`check-embedded` / `test-embedded` / `release.yml` can say which build they
+mean. `bare-metal` stays an alias of `distributed` for the launcher scripts.
+All six `jemalloc` flags are correct — every `#[global_allocator]` is in a bin
+target.

@@ -148,6 +148,7 @@ pub fn write_hudi_upsert(
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))
 }
 
+#[cfg(feature = "schema-registry")]
 #[pyfunction]
 #[pyo3(signature = (url, format="avro"))]
 pub fn schema_registry_confluent(url: String, format: &str) -> PyResult<PySchemaRegistryConfig> {
@@ -165,6 +166,7 @@ pub fn schema_registry_confluent(url: String, format: &str) -> PyResult<PySchema
     Ok(PySchemaRegistryConfig { _inner: config })
 }
 
+#[cfg(feature = "schema-registry")]
 #[pyclass(name = "SchemaRegistryConfig")]
 #[doc = "**Alpha**: The config struct is accepted but not yet consumed by any source or sink in the Python API. Schema fetching is deferred."]
 pub struct PySchemaRegistryConfig {

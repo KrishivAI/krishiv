@@ -19,7 +19,13 @@ pub mod hbase_connector;
 /// T9: JDBC source/sink implementation (Postgres; MySQL requires mysql sqlx feature).
 #[cfg(feature = "jdbc")]
 pub mod jdbc;
-#[cfg(feature = "kafka")]
+// `kafka` gates the *rdkafka backend*, not the module. The module ships
+// `#[cfg(not(feature = "kafka"))]` stubs for KafkaSource/KafkaSink that return
+// "not compiled in" at runtime, so dependents compile against a stable API
+// without dragging librdkafka into every build. Gating the `mod` itself made
+// those 13 stub arms unreachable (they had never compiled) and forced
+// krishiv-sql to pin `features = ["kafka"]` unconditionally — which is why a
+// lean `--features embedded` build still built rdkafka.
 pub mod kafka;
 #[cfg(feature = "kafka")]
 pub mod kafka_transactional_sink;

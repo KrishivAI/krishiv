@@ -9,7 +9,12 @@ pub enum ConnectorRole {
     Source,
     Sink,
     TwoPhaseSink,
-    #[cfg(feature = "vector-sinks")]
+    /// Ungated on purpose: the role is a *tag*, only the driver behind it needs
+    /// `vector-sinks`. Gating the variant made `ConnectorRole` change shape with
+    /// the feature, so every downstream `match` had to be cfg'd too — which is
+    /// why krishiv-mcp pinned `features = ["vector-sinks"]` unconditionally and
+    /// pulled reqwest into builds that never touch a vector sink. Without the
+    /// feature no driver registers for this role and `has_driver` returns false.
     VectorSink,
 }
 

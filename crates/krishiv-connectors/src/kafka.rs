@@ -399,6 +399,12 @@ pub fn decode_schema_from_columns(
 // KafkaSource
 // ---------------------------------------------------------------------------
 
+/// The one message both feature-absent arms return, so the remedy is stated
+/// identically wherever a lean build meets a Kafka table.
+#[cfg(not(feature = "kafka"))]
+const KAFKA_FEATURE_ABSENT: &str =
+    "Kafka support is not compiled into this build: rebuild with the `kafka` feature";
+
 /// A Kafka source stub when the `kafka` feature is disabled.
 #[cfg(not(feature = "kafka"))]
 pub struct KafkaSource {
@@ -407,9 +413,28 @@ pub struct KafkaSource {
 
 #[cfg(not(feature = "kafka"))]
 impl KafkaSource {
-    /// Create a new `KafkaSource` from a validated config.
-    pub fn new(config: KafkaConfig) -> Self {
-        Self { config }
+    /// Fail closed: without the `kafka` feature there is no broker client, so
+    /// the error is raised at construction rather than as an empty stream at
+    /// read time.
+    ///
+    /// The signature mirrors the rdkafka-backed arm exactly. It has to: these
+    /// stubs exist so dependents compile against one API regardless of the
+    /// feature, and when they silently drifted (this returned `Self`, the real
+    /// one `ConnectorResult<Self>`) nothing caught it, because the whole module
+    /// was gated on the feature being ON and this arm never compiled.
+    pub fn new(_config: KafkaConfig) -> ConnectorResult<Self> {
+        Err(ConnectorError::Unsupported {
+            message: KAFKA_FEATURE_ABSENT.into(),
+        })
+    }
+
+    /// Unreachable in this build: `new` never yields a value. Present so the
+    /// API is identical across both arms.
+    pub fn commit_current_offset(&self) {}
+
+    /// Unreachable in this build: `new` never yields a value.
+    pub fn all_current_offsets(&self) -> Vec<KafkaOffset> {
+        Vec::new()
     }
 
     /// Return the config this source was created with.
@@ -426,12 +451,39 @@ impl Source for KafkaSource {
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         Err(ConnectorError::Unsupported {
-            message: "Kafka broker connection requires the `kafka` feature".into(),
+            message: KAFKA_FEATURE_ABSENT.into(),
         })
     }
 
     fn current_offset(&self) -> Option<Box<dyn Any + Send>> {
         None
+    }
+
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        Ok(None)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, _encoded: &[u8]) -> ConnectorResult<()> {
+        Err(ConnectorError::Unsupported {
+            message: KAFKA_FEATURE_ABSENT.into(),
+        })
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+impl CheckpointSource for KafkaSource {
+    type Offset = MultiKafkaOffset;
+
+    fn checkpoint_offset(&self) -> ConnectorResult<Self::Offset> {
+        Err(ConnectorError::Unsupported {
+            message: KAFKA_FEATURE_ABSENT.into(),
+        })
+    }
+
+    fn restore_offset(&mut self, _offset: &Self::Offset) -> ConnectorResult<()> {
+        Err(ConnectorError::Unsupported {
+            message: KAFKA_FEATURE_ABSENT.into(),
+        })
     }
 }
 
@@ -530,9 +582,12 @@ pub struct KafkaSink {
 
 #[cfg(not(feature = "kafka"))]
 impl KafkaSink {
-    /// Create a new `KafkaSink` from a validated config.
-    pub fn new(config: KafkaConfig) -> Self {
-        Self { config }
+    /// Fail closed, with the same signature as the rdkafka-backed arm — see
+    /// the note on `KafkaSource::new`.
+    pub fn new(_config: KafkaConfig) -> ConnectorResult<Self> {
+        Err(ConnectorError::Unsupported {
+            message: KAFKA_FEATURE_ABSENT.into(),
+        })
     }
 
     /// Return the config this sink was created with.
@@ -1899,29 +1954,38 @@ mod tests {
     // KafkaSource capabilities
     // -----------------------------------------------------------------------
 
+    #[cfg(feature = "kafka")]
     #[tokio::test]
     async fn kafka_source_reports_unbounded_and_rewindable() {
         let config = test_kafka_config();
-        #[cfg(not(feature = "kafka"))]
-        let source = KafkaSource::new(config);
-        #[cfg(feature = "kafka")]
         let source = KafkaSource::new(config).expect("kafka source");
         let caps = source.capabilities();
-        #[cfg(feature = "kafka")]
         assert!(caps.is_unbounded());
-        #[cfg(not(feature = "kafka"))]
-        assert!(!caps.is_unbounded());
         assert!(!caps.is_rewindable());
         assert!(!caps.is_bounded());
         assert!(!caps.is_transactional());
         assert!(!caps.is_idempotent());
-        #[cfg(feature = "kafka")]
         assert!(
             caps.is_checkpoint_capable(),
             "broker Kafka source must advertise checkpoint capability now that seek-based restore is implemented"
         );
-        #[cfg(not(feature = "kafka"))]
-        assert!(!caps.is_checkpoint_capable());
+    }
+
+    /// Without the feature there is no broker client, so construction is where
+    /// the build says so — not a source that silently yields nothing.
+    #[cfg(not(feature = "kafka"))]
+    #[test]
+    fn kafka_source_construction_fails_closed_without_the_feature() {
+        let err = KafkaSource::new(test_kafka_config())
+            .err()
+            .expect("stub KafkaSource::new must fail, not hand back a dead source");
+        match err {
+            ConnectorError::Unsupported { message } => assert!(
+                message.contains("`kafka` feature"),
+                "the error must name the feature to rebuild with, got: {message}"
+            ),
+            other => panic!("expected Unsupported, got: {other}"),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1930,31 +1994,34 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "kafka"))]
-    fn kafka_sink_stub_reports_no_runtime_capabilities() {
-        let config = test_kafka_config();
-        let sink = KafkaSink::new(config);
-        let caps = sink.capabilities();
-        assert!(!caps.is_unbounded());
-        assert!(!caps.is_transactional());
-        assert!(!caps.is_bounded());
-        assert!(!caps.is_rewindable());
-        assert!(!caps.is_idempotent());
+    fn kafka_sink_construction_fails_closed_without_the_feature() {
+        let err = KafkaSink::new(test_kafka_config())
+            .err()
+            .expect("stub KafkaSink::new must fail, not hand back a dead sink");
+        match err {
+            ConnectorError::Unsupported { message } => assert!(
+                message.contains("`kafka` feature"),
+                "the error must name the feature to rebuild with, got: {message}"
+            ),
+            other => panic!("expected Unsupported, got: {other}"),
+        }
     }
 
     // -----------------------------------------------------------------------
     // Unsupported stubs
     // -----------------------------------------------------------------------
 
-    #[tokio::test]
+    /// The two arms must expose *one* API. When they drifted — this arm's
+    /// `new` returning `Self` while the rdkafka arm returned
+    /// `ConnectorResult<Self>` — nothing noticed, because `pub mod kafka` was
+    /// itself gated on the feature and this code had never been compiled.
+    /// Binding both constructors to the same signature is what makes the drift
+    /// a build failure.
     #[cfg(not(feature = "kafka"))]
-    async fn kafka_source_read_batch_returns_unsupported() {
-        let config = test_kafka_config();
-        let mut source = KafkaSource::new(config);
-        let err = source.read_batch().await.unwrap_err();
-        match err {
-            ConnectorError::Unsupported { .. } => {}
-            other => panic!("expected Unsupported, got: {other}"),
-        }
+    #[test]
+    fn stub_constructors_have_the_same_signature_as_the_rdkafka_arm() {
+        let _source: fn(KafkaConfig) -> ConnectorResult<KafkaSource> = KafkaSource::new;
+        let _sink: fn(KafkaConfig) -> ConnectorResult<KafkaSink> = KafkaSink::new;
     }
 
     #[tokio::test]
@@ -1973,25 +2040,19 @@ mod tests {
         assert!(source.read_batch().await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    /// `krishiv-sql` compiles its Kafka table provider against this module
+    /// unconditionally. If the stub arm ever stops satisfying `Source` /
+    /// `Sink` / `CheckpointSource`, a lean build breaks in krishiv-sql with a
+    /// confusing error instead of here.
     #[cfg(not(feature = "kafka"))]
-    async fn kafka_sink_write_batch_returns_unsupported() {
-        use arrow::array::Int32Array;
-        use arrow::datatypes::{DataType, Field, Schema};
-        use std::sync::Arc;
-
-        let config = test_kafka_config();
-        let mut sink = KafkaSink::new(config);
-
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let batch =
-            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
-
-        let err = sink.write_batch(batch).await.unwrap_err();
-        match err {
-            ConnectorError::Unsupported { .. } => {}
-            other => panic!("expected Unsupported, got: {other}"),
-        }
+    #[test]
+    fn stub_arms_still_satisfy_the_connector_traits() {
+        fn assert_source<T: crate::Source>() {}
+        fn assert_sink<T: crate::Sink>() {}
+        fn assert_checkpoint<T: crate::CheckpointSource>() {}
+        assert_source::<KafkaSource>();
+        assert_sink::<KafkaSink>();
+        assert_checkpoint::<KafkaSource>();
     }
 
     #[tokio::test]
@@ -2211,21 +2272,24 @@ mod tests {
         assert_checkpoint::<super::KafkaSource>();
     }
 
-    #[tokio::test]
-    async fn kafka_sink_stub_flush_returns_error() {
-        #[cfg(not(feature = "kafka"))]
-        {
-            use crate::Sink;
-            let config = test_kafka_config();
-            let mut sink = KafkaSink::new(config);
-            let result = sink.flush().await;
-            assert!(
-                result.is_err(),
-                "flush on stub KafkaSink must return an error"
-            );
-            let err = result.err().unwrap().to_string();
-            assert!(err.contains("Kafka sink flush requires the `kafka` feature"));
-        }
+    /// Both feature-absent arms must state the same remedy, so a lean build
+    /// gives one message wherever it meets Kafka.
+    #[cfg(not(feature = "kafka"))]
+    #[test]
+    fn both_stub_constructors_name_the_same_remedy() {
+        let source_err = KafkaSource::new(test_kafka_config())
+            .err()
+            .expect("source must fail")
+            .to_string();
+        let sink_err = KafkaSink::new(test_kafka_config())
+            .err()
+            .expect("sink must fail")
+            .to_string();
+        assert_eq!(source_err, sink_err);
+        assert!(
+            source_err.contains("rebuild with the `kafka` feature"),
+            "got: {source_err}"
+        );
     }
 
     // -----------------------------------------------------------------------
