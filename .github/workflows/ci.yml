@@ -115,6 +115,7 @@ jobs:
       - uses: taiki-e/install-action@cargo-hack
       - uses: taiki-e/install-action@just
       - run: just lint-features
+      - run: just lint-deps
 
   # ── Rust workspace tests ─────────────────────────────────────────────────────
   test:
@@ -149,6 +150,7 @@ jobs:
       - run: just test-k8s
       - run: just test-chaos
       - run: just test-feature-arms
+      - run: just check-excluded
 
   # ── External-service tests (audit §14 TEST-6) ────────────────────────────────
   # Runs the `#[ignore = "requires …"]` tests against real provisioned services

@@ -15,7 +15,6 @@ krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 sqllogictest = "0.29"
 thiserror = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = { workspace = true }
 tonic = { workspace = true }
 
 [lints]

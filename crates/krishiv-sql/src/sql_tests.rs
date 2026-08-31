@@ -2131,18 +2131,41 @@ mod query_spill_tests {
     /// host with more than ~125 GiB free on the spill filesystem resolves to
     /// something other than DataFusion's constant, so dropping the
     /// `with_max_temp_directory_size` call turns this red.
+    ///
+    /// The ceiling is derived from *live* filesystem free space, so the engine's
+    /// value and a freshly resolved one are two readings taken microseconds
+    /// apart and will not be bit-identical on a busy box: this asserted
+    /// equality and went red on a loaded CI run at 511,897,908,000 vs
+    /// 511,897,868,640 — a 7.7e-8 drift, and a false failure. The tolerance
+    /// below is far tighter than the thing the test exists to catch: dropping
+    /// `with_max_temp_directory_size` yields DataFusion's 100 GiB constant,
+    /// which is a *multiple* away, not a fraction of a percent.
     #[test]
     fn the_engine_runtime_carries_the_resolved_spill_ceiling() {
         let engine = crate::SqlEngine::new();
         let resolved = crate::query_spill_disk_limit_bytes(&std::env::temp_dir());
-        assert_eq!(
-            engine
-                .session_context()
-                .runtime_env()
-                .disk_manager
-                .max_temp_directory_size(),
-            resolved,
-            "engine runtime ignored the resolved spill ceiling"
+        let actual = engine
+            .session_context()
+            .runtime_env()
+            .disk_manager
+            .max_temp_directory_size();
+
+        let drift = actual.abs_diff(resolved);
+        assert!(
+            drift <= resolved / 100,
+            "engine runtime ignored the resolved spill ceiling: \
+             got {actual}, resolved {resolved} (drift {drift} exceeds 1%)"
         );
+
+        // On a host with room to spare the derived ceiling must not collapse
+        // back to the fallback — otherwise the assertion above would hold even
+        // with the call-site deleted, and this guard would prove nothing.
+        if resolved > crate::FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES {
+            assert_ne!(
+                actual,
+                crate::FALLBACK_QUERY_SPILL_DISK_LIMIT_BYTES,
+                "engine fell back to DataFusion's constant instead of the derived ceiling"
+            );
+        }
     }
 }

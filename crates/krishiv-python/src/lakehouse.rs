@@ -556,6 +556,7 @@ mod catalog_tests {
         );
     }
 
+    #[cfg(feature = "schema-registry")]
     #[test]
     fn schema_registry_config_rejects_unknown_format() {
         // PyErr::to_string() calls into Python to format the exception, so the
@@ -571,6 +572,7 @@ mod catalog_tests {
         );
     }
 
+    #[cfg(feature = "schema-registry")]
     #[test]
     fn schema_registry_config_validates_url() {
         assert!(schema_registry_confluent("not-a-url".into(), "avro").is_err());

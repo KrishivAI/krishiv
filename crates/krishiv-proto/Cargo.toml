@@ -24,7 +24,7 @@ tonic-prost.workspace = true
 serde = ["dep:serde", "dep:base64"]
 
 [dev-dependencies]
-proptest = "1"
+proptest = { workspace = true }
 serde_json = { workspace = true }
 
 [build-dependencies]

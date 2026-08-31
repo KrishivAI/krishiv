@@ -24,7 +24,6 @@ krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 dashmap = { workspace = true }
-datafusion = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = { workspace = true }
 arrow = { workspace = true }

@@ -14,7 +14,6 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
 krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
-krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 # Only `lakehouse` is a base dependency of the bindings. kafka / iceberg /

@@ -474,16 +474,35 @@ tidy: fmt lint
 # lint propagation is needed (e.g. test-only struct with helpers); see
 # AGENTS.md → "Dead code (12 scenarios — pick the right annotation)" for
 # the full taxonomy.
-audit-dead-code:
+# Unused-dependency gate. `cargo machete` exits non-zero on a finding, so this
+# fails CI — which is the point: the scan lived only inside `audit-dead-code`,
+# a recipe no job ran, and 18 unused declarations accumulated behind it
+# (reqwest and sha2 in the plan IR crate, datafusion in krishiv-ui and
+# krishiv-runtime, a `dep:rocksdb` in a feature whose crate never calls it,
+# and two dead internal edges). A guard nobody runs is not a guard.
+lint-deps:
     @command -v cargo-machete >/dev/null 2>&1 || {{ cargo }} install cargo-machete --locked
+    {{ cargo }} machete --with-metadata
+
+# Compile the crates the workspace recipes exclude, at their DEFAULT features
+# and including test targets.
+#
+# `just test` and `just lint` exclude krishiv-python and krishiv-chaos; the
+# python lint pass uses --all-features, and `lint-features` uses --no-dev-deps.
+# So krishiv-python's test targets on default features were built by nothing —
+# which is exactly how a `#[cfg(feature = "schema-registry")]` function kept two
+# ungated tests calling it, and only surfaced on a manual --all-targets run.
+check-excluded:
+    {{ cargo }} check -p krishiv-python --all-targets
+    {{ cargo }} check -p krishiv-chaos --all-targets
+
+audit-dead-code: lint-deps
     @echo "── #[allow(dead_code)] (legacy, prefer #[expect]) ──"
     @grep -rn "#\[allow(dead_code)\]" crates/ --include="*.rs" | wc -l
     @echo
     @echo "── #[expect(dead_code, ...)] (preferred) ──"
     @grep -rn "#\[expect(dead_code" crates/ --include="*.rs" | wc -l
     @echo
-    @echo "── cargo-machete scan ──"
-    {{ cargo }} machete --with-metadata
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
 

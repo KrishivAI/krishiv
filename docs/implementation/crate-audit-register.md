@@ -7628,3 +7628,73 @@ marker, documented as such: it is exactly `--no-default-features`, named so
 mean. `bare-metal` stays an alias of `distributed` for the launcher scripts.
 All six `jemalloc` flags are correct — every `#[global_allocator]` is in a bin
 target.
+
+## §84 — FEAT-2: 18 dependencies declared and never used, behind a guard nobody ran
+
+`just audit-dead-code` installs `cargo-machete` on demand and runs it, and
+`cargo machete` exits non-zero on a finding — so it is a real gate. No CI job
+invoked it, and `cargo-machete` was not installed on this box. Eighteen unused
+declarations had accumulated behind it, across ten crates:
+
+| crate | dead declarations |
+|---|---|
+| krishiv-plan | `reqwest` `sha2` `async-trait` `dashmap` |
+| krishiv-dataflow | **`krishiv-connectors`** **`krishiv-metrics`** `dashmap` |
+| krishiv-ui | `datafusion` `futures` |
+| krishiv-connectors | **`rocksdb`** `twox-hash` (both via `dep:` inside features) |
+| krishiv-delta | `serde_json` `futures` |
+| krishiv-runtime | `datafusion` |
+| krishiv-python | `krishiv-ivm` |
+| krishiv-state | `twox-hash` |
+| krishiv-flight-sql | `sha2` |
+| krishiv-mcp | `serde` |
+| krishiv-conformance | `tokio-stream` |
+
+Three are worth naming. `krishiv-connectors`'s `lakehouse` feature listed
+`dep:rocksdb` while no connectors source touches rocksdb — a C++-sized build
+pulled by a feature that never called it (the real users are krishiv-scheduler
+and krishiv-state). `krishiv-dataflow -> krishiv-connectors` was a dead edge,
+and it is one of the `lakehouse` pins catalogued in §83: the pin existed to
+satisfy a dependency the crate does not have. And `datafusion` — the largest
+crate in the tree — was declared twice for nothing.
+
+**Sized honestly.** Removing them does not shrink the shipped binary: `embedded`
+stays at 414 crates and `prod` at 524, because other crates legitimately pull
+the same libraries (rocksdb 3 -> 2 and reqwest 8 -> 7 in the graph). The win is
+standalone crate builds — `cargo check -p krishiv-plan` no longer builds reqwest
+and sha2 — and a manifest that describes the actual graph. Verified by removing
+all eighteen and compiling `--workspace --all-targets` clean.
+
+**A defect in §83's own commit, found by that check.** `392adb7` gated
+`schema_registry_confluent` behind the new `schema-registry` feature and left
+its two tests ungated. Nothing caught it: `just test` and `just lint` exclude
+krishiv-python, the python lint pass uses `--all-features` (which enables the
+flag), and `lint-features` uses `--no-dev-deps` (which builds no test target).
+So krishiv-python's test targets at *default* features were compiled by nothing.
+`just check-excluded` now builds krishiv-python and krishiv-chaos with
+`--all-targets` at default features, in CI.
+
+**A flaky test of my own, repaired and re-proven.**
+`the_engine_runtime_carries_the_resolved_spill_ceiling` (§77) asserted equality
+between two *live* filesystem free-space readings taken moments apart. On a
+loaded run it went red at 511,897,908,000 vs 511,897,868,640 — a 7.7e-8 drift,
+and a false failure. It now allows 1% drift and additionally asserts the derived
+ceiling has not collapsed to the fallback (without which the tolerance alone
+would hold even with the call site deleted). Re-proven red against the removed
+`with_max_temp_directory_size` call: rc=101 without it, rc=0 with it.
+
+**Guards added.** `just lint-deps` (cargo-machete as a gate, in CI) and
+`just check-excluded`. `krishiv-proto`'s `proptest = "1"` was the only dependency
+in 27 crates bypassing `[workspace.dependencies]`; it now uses
+`workspace = true`, so every shared dep routes through the 71-entry table. The
+35 crates present at multiple versions (`hashbrown` x4, `rand`/`rand_core`/
+`getrandom` x3) are upstream disagreements between DataFusion, Arrow and sqlx —
+not ours to unify, and recorded rather than churned.
+
+**Two false gate failures, both mine, both process.** A stray `nohup`'d gate
+runner overlapped a second one and produced a false RED on
+`incremental_checkpoints_cut_bytes_and_round_trip` (a byte-size assertion, load
+sensitive). Then a revert-proof experiment on `krishiv-sql/src/lib.rs` ran while
+a gate suite was reading that file, and `test-feature-arms` and `lint` compiled
+the broken intermediates. Neither was a defect. One suite at a time, and no tree
+mutation while one is running.
