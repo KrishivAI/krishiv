@@ -71,8 +71,21 @@ keywords = ["arrow", "datafusion", "streaming", "sql", "dataflow"]
 categories = ["database", "data-structures", "asynchronous"]
 
 [workspace.dependencies]
-arrow = { version = "58.3.0", features = ["prettyprint", "ipc_compression", "csv", "json"] }
-arrow-flight = { version = "58.3.0", features = ["flight-sql-experimental"] }
+# ── Arrow / DataFusion: pinned as a set, and NOT to the latest release ───────
+#
+# Latest is DataFusion 55 + arrow 59. We are held at 54.1 + 58.4 because
+# `iceberg` pins `arrow-* ^58` and `parquet ^58` — released 0.10.1 *and*
+# iceberg-rust `main`, so a git dependency is no escape either. On arrow 59 the
+# lakehouse bridge stops compiling with "expected `arrow::array::RecordBatch`,
+# found `arrow_array::record_batch::RecordBatch`": iceberg hands back a
+# different Rust type than DataFusion accepts. Everything outside
+# `krishiv-connectors/src/lakehouse/` migrates cleanly — the finished DF55 work
+# is kept at docs/implementation/patches/datafusion-55-arrow-59-migration.patch.
+#
+# 58.4 is what iceberg-rust main uses, so this pin tracks them exactly.
+# Re-attempt when iceberg publishes an arrow-59 release; see register §85.
+arrow = { version = "58.4.0", features = ["prettyprint", "ipc_compression", "csv", "json"] }
+arrow-flight = { version = "58.4.0", features = ["flight-sql-experimental"] }
 pyo3 = { version = "0.29.2", features = ["experimental-async"] }
 iceberg = "0.10.1"
 iceberg-catalog-rest = "0.10.1"
@@ -81,16 +94,16 @@ bytes = "1"
 object_store = "0.13.2"
 askama = "0.16.0"
 axum = "0.8.9"
-datafusion = "54.0.0"
-datafusion-proto = "54.0.0"
+datafusion = "54.1.0"
+datafusion-proto = "54.1.0"
 # Higher-order array functions (array_transform/filter/any_match) that the
 # Spark-parity HOF layer (transform/filter/exists/forall) delegates to for
 # exact semantics. Pinned to the datafusion 54 train.
-datafusion-functions-nested = "54.0.0"
+datafusion-functions-nested = "54.1.0"
 futures = "0.3"
 k8s-openapi = { version = "0.28", features = ["v1_33"] }
 kube = { version = "4.2", features = ["runtime"] }
-parquet = "58.3.0"
+parquet = "58.4.0"
 rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
