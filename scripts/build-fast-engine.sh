@@ -59,6 +59,15 @@ RUSTFLAGS_BENCH="${RUSTFLAGS:-} -C target-cpu=x86-64-v3"
 CFLAGS_BENCH="${CFLAGS:-} -mpclmul"
 CXXFLAGS_BENCH="${CXXFLAGS:-} -mpclmul"
 
+# rocksdb 0.25 builds RocksDB 11.8.1 from source, and its C++ toolchain writes
+# assembler intermediates to TMPDIR. On a box where /tmp is a tmpfs (this one,
+# and many CI runners) that fails with "can't open /tmp/ccXXXX.s for reading:
+# No such file or directory" — which reads like a compiler bug and is not one.
+# Point it at real disk beside the target dir.
+export TMPDIR="${KRISHIV_BUILD_TMPDIR:-${TMPDIR:-/var/tmp}}"
+mkdir -p "$TMPDIR"
+echo "== build TMPDIR $TMPDIR (rocksdb 0.25 needs non-tmpfs scratch)"
+
 echo "== cargo build (prod preset; isolated target dir; target-cpu=x86-64-v3)"
 (cd "$REPO" && CARGO_TARGET_DIR="$TARGET_DIR" RUSTFLAGS="$RUSTFLAGS_BENCH" \
     CFLAGS="$CFLAGS_BENCH" CXXFLAGS="$CXXFLAGS_BENCH" \

@@ -7698,3 +7698,164 @@ sensitive). Then a revert-proof experiment on `krishiv-sql/src/lib.rs` ran while
 a gate suite was reading that file, and `test-feature-arms` and `lint` compiled
 the broken intermediates. Neither was a defect. One suite at a time, and no tree
 mutation while one is running.
+
+## §85 — DEPS-1: upgrade every dependency, and what "latest" turned out to mean
+
+Goal: move all 71 workspace dependencies to their latest releases, DataFusion
+included, without changing behaviour. 18 moved. Four are held, each for a reason
+that is not "it was hard".
+
+### The blocker: DataFusion 55 / arrow 59 is gated on iceberg
+
+DataFusion 55 requires arrow 59. `iceberg` requires arrow 58 — `arrow-array`,
+`arrow-cast`, `arrow-ord`, `arrow-schema`, `arrow-string` and `parquet` all at
+`^58` in the published 0.10.1 **and** at `"58.4"` in iceberg-rust `main`, so a
+git dependency is no escape either. Both in one graph is not duplication of the
+harmless kind: the compiler's own words were
+
+    expected `arrow::array::RecordBatch`,
+    found `arrow_array::record_batch::RecordBatch`
+    note: there are multiple different versions of crate `arrow_array`
+
+Two `RecordBatch` types that cannot be passed to each other. The failure is
+confined to `krishiv-connectors/src/lakehouse/{dml,iceberg_native,maintenance}.rs`
+— **krishiv-sql compiles clean on DF55** — but that is exactly the Iceberg
+bridge, so the containment is no comfort.
+
+Bridging the seam with IPC round-trips per batch was considered and rejected: it
+would cost throughput on every lakehouse read and write, on the path TPC-H
+SF1000 exercises, to satisfy a version number.
+
+The DF55 migration is *finished* and kept at
+`docs/implementation/patches/datafusion-55-arrow-59-migration.patch` (2,163
+lines) so the work is not redone: `apply_expressions` on all five
+`ExecutionPlan` impls — with **`GraceHashJoinExec` delegating to its template**,
+since returning `Continue` there compiles and silently hides the join's
+expressions from every optimizer pass that walks them —
+`CreateExternalTable.location` -> `locations: Vec<String>` with a helper that
+*refuses* multiple rather than taking the first, `Arc<dyn SpillFile>`, the
+`PhysicalExtensionCodec` converter parameter, `PhysicalPlanningContext` through
+krishiv-ivm's six `create_physical_expr` sites, and the `ListingOptions` field
+removals. Re-attempt when iceberg publishes against arrow 59.
+
+Taken instead: arrow/arrow-flight/parquet **58.4.0** and datafusion(+proto,
++functions-nested) **54.1.0** — the ceiling the constraint allows, and 58.4 is
+precisely what iceberg-rust main pins, so the workspace now tracks them exactly.
+
+### "Latest" is wrong for a crate on DataFusion's public surface
+
+`object_store` 0.14.1 is newer than 0.13.2, and taking it was a mistake I made
+and had to undo. DataFusion 55 depends on 0.13.x, so declaring 0.14 put two
+`object_store`s in one graph and `ParquetObjectReader::new` rejected our
+`Arc<dyn ObjectStore>` with *"expected trait `object_store::ObjectStore`, found
+a different trait `object_store::ObjectStore`"*. I first read that as iceberg's
+fault; it was not. Pinned to 0.13.2, moves only in lockstep with DataFusion.
+
+### Two MSRV walls, left as the user's decision
+
+`sysinfo` 0.39.x and `vortex` 0.85 both declare `rust-version = "1.95"`; this
+workspace publishes `1.94.1`. Raising the toolchain has downstream consequences
+and is not a side effect of a dependency bump — so both took the newest release
+honouring the MSRV we advertise (0.38.4 and 0.84.0). `dashmap` stays at 6.x for
+a different reason: the only newer publish is `7.0.0-rc2`, and "latest" should
+not mean shipping a release candidate in the concurrency layer.
+
+### sha2 0.11 touches persisted hashes
+
+digest 0.11 returns `Array<u8, N>` (hybrid-array), which no longer implements
+`LowerHex`, so `format!("{:x}", …)` stopped compiling at three sites — two of
+them **checkpoint integrity hashes compared against values stored in the
+manifest**. A changed encoding would fail verification on every existing
+checkpoint. `hex::encode` is byte-identical, and the pre-existing empty-input
+known-answer test proves it — but empty input is degenerate and would pass even
+if content were mishandled, so a non-empty vector was added
+(`sha256_hex(b"hello")` against the published digest). krishiv-state's two sites
+now call `krishiv_common::hash::sha256_hex`; that module's doc already said all
+crates should, and the duplicate implementation is what let the encodings
+diverge in the first place. The test computing the expected value stays on
+`hex::encode` directly so it is not a tautology against the helper it checks.
+
+### sqlx 0.9's injection guard found the audit, not a bug
+
+sqlx 0.9 refuses dynamic SQL without an explicit assertion. Auditing all six
+sites rather than reaching for the escape hatch showed two different defences,
+both sound: `jdbc.rs` escapes at use (`quote_identifier` doubles embedded `"`),
+and `vector/pgvector.rs` validates at construction — `validate_sql_identifier`
+is a strict `[A-Za-z_][A-Za-z0-9_]*` allowlist, which is the *only* reason its
+raw `format!(r#""{}""#, …)` interpolation is safe. Each `AssertSqlSafe` carries
+the site-specific reason, so the assertion is evidence rather than a rubber
+stamp. A sixth site surfaced only after the first five compiled.
+
+### jsonwebtoken 11: fail closed
+
+`AlgorithmParameters` became non-exhaustive in JWK handling. The new arm
+**refuses** unrecognised key types. That function exists to stop a JWKS widening
+verification beyond what its key material supports; a permissive catch-all would
+have handed the guarantee back for the sake of a compile.
+
+### rocksdb 0.25 needs a non-tmpfs TMPDIR
+
+The release build failed with `can't open /tmp/ccXXXX.s`: rocksdb 0.25 builds
+RocksDB 11.8.1 from source, and `/tmp` here is a tmpfs. `TMPDIR` on real disk
+fixes it. This is deployment-relevant, not a local quirk — any CI runner with a
+small `/tmp` will hit it.
+
+### The near-miss worth recording
+
+That build failure left `target/release/krishiv` as the **Aug 30 binary**.
+Running the corpus against it would have produced 22 matching digests and
+"proved" the upgrade safe while measuring the pre-upgrade engine. Checking the
+artifact's timestamp — not the wrapper's exit code — is what caught it. Same
+lesson as [[krishiv-verify-the-artifact]], in a new costume.
+
+### Functional verification, and a false regression I reported before checking
+
+TPC-H SF100, 22/22 `ok` on the rebuilt binary. **20 of 22 digests identical** to
+the pre-upgrade run; corpus 702.2 s -> 552.3 s, which is *not* claimed as a
+speedup — this box also ran an unrelated release build during the baseline, and
+§82 already established that single-sample corpus deltas here do not reproduce.
+
+The two that differed both turned out to be measurement, not engine:
+
+* **q11** — `digest_unordered` identical, so the same 92,698 rows in a different
+  order. `ORDER BY value DESC` does not totally order ties.
+* **q8** — I first reported that krishiv had "switched sides", moving from
+  DuckDB's answer to Spark's, because the post-upgrade digest equalled the
+  baseline's Spark digest. **That was wrong.** Re-measuring both engines
+  directly: krishiv returns `0.03953510 / 0.03897424`, DuckDB
+  `0.039535108776109315 / 0.03897424492526502`, which canonicalise to the same
+  `0.039535 / 0.038974` and hash to the same digest. They agree. The baseline
+  JSON was written 08-30 09:43; `9d62731` fixed `canonical_value` at 08-30
+  11:52 — **two hours later**. The stored digests came from the older ruler, so
+  the diff compared two canonicalisation schemes and called it an engine change.
+
+### The fix, because the trap is the interesting part
+
+A result file recorded `scale`, `cores`, `repeat` — the machine — and nothing
+about the ruler. Two changes:
+
+1. `DIGEST_SCHEME` is stamped into every result JSON (`1` = pre-9d62731, `2` =
+   current), and
+2. `--compare-to` **refuses** a baseline whose scheme differs or is absent,
+   exiting 2 with the reason, rather than emitting false disagreements. It also
+   distinguishes a tie reorder (matching `digest_unordered`) from a real answer
+   change. Four tests cover refusal, a matching-scheme pass, a real change, and
+   a tie reorder; `scripts/tests` goes 15 -> 19.
+
+A passive version field would have been half a fix — this register's own rule is
+that a guard nobody enforces is not a guard, so the comparison itself refuses.
+
+### rocksdb 0.25 needs non-tmpfs build scratch, and now gets it
+
+`scripts/build-fast-engine.sh` sets `TMPDIR` (override with
+`KRISHIV_BUILD_TMPDIR`, default `/var/tmp`) before the prod build. Without it the
+RocksDB 11.8.1 C++ compile fails with `can't open /tmp/ccXXXX.s` on any box
+where `/tmp` is a tmpfs — this one, and plenty of CI runners. It reads like a
+compiler bug and is not one.
+
+### Not covered by this verification
+
+TPC-H exercises none of the DataFusion 55 behavioural changes (map casts,
+`time ± interval`, RANGE frame ORDER BY types, `array_distance`). Those need the
+NEXMark streaming corpus and the ANN distance tests, and only matter once the
+arrow-59 blocker clears.

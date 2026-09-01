@@ -183,6 +183,65 @@ def load_bench_script(name: str):
 compare_engines = load_bench_script("tpch_compare_engines")
 
 
+class BaselineSchemeGuardTests(unittest.TestCase):
+    """A digest is only meaningful relative to the ruler that produced it.
+
+    The 2026-08-30 baseline was written two hours before 9d62731 changed
+    `canonical_value`. Diffing a later run against it reported q8 and q11 as
+    answer changes when both engines agreed — a false regression that cost a
+    real investigation, and nothing in the file said which scheme it used.
+    """
+
+    def _result(self, tmp, scheme, digest="aaaa", unordered="bbbb"):
+        import json
+        path = Path(tmp) / f"r{scheme}.json"
+        payload = {"scale": 100, "engines": {"krishiv": [
+            {"id": 1, "name": "q1", "status": "ok", "elapsed_s": 1.0,
+             "rows": 1, "digest": digest, "digest_unordered": unordered}]}}
+        if scheme is not None:
+            payload["digest_scheme"] = scheme
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_a_baseline_with_no_scheme_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = self._result(tmp, None)
+            current = {"krishiv": [
+                {"id": 1, "status": "ok", "digest": "aaaa",
+                 "digest_unordered": "bbbb"}]}
+            self.assertEqual(
+                compare_engines.compare_to_baseline(baseline, current), 2)
+
+    def test_a_matching_scheme_compares_normally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = self._result(tmp, compare_engines.DIGEST_SCHEME)
+            current = {"krishiv": [
+                {"id": 1, "status": "ok", "digest": "aaaa",
+                 "digest_unordered": "bbbb"}]}
+            self.assertEqual(
+                compare_engines.compare_to_baseline(baseline, current), 0)
+
+    def test_a_changed_answer_is_reported(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = self._result(tmp, compare_engines.DIGEST_SCHEME)
+            current = {"krishiv": [
+                {"id": 1, "status": "ok", "digest": "cccc",
+                 "digest_unordered": "dddd"}]}
+            self.assertEqual(
+                compare_engines.compare_to_baseline(baseline, current), 1)
+
+    def test_a_tie_reorder_is_not_an_answer_change(self):
+        """Same rows in a different order is not a wrong answer — q11's
+        `ORDER BY value DESC` leaves ties free to permute."""
+        with tempfile.TemporaryDirectory() as tmp:
+            baseline = self._result(tmp, compare_engines.DIGEST_SCHEME)
+            current = {"krishiv": [
+                {"id": 1, "status": "ok", "digest": "different",
+                 "digest_unordered": "bbbb"}]}
+            self.assertEqual(
+                compare_engines.compare_to_baseline(baseline, current), 0)
+
+
 class CrossEngineCanonicalisationTests(unittest.TestCase):
     """Comparing answers across engines must survive differing *precisions*.
 

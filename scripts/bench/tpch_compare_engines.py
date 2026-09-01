@@ -112,6 +112,19 @@ SIGNIFICANT_DIGITS = 6
 # error of billions cannot hide inside the tolerance.
 DECIMAL_PLACES = 6
 
+# Bump whenever `canonical_value` or `fingerprint` changes what they hash.
+#
+# Digests are only comparable within one scheme. This is not hypothetical: the
+# 2026-08-30 09:43 baseline was written two hours *before* 9d62731 fixed
+# `canonical_value`, so a later run diffed against it reported q8 and q11 as
+# answer changes when both engines in fact agreed. That cost a real
+# investigation, and the file gave no way to know it was from another scheme.
+# `scale`/`cores`/`repeat` describe the machine; nothing described the ruler.
+#
+#   1 = pre-9d62731: str(value), type-sensitive
+#   2 = 9d62731 onward: numeric comparison, DECIMAL_PLACES rounding
+DIGEST_SCHEME = 2
+
 
 def canonical_value(value) -> str:
     """Render a cell so that equal values compare equal across engines.
@@ -400,6 +413,51 @@ def merge_passes(passes: list[list[dict]]) -> list[dict]:
     return merged
 
 
+def compare_to_baseline(baseline_path: str, current: dict) -> int:
+    """Diff this run's per-query digests against a stored baseline.
+
+    Refuses to compare across canonicalisation schemes. A digest is only
+    meaningful relative to the `canonical_value` that produced it, so diffing a
+    scheme-1 file against a scheme-2 run reports disagreements that do not
+    exist — which is exactly what happened with the 2026-08-30 baseline, on q8
+    and q11, and it read like an engine regression.
+    """
+    with open(baseline_path, encoding="utf-8") as handle:
+        baseline = json.load(handle)
+
+    got = baseline.get("digest_scheme")
+    if got != DIGEST_SCHEME:
+        where = f"scheme {got}" if got is not None else "no recorded scheme"
+        print(f"REFUSING to compare: baseline has {where}, this run is scheme "
+              f"{DIGEST_SCHEME}. Digests across schemes are not comparable; "
+              f"re-run the baseline with this harness.", flush=True)
+        return 2
+
+    problems = 0
+    for engine, rows in current.items():
+        base = {q["id"]: q for q in baseline.get("engines", {}).get(engine, [])}
+        for row in rows:
+            prior = base.get(row["id"])
+            if prior is None:
+                continue
+            if row.get("status") != "ok" or prior.get("status") != "ok":
+                continue
+            if row["digest"] == prior["digest"]:
+                continue
+            # Same rows in a different order is not a wrong answer: TPC-H
+            # ORDER BY clauses that do not fully determine a total order leave
+            # ties free to permute.
+            if row["digest_unordered"] == prior["digest_unordered"]:
+                print(f"  {engine} q{row['id']}: same rows, different tie order",
+                      flush=True)
+                continue
+            problems += 1
+            print(f"  {engine} q{row['id']}: ANSWER CHANGED "
+                  f"({prior['digest']} -> {row['digest']})", flush=True)
+    print(f"\nanswer changes vs baseline: {problems}", flush=True)
+    return 1 if problems else 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data", required=True)
@@ -411,6 +469,9 @@ def main() -> int:
                         help="passes over the whole corpus per engine; "
                              "reported time is the median (default 1)")
     parser.add_argument("--out")
+    parser.add_argument("--compare-to",
+                        help="baseline JSON to diff digests against; "
+                             "refuses across canonicalisation schemes")
     args = parser.parse_args()
 
     with open(args.corpus_json, encoding="utf-8") as handle:
@@ -499,9 +560,15 @@ def main() -> int:
         with open(args.out, "w", encoding="utf-8") as handle:
             json.dump({"scale": 100, "data_root": args.data,
                        "cores": os.cpu_count(), "repeat": args.repeat,
+                       # Stamped so a cross-scheme comparison is detectable
+                       # instead of silently reporting false disagreements.
+                       "digest_scheme": DIGEST_SCHEME,
                        "engines": results},
                       handle, indent=2)
         print(f"\nwrote {args.out}", flush=True)
+
+    if args.compare_to:
+        return compare_to_baseline(args.compare_to, results)
     return 0
 
 
