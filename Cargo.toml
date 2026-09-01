@@ -107,7 +107,7 @@ parquet = "58.4.0"
 rayon = "1.12"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 tempfile = "3"
 prost = "0.14.4"
 prost-build = "0.14.4"
@@ -126,7 +126,7 @@ http = "1"
 # on the first asymmetric verify ("could not determine the process-level
 # CryptoProvider"). Default features (use_pem) stay on: `from_jwk`/`from_ec_pem`
 # need simple_asn1, which is gated behind use_pem.
-jsonwebtoken = { version = "10.3", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 tracing-opentelemetry = "0.33.0"
@@ -134,28 +134,36 @@ opentelemetry = { version = "0.32.0", features = ["trace"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["trace"] }
 opentelemetry-stdout = { version = "0.32.0", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["grpc-tonic"] }
-rocksdb = { version = "0.24.0", features = ["multi-threaded-cf"] }
+rocksdb = { version = "0.25.0", features = ["multi-threaded-cf"] }
 mockito = "1"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "blocking"] }
 webpki-root-certs = "1.0"
 uuid = { version = "1", features = ["v4"] }
-lz4_flex = "0.11"
+lz4_flex = "0.14"
 twox-hash = "2.1"
 zstd = "0.13"
-thiserror = "1"
+thiserror = "2"
 ahash = "0.8"
+# Held at 6.x on purpose: the only newer publish is 7.0.0-rc2, a release
+# candidate. "Latest" should not mean shipping an RC in the concurrency layer.
 dashmap = "6.1"
 krishiv-delta = { path = "crates/krishiv-delta" }
-qdrant-client = "1.16"
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres"] }
+qdrant-client = "1.19"
+# sqlx 0.9 split the old combined `runtime-tokio-rustls` into a runtime feature
+# and a TLS feature. `tls-rustls-ring` is the like-for-like replacement: 0.8's
+# combined flag used ring, and a bump should not quietly move the Postgres
+# driver onto a different crypto backend. (Both ring and aws-lc-rs are already
+# in the tree — aws-lc-rs via jsonwebtoken — and nothing installs a rustls
+# CryptoProvider explicitly; that predates this change and is left alone here.)
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring", "postgres", "json"] }
 
-base64 = "0.22.1"
+base64 = "0.23"
 rust-embed = "8"
 mime_guess = "2"
-constant_time_eq = "0.3"
+constant_time_eq = "0.6"
 indexmap = "2"
 hex = "0.4"
-apache-avro = "0.17"
+apache-avro = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 proptest = "1"
 regex = "1"
@@ -163,13 +171,21 @@ sqlparser = "0.62.0"
 url = "2"
 urlencoding = "2.1"
 wiremock = "0.6"
-sysinfo = "0.35"
-vortex = { version = "0.75.0", features = ["files", "tokio"] }
+# 0.38.4, not 0.39.6. The whole 0.39 line declares `rust-version = "1.95"` and
+# this workspace publishes `rust-version = "1.94.1"`. Raising the toolchain is
+# an MSRV decision with downstream consequences, not a side effect of a
+# dependency bump — so this takes the newest release that honours the MSRV we
+# advertise. Revisit together with the toolchain.
+sysinfo = "0.38.4"
+# 0.84.0, not 0.85.0 — the same MSRV wall as sysinfo: 0.85 declares
+# `rust-version = "1.95"` and this workspace publishes 1.94.1. Only surfaced
+# under `--all-features`, since vortex is an optional connector.
+vortex = { version = "0.84.0", features = ["files", "tokio"] }
 # Production allocator for server binaries. Reduces allocator contention 2-4x
 # on multi-threaded workloads and cuts peak RSS 10-20% vs the system allocator.
 # unprefixed_malloc_on_supported_platforms replaces malloc/free globally so
 # native extensions (DataFusion C++ code paths) also benefit.
-tikv-jemallocator = { version = "0.6", features = ["unprefixed_malloc_on_supported_platforms"] }
+tikv-jemallocator = { version = "0.7", features = ["unprefixed_malloc_on_supported_platforms"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

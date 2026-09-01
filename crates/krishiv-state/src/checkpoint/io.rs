@@ -5,7 +5,6 @@ use crate::checkpoint::paths::{
     epoch_dir, latest_epoch_hint_path, manifest_path, metadata_path, snapshot_path,
 };
 use crate::checkpoint::storage_trait::CheckpointStorage;
-use sha2::{Digest, Sha256};
 
 // ── High-level helpers ────────────────────────────────────────────────────────
 
@@ -371,10 +370,13 @@ fn validate_manifest_entries(
                     // `data` is already fully in memory (read_bytes returns a
                     // Vec), so a single digest pass is equivalent to the former
                     // BufReader streaming, without the extra copy loop.
-                    let mut hasher = Sha256::new();
-                    hasher.update(&data);
-                    let hash = format!("{:x}", hasher.finalize());
-                    Ok(hash == expected_hex)
+                    // Canonical helper, not a second digest+hex implementation:
+                    // that duplication is what let the encodings drift apart
+                    // when sha2 0.11 dropped `LowerHex` on the digest type, and
+                    // this hash is compared against a value persisted in the
+                    // manifest — a changed encoding would fail verification on
+                    // every pre-existing checkpoint.
+                    Ok(krishiv_common::hash::sha256_hex(&data) == expected_hex)
                 }
             }
         });
@@ -412,9 +414,7 @@ async fn validate_manifest_entries_async(
                     move || {
                         // `data` is fully in memory; one digest pass equals the
                         // former BufReader streaming without the copy loop.
-                        let mut hasher = Sha256::new();
-                        hasher.update(&data);
-                        format!("{:x}", hasher.finalize()) == expected
+                        krishiv_common::hash::sha256_hex(&data) == expected
                     },
                 ));
             }

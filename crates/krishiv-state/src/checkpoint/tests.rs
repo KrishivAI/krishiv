@@ -1401,7 +1401,10 @@ fn manifest_sha256_matches_independent_computation() {
     m.insert_bytes("file.bin", data);
     // Compute expected SHA-256 independently
     use sha2::Digest;
-    let expected = format!("{:x}", sha2::Sha256::digest(data));
+    // Independent of the production helper on purpose: computing the expected
+    // value with `krishiv_common::hash::sha256_hex` would make this a tautology
+    // that passes even if that helper's encoding changed.
+    let expected = hex::encode(sha2::Sha256::digest(data));
     assert!(m.verify("file.bin", data));
     // Verify the recorded hash matches independent computation
     let serialized = String::from_utf8(m.serialize()).unwrap();

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use apache_avro::from_avro_datum;
+use apache_avro::reader::datum::GenericDatumReader;
 use apache_avro::types::Value;
 use arrow::array::{
     ArrayRef, BinaryArray, BooleanArray, Date32Array, Float32Array, Float64Array, Int32Array,
@@ -57,7 +57,15 @@ pub(crate) fn decode_avro_datum_payload(
         return Err(SchemaRegistryError::Decode("empty avro payload".into()));
     }
     let mut cursor = std::io::Cursor::new(payload);
-    let record = from_avro_datum(avro_schema, &mut cursor, None)
+    // apache-avro 0.22 deprecated `from_avro_datum` in favour of the builder.
+    // `read_value` on a reader built with only a writer schema is the exact
+    // equivalent of the old `(schema, reader, None)` call — no reader schema,
+    // so no schema resolution — which keeps the trailing-bytes check below
+    // meaningful: it depends on the decoder consuming exactly the datum.
+    let record = GenericDatumReader::builder(avro_schema)
+        .build()
+        .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?
+        .read_value(&mut cursor)
         .map_err(|e| SchemaRegistryError::Decode(e.to_string()))?;
     if cursor.position() != payload.len() as u64 {
         return Err(SchemaRegistryError::Decode(format!(
@@ -108,7 +116,7 @@ pub(crate) fn avro_schema_to_data_type(
         Schema::Float => DataType::Float32,
         Schema::Double => DataType::Float64,
         Schema::Bytes | Schema::Fixed(_) => DataType::Binary,
-        Schema::String | Schema::Enum(_) | Schema::Uuid => DataType::Utf8,
+        Schema::String | Schema::Enum(_) | Schema::Uuid(_) => DataType::Utf8,
         Schema::Date => DataType::Date32,
         Schema::TimeMillis => DataType::Time32(arrow::datatypes::TimeUnit::Millisecond),
         Schema::TimeMicros => DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),

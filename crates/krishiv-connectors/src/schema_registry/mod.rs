@@ -432,7 +432,13 @@ mod tests {
             ("name".to_string(), Value::String("alice".to_string())),
             ("active".to_string(), Value::Boolean(true)),
         ]);
-        let datum = apache_avro::to_avro_datum(&avro_schema, value).unwrap();
+        // `to_avro_datum` is deprecated in 0.22; upstream documents this builder
+        // chain as its exact equivalent.
+        let datum = apache_avro::writer::datum::GenericDatumWriter::builder(&avro_schema)
+            .build()
+            .unwrap()
+            .write_value_to_vec(value)
+            .unwrap();
 
         let (schema, batches) = decode_avro_datum_payload(&avro_schema, &datum).unwrap();
 

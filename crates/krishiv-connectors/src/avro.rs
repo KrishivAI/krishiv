@@ -75,7 +75,9 @@ fn avro_schema_to_arrow_type(schema: &AvroSchema) -> ConnectorResult<(DataType, 
         AvroSchema::Float => Ok((DataType::Float32, false)),
         AvroSchema::Double => Ok((DataType::Float64, false)),
         AvroSchema::Bytes | AvroSchema::Fixed(_) => Ok((DataType::Binary, false)),
-        AvroSchema::String | AvroSchema::Enum(_) | AvroSchema::Uuid => Ok((DataType::Utf8, false)),
+        AvroSchema::String | AvroSchema::Enum(_) | AvroSchema::Uuid(_) => {
+            Ok((DataType::Utf8, false))
+        }
         AvroSchema::Date => Ok((DataType::Date32, false)),
         AvroSchema::TimeMillis => Ok((DataType::Time32(TimeUnit::Millisecond), false)),
         AvroSchema::TimeMicros => Ok((DataType::Time64(TimeUnit::Microsecond), false)),
@@ -762,10 +764,14 @@ impl<W: Write> AvroSink<W> {
             buffered,
         } = self;
         {
-            let mut avro_writer = AvroWriter::new(&avro_schema, &mut writer);
+            // apache-avro 0.22 made `Writer::new` fallible (it resolves the
+            // schema up front instead of at first append), so the error surfaces
+            // here rather than on the first row.
+            let mut avro_writer = AvroWriter::new(&avro_schema, &mut writer)
+                .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
             for value in buffered {
                 avro_writer
-                    .append(value)
+                    .append_value(value)
                     .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
             }
             avro_writer
@@ -802,13 +808,13 @@ mod tests {
     fn make_avro_bytes(schema_json: &str, rows: &[Vec<(&str, AvroValue)>]) -> Vec<u8> {
         use apache_avro::types::Record;
         let schema = AvroSchema::parse_str(schema_json).unwrap();
-        let mut writer = AvroWriter::new(&schema, Vec::new());
+        let mut writer = AvroWriter::new(&schema, Vec::new()).unwrap();
         for row in rows {
             let mut record = Record::new(&schema).expect("schema must be a record");
             for (field, value) in row {
                 record.put(field, value.clone());
             }
-            writer.append(record).unwrap();
+            writer.append_value(record).unwrap();
         }
         writer.into_inner().unwrap()
     }

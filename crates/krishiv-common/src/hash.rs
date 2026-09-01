@@ -14,8 +14,12 @@ use sha2::{Digest, Sha256};
 /// ```
 #[must_use]
 pub fn sha256_hex(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
-    format!("{hash:x}")
+    // `hex::encode`, not `format!("{hash:x}")`: sha2 0.11 moved to digest 0.11,
+    // whose `Array<u8, N>` (hybrid-array) does not implement `LowerHex` the way
+    // the old `GenericArray` did. Both produce the same lowercase, unpadded,
+    // 64-character encoding, so hashes computed before and after this change
+    // are identical — which matters, because these strings are persisted.
+    hex::encode(Sha256::digest(data))
 }
 
 /// Incrementally hash multiple byte slices and return the raw `[u8; 32]`.
@@ -53,6 +57,19 @@ mod tests {
         assert_eq!(
             hash,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    /// A non-empty known-answer vector. `sha256_hex_empty` alone is degenerate —
+    /// it would still pass if the encoder mishandled content — and these digests
+    /// are persisted, so the sha2 0.11 move from `GenericArray`+`{:x}` to
+    /// `Array`+`hex::encode` had to be proven value-identical, not just
+    /// well-formed.
+    #[test]
+    fn sha256_hex_matches_the_published_vector_for_non_empty_input() {
+        assert_eq!(
+            sha256_hex(b"hello"),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
         );
     }
 

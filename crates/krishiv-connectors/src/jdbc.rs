@@ -158,7 +158,12 @@ impl Source for JdbcSource {
                 self.offset
             )
         };
-        let rows: Vec<PgRow> = sqlx::query(&sql)
+        // sqlx 0.9 requires dynamic SQL to be explicitly asserted safe. Audited:
+        // every identifier in `sql` goes through `quote_qualified`, which
+        // double-quotes each component and escapes embedded `"` as `""`, and the
+        // only other interpolations are `batch_size`/`offset`, which are integers.
+        // Values are never interpolated — they bind as parameters.
+        let rows: Vec<PgRow> = sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
             .fetch_all(&self.pool)
             .await
             .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
@@ -600,7 +605,9 @@ impl Sink for JdbcSink {
 
         for chunk in row_order.chunks(per_stmt) {
             let sql = render_insert(&self.table, &columns, chunk.len(), &self.conflict_keys);
-            let mut q = sqlx::query(&sql);
+            // Audited as above: `render_insert` renders the table and every
+            // column through `quote_identifier`; row values bind as parameters.
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for &row_idx in chunk {
                 for col_idx in 0..ncols {
                     let col = batch.column(col_idx);

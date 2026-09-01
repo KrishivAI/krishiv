@@ -71,7 +71,11 @@ mod imp {
                 )"#,
                 self.table_name, self.vector_dim
             );
-            sqlx::query(&create_table)
+            // Audited for sqlx 0.9: `table_name` is checked by `validate_identifier`
+            // in the constructor, a strict `[A-Za-z_][A-Za-z0-9_]*` allowlist, so
+            // it cannot contain the `"` that would close the quoting here.
+            // Everything else binds as a parameter.
+            sqlx::query(sqlx::AssertSqlSafe(create_table))
                 .execute(&self.pool)
                 .await
                 .map_err(|e| VectorSinkError::SchemaConflict(e.to_string()))?;
@@ -114,7 +118,7 @@ mod imp {
                     "#,
                     self.table_name
                 );
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(&id)
                     .bind(vector_to_pg(vector))
                     .bind(payload_json)
@@ -129,7 +133,7 @@ mod imp {
         async fn delete_by_ids(&self, ids: &[String]) -> VectorSinkResult<()> {
             for id in ids {
                 let sql = format!(r#"DELETE FROM "{}" WHERE id = $1"#, self.table_name);
-                sqlx::query(&sql)
+                sqlx::query(sqlx::AssertSqlSafe(sql))
                     .bind(id)
                     .execute(&self.pool)
                     .await
@@ -171,7 +175,10 @@ mod imp {
                 "#,
                 self.table_name, where_clause
             );
-            let mut query = sqlx::query_as::<_, (serde_json::Value, f64)>(&sql)
+            // Audited: `table_name` is allowlist-validated at construction and
+            // `where_clause` is one of two string literals — the filter itself
+            // binds as a `$3::jsonb` parameter, never interpolated.
+            let mut query = sqlx::query_as::<_, (serde_json::Value, f64)>(sqlx::AssertSqlSafe(sql))
                 .bind(vector_to_pg(vector))
                 .bind(top_k as i64);
             if let Some(json) = filter_json {

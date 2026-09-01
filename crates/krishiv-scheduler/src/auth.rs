@@ -771,6 +771,15 @@ fn jwk_signing_algorithms(
              (algorithm-confusion protection)"
                 .into(),
         ),
+        // jsonwebtoken 11 made `AlgorithmParameters` non-exhaustive. Refuse
+        // anything this function has not been taught to reason about: the whole
+        // point here is that a JWKS entry can never widen verification beyond
+        // what its key material supports, and a permissive catch-all would hand
+        // that guarantee back. A new key type must be added deliberately, above.
+        other => Err(format!(
+            "unrecognised JWKS key type for JWT verification, refused: {other:?}"
+        )
+        .into()),
     }
 }
 

@@ -39,10 +39,11 @@ use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
 use thiserror::Error;
 use vortex::VortexSessionDefault;
-use vortex::array::arrow::{ArrowSessionExt, FromArrowArray};
-use vortex::array::dtype::arrow::FromArrowType;
+// vortex 0.84 moved Arrow interop out of `array::` into a top-level `arrow`
+// module that re-exports the whole `vortex-arrow` crate.
 use vortex::array::stream::ArrayStreamAdapter;
 use vortex::array::{ArrayRef, VortexSessionExecute};
+use vortex::arrow::{ArrowSessionExt, FromArrowArray, FromArrowType};
 use vortex::dtype::DType;
 use vortex::file::{OpenOptionsSessionExt, WriteOptionsSessionExt};
 use vortex::session::VortexSession;
