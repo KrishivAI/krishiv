@@ -16,7 +16,6 @@ arrow = { workspace = true }
 arrow-flight = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
-krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.0" }
 krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
@@ -35,16 +34,15 @@ tonic = { workspace = true }
 prost = { workspace = true }
 
 [features]
-kafka = ["krishiv-runtime/kafka", "krishiv-api/kafka"]
+# krishiv-api was listed here as well, but no symbol of it is used in this crate
+# and nothing else in its graph pulls it in — the dep only existed to forward
+# `kafka`, which compiled an unused crate. Downstreams that want the api-side
+# kafka arm ask krishiv-api for it directly.
+kafka = ["krishiv-runtime/kafka"]
 jemalloc = ["dep:tikv-jemallocator"]
 # Attach an Iceberg REST catalog (e.g. the Krishiv Platform catalog) to the
 # in-process engine at daemon startup via KRISHIV_ICEBERG_REST_* env vars.
 rest-catalog = ["krishiv-sql/rest-catalog", "krishiv-sql/iceberg-datafusion"]
-
-[dev-dependencies]
-futures = { workspace = true }
-krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
-tokio = { workspace = true, features = ["rt", "macros"] }
 
 [lib]
 path = "src/lib.rs"

@@ -74,6 +74,37 @@ pub enum TaskStateBinding {
     /// pipeline job snapshotted the empty generic backend and restored to
     /// empty join and stage state).
     Pipeline(String),
+    /// A stateless (`stream:rbatch`) subtask: nothing to snapshot, bound so
+    /// the job's live-subtask count (which gates JOB-keyed teardown) sees it.
+    Stateless(String),
+}
+
+/// Key of a task's entry in `task_state_bindings`.
+///
+/// The coordinator names run-loop subtasks `task-streaming-<i>` PER JOB, so
+/// the bare task id is not unique on an executor that hosts two continuous
+/// jobs: keyed by task id alone, the second job's bind overwrote the first
+/// job's, its barrier then snapshotted the wrong operator, and its teardown
+/// removed the survivor's binding. The key is therefore `(job, task)`.
+pub fn task_binding_key(job_id: &str, task_id: &str) -> String {
+    format!("{job_id}\u{1f}{task_id}")
+}
+
+impl ExecutorTaskRunner {
+    /// Whether any task of `job_id` still holds a state binding — i.e. a
+    /// sibling subtask is still running in this process.
+    ///
+    /// JOB-keyed teardown (the restore entry, the shared registry sink, the
+    /// source read positions, the loss counters) may only run when the LAST
+    /// subtask of the job stops; retiring on the first subtask pulls them out
+    /// from under the others. Every run-loop family class binds its tasks, so
+    /// this is the one liveness question all four teardowns ask.
+    pub(crate) fn job_has_bound_tasks(&self, job_id: &str) -> bool {
+        let prefix = task_binding_key(job_id, "");
+        self.task_state_bindings
+            .iter()
+            .any(|entry| entry.key().starts_with(&prefix))
+    }
 }
 
 /// Dyn-erased coordinator client so long-lived fragments (the run-loop) can
@@ -1663,7 +1694,10 @@ impl ExecutorTaskRunner {
         task_id: &str,
         fallback: CheckpointStateHandle,
     ) -> CheckpointStateHandle {
-        if let Some(binding) = self.task_state_bindings.get(task_id) {
+        if let Some(binding) = self
+            .task_state_bindings
+            .get(&task_binding_key(job_id, task_id))
+        {
             match binding.value() {
                 TaskStateBinding::Window(key) => {
                     if let Some(entry) = self.loop_executors.get(key) {
@@ -1680,6 +1714,9 @@ impl ExecutorTaskRunner {
                         return CheckpointStateHandle::Pipeline(Arc::clone(entry.value()));
                     }
                 }
+                // Liveness-only: a stateless subtask has nothing of its own to
+                // snapshot, so it takes the job-level / generic fallback.
+                TaskStateBinding::Stateless(_) => {}
             }
         }
         self.checkpoint_state_for_job(job_id, fallback)

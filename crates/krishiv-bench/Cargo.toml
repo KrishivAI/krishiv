@@ -58,7 +58,6 @@ krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
 ahash = { workspace = true }
 arrow = { workspace = true }
 datafusion = { workspace = true }
-parquet = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

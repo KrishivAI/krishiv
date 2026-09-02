@@ -582,6 +582,12 @@ async fn a_drain_inside_the_budget_releases_the_egress_stall() {
 /// `the_egress_cap_drops_oldest_and_counts_every_lost_batch` stays green —
 /// that split is what proves the gate keys on the CONTRACT and not on
 /// something incidental to the fixture.
+// Without the `kafka` feature the sink dispatch fails fast (the contract is
+// honoured but no connection is attempted), which is what the test relies on.
+// With it, each staged output opens a transactional producer against a broker
+// that does not exist and the test hangs on `init_transactions` — which is how
+// the executor's kafka arm, never run until R1-17, first showed up.
+#[cfg(not(feature = "kafka"))]
 #[tokio::test]
 async fn a_durable_sink_job_does_not_report_its_staging_trims_as_lost_output() {
     let cap = krishiv_common::streaming_dials::rloop_egress_cap();

@@ -57,10 +57,30 @@ pub(crate) fn scheduler_error_response(error: &SchedulerError) -> (StatusCode, S
     (scheduler_status(error), error.to_string())
 }
 
+/// A registration the coordinator cannot act on because of what it says (an
+/// unencodable sink, a malformed fragment) is the client's request being
+/// wrong: 400, not the 409 that says "a job with this id already exists".
+fn registration_error_response(error: &ContinuousStreamError) -> (StatusCode, String) {
+    match error {
+        ContinuousStreamError::Scheduler(SchedulerError::InvalidJob { .. }) => {
+            (StatusCode::BAD_REQUEST, error.to_string())
+        }
+        ContinuousStreamError::Scheduler(e) => scheduler_error_response(e),
+        other @ ContinuousStreamError::Unavailable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
+        }
+        other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+    }
+}
+
 fn scheduler_status(error: &SchedulerError) -> StatusCode {
     match error {
         SchedulerError::DuplicateJob { .. } => StatusCode::CONFLICT,
         SchedulerError::UnknownJob { .. } => StatusCode::NOT_FOUND,
+        // `InvalidJob` on a running job (a push fenced by an in-flight cycle,
+        // a job that is not continuous) is a state conflict. At REGISTRATION
+        // it is the request being wrong — the two register handlers map it to
+        // 400 themselves (`registration_error_response`).
         SchedulerError::InvalidJob { .. } => StatusCode::CONFLICT,
         SchedulerError::InactiveCoordinator { .. } => StatusCode::SERVICE_UNAVAILABLE,
         SchedulerError::NoExecutors | SchedulerError::ExecutorUnavailable { .. } => {
@@ -357,6 +377,12 @@ pub struct ContinuousRegisterResponse {
     /// whose subtasks read nothing at all — which looks identical, from the
     /// outside, to a healthy job that simply has not seen input yet.
     pub sources: usize,
+    /// The sink kind actually armed (`"iceberg"` or the registry connector
+    /// kind); absent when the job has no sink. The runtime client refuses a
+    /// sink-carrying registration whose ack lacks this echo, so omitting it
+    /// made every sink registration through HTTP fail verification.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,6 +482,20 @@ fn continuous_delivery_view(record: &crate::JobRecord) -> ContinuousDeliveryView
                 _ => None,
             }
         });
+    // `registry-sink:<kind>|…` — the connector kind names the driver; its
+    // registered default capabilities give the guarantee. This arm was missing,
+    // so every registry-dispatched sink (csv, kafka-by-registry, …) reported
+    // `sink: null` as though the job wrote nowhere.
+    let registry_sink = record
+        .spec
+        .stages()
+        .first()
+        .and_then(|stage| stage.tasks().first())
+        .and_then(|task| task.sink_contract())
+        .and_then(|contract| contract.strip_prefix("registry-sink:"))
+        .and_then(|rest| rest.split_once('|'))
+        .map(|(kind, _)| kind.trim().to_string())
+        .filter(|kind| !kind.is_empty());
     if iceberg_sink.is_some() {
         let guarantee = iceberg_streaming_sink_capabilities().delivery_guarantee();
         ContinuousDeliveryView {
@@ -478,6 +518,31 @@ fn continuous_delivery_view(record: &crate::JobRecord) -> ContinuousDeliveryView
             sink_guarantee: Some("exactly-once".into()),
             source_offsets_in_sink_transaction: false,
             effective: "effectively-once".into(),
+        }
+    } else if let Some(kind) = registry_sink {
+        let guarantee = krishiv_connectors::registry::ConnectorKind::parse(&kind)
+            .ok()
+            .and_then(|kind| {
+                let registry = krishiv_connectors::registry::default_registry();
+                registry
+                    .sink_descriptor(kind)
+                    .map(|descriptor| descriptor.default_capabilities.delivery_guarantee())
+            });
+        // Source offsets never ride in a registry sink's transaction (they live
+        // in the checkpoint), so exactly-once at the sink is effectively-once
+        // end to end — the same honest label the Kafka arm above uses.
+        let effective = match guarantee {
+            Some(DeliveryGuarantee::ExactlyOnce) => DeliveryGuarantee::EffectivelyOnce,
+            Some(g) => g,
+            None => DeliveryGuarantee::AtLeastOnce,
+        };
+        ContinuousDeliveryView {
+            model,
+            parallelism,
+            sink: Some(kind),
+            sink_guarantee: guarantee.map(|g| g.as_str().into()),
+            source_offsets_in_sink_transaction: false,
+            effective: effective.as_str().into(),
         }
     } else {
         ContinuousDeliveryView {
@@ -772,13 +837,7 @@ pub async fn api_continuous_register(
     let applied =
         register_continuous_task_with_options(&coordinator, &body.job_id, &task, &options)
             .await
-            .map_err(|error| match error {
-                ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
-                other @ ContinuousStreamError::Unavailable(_) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
-                }
-                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-            })?;
+            .map_err(|error| registration_error_response(&error))?;
     Ok(Json(ContinuousRegisterResponse {
         class: task.class_name().to_string(),
         success: true,
@@ -786,6 +845,7 @@ pub async fn api_continuous_register(
         parallelism: applied.parallelism,
         checkpointing: applied.checkpointing,
         sources: applied.sources,
+        sink: applied.sink,
     }))
 }
 
@@ -830,6 +890,9 @@ pub struct ContinuousRegisterSqlResponse {
     /// whose subtasks read nothing at all — which looks identical, from the
     /// outside, to a healthy job that simply has not seen input yet.
     pub sources: usize,
+    /// Sink-kind echo — see [`ContinuousRegisterResponse::sink`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sink: Option<String>,
 }
 
 /// Register a continuous streaming job from **SQL**: the coordinator compiles
@@ -859,13 +922,7 @@ pub async fn api_continuous_register_sql(
     let applied =
         register_continuous_stream_with_options(&coordinator, &body.job_id, &plan.spec, &options)
             .await
-            .map_err(|error| match error {
-                ContinuousStreamError::Scheduler(e) => scheduler_error_response(&e),
-                other @ ContinuousStreamError::Unavailable(_) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, other.to_string())
-                }
-                other => (StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-            })?;
+            .map_err(|error| registration_error_response(&error))?;
     Ok(Json(ContinuousRegisterSqlResponse {
         success: true,
         source: plan.source,
@@ -873,6 +930,7 @@ pub async fn api_continuous_register_sql(
         parallelism: applied.parallelism,
         checkpointing: applied.checkpointing,
         sources: applied.sources,
+        sink: applied.sink,
     }))
 }
 
@@ -3728,6 +3786,160 @@ mod tests {
 
     /// #92: the view's delivery block is derived from the sink contract and
     /// connector capability metadata — never hardcoded platform-side.
+    /// The runtime client (`ContinuousRegisterOptions::verify_ack`) refuses a
+    /// sink-carrying registration whose ack does not echo the sink kind. Both
+    /// register handlers must therefore serialise `sink`; a registration
+    /// without a sink must omit it (absence means "no sink", not "dropped").
+    #[tokio::test]
+    async fn register_responses_echo_the_armed_sink_kind() {
+        let coordinator = make_coordinator_with_executor("sink-echo").await;
+        let sink = ContinuousSinkSpec {
+            connector: Some("csv".into()),
+            options: [("path".to_string(), "/tmp/sink-echo.csv".to_string())]
+                .into_iter()
+                .collect(),
+            root: String::new(),
+            table: String::new(),
+            mode: default_sink_mode(),
+            key_columns: Vec::new(),
+            op_column: None,
+            catalog: None,
+            namespace: None,
+        };
+
+        let with_sink = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-sink-echo".into(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
+                sink: Some(sink.clone()),
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&with_sink.0).unwrap();
+        assert_eq!(json["sink"], serde_json::json!("csv"), "{json}");
+
+        let without_sink = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-sink-echo-drain".into(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
+                sink: None,
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&without_sink.0).unwrap();
+        assert!(json.get("sink").is_none(), "{json}");
+
+        let sql = api_continuous_register_sql(
+            State(coordinator),
+            Json(ContinuousRegisterSqlRequest {
+                job_id: "cs-sink-echo-sql".into(),
+                sql: "SELECT key, COUNT(*) AS n FROM TUMBLE(TABLE src, DESCRIPTOR(ts), 1000) \
+                      GROUP BY key"
+                    .into(),
+                sink: Some(sink),
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let json = serde_json::to_value(&sql.0).unwrap();
+        assert_eq!(json["sink"], serde_json::json!("csv"), "{json}");
+    }
+
+    /// A registry-dispatched sink is a sink: the delivery view names its kind
+    /// instead of reporting the job as writing nowhere.
+    #[tokio::test]
+    async fn delivery_view_names_a_registry_sink() {
+        let coordinator = make_coordinator_with_executor("delivery-registry").await;
+        let _ = api_continuous_register(
+            State(coordinator.clone()),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-delivery-csv".into(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
+                sink: Some(ContinuousSinkSpec {
+                    connector: Some("csv".into()),
+                    options: [("path".to_string(), "/tmp/delivery.csv".to_string())]
+                        .into_iter()
+                        .collect(),
+                    root: String::new(),
+                    table: String::new(),
+                    mode: default_sink_mode(),
+                    key_columns: Vec::new(),
+                    op_column: None,
+                    catalog: None,
+                    namespace: None,
+                }),
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .unwrap();
+        let view = api_continuous_get(State(coordinator), Path(String::from("cs-delivery-csv")))
+            .await
+            .unwrap();
+        assert_eq!(view.0.delivery.sink.as_deref(), Some("csv"));
+        assert!(!view.0.delivery.source_offsets_in_sink_transaction);
+    }
+
+    /// A sink the coordinator cannot encode is the request being wrong: 400,
+    /// not the 409 that says "a job with this id already exists".
+    #[tokio::test]
+    async fn unencodable_sink_is_a_bad_request() {
+        let coordinator = make_coordinator_with_executor("bad-sink").await;
+        let error = api_continuous_register(
+            State(coordinator),
+            Json(ContinuousRegisterRequest {
+                job_id: "cs-bad-sink".into(),
+                spec: Some(tumbling_spec()),
+                stream_spec: None,
+                sink: Some(ContinuousSinkSpec {
+                    connector: None,
+                    options: Default::default(),
+                    root: String::new(),
+                    table: String::new(),
+                    mode: default_sink_mode(),
+                    key_columns: Vec::new(),
+                    op_column: None,
+                    catalog: None,
+                    namespace: None,
+                }),
+                parallelism: None,
+                mode: None,
+                sources: Vec::new(),
+                checkpoint_interval_ms: None,
+                checkpoint_storage_path: None,
+            }),
+        )
+        .await
+        .expect_err("empty sink must be refused");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST, "{}", error.1);
+    }
+
     #[tokio::test]
     async fn delivery_view_reflects_sink_capability_metadata() {
         let coordinator = make_coordinator_with_executor("delivery").await;

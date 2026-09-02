@@ -42,10 +42,10 @@ use krishiv_dataflow::ContinuousWindowExecutor;
 use krishiv_proto::{ExecutorTaskAssignment, KeyGroupRange};
 
 use crate::fragment::common::{
-    checkpoint_offset_from_dyn_source, coerce_batch_for_window, parse_registry_partition_specs,
-    read_continuous_restore_hint,
+    checkpoint_offset_from_dyn_source, coerce_batch_for_window, owned_registry_specs,
+    parse_registry_partition_specs, read_continuous_restore_hint,
 };
-use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner, TaskStateBinding};
+use crate::runner::{ExecutorTaskOutput, ExecutorTaskRunner, TaskStateBinding, task_binding_key};
 use crate::{ExecutorError, ExecutorResult};
 use krishiv_plan::window::decode_window_execution_spec;
 
@@ -802,9 +802,10 @@ pub(crate) async fn execute_run_loop_fragment(
 
     // Bind this task's checkpoint state to the subtask executor so barrier
     // snapshots capture per-subtask state (not a sibling's).
-    runner
-        .task_state_bindings
-        .insert(task_id.clone(), TaskStateBinding::Window(state_key.clone()));
+    runner.task_state_bindings.insert(
+        task_binding_key(job_id, &task_id),
+        TaskStateBinding::Window(state_key.clone()),
+    );
     // Egress buffer + input notifies must exist before the first push races us.
     runner
         .continuous_outputs
@@ -822,14 +823,7 @@ pub(crate) async fn execute_run_loop_fragment(
     // partitions, which also gives dynamic partition discovery for free
     // (topic growth triggers a rebalance, no job restart needed).
     let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
-    let owned_specs: Vec<_> = all_specs
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, spec)| {
-            spec.kind.eq_ignore_ascii_case("kafka") || idx % parsed.parallelism == parsed.subtask
-        })
-        .map(|(_, spec)| spec)
-        .collect();
+    let owned_specs = owned_registry_specs(all_specs, parsed.parallelism, parsed.subtask);
 
     let source_cache = runner.shared_continuous_connector_sources();
 
@@ -920,30 +914,15 @@ pub(crate) async fn execute_run_loop_fragment(
         let busy_iteration = runner.enter_busy_iteration(job_id);
         let read_started = Instant::now();
         let mut input: Vec<RecordBatch> = Vec::new();
-        // Pushed input (external producers AND peer-exchange deliveries) gets
-        // the same coercion as the owned-split path below. It used to be
-        // extended raw, so an unsigned source column (NEXMark's u64 price)
-        // reached the aggregate uncoerced and killed the fragment with
-        // "unsupported column type for pre-downcast: UInt64" — the embedded
-        // loop coerces every batch, and the two paths must not disagree.
-        for (_, pushed) in [
-            runner.continuous_inputs.remove(&input_key),
-            runner.continuous_inputs.remove(job_id),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            for batch in pushed {
-                input.push(coerce_batch_for_window(&batch, &window_spec)?);
-            }
-        }
-        if !input.is_empty() {
-            for batch in &input {
-                if let Some(ts) = batch_max_event_time(batch, &event_time_column) {
-                    split_watermarks.observe("push", ts);
-                }
-            }
-        }
+        drain_pushed_input(
+            runner,
+            &input_key,
+            job_id,
+            &window_spec,
+            &event_time_column,
+            &mut split_watermarks,
+            &mut input,
+        )?;
 
         // Owned registry connector splits (the source-owning seam), through the
         // ONE shared reader (task #147 factored it so the classed loops cannot
@@ -1066,12 +1045,20 @@ pub(crate) async fn execute_run_loop_fragment(
             // Throughput profile: micro-batch by lingering so per-drain fixed
             // costs amortize over more rows (Arroyo's batch/linger dial).
             tokio::time::sleep(linger).await;
-            if let Some((_, pushed)) = runner.continuous_inputs.remove(&input_key) {
-                input.extend(pushed);
-            }
-            if let Some((_, pushed)) = runner.continuous_inputs.remove(job_id) {
-                input.extend(pushed);
-            }
+            // The SAME drain as the head of the iteration: this re-drain used
+            // to extend the input raw, so under the throughput profile an
+            // unsigned source column skipped coercion (and its event time
+            // skipped the watermark) — re-opening, for one profile only, the
+            // defect the first drain had already been fixed for.
+            drain_pushed_input(
+                runner,
+                &input_key,
+                job_id,
+                &window_spec,
+                &event_time_column,
+                &mut split_watermarks,
+                &mut input,
+            )?;
         }
 
         // Keyed exchange: keep owned rows, forward the rest to their owners.
@@ -1189,7 +1176,9 @@ pub(crate) async fn execute_run_loop_fragment(
         });
     }
 
-    runner.task_state_bindings.remove(&task_id);
+    runner
+        .task_state_bindings
+        .remove(&task_binding_key(job_id, &task_id));
     // The restore entry is read, not consumed, by the executor constructor
     // (every sibling subtask needs the same entry), so it is dropped at
     // teardown — otherwise a job re-created with the same deterministic id
@@ -1207,11 +1196,7 @@ pub(crate) async fn execute_run_loop_fragment(
     // remains is the live siblings. (`loop_executors` cannot be used — the
     // run-loop deliberately keeps executors cached across reattach, so its
     // entries never go away.)
-    let job_binding_prefix = format!("{job_id}#");
-    let siblings_still_running = runner.task_state_bindings.iter().any(|entry| {
-        matches!(entry.value(), TaskStateBinding::Window(key) if key.starts_with(&job_binding_prefix))
-    });
-    if !siblings_still_running {
+    if !runner.job_has_bound_tasks(job_id) {
         runner.pending_restores.remove(job_id);
         // The same last-subtask rule governs every other JOB-keyed entry: the
         // source read positions, the shared registry sink, and the per-job loss
@@ -1726,11 +1711,142 @@ impl ExecutorTaskRunner {
     }
 }
 
+/// Take everything pushed at this subtask (its own key AND the job's shared
+/// key: external producers and peer-exchange deliveries), coerce each batch to
+/// the window's declared types and observe its event time.
+///
+/// Pushed input gets the same coercion as the owned-split path. It used to be
+/// extended raw, so an unsigned source column (NEXMark's u64 price) reached
+/// the aggregate uncoerced and killed the fragment with "unsupported column
+/// type for pre-downcast: UInt64" — the embedded loop coerces every batch, and
+/// the paths must not disagree. Both drains of an iteration (the head and the
+/// throughput-profile linger re-drain) go through here for that reason.
+pub(crate) fn drain_pushed_input(
+    runner: &ExecutorTaskRunner,
+    input_key: &str,
+    job_id: &str,
+    window_spec: &krishiv_plan::window::WindowExecutionSpec,
+    event_time_column: &str,
+    split_watermarks: &mut SplitWatermarks,
+    input: &mut Vec<RecordBatch>,
+) -> ExecutorResult<()> {
+    for (_, pushed) in [
+        runner.continuous_inputs.remove(input_key),
+        runner.continuous_inputs.remove(job_id),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        for batch in pushed {
+            let batch = coerce_batch_for_window(&batch, window_spec)?;
+            if let Some(ts) = batch_max_event_time(&batch, event_time_column) {
+                split_watermarks.observe("push", ts);
+            }
+            input.push(batch);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    /// Pushed input is coerced to the window's declared types and its event
+    /// time observed — on EVERY drain. The throughput-profile linger re-drain
+    /// used to extend the input raw, so a UInt64 source column reached the
+    /// aggregate uncoerced under that one profile.
+    #[test]
+    fn drain_pushed_input_coerces_and_observes_every_batch() {
+        use arrow::array::{Int64Array, UInt64Array};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new());
+        let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("key", "ts", 10_000);
+        let pushed = RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![
+                Field::new("key", DataType::Int64, false),
+                Field::new("ts", DataType::UInt64, false),
+            ])),
+            vec![
+                std::sync::Arc::new(Int64Array::from(vec![1, 2])),
+                std::sync::Arc::new(UInt64Array::from(vec![5_000, 7_000])),
+            ],
+        )
+        .unwrap();
+        runner
+            .continuous_inputs
+            .insert("job-d#task-0".into(), vec![pushed.clone()]);
+        runner
+            .continuous_inputs
+            .insert("job-d".into(), vec![pushed]);
+
+        let mut watermarks = SplitWatermarks::default();
+        let mut input = Vec::new();
+        drain_pushed_input(
+            &runner,
+            "job-d#task-0",
+            "job-d",
+            &spec,
+            "ts",
+            &mut watermarks,
+            &mut input,
+        )
+        .unwrap();
+        assert_eq!(input.len(), 2, "own key and shared key both drained");
+        for batch in &input {
+            assert_eq!(
+                batch.schema().field_with_name("ts").unwrap().data_type(),
+                &DataType::Int64,
+                "pushed batches are coerced"
+            );
+        }
+        assert_eq!(
+            watermarks.combined(std::time::Duration::from_secs(3600)),
+            Some(7_000),
+            "event time observed on the push split"
+        );
+        assert!(runner.continuous_inputs.get("job-d").is_none());
+    }
+
+    /// JOB-keyed teardown is gated on the job's LAST live subtask. Liveness
+    /// is asked of every binding variant under the `(job, task)` key, so a
+    /// join / pipeline / stateless sibling counts the same as a window one.
+    #[test]
+    fn job_has_bound_tasks_counts_every_binding_variant() {
+        let runner = crate::runner::ExecutorTaskRunner::new(crate::ExecutorAssignmentInbox::new());
+        assert!(!runner.job_has_bound_tasks("job-l"));
+        runner.task_state_bindings.insert(
+            task_binding_key("job-l", "task-streaming-0"),
+            TaskStateBinding::Pipeline("job-l#0".into()),
+        );
+        runner.task_state_bindings.insert(
+            task_binding_key("job-l", "task-streaming-1"),
+            TaskStateBinding::Stateless("job-l#1".into()),
+        );
+        runner.task_state_bindings.insert(
+            task_binding_key("job-l-2", "task-streaming-0"),
+            TaskStateBinding::Window("job-l-2#0".into()),
+        );
+        assert!(runner.job_has_bound_tasks("job-l"));
+        runner
+            .task_state_bindings
+            .remove(&task_binding_key("job-l", "task-streaming-0"));
+        assert!(
+            runner.job_has_bound_tasks("job-l"),
+            "the stateless sibling is still live"
+        );
+        runner
+            .task_state_bindings
+            .remove(&task_binding_key("job-l", "task-streaming-1"));
+        assert!(!runner.job_has_bound_tasks("job-l"));
+        assert!(
+            runner.job_has_bound_tasks("job-l-2"),
+            "a job-id prefix is not a match"
+        );
+    }
 
     /// #197 streaming leg: a run-loop cycle whose output contract is
     /// `registry-sink:` writes through the connector registry, reuses the sink

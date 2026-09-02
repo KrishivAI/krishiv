@@ -284,7 +284,7 @@ fn execute_window_join_fragment(
     // Bind the task's barrier snapshots to this operator (per-task, so a
     // barrier on the job captures buffered join state).
     runner.task_state_bindings.insert(
-        assignment.task_id().as_str().to_owned(),
+        crate::runner::task_binding_key(job_id, assignment.task_id().as_str()),
         crate::runner::TaskStateBinding::Join(job_id.to_owned()),
     );
     if let Some((snapshot_bytes, _)) = read_continuous_restore_hint(assignment.input_partitions()) {

@@ -1606,7 +1606,6 @@ async fn execute_broker_kafka_to_parquet(
     assignment: &ExecutorTaskAssignment,
     profile: krishiv_common::DurabilityProfile,
 ) -> ExecutorResult<ExecutorTaskOutput> {
-    use krishiv_connectors::CheckpointSource;
     use krishiv_connectors::kafka::{MultiKafkaOffset, RdkafkaKafkaSource};
 
     let (topic, partition, _, _) = parse_memory_kafka_partition(assignment.input_partitions())?;
@@ -1630,35 +1629,30 @@ async fn execute_broker_kafka_to_parquet(
     // restored checkpoint, bypassing group-managed positions.
     let job_id_str = assignment.job_id().as_str().to_owned();
     if let Some((_, restored)) = runner.kafka_restore_offsets.remove(&job_id_str) {
-        let for_topic: Vec<_> = restored
-            .iter()
-            .filter(|ko| ko.topic == topic)
-            .cloned()
-            .collect();
-        if !for_topic.is_empty() {
-            let multi = MultiKafkaOffset::new(for_topic);
-            source
-                .restore_offset(&multi)
-                .map_err(|error| ExecutorError::LocalExecution {
-                    message: format!("Kafka offset restore for topic '{topic}' failed: {error}"),
-                })?;
-            tracing::info!(
-                job_id = %assignment.job_id(),
-                topic = %topic,
-                partitions = multi.offsets.len(),
-                "Kafka source seeked to restored checkpoint offsets"
-            );
-        }
+        let (for_topic, remaining): (Vec<_>, Vec<_>) =
+            restored.into_iter().partition(|ko| ko.topic == topic);
         // Offsets for other topics belong to other source tasks of this job:
-        // put them back for those pipelines to consume.
-        let remaining: Vec<_> = restored
-            .into_iter()
-            .filter(|ko| ko.topic != topic)
-            .collect();
+        // put them back for those pipelines to consume — BEFORE anything
+        // below can fail, or a restore error here silently dropped the
+        // sibling topics' positions with it.
         if !remaining.is_empty() {
             runner
                 .kafka_restore_offsets
                 .insert(job_id_str.clone(), remaining);
+        }
+        if !for_topic.is_empty() {
+            // The group has not assigned anything yet (`subscribe` is
+            // asynchronous), so an eager `restore_offset` here refused every
+            // partition and failed the task. The seek is applied from the
+            // source's read path as each partition becomes assigned.
+            let partitions = for_topic.len();
+            source.restore_offset_on_assignment(MultiKafkaOffset::new(for_topic));
+            tracing::info!(
+                job_id = %assignment.job_id(),
+                topic = %topic,
+                partitions,
+                "Kafka source will seek to restored checkpoint offsets on assignment"
+            );
         }
     }
 
@@ -1695,7 +1689,6 @@ async fn execute_broker_kafka_two_phase(
 ) -> ExecutorResult<ExecutorTaskOutput> {
     use krishiv_connectors::{
         CheckpointSource, EpochTransactionLog, LocalParquetTwoPhaseCommitSink, Source,
-        TransactionalSinkParticipant as _,
     };
 
     // The configured sink path is the transactional output directory: each
@@ -1805,7 +1798,7 @@ async fn execute_broker_kafka_two_phase(
 #[cfg(feature = "kafka")]
 async fn execute_broker_kafka_at_least_once(
     runner: &ExecutorTaskRunner,
-    assignment: &ExecutorTaskAssignment,
+    _assignment: &ExecutorTaskAssignment,
     mut source: krishiv_connectors::kafka::RdkafkaKafkaSource,
     sink_path: &std::path::Path,
     source_id: &str,

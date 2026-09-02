@@ -23,8 +23,7 @@ krishiv = { path = "../../../crates/krishiv" }
 krishiv-connectors = { path = "../../../crates/krishiv-connectors", features = [
     "kafka",      # InMemoryKafkaSource + InMemoryKafkaOffsetCommitter
     "two-phase",  # EpochTransactionLog + LocalParquetTwoPhaseCommitSink
-    "lakehouse",  # CdcToLakehousePipeline, write_delta, DeltaWriteMode
-    "delta",      # write_delta local delta backend
+    "lakehouse",  # CdcToLakehousePipeline, write_delta, DeltaWriteMode (the former `delta` feature)
 ] }
 
 # Windowed aggregation: LocalWindowExecutionSpec, LocalWindowKind, execute_windowed_stream

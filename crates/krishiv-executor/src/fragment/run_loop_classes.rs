@@ -29,8 +29,10 @@ use super::run_loop::{
     parse_stream_peers, rloop_key_group_range, rloop_state_key, route_batch_by_key_group,
     watermark_idleness,
 };
-use crate::fragment::common::parse_registry_partition_specs;
-use crate::runner::{ExecutorTaskRunner, StreamingProgressSnapshot, TaskStateBinding};
+use crate::fragment::common::{owned_registry_specs, parse_registry_partition_specs};
+use crate::runner::{
+    ExecutorTaskRunner, StreamingProgressSnapshot, TaskStateBinding, task_binding_key,
+};
 use crate::{ExecutorError, ExecutorResult, ExecutorTaskOutput};
 
 /// True for every run-loop-FAMILY fragment body: windows (`stream:rloop:`)
@@ -180,15 +182,14 @@ pub(crate) async fn execute_rbatch_fragment(
     let shared_notify = runner.notify_handle(job_id);
     let peers = parse_stream_peers(assignment.input_partitions())?;
     let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
-    let owned_specs: Vec<_> = all_specs
-        .into_iter()
-        .enumerate()
-        .filter(|(idx, spec)| {
-            spec.kind.eq_ignore_ascii_case("kafka") || idx % parsed.parallelism == parsed.subtask
-        })
-        .map(|(_, spec)| spec)
-        .collect();
+    let owned_specs = owned_registry_specs(all_specs, parsed.parallelism, parsed.subtask);
     let _ = peers; // no keyed exchange for a stateless class
+    // Nothing to snapshot, but bound so the job's live-subtask count (which
+    // gates the JOB-keyed teardown below) sees this subtask.
+    runner.task_state_bindings.insert(
+        task_binding_key(job_id, &task_id),
+        TaskStateBinding::Stateless(state_key.clone()),
+    );
     let source_cache = runner.shared_continuous_connector_sources();
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
     let mut rows_emitted: u64 = 0;
@@ -283,6 +284,7 @@ pub(crate) async fn execute_rbatch_fragment(
             timestamp_ms: now_ms() as u64,
         });
     }
+    retire_classed_subtask(runner, job_id, &task_id);
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());
@@ -341,9 +343,10 @@ pub(crate) async fn execute_rjoin_fragment(
     };
     // Barrier snapshots bind by task; the join binding routes them to the
     // per-subtask operator (the H-6 keying, applied to joins).
-    runner
-        .task_state_bindings
-        .insert(task_id.clone(), TaskStateBinding::Join(state_key.clone()));
+    runner.task_state_bindings.insert(
+        task_binding_key(job_id, &task_id),
+        TaskStateBinding::Join(state_key.clone()),
+    );
 
     let own_left = runner.notify_handle(&left_key);
     let own_right = runner.notify_handle(&right_key);
@@ -352,12 +355,7 @@ pub(crate) async fn execute_rjoin_fragment(
     let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
     let mut left_specs = Vec::new();
     let mut right_specs = Vec::new();
-    for (idx, s) in all_specs.into_iter().enumerate() {
-        let owned =
-            s.kind.eq_ignore_ascii_case("kafka") || idx % parsed.parallelism == parsed.subtask;
-        if !owned {
-            continue;
-        }
+    for s in owned_registry_specs(all_specs, parsed.parallelism, parsed.subtask) {
         if s.table_name == spec.left_source {
             left_specs.push(s);
         } else if s.table_name == spec.right_source {
@@ -566,7 +564,7 @@ pub(crate) async fn execute_rjoin_fragment(
         });
     }
 
-    runner.task_state_bindings.remove(&task_id);
+    retire_classed_subtask(runner, job_id, &task_id);
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());
@@ -713,7 +711,7 @@ pub(crate) async fn execute_rpipe_fragment(
     // the per-subtask pipeline (task #149 fix 4 — without it a checkpointed
     // pipeline job snapshotted the empty generic backend).
     runner.task_state_bindings.insert(
-        task_id.clone(),
+        task_binding_key(job_id, &task_id),
         TaskStateBinding::Pipeline(state_key.clone()),
     );
     let pipe_arc = {
@@ -740,7 +738,9 @@ pub(crate) async fn execute_rpipe_fragment(
     let all_specs = parse_registry_partition_specs(assignment.input_partitions())?;
     let mut left_specs = Vec::new();
     let mut right_specs = Vec::new();
-    for s in all_specs {
+    // Ownership BEFORE side assignment: read every split on every subtask and
+    // each source row enters the keyed exchange once per subtask.
+    for s in owned_registry_specs(all_specs, parsed.parallelism, parsed.subtask) {
         if s.table_name == join.left_source {
             left_specs.push(s);
         } else if s.table_name == join.right_source {
@@ -1034,10 +1034,29 @@ pub(crate) async fn execute_rpipe_fragment(
     // directive) BEFORE deregistering; flushing here instead dumped
     // thousands of batches into egress after the last drain, where teardown
     // destroyed them unseen (observed live: NEXMark q9's whole output).
+    retire_classed_subtask(runner, job_id, &task_id);
     let _ = runner
         .inbox
         .clear_cancelled_task(assignment.job_id(), assignment.task_id());
     Ok(ExecutorTaskOutput::cancelled())
+}
+
+/// Teardown shared by the classed loops: drop this subtask's binding, and when
+/// it was the job's last live subtask in this process, retire the JOB-keyed
+/// state (restore entry, shared registry sink, source read positions, loss
+/// counters). The window run-loop does the same in its own teardown.
+///
+/// The classed loops used to skip this entirely: a deregistered pipeline or
+/// join job left its registry sink open for the process lifetime, and a job
+/// re-registered under the same id inherited the dead incarnation's writer.
+fn retire_classed_subtask(runner: &ExecutorTaskRunner, job_id: &str, task_id: &str) {
+    runner
+        .task_state_bindings
+        .remove(&task_binding_key(job_id, task_id));
+    if !runner.job_has_bound_tasks(job_id) {
+        runner.pending_restores.remove(job_id);
+        runner.retire_continuous_job_state(job_id);
+    }
 }
 
 fn now_ms() -> i64 {

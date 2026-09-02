@@ -81,7 +81,6 @@ kafka = [
     "krishiv-sql/kafka",
     "krishiv-api/kafka",
     "krishiv-executor/kafka",
-    "krishiv-runtime/kafka",
     "krishiv-flight-sql?/kafka",
 ]
 # jdbc: Postgres pull source/sink (sqlx) + the `STORED AS JDBC` SQL factory
@@ -133,10 +132,3 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 parquet = { workspace = true }
 tracing = { workspace = true }
-
-[dev-dependencies]
-arrow = { workspace = true }
-krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
-krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
-parquet = { workspace = true }
-tempfile = { workspace = true }

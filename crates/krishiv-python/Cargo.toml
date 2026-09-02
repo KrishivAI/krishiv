@@ -14,7 +14,6 @@ path = "src/lib.rs"
 [dependencies]
 krishiv-api = { path = "../krishiv-api", version = "0.1.0" }
 krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
-krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
 krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
 # Only `lakehouse` is a base dependency of the bindings. kafka / iceberg /
 # schema-registry / vector-sinks were pinned here too, which made the `kafka`,
@@ -56,7 +55,7 @@ schema-registry = ["krishiv-connectors/schema-registry"]
 iceberg = ["krishiv-connectors/iceberg", "krishiv-api/iceberg-sink"]
 # Cloud object-store backends (S3/MinIO, GCS, Azure) — required for Iceberg
 # tables and other sinks whose `path` is an `s3://` URI.
-cloud = ["krishiv-connectors/cloud", "krishiv-runtime/cloud"]
+cloud = ["krishiv-connectors/cloud", "krishiv-api/cloud"]
 jdbc = ["krishiv-connectors/jdbc"]
 kinesis = ["krishiv-connectors/kinesis"]
 pulsar = ["krishiv-connectors/pulsar-source"]

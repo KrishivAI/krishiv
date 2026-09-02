@@ -174,7 +174,11 @@ impl crate::Offset for MultiKafkaOffset {
                 })?,
         ) as usize;
         let mut pos = 4usize;
-        let mut offsets = Vec::with_capacity(count);
+        // Every entry carries at least its 4-byte length prefix, so the
+        // untrusted count can be bounded before it sizes an allocation — a
+        // corrupt `u32::MAX` header must fail on the truncation check below,
+        // not on a multi-gigabyte `with_capacity`.
+        let mut offsets = Vec::with_capacity(count.min((bytes.len() - 4) / 4));
         for i in 0..count {
             if pos + 4 > bytes.len() {
                 return Err(ConnectorError::Offset {
@@ -988,6 +992,10 @@ pub struct RdkafkaKafkaSource {
     max_decode_batch: usize,
     /// Latest offset read per partition — tracks all partitions, not just the last one.
     partition_offsets: std::collections::HashMap<i32, i64>,
+    /// Checkpoint offsets to seek to once the group assigns their partitions
+    /// (see [`Self::restore_offset_on_assignment`]). Applied lazily from
+    /// `read_batch`, one partition at a time as each becomes assigned.
+    pending_restore: Vec<KafkaOffset>,
     /// Typed-decode schema derived from `KafkaConfig::decode_columns`
     /// (Phase 65). `None` = the untyped all-Utf8 fold.
     decode_schema: Option<std::sync::Arc<arrow::datatypes::Schema>>,
@@ -1082,9 +1090,97 @@ impl RdkafkaKafkaSource {
                 .filter(|n| *n > 0)
                 .unwrap_or(512),
             partition_offsets: std::collections::HashMap::new(),
+            pending_restore: Vec::new(),
             #[cfg(feature = "schema-registry")]
             schema_registry: None,
         })
+    }
+
+    /// Record checkpoint offsets to seek to as soon as the consumer group
+    /// assigns their partitions.
+    ///
+    /// `subscribe` is asynchronous: the assignment is empty until the first
+    /// poll joins the group, so an eager `restore_offset` right after
+    /// construction refused every partition ("not currently assigned") and
+    /// the restoring task failed before reading a message. The offsets are
+    /// held here instead and applied from `read_batch`: each partition is
+    /// seeked the first time it shows up in the assignment, partitions that
+    /// end up on another group member stay pending for a later rebalance,
+    /// and assigned partitions absent from the checkpoint start from the
+    /// group position as before.
+    pub fn restore_offset_on_assignment(&mut self, offset: MultiKafkaOffset) {
+        for ko in offset.offsets {
+            if ko.topic != self.topic {
+                continue;
+            }
+            self.pending_restore.retain(|p| p.partition != ko.partition);
+            self.pending_restore.push(ko);
+        }
+    }
+
+    /// Checkpoint offsets still waiting for their partition to be assigned.
+    pub fn pending_restore(&self) -> &[KafkaOffset] {
+        &self.pending_restore
+    }
+
+    /// Seek every pending partition that is now assigned. Returns the
+    /// partitions that were seeked this call.
+    fn apply_pending_restore(&mut self) -> crate::ConnectorResult<Vec<i32>> {
+        use rdkafka::consumer::Consumer;
+        use rdkafka::topic_partition_list::Offset as RdOffset;
+
+        if self.pending_restore.is_empty() {
+            return Ok(Vec::new());
+        }
+        let assignment = self
+            .consumer
+            .assignment()
+            .map_err(|e| crate::ConnectorError::Offset {
+                message: format!("restore: failed to fetch current assignment: {e}"),
+            })?;
+        let assigned: std::collections::HashSet<i32> = assignment
+            .elements()
+            .iter()
+            .filter(|el| el.topic() == self.topic)
+            .map(|el| el.partition())
+            .collect();
+        let mut seeked = Vec::new();
+        let mut still_pending = Vec::new();
+        for ko in std::mem::take(&mut self.pending_restore) {
+            if !assigned.contains(&ko.partition) {
+                still_pending.push(ko);
+                continue;
+            }
+            self.consumer
+                .seek(
+                    &ko.topic,
+                    ko.partition,
+                    RdOffset::Offset(ko.offset),
+                    std::time::Duration::from_secs(5),
+                )
+                .map_err(|e| crate::ConnectorError::Offset {
+                    message: format!(
+                        "restore: failed to seek partition {}/{} at offset {}: {e}",
+                        ko.topic, ko.partition, ko.offset
+                    ),
+                })?;
+            // `partition_offsets` holds the last RECEIVED offset; `ko.offset`
+            // is next-to-read.
+            if ko.offset > 0 {
+                self.partition_offsets.insert(ko.partition, ko.offset - 1);
+            } else {
+                self.partition_offsets.remove(&ko.partition);
+            }
+            tracing::info!(
+                topic = %ko.topic,
+                partition = ko.partition,
+                offset = ko.offset,
+                "Kafka partition seeked to its restored checkpoint offset on assignment"
+            );
+            seeked.push(ko.partition);
+        }
+        self.pending_restore = still_pending;
+        Ok(seeked)
     }
 
     /// Attach a Confluent-compatible schema registry deserializer.
@@ -1344,9 +1440,10 @@ impl Source for RdkafkaKafkaSource {
     ) -> crate::ConnectorResult<Option<arrow::record_batch::RecordBatch>> {
         use rdkafka::Message;
 
+        let consumer = std::sync::Arc::clone(&self.consumer);
         let msg = tokio::time::timeout(
             std::time::Duration::from_millis(self.poll_timeout_ms),
-            self.consumer.recv(),
+            consumer.recv(),
         )
         .await;
 
@@ -1358,6 +1455,16 @@ impl Source for RdkafkaKafkaSource {
                 retriable: true,
             }),
             Ok(Ok(msg)) => {
+                // A received message proves the group has assigned partitions:
+                // apply any restore that was waiting for exactly that. A message
+                // from a partition seeked just now is from BEFORE the seek, so
+                // it is dropped — the seek re-delivers from the checkpoint.
+                if !self.pending_restore.is_empty() {
+                    let seeked = self.apply_pending_restore()?;
+                    if seeked.contains(&msg.partition()) {
+                        return Ok(None);
+                    }
+                }
                 // C6: Track offset per partition. Offsets are STAGED locally
                 // during the drain and merged into `partition_offsets` only
                 // once a batch has been successfully built — an error path
@@ -1816,6 +1923,17 @@ mod tests {
         }
     }
 
+    /// A corrupt header claiming `u32::MAX` entries must be rejected by the
+    /// truncation check, not turned into a multi-gigabyte allocation.
+    #[test]
+    fn multi_kafka_offset_decode_bounds_capacity_by_payload() {
+        let mut bytes = u32::MAX.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 8]);
+        let err = MultiKafkaOffset::decode(&bytes).expect_err("must be rejected");
+        // Any decode error is the right answer; the wrong one is an allocation abort.
+        assert!(!err.to_string().is_empty());
+    }
+
     #[test]
     fn multi_kafka_offset_empty_roundtrip() {
         let original = MultiKafkaOffset::default();
@@ -2245,6 +2363,52 @@ mod tests {
         assert!(
             source.all_current_offsets().is_empty(),
             "a refused restore must not mutate partition offsets"
+        );
+    }
+
+    /// A restore recorded before the group has assigned anything stays
+    /// pending (nothing is seeked, nothing mutated) instead of being refused
+    /// — the eager `restore_offset` right after `subscribe` failed every
+    /// restoring task, because the assignment is empty until the first poll.
+    #[cfg(feature = "kafka")]
+    #[tokio::test]
+    async fn restore_on_assignment_waits_for_the_partition() {
+        let Ok(mut source) =
+            super::RdkafkaKafkaSource::new("localhost:1", "test-group", "events", None, None)
+        else {
+            return;
+        };
+        source.restore_offset_on_assignment(super::MultiKafkaOffset {
+            offsets: vec![
+                super::KafkaOffset {
+                    topic: "events".into(),
+                    partition: 0,
+                    offset: 42,
+                },
+                super::KafkaOffset {
+                    topic: "other-topic".into(),
+                    partition: 0,
+                    offset: 7,
+                },
+            ],
+        });
+        assert_eq!(
+            source.pending_restore().len(),
+            1,
+            "only this topic's partitions are kept"
+        );
+        let seeked = source
+            .apply_pending_restore()
+            .expect("no assignment is not an error");
+        assert!(seeked.is_empty());
+        assert_eq!(
+            source.pending_restore().len(),
+            1,
+            "still waiting for partition 0"
+        );
+        assert!(
+            source.all_current_offsets().is_empty(),
+            "nothing mutated before the seek"
         );
     }
 

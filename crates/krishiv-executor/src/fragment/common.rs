@@ -235,6 +235,30 @@ pub(crate) struct RegistryPartitionSpec {
     pub connector_config: krishiv_connectors::ConnectorConfig,
 }
 
+/// Split ownership for a parallelism-N run-loop family job: non-Kafka registry
+/// splits are owned by index (`idx % parallelism == subtask`); Kafka
+/// consumer-group sources are NOT index-filtered — each subtask joins the
+/// group and the broker assigns partitions, which also gives dynamic partition
+/// discovery for free.
+///
+/// Every classed loop must take its splits through here: the pipeline loop
+/// read every split on every subtask, so with parallelism 2 each source row
+/// entered the keyed exchange twice and every key owner joined it twice.
+pub(crate) fn owned_registry_specs(
+    all_specs: Vec<RegistryPartitionSpec>,
+    parallelism: usize,
+    subtask: usize,
+) -> Vec<RegistryPartitionSpec> {
+    all_specs
+        .into_iter()
+        .enumerate()
+        .filter(|(idx, spec)| {
+            spec.kind.eq_ignore_ascii_case("kafka") || idx % parallelism.max(1) == subtask
+        })
+        .map(|(_, spec)| spec)
+        .collect()
+}
+
 impl RegistryPartitionSpec {
     pub fn continuous_source_key(&self, job_id: &str) -> String {
         format!("{job_id}|{}|{}", self.partition_id, self.raw_descriptor)
@@ -1382,6 +1406,45 @@ mod tests {
     use std::sync::Arc;
 
     use arrow::array::Int64Array;
+
+    fn spec(kind: &str, partition_id: &str) -> super::RegistryPartitionSpec {
+        super::RegistryPartitionSpec {
+            partition_id: partition_id.into(),
+            raw_descriptor: String::new(),
+            kind: kind.into(),
+            table_name: "t".into(),
+            connector_config: ConnectorConfig::new("t", kind),
+        }
+    }
+
+    /// Non-Kafka splits are owned by index; Kafka consumer-group splits are
+    /// owned by every subtask (the broker assigns partitions). Every classed
+    /// loop takes its splits through this one function.
+    #[test]
+    fn owned_registry_specs_partitions_non_kafka_splits_by_index() {
+        let all = || {
+            vec![
+                spec("csv", "s0"),
+                spec("csv", "s1"),
+                spec("kafka", "k"),
+                spec("csv", "s3"),
+            ]
+        };
+        let owned = |subtask| -> Vec<String> {
+            super::owned_registry_specs(all(), 2, subtask)
+                .into_iter()
+                .map(|s| s.partition_id)
+                .collect()
+        };
+        assert_eq!(owned(0), vec!["s0", "k"]);
+        assert_eq!(owned(1), vec!["s1", "k", "s3"]);
+        let single: Vec<String> = super::owned_registry_specs(all(), 1, 0)
+            .into_iter()
+            .map(|s| s.partition_id)
+            .collect();
+        assert_eq!(single, vec!["s0", "s1", "k", "s3"]);
+    }
+
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use krishiv_common::MemoryBudget;

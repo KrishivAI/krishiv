@@ -7859,3 +7859,212 @@ TPC-H exercises none of the DataFusion 55 behavioural changes (map casts,
 `time ± interval`, RANGE frame ORDER BY types, `array_distance`). Those need the
 NEXMark streaming corpus and the ANN distance tests, and only matter once the
 arrow-59 blocker clears.
+
+## §86 — DEPS-2: the dependency guard was red, on my own feature rename
+
+Goal: `just lint-deps` green again. It had two failure causes, both of which
+were mine to own.
+
+### The examples asked for a feature FEAT-1 had removed
+
+`examples/rust/Cargo.toml` and `examples/enterprise/rust/Cargo.toml` still
+requested `krishiv-connectors/delta` (and `hudi`), which §83 folded into
+`lakehouse` — the metadata step of `lint-deps` failed before machete ran. The
+gate caught it; nothing else did, because the examples are not workspace
+members and no other recipe resolves them. They now ask for `lakehouse`.
+
+### Eleven machete hits: seven fictions, one false positive, three forwarding deps
+
+Removed (zero uses; the `[dev-dependencies]` ones were checked against their
+crate's `*.rs` and `*.rs.inc` before going): krishiv-plan `tokio`, `uuid`
+(named only in doc comments), `mockito`; krishiv-sql `typetag` (the
+registration it once served lives in krishiv-connectors); krishiv-bench
+`parquet`; krishiv-ui `futures`; **krishiv-api's optional `iceberg`** — no
+`iceberg::` path anywhere in the crate, so `iceberg-catalog = ["dep:iceberg",
+…]` compiled a dependency into a feature that only forwards to krishiv-sql and
+krishiv-connectors. A `dep:` with zero uses is exactly the §83 fiction.
+
+False positive: krishiv-proto's `prost`, `tonic-prost`, `prost-build`,
+`protoc-bin-vendored`, `tonic-prost-build` — used by the `include!`d generated
+code and by build.rs, which machete cannot see. Declared as
+`[package.metadata.cargo-machete] ignored` with the reason in the manifest,
+which is the mechanism, not a suppression.
+
+Forwarding deps, decided one each rather than blanket-ignored:
+
+* **krishiv-flight-sql `krishiv-api`** — no symbol used, and `cargo tree -i`
+  shows nothing else in flight-sql's graph pulls it in. So the dependency
+  existed only to forward `kafka`, which compiled an entire unused crate.
+  Removed with the forward; `krishiv-flight-sql/kafka` now forwards to the
+  runtime only, and a downstream that wants the api-side kafka arm asks
+  krishiv-api directly (the `krishiv` binary already does).
+* **krishiv-python `krishiv-runtime`** — no symbol used, but `cloud` had to
+  reach `krishiv-runtime/cloud` and krishiv-api (which python does use) had no
+  `cloud` feature to route through. Added `krishiv-api/cloud` (forwards to
+  connectors and runtime) and python now goes through it; the direct
+  dependency is gone.
+
+### What proved it
+
+The two example lockfiles were re-resolved by the metadata check (they had
+not been regenerated since §85 moved the workspace; the diff is the upgrade
+landing there, not a change of policy). `just lint-deps` rc=0; `cargo metadata` on both example manifests rc=0; `cargo
+check -p krishiv-api --features iceberg-catalog,cloud,kafka`, `-p
+krishiv-flight-sql --features kafka --all-targets`, `-p krishiv-python
+--features cloud`, and the five other touched crates `--all-targets`, all
+rc=0. A stray uncommitted diff found in the tree at the start of this session
+stripped 21 crates' `[dev-dependencies]` that ARE used (`proptest` at
+`krishiv-plan/src/window.rs:1532`, `tokio::test` at
+`krishiv-metrics/src/lib.rs:715`, …); it was reverted, not adopted — machete's
+`--fix` output is not a patch to apply blind.
+
+## §87 — AUDIT-R1: sixteen findings from three units, verified by reading
+
+The full-tree hunt (42 units: every crate plus eight cross-cutting sweeps) was
+orchestrated as a workflow and lost 39 of its 42 finders to the account's
+session limit; the adversarial verify pass lost all 48 of its verifiers the
+same way. The three units that returned (scheduler HTTP, connectors
+Kafka/CDC, executor fragments) produced 16 findings. **A verify run that
+returns `votes: 0` for every finding is not a refutation**, so each one was
+verified by reading the code directly. All 16 held up. The remaining 39 units
+are untouched and are the next round.
+
+Each fix below has a test that was run against the reverted production line
+and went red (the revert result is recorded per item).
+
+### Silent wrong answers (checklist A)
+
+* **R1-11 / critical — the coordinator never echoed the sink it armed.**
+  `ContinuousRegisterResponse` and `ContinuousRegisterSqlResponse` had no
+  `sink` field, while the runtime client's `verify_ack` refuses any
+  sink-carrying registration whose ack lacks it ("coordinator dropped the
+  sink"). Every sink registration through HTTP failed verification — the
+  handler already had `applied.sink` and threw it away. Both responses now
+  carry `sink` (omitted when none). Test
+  `register_responses_echo_the_armed_sink_kind` decodes the JSON the client
+  sees.
+* **R1-1 / critical — checkpoint bindings keyed by a per-JOB task name.**
+  The coordinator names run-loop subtasks `task-streaming-<i>` per job; the
+  executor kept `task_state_bindings` by that bare id. Two continuous jobs on
+  one executor: the second bind overwrote the first, job A's barrier
+  snapshotted job B's operator, and B's teardown removed A's binding. Keyed
+  by `(job, task)` (`task_binding_key`) at every bind, unbind and lookup, and
+  the sibling-liveness check now asks the same key. Test
+  `task_state_bindings_are_scoped_by_job`.
+* **R1-6 / critical — the Kafka transactional sink could not commit an epoch
+  with two batches.** `EpochTransactionLog::pre_commit` prepares once per
+  buffered batch; the sink opened one Kafka transaction per prepare and
+  refused the second ("still open"), so `pre_commit` aborted everything and
+  no multi-batch epoch ever committed. One transaction per epoch now: a
+  prepare for the open epoch joins it under its own handle
+  (`open_handles`), the first finalize closes it, siblings finalize as
+  idempotent no-ops. Tests `prepare_rejects_other_epoch_while_open_but_joins_
+  the_open_epoch`, `every_handle_of_the_open_epoch_finalizes`.
+* **R1-7 / high — a failed `prepare` wedged the sink.** State was set to
+  "open" before encoding and sending, so an IPC or send failure left
+  `transaction_open = true` with no handle that could ever close it. Encoding
+  now precedes the producer; a send failure aborts and forgets the
+  transaction (`discard_open_transaction`).
+* **R1-2 / high — the throughput-profile linger re-drain skipped coercion.**
+  The head-of-iteration drain coerces pushed batches (the NEXMark UInt64
+  fix); the linger re-drain extended input raw, re-opening the same defect
+  under one profile. Both drains now go through `drain_pushed_input`, which
+  also observes event time for the watermark. Test
+  `drain_pushed_input_coerces_and_observes_every_batch`.
+* **R1-3 / high — the pipeline loop read every split on every subtask.**
+  rloop, rbatch and rjoin filter registry splits by `idx % parallelism ==
+  subtask`; rpipe did not, so with parallelism 2 each source row entered the
+  keyed exchange twice and every key owner joined it twice. All four loops
+  now take splits through `owned_registry_specs`. Test
+  `owned_registry_specs_partitions_non_kafka_splits_by_index`.
+* **R1-8 / high — Kafka→Parquet restore failed on every restore.** `subscribe`
+  is asynchronous; the assignment is empty until the first poll, so the eager
+  `restore_offset` right after construction refused every partition ("not
+  currently assigned") and the task died — and the error path had already
+  removed the sibling topics' offsets from `kafka_restore_offsets`. The
+  source now holds the offsets (`restore_offset_on_assignment`) and seeks
+  each partition the first time it appears in the assignment, dropping the
+  one pre-seek message; batch.rs re-inserts the sibling topics' offsets
+  BEFORE anything can fail. Test `restore_on_assignment_waits_for_the_
+  partition`.
+* **R1-12 / high — a batch that would not coalesce was dropped.**
+  `submit_resident_ivm_step` drained `take_pending` and coalesced it before
+  the `refeed` guard existed; a coalesce failure (schema drift between two
+  pushes) lost the batch and the central fallback answered 200 with zero
+  rows. `drain_for_dispatch` re-feeds on coalesce failure. Test
+  `drain_for_dispatch_refeeds_when_coalescing_fails`.
+* **R1-13 / medium — `force_diff_based` applied to a rehydrated job.**
+  `freshly_created` meant "not in the registry yet", which is also true when
+  restoring from a durable snapshot. Now true only in the two create arms.
+  Test `rehydrate_does_not_apply_force_diff_based` (both directions).
+* **R1-14 / medium — every registry-dispatched sink reported `sink: null`.**
+  `continuous_delivery_view` had arms for the Iceberg and Kafka contracts and
+  nothing for `registry-sink:<kind>|…`. Added; the guarantee comes from the
+  registered driver's default capabilities, effective is capped at
+  effectively-once because source offsets never ride in the sink
+  transaction. Test `delivery_view_names_a_registry_sink`.
+* **R1-10 / low — CDC reverse-mapping guessed.** A payload column named
+  `_op_src` was reverse-mapped to `_op` and came out wrong (all-NULL when the
+  payload has no `_op`; the OTHER column's value when it does — and a payload
+  carrying both collapsed them onto one output column). My first fix, an
+  explicit safe→payload map, **stayed green on the reverted line**: it had
+  the same collision, so the test could not tell the two apart. The mapping
+  is now injective — non-reserved payload fields keep their names, reserved
+  ones take `_src` suffixes until free — and the test went red on the old
+  reverse-map (`kafka,lakehouse` features; the cdc tests do not build under
+  `kafka` alone, which is why the first red-proof run reported 0 tests).
+  Test `payload_column_named_like_a_renamed_reserved_column_keeps_its_values`.
+
+### Bounded growth / leaks (checklist F)
+
+* **R1-4 / medium — classed teardowns retired nothing.** rbatch, rjoin and
+  rpipe never called `retire_continuous_job_state`, so a deregistered
+  pipeline or join job left its registry sink open for the process lifetime
+  and a job re-registered under the same id inherited the dead incarnation's
+  writer; rpipe also never removed its binding. `retire_classed_subtask`
+  now does what the window loop's teardown does, gated on
+  `job_has_bound_tasks` (all variants; rbatch binds a new `Stateless`
+  variant so its liveness counts). Test
+  `job_has_bound_tasks_counts_every_binding_variant`.
+* **R1-9 / medium — `Vec::with_capacity` from an untrusted u32.**
+  `MultiKafkaOffset::decode` sized its vector from the header count before
+  any bounds check; a corrupt `u32::MAX` was a multi-gigabyte allocation
+  (abort) instead of a decode error. Capacity is capped by the bytes that
+  remain. Test `multi_kafka_offset_decode_bounds_capacity_by_payload` — and
+  here the standing rule bites: **on the reverted line the test stays
+  green.** Linux overcommit hands out a 170 GB reservation that is never
+  touched, so the abort only happens under strict overcommit or a memory
+  cgroup. The fix stays as hygiene; the test pins the decode error path,
+  not the allocation, and is recorded as such.
+
+### Honesty / surface (checklist E)
+
+* **R1-15 / low** — `/debug-info` answered 400 for a missing view while
+  `/stats` said 404 for the identical condition. Now 404. Test
+  `view_debug_info_404s_on_missing_view`.
+* **R1-16 / low** — `SchedulerError::InvalidJob` (an unencodable sink, a
+  malformed fragment: the request being wrong) was mapped to 409, the code
+  that says "this id already exists". Now 400. Test
+  `unencodable_sink_is_a_bad_request`.
+
+### Found on the way
+
+* **R1-17 — the executor's `kafka` feature arm had no test gate, and its
+  test target did not compile.** Two kafka-gated tests in
+  `sections/core.rs.inc` named `MemoryKafkaRecord` without a path, and the
+  lib carried two warnings (`TransactionalSinkParticipant` unused, an unused
+  `assignment` parameter). Nothing ran `cargo test -p krishiv-executor
+  --features kafka`; `test-feature-arms` now does. Running it found a third
+  thing: `a_durable_sink_job_does_not_report_its_staging_trims_as_lost_output`
+  says in its own comment that it assumes no `kafka` feature, and under it
+  opens a transactional producer against a broker that does not exist, once
+  per staged output, and hangs on `init_transactions`. Gated
+  `cfg(not(feature = "kafka"))`.
+
+### Not fixed — recorded
+
+* **R1-5 / test weakness** — `parallel_rpipe_is_refused_by_name` asserts that
+  a fragment string parses; the refusal it names lives inside
+  `execute_rpipe_fragment`, which the test never calls. Driving the loop
+  needs a valid pipeline spec and a runner; left for the executor's next
+  read, noted here so it is not mistaken for coverage.

@@ -284,7 +284,7 @@ async fn run_loop_idle_tick_closes_session_windows_distributed() {
 /// (the H-6 fix carried through the checkpoint path).
 #[tokio::test]
 async fn checkpoint_state_for_task_resolves_bound_subtask_state() {
-    use crate::runner::{CheckpointStateHandle, TaskStateBinding};
+    use crate::runner::{task_binding_key, CheckpointStateHandle, TaskStateBinding};
 
     let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
     let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("key", "ts", 10_000);
@@ -296,12 +296,14 @@ async fn checkpoint_state_for_task_resolves_bound_subtask_state() {
     ));
     runner.loop_executors.insert("job-x#0".into(), exec_a.clone());
     runner.loop_executors.insert("job-x#1".into(), exec_b.clone());
-    runner
-        .task_state_bindings
-        .insert("task-streaming-0".into(), TaskStateBinding::Window("job-x#0".into()));
-    runner
-        .task_state_bindings
-        .insert("task-streaming-1".into(), TaskStateBinding::Window("job-x#1".into()));
+    runner.task_state_bindings.insert(
+        task_binding_key("job-x", "task-streaming-0"),
+        TaskStateBinding::Window("job-x#0".into()),
+    );
+    runner.task_state_bindings.insert(
+        task_binding_key("job-x", "task-streaming-1"),
+        TaskStateBinding::Window("job-x#1".into()),
+    );
 
     let fallback = CheckpointStateHandle::from_backend(
         krishiv_state::InMemoryStateBackend::default(),
@@ -324,6 +326,47 @@ async fn checkpoint_state_for_task_resolves_bound_subtask_state() {
     // Unbound tasks fall back to the job-level lookup, then the backend.
     let unbound = runner.checkpoint_state_for_task("job-x", "task-other", fallback);
     assert!(matches!(unbound, CheckpointStateHandle::Backend(_)));
+}
+
+/// Two continuous jobs on one executor both name their subtask
+/// `task-streaming-0` (the coordinator numbers subtasks per job). Bound by the
+/// bare task id, the second bind overwrote the first and job A's barrier then
+/// snapshotted job B's operator. Bindings are keyed by `(job, task)`.
+#[tokio::test]
+async fn task_state_bindings_are_scoped_by_job() {
+    use crate::runner::{task_binding_key, CheckpointStateHandle, TaskStateBinding};
+    let runner = ExecutorTaskRunner::new(ExecutorAssignmentInbox::new());
+    let spec = krishiv_plan::window::WindowExecutionSpec::tumbling("key", "ts", 10_000);
+    let exec_a = std::sync::Arc::new(std::sync::Mutex::new(
+        krishiv_dataflow::ContinuousWindowExecutor::new(spec.clone()).unwrap(),
+    ));
+    let exec_b = std::sync::Arc::new(std::sync::Mutex::new(
+        krishiv_dataflow::ContinuousWindowExecutor::new(spec).unwrap(),
+    ));
+    runner.loop_executors.insert("job-a#0".into(), exec_a.clone());
+    runner.loop_executors.insert("job-b#0".into(), exec_b.clone());
+    runner.task_state_bindings.insert(
+        task_binding_key("job-a", "task-streaming-0"),
+        TaskStateBinding::Window("job-a#0".into()),
+    );
+    runner.task_state_bindings.insert(
+        task_binding_key("job-b", "task-streaming-0"),
+        TaskStateBinding::Window("job-b#0".into()),
+    );
+    assert_eq!(runner.task_state_bindings.len(), 2, "one binding per job");
+
+    let fallback = CheckpointStateHandle::from_backend(
+        krishiv_state::InMemoryStateBackend::default(),
+    );
+    let a = runner.checkpoint_state_for_task("job-a", "task-streaming-0", fallback.clone());
+    let b = runner.checkpoint_state_for_task("job-b", "task-streaming-0", fallback);
+    match (&a, &b) {
+        (CheckpointStateHandle::ContinuousWindow(a), CheckpointStateHandle::ContinuousWindow(b)) => {
+            assert!(std::sync::Arc::ptr_eq(a, &exec_a), "job A snapshots its own operator");
+            assert!(std::sync::Arc::ptr_eq(b, &exec_b), "job B snapshots its own operator");
+        }
+        other => panic!("expected ContinuousWindow handles, got {other:?}"),
+    }
 }
 
 /// G5 / platform #88 exit wording: a two-input streaming join retains state

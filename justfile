@@ -300,6 +300,7 @@ test-single-node:
 test-feature-arms:
     {{ sccache_env }} {{ cargo }} test -p krishiv-sql --lib --features kafka
     {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib --features kafka
+    {{ sccache_env }} {{ cargo }} test -p krishiv-executor --lib --features kafka
     {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib --features vector-sinks
     {{ sccache_env }} {{ cargo }} test -p krishiv-connectors --lib --features schema-registry
 

@@ -895,15 +895,40 @@ pub fn build_batch_from_events(events: &[CdcEvent]) -> Result<RecordBatch, CdcBa
     }
 
     // Collect the union of all column names from after/before payloads, sorted.
-    let mut col_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // The output name maps back to the payload field it came from EXPLICITLY
+    // and injectively: a payload field that is not a reserved name keeps its
+    // own name; a reserved one takes `_src` suffixes until the name is free.
+    // Reverse-mapping by stripping `_src` guessed wrong for a payload column
+    // literally named `_op_src` (it was read as `_op`), and a payload carrying
+    // both `_op` and `_op_src` collapsed them onto one output column.
+    let mut payload_fields: std::collections::BTreeSet<String> = Default::default();
     for event in events {
         let payload = event.after.as_ref().or(event.before.as_ref());
         if let Some(batch) = payload {
             for field in batch.schema().fields() {
-                col_names.insert(safe_payload_column(field.name()));
+                payload_fields.insert(field.name().to_string());
             }
         }
     }
+    let mut payload_field_for: std::collections::BTreeMap<String, String> = Default::default();
+    for name in payload_fields
+        .iter()
+        .filter(|n| !RESERVED_CDC_COLUMNS.contains(&n.as_str()))
+    {
+        payload_field_for.insert(name.clone(), name.clone());
+    }
+    for name in payload_fields
+        .iter()
+        .filter(|n| RESERVED_CDC_COLUMNS.contains(&n.as_str()))
+    {
+        let mut safe = safe_payload_column(name);
+        while payload_field_for.contains_key(&safe) {
+            safe.push_str("_src");
+        }
+        payload_field_for.insert(safe, name.clone());
+    }
+    let mut col_names: std::collections::BTreeSet<String> =
+        payload_field_for.keys().cloned().collect();
 
     // Add metadata columns present on every row.
     let meta_cols = ["_op", "_table", "_lsn", "_ts_ms", "_partition", "_offset"];
@@ -928,14 +953,9 @@ pub fn build_batch_from_events(events: &[CdcEvent]) -> Result<RecordBatch, CdcBa
                 "_partition" => Some(event.partition_id.to_string()),
                 "_offset" => Some(event.offset.to_string()),
                 user_col => {
-                    // Reverse-map safe name back to original payload field name.
-                    let orig_col = if user_col.ends_with("_src")
-                        && RESERVED_CDC_COLUMNS.contains(&&user_col[..user_col.len() - 4])
-                    {
-                        &user_col[..user_col.len() - 4]
-                    } else {
-                        user_col
-                    };
+                    let orig_col = payload_field_for
+                        .get(user_col)
+                        .map_or(user_col, String::as_str);
                     match payload {
                         Some(batch) => payload_value_to_string(batch, orig_col)?,
                         None => None,
@@ -1010,6 +1030,62 @@ mod tests {
 
     use super::*;
     use crate::lakehouse::{IcebergTwoPhaseCommit, LakehouseError, StagedSnapshot};
+
+    /// A payload column literally named `_op_src` must reach the output under
+    /// its own name with its own values: reverse-mapping by stripping `_src`
+    /// looked it up as `_op`, which the payload does not have, so the column
+    /// came out all-NULL.
+    #[test]
+    fn payload_column_named_like_a_renamed_reserved_column_keeps_its_values() {
+        use arrow::array::StringArray;
+        let payload = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("_op", DataType::Utf8, true),
+                Field::new("_op_src", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["user-op"])),
+                Arc::new(StringArray::from(vec!["user-op-src"])),
+            ],
+        )
+        .unwrap();
+        let event = CdcEvent {
+            op: super::super::debezium::CdcOp::Insert,
+            before: None,
+            after: Some(payload),
+            source_lsn: None,
+            source_ts_ms: None,
+            partition_id: 0,
+            offset: 1,
+            table: "t".into(),
+        };
+        let batch = build_batch_from_events(&[event]).unwrap();
+        let col = |name: &str| -> String {
+            let idx = batch.schema().index_of(name).unwrap();
+            batch
+                .column(idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+                .to_string()
+        };
+        assert_eq!(
+            col("_op"),
+            "Insert",
+            "metadata column wins the reserved name"
+        );
+        assert_eq!(
+            col("_op_src"),
+            "user-op-src",
+            "the payload's own `_op_src` value"
+        );
+        assert_eq!(
+            col("_op_src_src"),
+            "user-op",
+            "the payload's `_op` is shifted past it"
+        );
+    }
 
     struct FailingIcebergCommitter;
 

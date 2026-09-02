@@ -55,7 +55,6 @@ uuid = { workspace = true }
 futures.workspace = true
 object_store = { workspace = true, features = ["aws"] }
 bytes = { workspace = true }
-typetag = "0.2"
 tokio.workspace = true
 tokio-stream.workspace = true
 
@@ -108,11 +107,6 @@ iceberg-datafusion = [
 unity-catalog = ["rest-catalog"]
 # AWS Glue catalog backend (uses Glue's built-in Iceberg REST endpoint).
 glue-catalog = ["rest-catalog"]
-
-[dev-dependencies]
-tokio = { workspace = true }
-wiremock = { workspace = true }
-tempfile = { workspace = true }
 
 [lib]
 path = "src/lib.rs"

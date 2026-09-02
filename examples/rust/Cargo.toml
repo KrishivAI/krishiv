@@ -16,7 +16,7 @@ krishiv-api = { path = "../../crates/krishiv-api" }
 krishiv-sql = { path = "../../crates/krishiv-sql" }
 krishiv-common = { path = "../../crates/krishiv-common" }
 krishiv-dataflow = { path = "../../crates/krishiv-dataflow" }
-krishiv-connectors = { path = "../../crates/krishiv-connectors", features = ["lakehouse", "delta", "hudi"] }
+krishiv-connectors = { path = "../../crates/krishiv-connectors", features = ["lakehouse"] }
 krishiv-runtime = { path = "../../crates/krishiv-runtime" }
 parquet = "58.3.0"
 rdkafka = { version = "0.39", optional = false, default-features = false, features = ["tokio"] }

@@ -367,7 +367,12 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
     delta_checkpoints: bool,
     force_diff_based: bool,
 ) -> Result<(), StatusCode> {
-    let freshly_created = registry.get(job_id).is_none();
+    // True only when this call CREATES the job. A rehydrated job is a running
+    // job restored from its snapshot, and creation-time-only flags must not
+    // reach it: `freshly_created` used to be "not in the registry yet", which
+    // is also true on the rehydrate arm, so `force_diff_based` flipped a
+    // restored flow's route.
+    let mut freshly_created = false;
     if registry.get(job_id).is_none() {
         if let Some(snapshot) = coordinator.load_ivm_snapshot(job_id).await {
             registry
@@ -377,8 +382,10 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
             registry
                 .create_unpartitioned(job_id.to_owned())
                 .map_err(ivm_err)?;
+            freshly_created = true;
         } else {
             registry.create(job_id.to_owned()).map_err(ivm_err)?;
+            freshly_created = true;
         }
     }
     // IVM-AUD-INT-F16. Checked after the branch above so it covers all three
@@ -1228,6 +1235,30 @@ async fn run_ivm_fragment_job(
 /// placement drift self-healing: a tick that lands on an executor without
 /// the flow (or replays after a retry) errors instead of corrupting state,
 /// and the caller re-attaches.
+/// What `drain_for_dispatch` took custody of: the raw pending deltas (to
+/// re-feed on failure) and their coalesced form (to ship).
+type DrainedForDispatch = (
+    HashMap<String, Vec<DeltaBatch>>,
+    HashMap<String, DeltaBatch>,
+);
+
+/// Take custody of the flow's pending deltas and coalesce them for dispatch.
+///
+/// The drained deltas are re-fed if coalescing fails: it used to run before
+/// the refeed guard existed, so a batch that would not coalesce (a schema
+/// drift between two pushes of one source) was dropped on the floor and the
+/// central fallback then answered 200 with zero rows for it.
+fn drain_for_dispatch(flow: &IncrementalFlow) -> Result<DrainedForDispatch, String> {
+    let local_pending = flow.take_pending().map_err(|e| e.to_string())?;
+    match coalesce_pending(local_pending.clone()) {
+        Ok(dispatch_deltas) => Ok((local_pending, dispatch_deltas)),
+        Err(error) => {
+            let _ = flow.re_feed(local_pending);
+            Err(error.to_string())
+        }
+    }
+}
+
 async fn submit_resident_ivm_step(
     coordinator: &SharedCoordinator,
     registry: &SharedIvmJobRegistry,
@@ -1235,8 +1266,11 @@ async fn submit_resident_ivm_step(
     ivm_job_id: &str,
 ) -> Result<(krishiv_ivm::StepSummary, Option<krishiv_ivm::TickHealth>), String> {
     // 1. Drain pending locally — never lost: re-fed on any failure below.
-    let local_pending = flow.take_pending().map_err(|e| e.to_string())?;
-    let dispatch_deltas = coalesce_pending(local_pending.clone()).map_err(|e| e.to_string())?;
+    let (local_pending, dispatch_deltas) = drain_for_dispatch(flow)?;
+    let refeed = |e: String| -> String {
+        let _ = flow.re_feed(local_pending.clone());
+        e
+    };
 
     // Nothing to compute: advance the tick structurally and return. No view is
     // evaluated, so "nothing failed" is a fact rather than an absence of signal
@@ -1249,11 +1283,6 @@ async fn submit_resident_ivm_step(
             Some(krishiv_ivm::TickHealth::default()),
         ));
     }
-
-    let refeed = |e: String| -> String {
-        let _ = flow.re_feed(local_pending.clone());
-        e
-    };
 
     // 2. Attach if needed: ship the full state mirror once.
     let mut disp = registry.dispatch_state(ivm_job_id);
@@ -1671,10 +1700,12 @@ pub async fn api_ivm_view_debug_info(
 ) -> Result<Json<ViewDebugInfo>, StatusCode> {
     let job = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     // is_materialized from spec
+    // 404 for a view that isn't registered — the same answer `/stats` gives;
+    // this used to say 400 for the identical condition.
     let is_materialized = job
         .view_spec(&view_name)
         .map_err(ivm_err)?
-        .ok_or_else(|| ivm_err(format!("view {view_name} not found")))?
+        .ok_or_else(|| ivm_not_found(&view_name))?
         .is_materialized;
     let snapshot = job.snapshot(&view_name).map_err(ivm_err)?;
     let has_snapshot = snapshot.is_some();
@@ -3287,6 +3318,132 @@ mod tests {
         assert_eq!(disp.last.unwrap().mode, "central-partitioned");
     }
 
+    /// A batch that will not coalesce (schema drift between two pushes of one
+    /// source) must stay with the flow, not vanish: the drain used to run
+    /// before the refeed guard existed.
+    #[test]
+    fn drain_for_dispatch_refeeds_when_coalescing_fails() {
+        let registry = crate::ivm::IvmJobRegistry::new();
+        registry.create_unpartitioned("job-drain".into()).unwrap();
+        let Some(crate::ivm::IvmJob::Single(flow)) = registry.get("job-drain") else {
+            panic!("single flow");
+        };
+        flow.feed(
+            "t",
+            DeltaBatch::from_inserts(orders(&["US"], &[1])).unwrap(),
+        )
+        .unwrap();
+        let drifted = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "other",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![2]))],
+        )
+        .unwrap();
+        flow.feed("t", DeltaBatch::from_inserts(drifted).unwrap())
+            .unwrap();
+
+        let err = drain_for_dispatch(&flow).expect_err("schema drift cannot coalesce");
+        assert!(!err.is_empty());
+        let pending = flow.take_pending().unwrap();
+        assert_eq!(
+            pending.get("t").map(Vec::len),
+            Some(2),
+            "both drained deltas are back with the flow"
+        );
+    }
+
+    /// `force_diff_based` is a creation-time flag. Rehydrating a job from its
+    /// durable snapshot is not creation, so the flag must not flip the
+    /// restored flow's route.
+    #[tokio::test]
+    async fn rehydrate_does_not_apply_force_diff_based() {
+        let registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(1));
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord-rehydrate").unwrap())
+                .with_store(crate::InMemoryMetadataStore::default()),
+        );
+        create_or_rehydrate_ivm_job(
+            &registry,
+            &coordinator,
+            "job-rehydrate",
+            Some(false),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        // Simulate a coordinator restart: the registry forgets the job, the
+        // durable snapshot survives.
+        assert!(registry.delete("job-rehydrate"));
+        assert!(
+            coordinator
+                .load_ivm_snapshot("job-rehydrate")
+                .await
+                .is_some()
+        );
+
+        create_or_rehydrate_ivm_job(
+            &registry,
+            &coordinator,
+            "job-rehydrate",
+            Some(false),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let Some(crate::ivm::IvmJob::Single(flow)) = registry.get("job-rehydrate") else {
+            panic!("single flow");
+        };
+        assert!(
+            !flow.is_force_diff_based().unwrap(),
+            "a rehydrated flow keeps its route"
+        );
+
+        // The flag still applies where it belongs: on creation.
+        create_or_rehydrate_ivm_job(
+            &registry,
+            &coordinator,
+            "job-created",
+            Some(false),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+        let Some(crate::ivm::IvmJob::Single(created)) = registry.get("job-created") else {
+            panic!("single flow");
+        };
+        assert!(created.is_force_diff_based().unwrap());
+    }
+
+    /// `/debug-info` and `/stats` answer the same condition the same way.
+    #[tokio::test]
+    async fn view_debug_info_404s_on_missing_view() {
+        let (registry, coordinator) = test_deps();
+        create_or_rehydrate_ivm_job(
+            &registry,
+            &coordinator,
+            "job-dbg",
+            Some(false),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let err = api_ivm_view_debug_info(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("job-dbg".into(), "nope".into())),
+        )
+        .await
+        .expect_err("must 404");
+        assert_eq!(err, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn dispatch_state_404s_on_missing_job() {
         let (registry, coordinator) = test_deps_with_shards(1);
@@ -3612,7 +3769,8 @@ mod tests {
         )
         .await
         .expect_err("unknown view");
-        assert_eq!(err, StatusCode::BAD_REQUEST);
+        // The same answer `/stats` gives for the same condition.
+        assert_eq!(err, StatusCode::NOT_FOUND);
     }
 
     // ── checkpoint / restore ──────────────────────────────────────────────────

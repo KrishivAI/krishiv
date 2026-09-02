@@ -29,12 +29,5 @@ tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
-[dev-dependencies]
-hex = { workspace = true }
-tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
-proptest = { workspace = true }
-serde_json = { workspace = true }
-
 [lints]
 workspace = true

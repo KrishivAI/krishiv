@@ -1349,9 +1349,9 @@ async fn executor_runs_kafka_to_parquet_pipeline_on_real_runner() {
                 partition: 0,
                 start_offset: 5,
                 records: vec![
-                    MemoryKafkaRecord::new(1, "created"),
-                    MemoryKafkaRecord::new(2, "updated"),
-                    MemoryKafkaRecord::new(3, "deleted"),
+                    krishiv_proto::MemoryKafkaRecord::new(1, "created"),
+                    krishiv_proto::MemoryKafkaRecord::new(2, "updated"),
+                    krishiv_proto::MemoryKafkaRecord::new(3, "deleted"),
                 ],
             },
         )]);

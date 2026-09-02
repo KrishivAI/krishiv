@@ -39,40 +39,26 @@ krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
 krishiv-engines = { path = "../krishiv-engines", version = "0.1.0" }
 datafusion = { workspace = true }
-# iceberg feature deps — pulled in only when local-catalog or iceberg-datafusion are requested
-iceberg = { workspace = true, optional = true }
 parquet = { workspace = true }
 twox-hash = { workspace = true }
 
 [features]
 kafka = ["krishiv-connectors/kafka", "krishiv-runtime/kafka"]
+# Cloud object-store backends; forwards so bindings (krishiv-python) need no
+# direct krishiv-runtime dependency just to reach `krishiv-runtime/cloud`.
+cloud = ["krishiv-connectors/cloud", "krishiv-runtime/cloud"]
 # Enables the checkpoint-aligned streaming Iceberg sink (format("iceberg")).
 iceberg-sink = ["krishiv-connectors/iceberg"]
-# Alias so downstream `krishiv-api/iceberg` resolves (krishiv-api has an optional
-# `iceberg` dependency whose implicit feature is suppressed by `dep:` syntax in
-# `iceberg-catalog`; without this explicit feature, a workspace-wide
-# `--features iceberg` from a dependent crate fails to resolve).
+# Alias so downstream `krishiv-api/iceberg` resolves.
 iceberg = ["iceberg-sink"]
 # Enable Iceberg catalog integration (registers KrishivCatalog as DataFusion catalog provider).
+# This crate never names the `iceberg` crate itself — the catalog wiring lives in
+# krishiv-sql / krishiv-connectors — so the feature only forwards.
 iceberg-catalog = [
-    "dep:iceberg",
     "krishiv-sql/local-catalog",
     "krishiv-sql/iceberg-datafusion",
     "krishiv-connectors/iceberg",
 ]
-
-[dev-dependencies]
-# dev-only cycle (flight-sql depends on api); Cargo permits dev-dep cycles.
-# Gives the remote-execution Flight test a live server to hit.
-krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
-krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
-krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
-tempfile = { workspace = true }
-tonic = { workspace = true }
-tokio = { workspace = true }
-# Parses the NDJSON this crate emits, so the explicit-nulls test checks the
-# actual key set of each row rather than doing substring matching on the text.
-serde_json = { workspace = true }
 
 [lib]
 path = "src/lib.rs"
