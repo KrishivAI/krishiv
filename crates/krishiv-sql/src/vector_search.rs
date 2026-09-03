@@ -474,6 +474,22 @@ pub struct VectorIndexStats {
     pub nlist: usize,
 }
 
+/// Whether `sql` starts like a statement that mutates nothing (SELECT, WITH,
+/// EXPLAIN, SHOW, …). Everything else is treated as a mutation for cache
+/// invalidation — over-invalidation only costs a re-plan.
+pub(crate) fn statement_is_read_shaped(sql: &str) -> bool {
+    let first_word = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_uppercase();
+    const READ_SHAPED: &[&str] = &[
+        "SELECT", "WITH", "VALUES", "EXPLAIN", "SHOW", "DESCRIBE", "DESC", "TABLE", "ANALYZE",
+    ];
+    READ_SHAPED.contains(&first_word.as_str())
+}
+
 impl crate::SqlEngine {
     /// IVF-accelerated top-`k` nearest neighbors of `query` in
     /// `table`.`embedding_col`, identified by `id_col`.
@@ -708,6 +724,14 @@ impl crate::SqlEngine {
     /// is the one path to a wrong answer. Over-invalidation only costs a
     /// rebuild; the serving pattern (index once, SELECT many) never pays.
     pub(crate) fn invalidate_vector_indexes_for_statement(&self, sql: &str) {
+        // The plan cache is protected regardless of the vector cache: this
+        // fast path used to return before `invalidate_plan_cache`, so with no
+        // vector index built (the normal case) `CREATE OR REPLACE TABLE` /
+        // `DROP TABLE` left cached plans pinning the replaced provider, and
+        // identical SELECT text served the old rows for the cache lifetime.
+        if !statement_is_read_shaped(sql) {
+            self.invalidate_plan_cache();
+        }
         // Fast path: nothing cached, nothing to protect.
         if self
             .vector_indexes
@@ -722,16 +746,7 @@ impl crate::SqlEngine {
         if crate::statement_completion::parse_create_vector_index(sql).is_some() {
             return;
         }
-        let first_word = sql
-            .trim_start()
-            .split(|c: char| c.is_whitespace() || c == '(' || c == ';')
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        const READ_SHAPED: &[&str] = &[
-            "SELECT", "WITH", "VALUES", "EXPLAIN", "SHOW", "DESCRIBE", "DESC", "TABLE", "ANALYZE",
-        ];
-        if !READ_SHAPED.contains(&first_word.as_str()) {
+        if !statement_is_read_shaped(sql) {
             if let Ok(mut cache) = self.vector_indexes.write() {
                 cache.clear();
             }

@@ -4,16 +4,22 @@
 //! - `row_count`
 //! - `null_count` per column
 //! - `min_value` / `max_value` (stringified for cross-type safety)
-//! - `distinct_count` per column (HyperLogLog-style approximation, or
-//!   exact when the input is small)
+//! - `distinct_count` per column — exact while the column has fewer than
+//!   [`EXACT_NDV_CAP`] distinct values, and **absent (`None`) above it**.
+//!   There is no sketch fallback; an earlier version of this doc described
+//!   a HyperLogLog estimate that was never implemented.
 //!
-//! The driver calls
-//! [`analyze_batch`] over a single `RecordBatch` or
-//! [`analyze_record_batches`] for an aggregate
-//! over many batches (e.g. every file behind a table). The result is a
-//! [`ColumnStatistics`] ready to attach to
+//! Callers use [`analyze_batch`] over a single `RecordBatch` or
+//! [`analyze_record_batches`] for an aggregate over many batches. The result
+//! is a [`ColumnStatistics`] ready to attach to
 //! [`TableMetadata`][crate::catalog::TableMetadata] via
 //! [`with_stats`][crate::catalog::TableMetadata::with_stats].
+//!
+//! Reachability (audit §88): the engine's `ANALYZE TABLE` statement computes
+//! its statistics through DataFusion (`approx_distinct`, `min`, `max`) and
+//! does not call this module; it is a library surface with no production
+//! caller inside krishiv. Wire-or-delete is a product decision recorded in
+//! the register, not guessed at here.
 
 use std::collections::HashSet;
 
@@ -23,13 +29,12 @@ use arrow::record_batch::RecordBatch;
 
 use crate::catalog::ColumnStatistics;
 
-/// Approximate NDV cap above which we drop to a HyperLogLog-style estimate.
+/// Exact-NDV cap: above this many distinct values the column's
+/// `distinct_count` is left `None` rather than estimated.
 ///
-/// The exact-count implementation uses a `HashSet<Box<dyn Any>>` which is
-/// O(unique-values) memory. Above this cap we use HyperLogLog (`HllSketch`)
-/// instead, which is bounded. The threshold is deliberately generous so
-/// typical small/medium tables stay exact; lakehouse-scale tables switch
-/// to the sketch.
+/// The exact-count implementation keeps a `HashSet` of the values, which is
+/// O(unique-values) memory, so it is abandoned past the cap. The threshold is
+/// deliberately generous so typical small/medium tables stay exact.
 pub const EXACT_NDV_CAP: usize = 1_000_000;
 
 /// Compute column statistics from a single `RecordBatch`.

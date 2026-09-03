@@ -170,17 +170,7 @@ pub type SqlResult<T> = Result<T, SqlError>;
 pub type SqlStream =
     std::pin::Pin<Box<dyn futures::stream::Stream<Item = Result<RecordBatch, SqlError>> + Send>>;
 
-/// Global counter for unique ephemeral table names, preventing concurrent
-/// MERGE/CEP queries from overwriting each other's result tables.
-static EPHEMERAL_TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn next_ephemeral_name(prefix: &str) -> String {
-    let id = EPHEMERAL_TABLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("__{prefix}_{id}")
-}
-
 // ── Plan cache (single-lock, race-free) ──────────────────────────────────────
-
 /// Whether the [`SqlEngine`] internal builder should attempt to register the
 /// helper window UDFs (`tumble_start` / `tumble_end` / `hop_start` / `hop_end`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2768,29 +2758,21 @@ impl SqlEngine {
             return match stmt {
                 introspection_sql::IntrospectionStatement::Describe { table } => {
                     let batch = introspection_sql::describe_table(&self.context, &table).await?;
-                    let describe_table_name = next_ephemeral_name("describe_result");
-                    lakehouse::register_scan_batches(
-                        &self.context,
-                        &describe_table_name,
-                        vec![batch],
-                    )
-                    .await?;
-                    let dataframe = self
-                        .context
-                        .sql(&format!("SELECT * FROM {describe_table_name}"))
-                        .await?;
+                    let dataframe = self.context.read_batches(vec![batch]).map_err(|e| {
+                        SqlError::DataFusion {
+                            message: e.to_string(),
+                        }
+                    })?;
                     Ok(self.attach_query_metadata(self.make_sql_df("describe", dataframe), query))
                 }
                 introspection_sql::IntrospectionStatement::Explain { mode, query: inner } => {
                     let text = introspection_sql::explain_query(&inner, mode)?;
                     let batch = introspection_sql::explain_result_batch(&text)?;
-                    let explain_table = next_ephemeral_name("explain_result");
-                    lakehouse::register_scan_batches(&self.context, &explain_table, vec![batch])
-                        .await?;
-                    let dataframe = self
-                        .context
-                        .sql(&format!("SELECT * FROM {explain_table}"))
-                        .await?;
+                    let dataframe = self.context.read_batches(vec![batch]).map_err(|e| {
+                        SqlError::DataFusion {
+                            message: e.to_string(),
+                        }
+                    })?;
                     Ok(self.attach_query_metadata(self.make_sql_df("explain", dataframe), query))
                 }
             };
@@ -2944,22 +2926,30 @@ impl SqlEngine {
             let dataframe = self.context.sql(&inner).await?;
             let schema = dataframe.schema().as_arrow().clone();
             let batch = introspection_sql::describe_schema(&schema)?;
-            let res_table = next_ephemeral_name("describe_query");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
             let out = self
                 .context
-                .sql(&format!("SELECT * FROM {res_table}"))
-                .await?;
+                .read_batches(vec![batch])
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("describe-query", out), query));
         }
         if let Some(table) = statement_completion::parse_show_partitions(query) {
             let batch = self.show_partitions(&table).await?;
-            let res_table = next_ephemeral_name("show_partitions");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
             let out = self
                 .context
-                .sql(&format!("SELECT * FROM {res_table} ORDER BY 1"))
-                .await?;
+                .read_batches(vec![batch])
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
+            let first_column = out.schema().field(0).name().clone();
+            let out = out
+                .sort(vec![
+                    datafusion::prelude::col(first_column).sort(true, false),
+                ])
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("show-partitions", out), query));
         }
 
@@ -3009,6 +2999,35 @@ impl SqlEngine {
                     message: error.to_string(),
                 })?,
             );
+            // Without OR REPLACE, redefining an existing function is an error;
+            // the token used to be parsed and discarded, so a plain CREATE
+            // silently overwrote whatever was registered under the name.
+            if !ddl.or_replace {
+                let in_registry = match &self.udf_registry {
+                    Some(registry) => registry
+                        .read()
+                        .map_err(|e| SqlError::DataFusion {
+                            message: e.to_string(),
+                        })?
+                        .get_table(&ddl.function_name)
+                        .is_some(),
+                    None => false,
+                };
+                let in_context = self
+                    .context
+                    .state()
+                    .table_functions()
+                    .contains_key(&ddl.function_name);
+                if in_registry || in_context {
+                    return Err(SqlError::InvalidTableFunction {
+                        message: format!(
+                            "function '{}' already exists; use CREATE OR REPLACE FUNCTION to \
+                             redefine it",
+                            ddl.function_name
+                        ),
+                    });
+                }
+            }
             if let Some(registry) = &self.udf_registry {
                 let mut guard = registry.write().map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
@@ -3032,12 +3051,12 @@ impl SqlEngine {
             .starts_with("MERGE INTO")
         {
             let batches = lakehouse::execute_merge_sql(&self.context, query).await?;
-            let merge_table = next_ephemeral_name("merge_result");
-            lakehouse::register_scan_batches(&self.context, &merge_table, batches).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {merge_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(batches)
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("merge", dataframe), query));
         }
 
@@ -3077,12 +3096,12 @@ impl SqlEngine {
         #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
         if trimmed.to_ascii_uppercase().starts_with("CALL SYSTEM.") {
             let result = self.dispatch_call_system(trimmed).await?;
-            let call_table = next_ephemeral_name("call_result");
-            lakehouse::register_scan_batches(&self.context, &call_table, vec![result]).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {call_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(vec![result])
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("call", dataframe), query));
         }
 
@@ -3096,12 +3115,12 @@ impl SqlEngine {
             .is_some_and(|p| p.eq_ignore_ascii_case("ANALYZE TABLE "))
         {
             let result = self.dispatch_analyze_table(trimmed).await?;
-            let res_table = next_ephemeral_name("analyze_result");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![result]).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {res_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(vec![result])
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("analyze", dataframe), query));
         }
 
@@ -3137,12 +3156,12 @@ impl SqlEngine {
                 RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
                 })?;
-            let res_table = next_ephemeral_name("delete_result");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {res_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(vec![batch])
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("delete", dataframe), query));
         }
 
@@ -3182,12 +3201,12 @@ impl SqlEngine {
                 RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
                 })?;
-            let res_table = next_ephemeral_name("update_result");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {res_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(vec![batch])
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("update", dataframe), query));
         }
 
@@ -3237,12 +3256,12 @@ impl SqlEngine {
                 RecordBatch::try_new(schema, vec![array]).map_err(|e| SqlError::DataFusion {
                     message: e.to_string(),
                 })?;
-            let res_table = next_ephemeral_name("insert_result");
-            lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {res_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(vec![batch])
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("insert", dataframe), query));
         }
 
@@ -3284,12 +3303,12 @@ impl SqlEngine {
                 );
             }
             let results = cep_sql::execute_match_recognize(stmt, &source_batches)?;
-            let cep_table = next_ephemeral_name("cep_result");
-            lakehouse::register_scan_batches(&self.context, &cep_table, results).await?;
-            let dataframe = self
-                .context
-                .sql(&format!("SELECT * FROM {cep_table}"))
-                .await?;
+            let dataframe =
+                self.context
+                    .read_batches(results)
+                    .map_err(|e| SqlError::DataFusion {
+                        message: e.to_string(),
+                    })?;
             return Ok(self.attach_query_metadata(self.make_sql_df("cep", dataframe), query));
         }
 
@@ -3563,12 +3582,12 @@ impl SqlEngine {
         let batch = RecordBatch::try_new(schema, columns).map_err(|e| SqlError::DataFusion {
             message: e.to_string(),
         })?;
-        let res_table = next_ephemeral_name("ctas_result");
-        lakehouse::register_scan_batches(&self.context, &res_table, vec![batch]).await?;
-        let dataframe = self
-            .context
-            .sql(&format!("SELECT * FROM {res_table}"))
-            .await?;
+        let dataframe =
+            self.context
+                .read_batches(vec![batch])
+                .map_err(|e| SqlError::DataFusion {
+                    message: e.to_string(),
+                })?;
         Ok(self.attach_query_metadata(self.make_sql_df("ctas", dataframe), query))
     }
 
@@ -3661,6 +3680,9 @@ impl SqlEngine {
             .map_err(|e| SqlError::DataFusion {
                 message: e.to_string(),
             })?;
+        // A cached plan pins the provider it was planned against; the swap
+        // above would otherwise keep serving the truncated rows.
+        self.invalidate_plan_cache();
         if let Ok(mut counts) = self.table_row_counts.write()
             && let Some(count) = counts.get_mut(table)
         {

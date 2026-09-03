@@ -1094,6 +1094,49 @@ mod tests {
         /// The `state` feature's offset persistence must survive a restart:
         /// offsets committed by run 1 are read back by run 2 and used to seek
         /// the source past already-processed records.
+        /// A backend that cannot be read must not become an empty offset map
+        /// (which the pipeline reads as "start from the beginning").
+        #[test]
+        fn offset_tracker_refuses_an_unreadable_backend() {
+            struct Unreadable;
+            impl StateBackend for Unreadable {
+                fn get(&self, _: &Namespace, _: &[u8]) -> StateResult<Option<Vec<u8>>> {
+                    Err(krishiv_state::StateError::BackendUnavailable {
+                        message: "down".into(),
+                        source: None,
+                    })
+                }
+                fn put(&mut self, _: &Namespace, _: Vec<u8>, _: Vec<u8>) -> StateResult<()> {
+                    Ok(())
+                }
+                fn delete(&mut self, _: &Namespace, _: &[u8]) -> StateResult<()> {
+                    Ok(())
+                }
+                fn clear_namespace(&mut self, _: &Namespace) -> StateResult<()> {
+                    Ok(())
+                }
+                fn list_namespaces(&self) -> StateResult<Vec<Namespace>> {
+                    Ok(Vec::new())
+                }
+                fn list_keys(&self, _: &Namespace) -> StateResult<Vec<Vec<u8>>> {
+                    Err(krishiv_state::StateError::BackendUnavailable {
+                        message: "down".into(),
+                        source: None,
+                    })
+                }
+                fn snapshot(&self) -> StateResult<Vec<u8>> {
+                    Ok(Vec::new())
+                }
+                fn load_snapshot(&mut self, _: &[u8]) -> StateResult<()> {
+                    Ok(())
+                }
+            }
+            let err = CdcOffsetTracker::new(Box::new(Unreadable))
+                .err()
+                .expect("an unreadable backend is an error, not an empty map");
+            assert!(err.to_string().contains("listing keys failed"), "{err}");
+        }
+
         #[tokio::test]
         async fn offset_tracker_restart_resumes_from_persisted_offsets() {
             let backend = SharedBackend(Arc::new(Mutex::new(InMemoryStateBackend::default())));
@@ -1101,7 +1144,7 @@ mod tests {
 
             // Run 1: process three records, persisting offsets to the tracker.
             let (table1, tpc1) = orders_lakehouse().await;
-            let mut tracker = CdcOffsetTracker::new(Box::new(backend.clone()));
+            let mut tracker = CdcOffsetTracker::new(Box::new(backend.clone())).unwrap();
             let (_tx1, rx1) = tokio::sync::watch::channel(false);
             pipeline
                 .run_with_iceberg_sink_and_offset_tracker(
@@ -1118,7 +1161,7 @@ mod tests {
             // Run 2 ("restart"): a fresh tracker over the same backend and a
             // fresh sink — resume must come from the persisted offsets alone.
             let (table2, tpc2) = orders_lakehouse().await;
-            let mut tracker = CdcOffsetTracker::new(Box::new(backend));
+            let mut tracker = CdcOffsetTracker::new(Box::new(backend)).unwrap();
             assert_eq!(
                 tracker.get_offset(0),
                 Some(3),

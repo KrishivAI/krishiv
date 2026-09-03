@@ -110,6 +110,7 @@ impl Coordinator {
                 }
             })
             .collect();
+        let mut failed_on_recovery: Vec<JobId> = Vec::new();
         for (job_id, interval_ms, storage_path, task_count) in streaming_checkpoint_jobs {
             match Self::open_checkpoint_storage(&storage_path) {
                 Ok(storage) => {
@@ -138,6 +139,7 @@ impl Coordinator {
                                 record.state = JobState::Failed;
                             }
                         }
+                        failed_on_recovery.push(job_id);
                         // Do not insert a checkpoint coordinator for a failed job.
                         continue;
                     }
@@ -156,8 +158,12 @@ impl Coordinator {
                             record.state = JobState::Failed;
                         }
                     }
+                    failed_on_recovery.push(job_id);
                 }
             }
+        }
+        for job_id in &failed_on_recovery {
+            self.finish_terminal_job(job_id);
         }
         // SC4: Pre-populate checkpoint_complete_sent for all committed epochs so
         // the coordinator does not re-deliver "epoch N committed" to executors

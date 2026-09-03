@@ -186,6 +186,27 @@ pub async fn iceberg_delete_where(
 ///
 /// `set_expressions` is a list of `(column_name, sql_expression)` pairs.
 /// Returns `(rows_updated, new_snapshot_id)`.
+/// Assignment targets that match no table column exactly. A quoted or
+/// mis-cased spelling of a real column is reported with its intended match so
+/// the caller can fix the statement.
+fn unknown_assignment_columns(
+    field_names: &[String],
+    set_expressions: &[(&str, &str)],
+) -> Vec<String> {
+    set_expressions
+        .iter()
+        .map(|(target, _)| *target)
+        .filter(|target| !field_names.iter().any(|f| f == target))
+        .map(|target| {
+            let bare = target.trim_matches('"');
+            match field_names.iter().find(|f| f.eq_ignore_ascii_case(bare)) {
+                Some(actual) => format!("'{target}' (did you mean '{actual}'?)"),
+                None => format!("'{target}'"),
+            }
+        })
+        .collect()
+}
+
 pub async fn iceberg_update_where(
     catalog: Arc<dyn Catalog + Send + Sync>,
     table_ident: &TableIdent,
@@ -214,6 +235,19 @@ pub async fn iceberg_update_where(
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
     ctx.register_table(&tmp_name, Arc::new(mem))
         .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
+
+    // Every assignment must name a column the table has. Unmatched targets
+    // used to be dropped from the rewrite while the row count still said
+    // "N rows updated" — `UPDATE t SET "Name" = …` did nothing and reported
+    // success.
+    let unknown = unknown_assignment_columns(&field_names, set_expressions);
+    if !unknown.is_empty() {
+        return Err(LakehouseError::Iceberg(format!(
+            "UPDATE: unknown column(s) {}; table columns are {}",
+            unknown.join(", "),
+            field_names.join(", ")
+        )));
+    }
 
     // Build CASE WHEN per updated column. Use quote_identifier so column names
     // with special characters (including embedded '"') are properly escaped.
@@ -1442,6 +1476,18 @@ fn extract_count(batches: &[RecordBatch]) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    /// An UPDATE assignment that matches no column is refused — it used to
+    /// be silently dropped while the statement still reported rows updated.
+    #[test]
+    fn update_refuses_assignments_to_unknown_columns() {
+        let fields = vec!["id".to_string(), "name".to_string()];
+        assert!(super::unknown_assignment_columns(&fields, &[("name", "'x'")]).is_empty());
+        let unknown =
+            super::unknown_assignment_columns(&fields, &[("\"Name\"", "'x'"), ("nope", "1")]);
+        assert_eq!(unknown.len(), 2, "{unknown:?}");
+        assert!(unknown[0].contains("did you mean 'name'"), "{unknown:?}");
+    }
+
     use super::*;
     use datafusion::prelude::SessionContext;
     use iceberg::io::LocalFsStorageFactory;

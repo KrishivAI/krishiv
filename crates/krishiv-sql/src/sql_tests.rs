@@ -894,6 +894,46 @@ mod udtf_ddl_tests {
         assert!(registry.read().unwrap().table_names().is_empty());
     }
 
+    /// A second plain CREATE FUNCTION under a live name is refused; OR REPLACE
+    /// is what redefines. Both spellings used to overwrite silently.
+    #[tokio::test]
+    async fn create_function_without_or_replace_refuses_an_existing_name() {
+        let engine = SqlEngine::new();
+        let create = |or_replace: bool, v: i64| {
+            format!(
+                "CREATE {}FUNCTION f_dup() RETURNS TABLE (v BIGINT) LANGUAGE SQL AS 'SELECT {v} AS v'",
+                if or_replace { "OR REPLACE " } else { "" }
+            )
+        };
+        engine.sql(create(false, 1)).await.unwrap();
+        let err = engine
+            .sql(create(false, 2))
+            .await
+            .expect_err("plain CREATE over a live name must be refused");
+        assert!(
+            matches!(err, SqlError::InvalidTableFunction { .. })
+                && err.to_string().contains("OR REPLACE"),
+            "{err}"
+        );
+        engine.sql(create(true, 3)).await.unwrap();
+        let rows = engine
+            .sql("SELECT v FROM f_dup()")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            rows[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            3
+        );
+    }
+
     #[tokio::test]
     async fn create_function_returns_table_registers_sql_body() {
         let engine = SqlEngine::new();
@@ -1311,6 +1351,139 @@ mod udtf_ddl_tests {
         assert!(
             engine.plan_cache.lock().unwrap().is_empty(),
             "cache must be empty after clear_plan_cache()"
+        );
+    }
+
+    /// Identical SELECT text after a replacing DDL must see the new table:
+    /// the cached plan pinned the old provider, and with no vector index
+    /// built the invalidation fast path returned before clearing it.
+    #[tokio::test]
+    async fn replacing_ddl_invalidates_the_plan_cache() {
+        let engine = SqlEngine::new();
+        engine
+            .sql("CREATE TABLE t_cache AS SELECT 1 AS v")
+            .await
+            .unwrap();
+        let first = engine
+            .sql("SELECT v FROM t_cache")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            first[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        engine
+            .sql("CREATE OR REPLACE TABLE t_cache AS SELECT 2 AS v")
+            .await
+            .unwrap();
+        let second = engine
+            .sql("SELECT v FROM t_cache")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            second[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            2,
+            "the SELECT after CREATE OR REPLACE must read the replaced table"
+        );
+    }
+
+    /// TRUNCATE swaps the provider; a cached plan for the same SELECT text
+    /// must not keep serving the truncated rows.
+    #[tokio::test]
+    async fn truncate_invalidates_the_plan_cache() {
+        let engine = SqlEngine::new();
+        engine
+            .sql("CREATE TABLE t_trunc AS SELECT 1 AS v")
+            .await
+            .unwrap();
+        let before = engine
+            .sql("SELECT COUNT(*) AS n FROM t_trunc")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            before[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        engine.sql("TRUNCATE TABLE t_trunc").await.unwrap();
+        let after = engine
+            .sql("SELECT COUNT(*) AS n FROM t_trunc")
+            .await
+            .unwrap()
+            .collect()
+            .await
+            .unwrap();
+        assert_eq!(
+            after[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(0),
+            0,
+            "the SELECT after TRUNCATE must see the empty table"
+        );
+    }
+
+    /// Statement results (DESCRIBE, EXPLAIN, DML summaries) used to be served
+    /// by registering a uniquely named `__<kind>_<n>` MemTable that nothing
+    /// ever deregistered — one catalog entry per statement for the engine's
+    /// lifetime.
+    #[tokio::test]
+    async fn statement_results_leave_no_catalog_entry() {
+        let engine = SqlEngine::new();
+        engine
+            .sql("CREATE TABLE t_desc AS SELECT 1 AS v")
+            .await
+            .unwrap();
+        let table_count = || {
+            engine
+                .context
+                .catalog("datafusion")
+                .unwrap()
+                .schema("public")
+                .unwrap()
+                .table_names()
+                .len()
+        };
+        let baseline = table_count();
+        for _ in 0..3 {
+            let rows = engine
+                .sql("DESCRIBE t_desc")
+                .await
+                .unwrap()
+                .collect()
+                .await
+                .unwrap();
+            assert!(rows.iter().map(|b| b.num_rows()).sum::<usize>() >= 1);
+        }
+        assert_eq!(
+            table_count(),
+            baseline,
+            "DESCRIBE must not register result tables"
         );
     }
 

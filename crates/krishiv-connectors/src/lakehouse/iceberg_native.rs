@@ -840,6 +840,22 @@ pub mod native {
 
     #[async_trait]
     impl IcebergTwoPhaseCommit for IcebergNativeTwoPhaseCommit {
+        /// The trait's default answers an empty map, which generic and `dyn`
+        /// callers (the CDC pipeline's startup positioning) took for "nothing
+        /// committed" — the inherent method of the same name was invisible
+        /// through the trait. A load failure is logged and answered as empty
+        /// only because the trait offers no error channel; the DUR-2 gate
+        /// uses the inherent, fallible method.
+        async fn committed_kafka_offsets(&self) -> BTreeMap<String, i64> {
+            match IcebergNativeTwoPhaseCommit::committed_kafka_offsets(self).await {
+                Ok(offsets) => offsets,
+                Err(error) => {
+                    tracing::warn!(error = %error, "committed_kafka_offsets: loading the table failed; answering empty");
+                    BTreeMap::new()
+                }
+            }
+        }
+
         /// Write `batches` to `{root}/data/staged-{id}.parquet` and record the
         /// resulting `DataFile` descriptors in the pending map.
         async fn prepare(

@@ -22,5 +22,9 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing = { workspace = true }
 twox-hash = { workspace = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+proptest = { workspace = true }
+
 [lints]
 workspace = true

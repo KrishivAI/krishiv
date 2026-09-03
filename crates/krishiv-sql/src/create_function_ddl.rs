@@ -20,7 +20,7 @@ use std::sync::LazyLock;
 
 static CREATE_FUNCTION_RE: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
-        r"(?is)^\s*CREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\(([^)]*)\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?\s*;?\s*$",
+        r"(?is)^\s*CREATE\s+(OR\s+REPLACE\s+)?FUNCTION\s+(\w+)\s*\(([^)]*)\)\s*RETURNS\s+TABLE\s*\(([^)]*)\)(?:\s+LANGUAGE\s+(\w+))?(?:\s+AS\s+'((?:[^']|'')*)')?\s*;?\s*$",
     )
     .ok()
 });
@@ -48,6 +48,10 @@ pub struct FunctionArgDef {
 /// Parsed descriptor produced by [`parse_create_function`].
 #[derive(Debug, Clone)]
 pub struct CreateFunctionDdl {
+    /// Whether the statement said `OR REPLACE`. Without it, redefining an
+    /// existing function is an error — the token used to be parsed and
+    /// discarded, so both spellings silently overwrote.
+    pub or_replace: bool,
     /// Function name as written in the SQL statement.
     pub function_name: String,
     /// Typed arguments declared in the function signature.
@@ -93,21 +97,23 @@ pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String> {
         .captures(sql)
         .ok_or_else(|| "SQL does not match CREATE FUNCTION … RETURNS TABLE pattern".to_string())?;
 
+    let or_replace = caps.get(1).is_some();
     let function_name = caps
-        .get(1)
+        .get(2)
         .map(|m| m.as_str().to_string())
         .ok_or("could not extract function name")?;
 
-    let arg_list = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+    let arg_list = caps.get(3).map(|m| m.as_str()).unwrap_or("");
     let arguments = parse_argument_list(arg_list)?;
 
-    let col_list = caps.get(3).map(|m| m.as_str()).unwrap_or("");
+    let col_list = caps.get(4).map(|m| m.as_str()).unwrap_or("");
     let return_columns = parse_column_list(col_list)?;
 
-    let language = caps.get(4).map(|m| m.as_str().to_ascii_lowercase());
-    let body = caps.get(5).map(|m| m.as_str().replace("''", "'"));
+    let language = caps.get(5).map(|m| m.as_str().to_ascii_lowercase());
+    let body = caps.get(6).map(|m| m.as_str().replace("''", "'"));
 
     Ok(CreateFunctionDdl {
+        or_replace,
         function_name,
         arguments,
         return_columns,

@@ -179,9 +179,20 @@ fn dur1_recovery_redrives_committing_job() {
     )
     .unwrap();
 
-    // Persist a record in the mid-publish Committing state.
+    // Persist a record in the mid-publish Committing state — through the
+    // persisted-record codec every durable store uses. The in-memory store
+    // keeps the `JobRecord` as-is, which let this test stay green while
+    // `parse_job_state` had no `"committing"` arm and no real store could
+    // load the record back.
     let mut record = crate::job::JobRecord::from_spec(spec, 0);
     record.state = JobState::Committing;
+    let record = crate::job::JobRecord::try_from(
+        serde_json::from_slice::<crate::store::PersistedJobRecord>(
+            &serde_json::to_vec(&crate::store::PersistedJobRecord::from(&record)).unwrap(),
+        )
+        .unwrap(),
+    )
+    .expect("a Committing record must survive the persisted codec");
     let mut store = crate::store::InMemoryMetadataStore::default();
     store.save_job(&record).unwrap();
 

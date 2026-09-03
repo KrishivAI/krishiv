@@ -108,6 +108,11 @@ unity-catalog = ["rest-catalog"]
 # AWS Glue catalog backend (uses Glue's built-in Iceberg REST endpoint).
 glue-catalog = ["rest-catalog"]
 
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+tempfile = { workspace = true }
+
 [lib]
 path = "src/lib.rs"
 

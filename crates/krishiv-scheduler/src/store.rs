@@ -1289,6 +1289,12 @@ pub(crate) fn parse_job_state(value: &str) -> SchedulerResult<JobState> {
         "accepted" => Ok(JobState::Accepted),
         "planning" => Ok(JobState::Planning),
         "running" => Ok(JobState::Running),
+        // DUR-1: a job whose staged sink publish was in flight when the
+        // coordinator died. This arm was missing, so the persisted string the
+        // Display impl writes could not be read back by any durable store —
+        // rocksdb skipped the record, etcd refused the whole prefix load — and
+        // the Committing re-drive on recovery never had a job to re-drive.
+        "committing" => Ok(JobState::Committing),
         "succeeded" => Ok(JobState::Succeeded),
         "failed" => Ok(JobState::Failed),
         "cancelled" => Ok(JobState::Cancelled),
@@ -1525,14 +1531,28 @@ impl NonBlockingStoreHandle {
                             let bg = std::sync::Arc::clone(&bg_store);
                             let in_flight_done = std::sync::Arc::clone(&in_flight);
                             let notify_done = std::sync::Arc::clone(&notify);
+                            let latch = std::sync::Arc::clone(&bg_terminal_jobs);
                             tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Err(e) = guard.remove_job(&job_id) {
-                                    tracing::error!(
+                                match guard.remove_job(&job_id) {
+                                    Ok(()) => {
+                                        // Every SaveJob queued before this
+                                        // removal has been applied (FIFO), so
+                                        // nothing can resurrect the record any
+                                        // more and the latch entry has done its
+                                        // job. Kept past this point it grew by
+                                        // one String per terminal job for the
+                                        // process lifetime.
+                                        latch
+                                            .lock()
+                                            .unwrap_or_else(|p| p.into_inner())
+                                            .remove(&job_id);
+                                    }
+                                    Err(e) => tracing::error!(
                                         error = %e,
                                         job_id = %job_id,
                                         "NonBlockingStoreHandle: remove_job failed"
-                                    );
+                                    ),
                                 }
                                 in_flight_done.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
                                 notify_done.notify_one();
@@ -2366,6 +2386,54 @@ mod terminal_job_latch_tests {
     /// `reconcile_store_latched_terminal_jobs` both depend on: it must track
     /// exactly what `admit_job_write` has latched, independent of whatever a
     /// job's in-memory record currently says.
+    /// Every state the Display impl can write must read back: a variant
+    /// missing here is a record no durable store can load (DUR-1's
+    /// `Committing` was, and the recovery re-drive never saw the job).
+    #[test]
+    fn parse_job_state_round_trips_every_variant() {
+        for state in [
+            JobState::Queued,
+            JobState::Accepted,
+            JobState::Planning,
+            JobState::Running,
+            JobState::Committing,
+            JobState::Succeeded,
+            JobState::Failed,
+            JobState::Cancelled,
+        ] {
+            assert_eq!(
+                parse_job_state(&state.to_string()).unwrap(),
+                state,
+                "{state}"
+            );
+        }
+    }
+
+    /// The terminal-job latch is released once the job's removal has been
+    /// applied — resurrection protection only needs to outlive the queued
+    /// saves ahead of the removal, not the process.
+    #[tokio::test]
+    async fn removing_a_job_releases_its_terminal_latch() {
+        let handle = NonBlockingStoreHandle::new(InMemoryMetadataStore::default());
+        let mut done = job_record("job-latch");
+        done.state = JobState::Succeeded;
+        handle.save_job_checked(&done).unwrap();
+        assert!(handle.is_terminal_latched("job-latch"));
+        handle.remove_job("job-latch");
+        handle.flush().await;
+        assert!(
+            !handle.is_terminal_latched("job-latch"),
+            "latch released after removal"
+        );
+        assert!(
+            handle
+                .inner()
+                .jobs()
+                .iter()
+                .all(|j| j.job_id().as_str() != "job-latch")
+        );
+    }
+
     #[test]
     fn is_terminal_latched_reflects_the_current_latch_state() {
         let handle = NonBlockingStoreHandle::new(InMemoryMetadataStore::default());

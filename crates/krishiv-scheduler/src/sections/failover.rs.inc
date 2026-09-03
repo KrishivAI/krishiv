@@ -205,6 +205,60 @@ fn fast_failed_continuous_task_is_rescued_not_terminal() {
     }
 }
 
+/// Task ids are only unique within a job. A heartbeat from executor A listing
+/// `task-1` must refresh job A's `task-1` only — not job B's `task-1` running on
+/// executor B, which the stall watchdog would then never fail.
+#[test]
+fn heartbeat_progress_refresh_is_scoped_to_the_reporting_executor() {
+    allow_anonymous_for_tests();
+    let mut coordinator = Coordinator::active(CoordinatorId::try_new("coord-hb-scope").unwrap());
+    let exec_a = ExecutorId::try_new("hb-exec-a").unwrap();
+    let exec_b = ExecutorId::try_new("hb-exec-b").unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_a.clone(), "pod-a", 1))
+        .unwrap();
+    coordinator
+        .register_executor(ExecutorDescriptor::new(exec_b.clone(), "pod-b", 1))
+        .unwrap();
+    let job_a = JobId::try_new("hb-job-a").unwrap();
+    let job_b = JobId::try_new("hb-job-b").unwrap();
+    coordinator.submit_job(single_task_job(job_a.clone())).unwrap();
+    coordinator.submit_job(single_task_job(job_b.clone())).unwrap();
+    for (job_id, exec_id) in [(&job_a, &exec_a), (&job_b, &exec_b)] {
+        let jc = coordinator.job_coordinator(job_id).unwrap();
+        let mut record = jc.write_record();
+        for stage in record.stages_mut() {
+            for task in stage.tasks_mut() {
+                task.assigned_executor = Some(exec_id.clone());
+                task.state = TaskState::Running;
+                task.launch_in_flight = false;
+                task.last_progress_ms = None;
+            }
+        }
+    }
+    let task_id = {
+        let jc = coordinator.job_coordinator(&job_a).unwrap();
+        let record = jc.read_record();
+        record.stages()[0].tasks()[0].task_id().clone()
+    };
+    coordinator
+        .executor_heartbeat(
+            ExecutorHeartbeat::new(exec_a.clone(), ExecutorState::Healthy)
+                .with_running_tasks(vec![task_id]),
+        )
+        .unwrap();
+    let progress = |coordinator: &Coordinator, job_id: &JobId| {
+        let jc = coordinator.job_coordinator(job_id).unwrap();
+        let record = jc.read_record();
+        record.stages()[0].tasks()[0].last_progress_ms
+    };
+    assert!(progress(&coordinator, &job_a).is_some(), "the reporter's own task is refreshed");
+    assert!(
+        progress(&coordinator, &job_b).is_none(),
+        "a colliding task id on another executor is not kept alive by this heartbeat"
+    );
+}
+
 #[test]
 fn executor_max_losses_permanently_fails_task() {
     allow_anonymous_for_tests();
@@ -249,15 +303,25 @@ fn executor_max_losses_permanently_fails_task() {
     }
 
     let jc = coordinator.job_coordinator(&job_id).unwrap();
-    let record = jc.read_record();
-    let task = &record.stages()[0].tasks()[0];
+    let (state, loss_count) = {
+        let record = jc.read_record();
+        let task = &record.stages()[0].tasks()[0];
+        (task.state(), task.executor_loss_count)
+    };
     assert_eq!(
-        task.state(),
+        state,
         TaskState::Failed,
         "the task must be permanently Failed at {MAX_LOSSES} consecutive executor losses"
     );
+    // The job this drove terminal must have gone through the terminal funnel:
+    // it used to stop at `refresh_state()`, sitting Failed in memory forever
+    // with no GC, no history and every later report short-circuited.
+    assert!(
+        coordinator.gc_ready_jobs.contains(&job_id),
+        "a job failed by the executor-loss budget must be GC-ready"
+    );
     assert_eq!(
-        task.executor_loss_count, MAX_LOSSES,
+        loss_count, MAX_LOSSES,
         "and the recorded loss count must be exactly the threshold"
     );
 }

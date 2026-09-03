@@ -55,6 +55,23 @@ fn parse_batch_size(config: &ConnectorConfig) -> ConnectorResult<Option<usize>> 
     }
 }
 
+/// Strictly parse the optional `has_header`: only `true`/`false` (any case)
+/// and `1`/`0` are accepted. It used to be `value == "true" || value == "1"`,
+/// so `True`, `yes` or `TRUE` silently meant *false* — the header row was
+/// ingested as data, or a file was written without one.
+fn parse_has_header(config: &ConnectorConfig) -> ConnectorResult<Option<bool>> {
+    match config.get("has_header") {
+        None => Ok(None),
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" => Ok(Some(true)),
+            "false" | "0" => Ok(Some(false)),
+            _ => Err(crate::error::ConnectorError::Config {
+                message: format!("csv option 'has_header' must be true or false, got '{value}'"),
+            }),
+        },
+    }
+}
+
 struct CsvFileSource {
     inner: CsvSource,
 }
@@ -95,6 +112,7 @@ impl SourceDriver for CsvSourceDriver {
     }
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
+        parse_has_header(config)?;
         let _ = require_path(config)?;
         let _ = parse_delimiter(config)?;
         let _ = parse_batch_size(config)?;
@@ -105,8 +123,8 @@ impl SourceDriver for CsvSourceDriver {
         Box::pin(async move {
             let path = require_path(config)?;
             let mut opts = CsvOptions::default();
-            if let Some(value) = config.get("has_header") {
-                opts = opts.with_has_header(value == "true" || value == "1");
+            if let Some(has_header) = parse_has_header(config)? {
+                opts = opts.with_has_header(has_header);
             }
             if let Some(delimiter) = parse_delimiter(config)? {
                 opts = opts.with_delimiter(delimiter);
@@ -211,6 +229,7 @@ impl SinkDriver for CsvSinkDriver {
     }
 
     fn validate(&self, config: &ConnectorConfig) -> ConnectorResult<()> {
+        parse_has_header(config)?;
         let _ = require_path(config)?;
         let _ = parse_delimiter(config)?;
         Ok(())
@@ -220,8 +239,8 @@ impl SinkDriver for CsvSinkDriver {
         Box::pin(async move {
             let path = require_path(config)?;
             let mut builder = arrow::csv::WriterBuilder::new();
-            if let Some(value) = config.get("has_header") {
-                builder = builder.with_header(value == "true" || value == "1");
+            if let Some(has_header) = parse_has_header(config)? {
+                builder = builder.with_header(has_header);
             }
             if let Some(delimiter) = parse_delimiter(config)? {
                 builder = builder.with_delimiter(delimiter);
@@ -262,6 +281,26 @@ mod tests {
             CsvSinkDriver.descriptor().default_capabilities,
             sink.capabilities(),
             "descriptor and opened-instance capabilities must agree"
+        );
+    }
+
+    /// `has_header` is strict like every other option here: `yes` / `True`
+    /// used to silently mean *false*, ingesting the header row as data.
+    #[test]
+    fn has_header_is_parsed_strictly() {
+        assert_eq!(
+            parse_has_header(&config(&[("has_header", "TRUE")])).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse_has_header(&config(&[("has_header", "0")])).unwrap(),
+            Some(false)
+        );
+        assert!(parse_has_header(&config(&[("has_header", "yes")])).is_err());
+        let bad = config(&[("path", "/tmp/x.csv"), ("has_header", "yes")]);
+        assert!(
+            CsvSourceDriver.validate(&bad).is_err(),
+            "validate refuses it too"
         );
     }
 

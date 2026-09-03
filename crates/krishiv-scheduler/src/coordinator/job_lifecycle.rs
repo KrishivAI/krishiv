@@ -994,6 +994,22 @@ impl Coordinator {
     /// it eagerly (no-op while `Committing`) and again from
     /// `mark_sink_publish_committed`/`mark_sink_publish_failed` once the publish
     /// resolves the job to a terminal state.
+    /// The one funnel for a job that a coordinator-side path (executor loss
+    /// budget, stall budget, recovery failure) has just driven terminal:
+    /// persist the terminal record, then run the terminal bookkeeping.
+    ///
+    /// Four such paths used to stop at `refresh_state()`. The job then sat
+    /// Failed in memory forever: never GC'd (`take_gc_ready_jobs` only evicts
+    /// what `on_job_terminal` marked), never persisted, no history entry, no
+    /// `JobCompleted`, waiters never woken — and every later executor report
+    /// for it short-circuited on `already_terminal`.
+    pub(crate) fn finish_terminal_job(&mut self, job_id: &JobId) {
+        if let Err(error) = self.persist_job_record(job_id, true) {
+            tracing::warn!(job_id = %job_id, error = %error, "terminal job record could not be persisted");
+        }
+        self.on_job_terminal(job_id);
+    }
+
     pub(crate) fn on_job_terminal(&mut self, job_id: &JobId) {
         let (is_terminal, usage, state) = self
             .job_coordinators

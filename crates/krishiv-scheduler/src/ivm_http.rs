@@ -555,12 +555,16 @@ pub async fn api_ivm_delete_job(
             }
         });
     }
+    // A job may exist only as a durable snapshot (a `live: false` row of the
+    // listing); removing that IS a deletion, and used to be reported as
+    // `deleted: false`. A failed removal is a 503 like a failed persist.
+    let had_snapshot = coordinator.load_ivm_snapshot(&job_id).await.is_some();
     if let Err(error) = coordinator.remove_ivm_snapshot(&job_id).await {
         tracing::error!(job_id, %error, "removing IVM snapshot failed");
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    Ok(Json(DeleteJobResponse {
-        deleted: registry.delete(&job_id),
-    }))
+    let deleted = registry.delete(&job_id) || had_snapshot;
+    Ok(Json(DeleteJobResponse { deleted }))
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/views ─────────────────────────────────────
@@ -2022,11 +2026,13 @@ pub struct ListVectorViewsResponse {
 /// subscriber was a log line, and the index contents were unreachable.
 pub async fn api_ivm_list_vector_views(
     State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
     Path(job_id): Path<String>,
 ) -> Result<Json<ListVectorViewsResponse>, StatusCode> {
-    if registry.get(&job_id).is_none() {
-        return Err(ivm_not_found(&job_id));
-    }
+    // Every handler that names a job goes through `ensure_ivm_job`: a job
+    // that exists durably but not in this process is rehydrated and answers
+    // honestly (no vector views yet), not 404.
+    ensure_ivm_job(&registry, &coordinator, &job_id).await?;
     let vector_views = registry.map_vector_views(&job_id, |v| VectorViewSummary {
         view_name: v.view_name.clone(),
         id_column: v.id_column.clone(),
@@ -3420,6 +3426,68 @@ mod tests {
         assert!(created.is_force_diff_based().unwrap());
     }
 
+    /// A job that exists only as a durable snapshot (a `live: false` row) is
+    /// deleted by DELETE: the snapshot goes and the answer says so.
+    #[tokio::test]
+    async fn deleting_a_snapshot_only_job_reports_deleted() {
+        let registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(1));
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord-del").unwrap())
+                .with_store(crate::InMemoryMetadataStore::default()),
+        );
+        create_or_rehydrate_ivm_job(
+            &registry,
+            &coordinator,
+            "job-del",
+            Some(false),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            registry.delete("job-del"),
+            "forget it in-process; the snapshot survives"
+        );
+        assert!(coordinator.load_ivm_snapshot("job-del").await.is_some());
+        let resp = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("job-del".into()),
+        )
+        .await
+        .unwrap();
+        assert!(
+            resp.0.deleted,
+            "removing the durable snapshot is a deletion"
+        );
+        assert!(coordinator.load_ivm_snapshot("job-del").await.is_none());
+    }
+
+    /// GET vector-views rehydrates a durable-only job like every other
+    /// job-scoped handler, answering with an empty list rather than 404.
+    #[tokio::test]
+    async fn listing_vector_views_rehydrates_a_durable_job() {
+        let registry = std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(1));
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("test-coord-vv").unwrap())
+                .with_store(crate::InMemoryMetadataStore::default()),
+        );
+        create_or_rehydrate_ivm_job(&registry, &coordinator, "job-vv", Some(false), false, false)
+            .await
+            .unwrap();
+        assert!(registry.delete("job-vv"));
+        let listed = api_ivm_list_vector_views(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("job-vv".into()),
+        )
+        .await
+        .expect("a durable job is not 404");
+        assert!(listed.0.vector_views.is_empty());
+        assert!(registry.get("job-vv").is_some(), "rehydrated");
+    }
+
     /// `/debug-info` and `/stats` answer the same condition the same way.
     #[tokio::test]
     async fn view_debug_info_404s_on_missing_view() {
@@ -4369,9 +4437,13 @@ mod tests {
         .expect("register vector view");
         assert_eq!(resp.shards, 1);
 
-        let listed = api_ivm_list_vector_views(State(registry.clone()), Path("j".into()))
-            .await
-            .expect("list vector views");
+        let listed = api_ivm_list_vector_views(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("list vector views");
         assert_eq!(
             listed.vector_views.len(),
             1,
@@ -4414,9 +4486,13 @@ mod tests {
         .await
         .expect("delete vector view");
         assert!(del.deleted);
-        let listed = api_ivm_list_vector_views(State(registry.clone()), Path("j".into()))
-            .await
-            .expect("list vector views");
+        let listed = api_ivm_list_vector_views(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("list vector views");
         assert!(listed.vector_views.is_empty());
     }
 

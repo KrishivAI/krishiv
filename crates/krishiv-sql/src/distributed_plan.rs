@@ -154,8 +154,11 @@ pub fn derive_stage_target_partitions(
     cluster: Option<ClusterCapacity>,
     local_cores: usize,
 ) -> usize {
+    // The explicit override is clamped like the derived value: the shuffle
+    // fragment count grows as partitions², and docs/architecture.md promises
+    // the `[2, 512]` bound — an env var used to walk straight past it.
     if let Some(explicit) = explicit.filter(|&n| n >= MIN_STAGE_PARTITIONS) {
-        return explicit;
+        return explicit.min(MAX_STAGE_PARTITIONS);
     }
     cluster
         .map_or(local_cores, |c| c.total_slots)
@@ -4844,6 +4847,17 @@ mod tests {
     ///
     /// Asserting on stage COUNT is what makes this a regression test: a plan
     /// that merely round-trips proves nothing about distribution.
+    /// The env override is bounded like the derived value: docs/architecture.md
+    /// promises `[2, 512]`, and the shuffle fragment count is partitions².
+    #[test]
+    fn explicit_stage_target_partitions_is_clamped_to_the_maximum() {
+        assert_eq!(
+            derive_stage_target_partitions(Some(4096), None, 8),
+            MAX_STAGE_PARTITIONS
+        );
+        assert_eq!(derive_stage_target_partitions(Some(64), None, 8), 64);
+    }
+
     #[test]
     fn target_partitions_scale_with_the_cluster_not_a_constant() {
         // The defect: this was 4 regardless of the cluster, so a large cluster

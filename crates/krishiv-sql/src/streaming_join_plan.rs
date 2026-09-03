@@ -18,8 +18,8 @@
 
 use krishiv_plan::stream_join::StreamingJoinSpec;
 use sqlparser::ast::{
-    BinaryOperator, Expr, JoinConstraint, JoinOperator, Query, Select, SetExpr, Statement,
-    TableFactor, Value,
+    BinaryOperator, Expr, GroupByExpr, JoinConstraint, JoinOperator, Query, Select, SetExpr,
+    Statement, TableFactor, Value,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -138,6 +138,23 @@ pub fn compile_streaming_join_sql(sql: &str) -> SqlResult<StreamingJoinPlan> {
     if query.with.is_some() {
         return Err(unsupported("streaming joins do not support WITH / CTEs"));
     }
+    // The join emits every column of both sides; nothing downstream applies
+    // an aggregate or a DISTINCT, so these clauses were accepted and dropped.
+    let has_group_by = match &select.group_by {
+        GroupByExpr::Expressions(exprs, modifiers) => !exprs.is_empty() || !modifiers.is_empty(),
+        GroupByExpr::All(_) => true,
+    };
+    if has_group_by || select.having.is_some() {
+        return Err(unsupported(
+            "streaming joins do not aggregate: GROUP BY / HAVING would be silently dropped \
+             and every joined row emitted. Aggregate the join output in a window stage",
+        ));
+    }
+    if select.distinct.is_some() {
+        return Err(unsupported(
+            "streaming joins do not apply DISTINCT: duplicates would be emitted unchanged",
+        ));
+    }
 
     if select.from.len() != 1 {
         return Err(unsupported(
@@ -173,6 +190,10 @@ pub fn compile_streaming_join_sql(sql: &str) -> SqlResult<StreamingJoinPlan> {
 
     let left_source = table_name(&from.relation)?;
     let right_source = table_name(&join.relation)?;
+    let sides = JoinSides {
+        left: side_names(&from.relation),
+        right: side_names(&join.relation),
+    };
 
     let constraint = match &join.join_operator {
         JoinOperator::Inner(c) | JoinOperator::Join(c) => c,
@@ -188,7 +209,7 @@ pub fn compile_streaming_join_sql(sql: &str) -> SqlResult<StreamingJoinPlan> {
     let mut equi: Option<(String, String)> = None;
     let mut band: Option<TimeBand> = None;
     for term in flatten_and(on) {
-        if let Some(pair) = as_equi_key(term) {
+        if let Some(pair) = as_equi_key(term, &sides)? {
             if equi.is_some() {
                 return Err(unsupported(
                     "streaming joins support a single equi-key; combine the columns into one \
@@ -278,26 +299,103 @@ fn flatten_and(expr: &Expr) -> Vec<&Expr> {
     }
 }
 
-/// `left.key = right.key` → (left column, right column).
-fn as_equi_key(expr: &Expr) -> Option<(String, String)> {
+/// The names (table name and alias) each side of the join answers to, so an
+/// ON-clause qualifier can be resolved to a side.
+struct JoinSides {
+    left: Vec<String>,
+    right: Vec<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Side {
+    Left,
+    Right,
+}
+
+impl JoinSides {
+    fn resolve(&self, qualifier: &str) -> Option<Side> {
+        if self.left.iter().any(|n| n.eq_ignore_ascii_case(qualifier)) {
+            Some(Side::Left)
+        } else if self.right.iter().any(|n| n.eq_ignore_ascii_case(qualifier)) {
+            Some(Side::Right)
+        } else {
+            None
+        }
+    }
+}
+
+fn side_names(factor: &TableFactor) -> Vec<String> {
+    let mut names = Vec::new();
+    if let TableFactor::Table { name, alias, .. } = factor {
+        if let Some(last) = name.0.last() {
+            names.push(last.to_string().trim_matches('"').to_owned());
+        }
+        if let Some(alias) = alias {
+            names.push(alias.name.value.clone());
+        }
+    }
+    names
+}
+
+/// `left.key = right.key` → (left column, right column), assigned by the
+/// qualifier each operand carries — not by which side of `=` it was written
+/// on. `r.k = l.k` used to make the RIGHT stream's column the left key, and an
+/// unknown qualifier was silently accepted.
+fn as_equi_key(expr: &Expr, sides: &JoinSides) -> SqlResult<Option<(String, String)>> {
     let Expr::BinaryOp {
         left,
         op: BinaryOperator::Eq,
         right,
     } = expr
     else {
-        return None;
+        return Ok(None);
     };
-    Some((column_of(left)?, column_of(right)?))
+    let (Some(a), Some(b)) = (qualified_column_of(left), qualified_column_of(right)) else {
+        return Ok(None);
+    };
+    let side_of = |q: &Option<String>| -> SqlResult<Option<Side>> {
+        match q {
+            None => Ok(None),
+            Some(q) => sides.resolve(q).map(Some).ok_or_else(|| {
+                unsupported(format!(
+                    "streaming join ON clause qualifier `{q}` names neither side of the join"
+                ))
+            }),
+        }
+    };
+    match (side_of(&a.0)?, side_of(&b.0)?) {
+        (Some(Side::Right), Some(Side::Left)) => Ok(Some((b.1, a.1))),
+        (Some(Side::Left), Some(Side::Left)) | (Some(Side::Right), Some(Side::Right)) => {
+            Err(unsupported(
+                "streaming join equi-key must compare a column of each side; both operands \
+                 name the same stream",
+            ))
+        }
+        // Left-first, or unqualified on one/both sides: written order.
+        _ => Ok(Some((a.1, b.1))),
+    }
+}
+
+/// (qualifier, column) of a column reference.
+fn qualified_column_of(expr: &Expr) -> Option<(Option<String>, String)> {
+    match expr {
+        Expr::Identifier(id) => Some((None, id.value.clone())),
+        Expr::CompoundIdentifier(parts) => {
+            let column = parts.last()?.value.clone();
+            let qualifier = parts
+                .len()
+                .checked_sub(2)
+                .and_then(|i| parts.get(i))
+                .map(|p| p.value.clone());
+            Some((qualifier, column))
+        }
+        Expr::Nested(inner) => qualified_column_of(inner),
+        _ => None,
+    }
 }
 
 fn column_of(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Identifier(id) => Some(id.value.clone()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
-        Expr::Nested(inner) => column_of(inner),
-        _ => None,
-    }
+    qualified_column_of(expr).map(|(_, column)| column)
 }
 
 struct TimeBand {
@@ -420,6 +518,49 @@ mod tests {
     }
 
     /// ON-clause term order must not change the result.
+    /// The equi-key sides follow the qualifiers, not the order written:
+    /// `b.auction = a.id` (right stream first) still keys the LEFT stream on
+    /// `id`. It used to make `auction` the left key.
+    #[test]
+    fn equi_key_sides_follow_the_table_qualifiers() {
+        let plan = compile_streaming_join_sql(
+            "SELECT * FROM auction a JOIN bid b \
+             ON b.auction = a.id \
+             AND b.dateTime BETWEEN a.dateTime - 5000 AND a.dateTime + 5000",
+        )
+        .expect("compiles");
+        assert_eq!(plan.spec.left_source, "auction");
+        assert_eq!(plan.spec.left_key_column, "id");
+        assert_eq!(plan.spec.right_key_column, "auction");
+        let err = compile_streaming_join_sql(
+            "SELECT * FROM auction a JOIN bid b \
+             ON x.auction = a.id \
+             AND b.dateTime BETWEEN a.dateTime - 5000 AND a.dateTime + 5000",
+        )
+        .expect_err("an unknown qualifier is refused");
+        assert!(err.to_string().contains("names neither side"), "{err}");
+    }
+
+    /// Clauses the join cannot honour are refused by name, never dropped.
+    #[test]
+    fn aggregate_and_distinct_clauses_are_refused() {
+        for (sql, needle) in [
+            (
+                "SELECT a.id, COUNT(*) FROM auction a JOIN bid b ON a.id = b.auction \
+                 AND b.dateTime BETWEEN a.dateTime - 5000 AND a.dateTime + 5000 GROUP BY a.id",
+                "GROUP BY",
+            ),
+            (
+                "SELECT DISTINCT * FROM auction a JOIN bid b ON a.id = b.auction \
+                 AND b.dateTime BETWEEN a.dateTime - 5000 AND a.dateTime + 5000",
+                "DISTINCT",
+            ),
+        ] {
+            let err = compile_streaming_join_sql(sql).expect_err(needle);
+            assert!(err.to_string().contains(needle), "{needle}: {err}");
+        }
+    }
+
     #[test]
     fn the_band_may_precede_the_equi_key() {
         let swapped = "SELECT * FROM bid b JOIN auction a \

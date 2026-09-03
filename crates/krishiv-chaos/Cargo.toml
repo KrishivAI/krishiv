@@ -19,6 +19,9 @@ krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [[test]]
 name = "chaos_suite"
 path = "tests/chaos_suite.rs"

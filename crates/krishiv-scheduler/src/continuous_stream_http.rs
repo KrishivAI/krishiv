@@ -1143,6 +1143,12 @@ pub async fn api_continuous_restore(
     }
     let watermark_ms = {
         let mut coord = coordinator.write().await;
+        // Leader fence: a demoted coordinator still holds `job_coordinators`
+        // and writes straight to the shared store, so without this a standby
+        // answered `restored: true` and overwrote the leader's snapshot.
+        coord
+            .ensure_active()
+            .map_err(|error| scheduler_error_response(&error))?;
         let view = continuous_job_view(&coord, &job_id)
             .map_err(|error| scheduler_error_response(&error))?;
         let watermark_ms = view
@@ -2432,6 +2438,24 @@ async fn launch_run_loop_job(
     Ok(())
 }
 
+/// The JobSpec-carried registration knobs that `ContinuousJobShape` does not
+/// cover: the sink contract and the checkpoint interval/path. Registry
+/// sources are launch-time input partitions and are not compared here.
+fn existing_spec_matches(
+    existing: &krishiv_proto::JobSpec,
+    desired: &krishiv_proto::JobSpec,
+) -> bool {
+    let sink = |spec: &krishiv_proto::JobSpec| {
+        spec.stages()
+            .first()
+            .and_then(|stage| stage.tasks().first())
+            .and_then(|task| task.sink_contract().map(str::to_owned))
+    };
+    sink(existing) == sink(desired)
+        && existing.checkpoint_interval_ms() == desired.checkpoint_interval_ms()
+        && existing.checkpoint_storage_path() == desired.checkpoint_storage_path()
+}
+
 /// Convergent (upsert) submission of a continuous streaming job.
 ///
 /// A continuous streaming job is a declarative, desired-state object keyed by
@@ -2464,9 +2488,9 @@ async fn upsert_continuous_streaming_job(
         let is_streaming = record.spec.kind() == JobKind::Streaming;
         let terminal = record.state().is_terminal();
         let decoded = decode_continuous_job_shape(&record).ok();
-        (is_streaming, terminal, decoded)
+        (is_streaming, terminal, decoded, record.spec.clone())
     });
-    if let Some((is_streaming, terminal, decoded)) = existing {
+    if let Some((is_streaming, terminal, decoded, existing_spec)) = existing {
         if !is_streaming {
             return Err(crate::SchedulerError::DuplicateJob {
                 job_id: job_id.clone(),
@@ -2478,7 +2502,12 @@ async fn upsert_continuous_streaming_job(
             mode: desired_mode,
             parallelism: desired_parallelism,
         };
-        if healthy && decoded.as_ref() == Some(&desired_shape) {
+        // The shape covers spec/mode/parallelism. The sink contract and the
+        // checkpoint knobs live on the JobSpec, so a re-register that changed
+        // only one of those used to be a silent no-op — while the ack, built
+        // from the request, echoed the new sink as applied.
+        let same_sink_and_checkpointing = existing_spec_matches(&existing_spec, &job_spec);
+        if healthy && decoded.as_ref() == Some(&desired_shape) && same_sink_and_checkpointing {
             // Already running the desired spec/mode/parallelism — nothing to
             // do; a steady-state reconcile must not reset window state.
             return Ok(false);
@@ -3010,6 +3039,9 @@ pub async fn restore_continuous_stream_coordinated(
         ));
     }
     let mut coord = coordinator.write().await;
+    coord
+        .ensure_active()
+        .map_err(ContinuousStreamError::Scheduler)?;
     let watermark_ms = continuous_job_view(&coord, &job_id_typed)
         .ok()
         .and_then(|view| view.persisted_watermark_ms.or(view.last_watermark_ms))
@@ -3864,6 +3896,60 @@ mod tests {
         .unwrap();
         let json = serde_json::to_value(&sql.0).unwrap();
         assert_eq!(json["sink"], serde_json::json!("csv"), "{json}");
+    }
+
+    /// Re-registering with a sink the running job does not have is a spec
+    /// change: the job is retired and resubmitted, and the view reflects it.
+    /// It used to be a silent no-op whose ack still echoed the sink.
+    #[tokio::test]
+    async fn re_register_with_a_new_sink_applies_it() {
+        let coordinator = make_coordinator_with_executor("re-register-sink").await;
+        let request = |sink: Option<ContinuousSinkSpec>| ContinuousRegisterRequest {
+            job_id: "cs-re-register".into(),
+            spec: Some(tumbling_spec()),
+            stream_spec: None,
+            sink,
+            parallelism: None,
+            mode: None,
+            sources: Vec::new(),
+            checkpoint_interval_ms: None,
+            checkpoint_storage_path: None,
+        };
+        let _ = api_continuous_register(State(coordinator.clone()), Json(request(None)))
+            .await
+            .unwrap();
+        let before = api_continuous_get(
+            State(coordinator.clone()),
+            Path(String::from("cs-re-register")),
+        )
+        .await
+        .unwrap();
+        assert_eq!(before.0.delivery.sink, None);
+
+        let csv = ContinuousSinkSpec {
+            connector: Some("csv".into()),
+            options: [("path".to_string(), "/tmp/re-register.csv".to_string())]
+                .into_iter()
+                .collect(),
+            root: String::new(),
+            table: String::new(),
+            mode: default_sink_mode(),
+            key_columns: Vec::new(),
+            op_column: None,
+            catalog: None,
+            namespace: None,
+        };
+        let _ = api_continuous_register(State(coordinator.clone()), Json(request(Some(csv))))
+            .await
+            .unwrap();
+        let after = api_continuous_get(State(coordinator), Path(String::from("cs-re-register")))
+            .await
+            .unwrap();
+        assert_eq!(
+            after.0.delivery.sink.as_deref(),
+            Some("csv"),
+            "the new sink runs"
+        );
     }
 
     /// A registry-dispatched sink is a sink: the delivery view names its kind
@@ -5008,6 +5094,32 @@ mod tests {
     /// phase58 gate's `retry_engine` treats as a permanent failure. Without
     /// the leader fence the standby falls straight into the existence check
     /// and returns `Scheduler(UnknownJob)`, the intermittent gate failure.
+    /// Restore is a mutation of the shared store; like push and register it
+    /// must be fenced to the active leader.
+    #[tokio::test]
+    async fn continuous_restore_on_a_standby_is_retryable_not_applied() {
+        let coord_id = CoordinatorId::try_new("coord-cs-standby-restore").unwrap();
+        let coordinator = SharedCoordinator::new(Coordinator::standby(coord_id));
+        let err = restore_continuous_stream_coordinated(&coordinator, "any-job", vec![1, 2, 3])
+            .await
+            .expect_err("a standby must not apply a continuous restore");
+        assert!(
+            matches!(
+                err,
+                ContinuousStreamError::Scheduler(SchedulerError::InactiveCoordinator { .. })
+            ),
+            "expected the leader fence, got {err:?}"
+        );
+        assert!(
+            coordinator
+                .read()
+                .await
+                .pending_continuous_restores
+                .is_empty(),
+            "nothing may be staged on a standby"
+        );
+    }
+
     #[tokio::test]
     async fn continuous_push_to_a_standby_is_retryable_not_unknown_job() {
         let coord_id = CoordinatorId::try_new("coord-cs-standby-push").unwrap();

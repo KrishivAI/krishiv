@@ -234,7 +234,14 @@ impl Coordinator {
             let mut record = jc.write_record();
             for stage in record.stages_mut() {
                 for task in stage.tasks_mut() {
+                    // Task ids are only unique within a job (the distributed
+                    // planner names them positionally), so the heartbeat's
+                    // bare ids must be matched against THIS executor's tasks
+                    // — the streaming re-attach path was fixed for exactly
+                    // this shape. Without the owner check, any executor's
+                    // heartbeat kept a colliding hung task alive forever.
                     if task.state() == krishiv_proto::TaskState::Running
+                        && task.assigned_executor() == Some(executor_id)
                         && running.contains(task.task_id())
                     {
                         task.last_progress_ms = Some(now_ms);
@@ -849,6 +856,8 @@ impl Coordinator {
         let profile = self.durability_profile;
 
         let mut jobs_to_reassign = Vec::new();
+
+        let mut jobs_driven_terminal: Vec<JobId> = Vec::new();
         let mut jobs_needing_restore_seed: Vec<JobId> = Vec::new();
         for (job_id, job_arc) in &self.job_coordinators {
             let mut job = job_arc.write_record();
@@ -937,6 +946,12 @@ impl Coordinator {
             if job_affected {
                 jobs_to_reassign.push(job_id.clone());
             }
+            if job.state().is_terminal() {
+                jobs_driven_terminal.push(job_id.clone());
+            }
+        }
+        for job_id in &jobs_driven_terminal {
+            self.finish_terminal_job(job_id);
         }
         for job_id in &jobs_needing_restore_seed {
             if let Some(snapshot) = self.load_continuous_snapshot(job_id.as_str()) {

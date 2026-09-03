@@ -28,3 +28,7 @@ krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
 krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
 krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

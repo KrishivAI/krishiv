@@ -1866,10 +1866,15 @@ impl Coordinator {
                 continue;
             };
             let reason = format!("task stalled: no progress for {} min", item.stall_secs / 60);
-            let applied = {
+            let (applied, now_terminal) = {
                 let mut record = jc.write_record();
-                record.apply_stall_failure(&item.stage_id, &item.task_id, item.attempt, reason)
+                let applied =
+                    record.apply_stall_failure(&item.stage_id, &item.task_id, item.attempt, reason);
+                (applied, record.state().is_terminal())
             };
+            if now_terminal {
+                self.finish_terminal_job(&item.job_id);
+            }
             match applied {
                 Ok(true) => tracing::warn!(
                     job_id = %item.job_id,
@@ -2003,6 +2008,7 @@ impl Coordinator {
     /// divergence recurs under further chaos, it gets corrected again within
     /// one heartbeat rather than compounding.
     pub(crate) fn reconcile_store_latched_terminal_jobs(&mut self) {
+        let mut healed: Vec<JobId> = Vec::new();
         let Some(store) = self.store.clone() else {
             return;
         };
@@ -2040,6 +2046,10 @@ impl Coordinator {
                      will retry on the next assignment round"
                 );
             }
+            healed.push(job_id.clone());
+        }
+        for job_id in &healed {
+            self.on_job_terminal(job_id);
         }
     }
 

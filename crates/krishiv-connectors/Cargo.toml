@@ -135,6 +135,13 @@ thrift = { version = "0.17", optional = true }
 # Vortex feature dependencies
 vortex = { workspace = true, optional = true }
 
+[dev-dependencies]
+mockito = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+proptest = { workspace = true }
+wiremock = { workspace = true }
+
 [[test]]
 name = "exactly_once"
 path = "tests/exactly_once.rs"

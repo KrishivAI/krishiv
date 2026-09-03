@@ -8068,3 +8068,144 @@ and went red (the revert result is recorded per item).
   `execute_rpipe_fragment`, which the test never calls. Driving the loop
   needs a valid pipeline spec and a runner; left for the executor's next
   read, noted here so it is not mistaken for coverage.
+
+## §88 — AUDIT-R2: seven more units returned; 40 findings, 26 fixed, 14 recorded
+
+The hunt was resumed twice more. Fanning 42 finders out at once trips the
+account's session limit within minutes, so from here units run **one at a
+time** (the user's instruction). Units that returned this round:
+sql:distributed-plan, sql:core, sql:catalog(+udf), scheduler:http,
+scheduler:coordinator, connectors:lakehouse, connectors:rest (110 files read
+between them). 35 units are still uncovered.
+
+Every fix below has a test that was run against the reverted production line
+and went red, except where the entry says otherwise.
+
+### Scheduler (coordinator + store)
+
+* **R2-15 / critical — a `Committing` job could not be loaded from any
+  durable store.** DUR-1 persists `"committing"`; `parse_job_state` had no
+  arm for it, so rocksdb skipped the record and etcd refused the whole
+  prefix load — and the recovery re-drive never had a job to re-drive. The
+  DUR-1 recovery test stayed green because the in-memory store keeps the
+  `JobRecord` as-is and never runs the codec (**R2-19**); it now round-trips
+  the record through `PersistedJobRecord`, and
+  `parse_job_state_round_trips_every_variant` pins every variant.
+* **R2-16 / high — four paths drove a job terminal without the terminal
+  funnel.** Executor-loss budget, stall budget, the store-latch self-heal
+  and recovery failure all stopped at `refresh_state()`: no persist, no
+  GC-ready mark, no history, waiters never woken, and every later report
+  short-circuited on `already_terminal`. `finish_terminal_job` (persist +
+  `on_job_terminal`) now runs at all four. Test: the loss-budget test
+  asserts GC-readiness.
+* **R2-17 / high — heartbeat progress refresh matched tasks by bare id
+  across jobs.** Task ids are per-job; any executor's heartbeat kept a
+  colliding hung task alive against the stall watchdog. Owner check added
+  (the streaming re-attach path had been fixed for the same shape). Test
+  `heartbeat_progress_refresh_is_scoped_to_the_reporting_executor`.
+* **R2-18 / medium — the terminal-job latch grew forever.** Released inside
+  the FIFO `RemoveJob` handler once the removal is applied. Test
+  `removing_a_job_releases_its_terminal_latch`.
+
+### Scheduler (HTTP)
+
+* **R2-5 / high — re-registering with a new sink was a silent no-op whose
+  ack echoed the sink as applied.** Convergence compared only
+  spec/mode/parallelism; the sink contract and checkpoint knobs live on the
+  JobSpec. `existing_spec_matches` adds them. Registry sources (launch-time
+  partitions) are still not compared — recorded. Test
+  `re_register_with_a_new_sink_applies_it`.
+* **R2-6 / medium — restore had no leader fence.** Both restore entry points
+  now `ensure_active()`; a standby answers 503 and stages nothing. Test
+  `continuous_restore_on_a_standby_is_retryable_not_applied`.
+* **R2-8 / low** — DELETE of a snapshot-only IVM job removed the snapshot and
+  said `deleted: false`; a failed removal was a log line. Now true / 503.
+* **R2-9 / low** — GET vector-views 404'd a durable-only job; it goes through
+  `ensure_ivm_job` like every other job-scoped handler.
+* **R2-7 / test weakness — recorded, not fixed.** The "refuses every mutating
+  call" test covers 4 of the 12 mutating IVM handlers.
+
+### SQL
+
+* **R2-1 / high — DDL and TRUNCATE never invalidated the plan cache.** The
+  statement-shaped invalidation lived behind the vector-cache-empty fast
+  path, so with no vector index built (the normal case) `CREATE OR REPLACE
+  TABLE` left cached plans pinning the replaced provider, and identical
+  SELECT text served the old rows for the cache lifetime. The plan cache is
+  now cleared for every non-read-shaped statement regardless of the vector
+  cache, and by `execute_truncate`. Tests
+  `replacing_ddl_invalidates_the_plan_cache`, `truncate_invalidates_the_plan_cache`.
+* **R2-2 / medium — one catalog entry per statement, forever.** DESCRIBE,
+  EXPLAIN, MERGE, CALL, ANALYZE, DELETE, UPDATE, INSERT, CEP, CTAS and SHOW
+  PARTITIONS each registered a uniquely named `__<kind>_<n>` MemTable that
+  nothing deregistered. All twelve sites build the result DataFrame with
+  `read_batches`; the counter is gone. Test
+  `statement_results_leave_no_catalog_entry`.
+* **R2-20 / high — the streaming join compiler dropped GROUP BY, HAVING and
+  DISTINCT.** Refused by name now. **The SELECT list is still not applied**
+  (the join emits every column of both sides): refusing non-`*` projections
+  would break NEXMark q9, which depends on the current behaviour — recorded
+  as a product decision, not guessed at.
+* **R2-21 / medium — ON-clause sides came from lexical order.** `b.auction =
+  a.id` made the right stream's column the left key. Sides now follow the
+  table qualifiers; an unknown qualifier is refused. Test
+  `equi_key_sides_follow_the_table_qualifiers`.
+* **R2-24 / low** — `CREATE FUNCTION` without `OR REPLACE` silently
+  overwrote; the token was parsed and discarded. Refused unless OR REPLACE.
+* **R2-13 / low** — `KRISHIV_STAGE_TARGET_PARTITIONS` walked past the 512
+  clamp the architecture doc promises. Clamped.
+* **R2-23 / doc** — `analyze.rs` described a HyperLogLog fallback that does
+  not exist (NDV is `None` above the cap) and has no production caller;
+  the doc now says both. Wire-or-delete recorded.
+* **Recorded, not fixed (need a design decision or a fixture this session
+  did not have):** R2-10 (AQE skew split when both join sides read one
+  reused stage), R2-11 (shuffle keys by column name; duplicate names
+  mis-route), R2-12 (text-keyed exchange reuse in `cut_exchanges`), R2-22
+  (hand-built `SqlError::DataFusion` user errors map to XX000), R2-3
+  (`execute_with_timeout` times planning only), R2-4 (the "for tests"
+  spillable-join constructor drifts from production), R2-14 (vacuous
+  correlated-subquery test).
+
+### Connectors
+
+* **R2-26 / high — Delta 2PC answered Ok for a lost write.** The staging
+  file is renamed into the table before the log version is claimed, so a
+  crash between the two left no staging file and no log entry, and a
+  retried commit took the "already committed" branch. The commit records
+  the handle id in `commitInfo` and a missing staging file is committed
+  only if the log says so. Test
+  `delta_two_phase_commit_of_an_unlogged_lost_handle_is_an_error`.
+* **R2-34 / high — JdbcSource advertised checkpointing and answered
+  "unsupported" through the `Source`-level methods the engine uses**, so a
+  restart re-read the whole table. Overrides added (as parquet/s3 have);
+  `connect_lazy` lets the plumbing be tested without a database.
+* **R2-40 / medium — the CDC offset tracker swallowed backend read errors
+  and started empty**, which the pipeline reads as "nothing to resume": a
+  transient backend fault replayed every committed record. `new` is
+  fallible; malformed keys/values are errors too.
+* **R2-37 / medium** — an exhausted `S3Source` re-opened the object over the
+  network on every poll. `exhausted` flag, as ParquetSource has.
+* **R2-38 / medium** — CSV `has_header` accepted `yes` / `True` as *false*.
+  Strict parse in validate and open, source and sink.
+* **R2-25 / high — UPDATE ignored assignments to unknown columns and still
+  reported rows updated.** Refused with the intended column named. The
+  test pins the check (`unknown_assignment_columns`); the wiring is one
+  line, so a revert of the call site is not caught by it — noted.
+* **R2-36 / high — JDBC decode failures became NULLs.** Every typed arm
+  turned `Err(ColumnDecode)` into null, so NUMERIC / TIMESTAMP / UUID
+  columns read back all-NULL. Errors propagate now. **No red test: the only
+  seam needs a live `PgRow`**; the ignored Postgres integration tests are
+  where this is observable. The type mapping itself (everything else →
+  Utf8) is unchanged and recorded.
+* **R2-29 / medium** — the native Iceberg committer never implemented the
+  trait's `committed_kafka_offsets`, so generic callers got an empty map.
+  Implemented by delegation. The "cumulative summary" comment in
+  two_phase.rs is recorded as wrong; not corrected here because the right
+  fix (merge previous offsets into each commit) is a behaviour change.
+* **Recorded, not fixed:** R2-27 (CTAS failure leaves an empty table
+  registered), R2-28 (copy-on-write DML has no concurrent-commit check),
+  R2-30 (compaction drops table properties / refs / sort order), R2-31
+  (Hudi delete change-file shape), R2-32 (delete files orphaned on
+  rewrite; enumeration errors swallowed), R2-33 (LanceDB payloads never
+  persisted), R2-35 (sinks turn unsupported Arrow types into NULLs),
+  R2-39 (`ConnectorQualityHook` has no callers).

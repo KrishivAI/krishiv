@@ -88,6 +88,26 @@ impl JdbcSource {
         })
     }
 
+    /// Like [`connect`](Self::connect) but without touching the network: the
+    /// pool connects on first use. Lets callers build the source before the
+    /// database is reachable (and tests exercise its plumbing without one).
+    pub fn connect_lazy(url: &str, table: impl Into<String>) -> ConnectorResult<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect_lazy(url)
+            .map_err(|e| ConnectorError::Io(std::io::Error::other(e.to_string())))?;
+        Ok(Self {
+            pool,
+            table: table.into(),
+            batch_size: DEFAULT_BATCH_SIZE,
+            offset: 0,
+            key_column: None,
+            last_key: None,
+            schema: None,
+            exhausted: false,
+        })
+    }
+
     /// Override the page size.  Defaults to 1 000 rows.
     #[must_use]
     pub fn with_batch_size(mut self, n: u32) -> Self {
@@ -124,6 +144,19 @@ impl Source for JdbcSource {
             .with_bounded()
             .with_rewindable()
             .with_checkpoint()
+    }
+
+    // The registry/engine path checkpoints through the `Source`-level
+    // encoded-offset methods (`DynSource` forwards to them). Without these
+    // overrides the trait default answered "unsupported" for a source that
+    // advertises checkpointing, the engine read that as `None`, and a
+    // restart re-read the whole table.
+    fn encoded_checkpoint_offset(&self) -> ConnectorResult<Option<Vec<u8>>> {
+        crate::source::CheckpointSource::encoded_checkpoint_offset(self).map(Some)
+    }
+
+    fn restore_encoded_checkpoint_offset(&mut self, encoded: &[u8]) -> ConnectorResult<()> {
+        crate::source::CheckpointSource::restore_encoded_offset(self, encoded)
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
@@ -664,7 +697,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<i16>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -674,7 +713,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<i32>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -684,7 +729,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<i64>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -694,7 +745,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<f32>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -704,7 +761,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<f64>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -714,7 +777,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<bool>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -724,7 +793,13 @@ fn pg_rows_to_batch(schema: SchemaRef, rows: &[PgRow]) -> arrow::error::Result<R
                 for row in rows {
                     match row.try_get::<Option<String>, _>(col_idx) {
                         Ok(Some(v)) => b.append_value(v),
-                        _ => b.append_null(),
+                        Ok(None) => b.append_null(),
+                        // A decode failure (a NUMERIC / TIMESTAMP / UUID column
+                        // read as the mapped type) used to become NULL, so
+                        // whole columns read back empty with no error.
+                        Err(e) => {
+                            return Err(arrow::error::ArrowError::ExternalError(Box::new(e)));
+                        }
                     }
                 }
                 Arc::new(b.finish())
@@ -856,6 +931,22 @@ mod tests {
 
     /// `pg_rows_to_batch` with zero rows still honours the schema — the only
     /// input constructible without a live `PgRow`.
+    /// The registry/engine path checkpoints through the `Source`-level
+    /// encoded-offset methods; a source advertising checkpoint capability
+    /// must answer them, or the engine reads "unsupported" as "no offset"
+    /// and a restart re-reads the whole table.
+    #[tokio::test]
+    async fn source_level_checkpoint_offset_is_answered() {
+        let source = JdbcSource::connect_lazy("postgres://localhost:1/nowhere", "t")
+            .expect("lazy pool needs no database")
+            .with_batch_size(7);
+        let encoded = crate::Source::encoded_checkpoint_offset(&source)
+            .expect("advertised capability must be honoured")
+            .expect("a bounded source always has a position");
+        let mut restored = JdbcSource::connect_lazy("postgres://localhost:1/nowhere", "t").unwrap();
+        crate::Source::restore_encoded_checkpoint_offset(&mut restored, &encoded).unwrap();
+    }
+
     #[test]
     fn pg_rows_to_batch_empty_rows_yield_empty_batch_with_schema() {
         let schema = Arc::new(Schema::new(vec![

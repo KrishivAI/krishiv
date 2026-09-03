@@ -43,6 +43,11 @@ pub struct S3Source {
     file_size: u64,
     stream: Option<ObjectBatchStream>,
     cursor: usize,
+    /// Set once the stream returned `None`. Without it every later poll of a
+    /// finished source re-opened the object over the network and re-decoded
+    /// all `cursor` batches just to answer `None` again (the ParquetSource
+    /// fix, applied here). Cleared by `reset` / `restore_offset`.
+    exhausted: bool,
 }
 
 impl S3Source {
@@ -70,6 +75,7 @@ impl S3Source {
             file_size,
             stream: None,
             cursor: 0,
+            exhausted: false,
         })
     }
 
@@ -190,6 +196,9 @@ impl Source for S3Source {
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
         let stream = self.ensure_stream().await?;
         match stream.next().await {
             Some(Ok(batch)) => {
@@ -201,6 +210,7 @@ impl Source for S3Source {
             ))),
             None => {
                 self.stream = None;
+                self.exhausted = true;
                 Ok(None)
             }
         }
@@ -224,6 +234,7 @@ impl Source for S3Source {
     fn reset(&mut self) {
         self.cursor = 0;
         self.stream = None;
+        self.exhausted = false;
     }
 }
 
@@ -244,6 +255,7 @@ impl CheckpointSource for S3Source {
         // object has fewer batches than the requested index.
         self.cursor = offset.batch_index;
         self.stream = None;
+        self.exhausted = false;
         Ok(())
     }
 }
@@ -673,6 +685,33 @@ mod tests {
         assert!(!caps.is_unbounded());
         assert!(!caps.is_transactional());
         assert!(!caps.is_idempotent());
+    }
+
+    /// A finished source answers `None` from memory: it must not re-open the
+    /// object (which may be gone by then) to discover it is still finished.
+    #[tokio::test]
+    async fn s3_source_stays_exhausted_without_reopening_the_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let store: Arc<dyn ObjectStore> =
+            Arc::new(LocalFileSystem::new_with_prefix(dir.path()).unwrap());
+        let path = Path::from("gone.parquet");
+        let mut sink = S3Sink::new(Arc::clone(&store), path.clone());
+        sink.write_batch(make_batch(&[1], &["a"])).await.unwrap();
+        sink.flush().await.unwrap();
+        let mut source = S3Source::open(Arc::clone(&store), path.clone())
+            .await
+            .unwrap();
+        while source.read_batch().await.unwrap().is_some() {}
+        store.delete(&path).await.unwrap();
+        assert!(
+            source.read_batch().await.unwrap().is_none(),
+            "an exhausted source answers None without touching the store"
+        );
+        source.reset();
+        assert!(
+            source.read_batch().await.is_err(),
+            "after a reset the object is genuinely re-read (and is gone)"
+        );
     }
 
     #[tokio::test]

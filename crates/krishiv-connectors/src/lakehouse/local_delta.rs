@@ -54,6 +54,36 @@ fn commit_attempt_suffix() -> String {
 /// the version first. Returns `Ok(true)` if this writer won the claim,
 /// `Ok(false)` on a version collision (the caller must pick a new version
 /// and retry); never overwrites another writer's committed log entry.
+/// Whether the `_delta_log` holds a commit for `(epoch, handle)`.
+fn commit_logged(root: &Path, epoch: u64, handle: u64) -> ConnectorResult<bool> {
+    let log_dir = delta_log_dir(root);
+    let Ok(entries) = fs::read_dir(&log_dir) else {
+        return Ok(false);
+    };
+    for entry in entries {
+        let entry = entry.map_err(to_connector)?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let contents = fs::read_to_string(&path).map_err(to_connector)?;
+        for line in contents.lines() {
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(info) = value.get("commitInfo") else {
+                continue;
+            };
+            let logged_epoch = info.get("epoch").and_then(serde_json::Value::as_u64);
+            let logged_handle = info.get("handle").and_then(serde_json::Value::as_u64);
+            if logged_epoch == Some(epoch) && logged_handle == Some(handle) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn claim_commit_log(root: &Path, version: u64, contents: &str) -> LakehouseResult<bool> {
     let log_dir = delta_log_dir(root);
     fs::create_dir_all(&log_dir).map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -638,6 +668,10 @@ fn to_connector(e: impl std::fmt::Display) -> ConnectorError {
 pub struct DeltaStageHandle {
     /// Checkpoint epoch this write belongs to.
     pub epoch: u64,
+    /// Writer-local sequence of this handle; recorded in the commit's
+    /// `commitInfo` so a retried commit can tell "already committed" from
+    /// "renamed into the table but never logged".
+    pub id: u64,
     /// Path to the `.parquet.tmp` staging file.
     pub staging_path: PathBuf,
 }
@@ -694,13 +728,27 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
         f.sync_all().map_err(to_connector)?;
         Ok(DeltaStageHandle {
             epoch,
+            id: handle_id,
             staging_path,
         })
     }
 
     fn commit(&mut self, handle: Self::Handle) -> ConnectorResult<()> {
         if !handle.staging_path.exists() {
-            return Ok(());
+            // The staging file is renamed into the table BEFORE the log
+            // version is claimed, so "no staging file" alone does not mean
+            // committed: a crash between the two leaves the file in the root
+            // and nothing in the log, and a retried commit used to answer Ok
+            // — at-most-once wearing 2PC's clothes. The log is the authority.
+            return if commit_logged(&self.root, handle.epoch, handle.id)? {
+                Ok(())
+            } else {
+                Err(to_connector(format!(
+                    "delta 2PC: handle {}-{} has no staging file and no log entry; the \
+                     write was lost before its commit was logged",
+                    handle.epoch, handle.id
+                )))
+            };
         }
         let root = &self.root;
         fs::create_dir_all(root).map_err(to_connector)?;
@@ -716,7 +764,7 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
             // (AS OF), matching write_table's commitInfo.
             let ts = chrono::Utc::now().timestamp_millis();
             let commit_entry = json!(
-                {"commitInfo":{"operation":"WRITE","epoch":handle.epoch,"timestamp":ts}}
+                {"commitInfo":{"operation":"WRITE","epoch":handle.epoch,"handle":handle.id,"timestamp":ts}}
             );
             let add_entry = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
             let contents = format!("{commit_entry}\n{add_entry}\n");
@@ -826,6 +874,22 @@ mod tests {
         let handle = sink.prepare(3, &batch(&[5])).unwrap();
         sink.abort(handle.clone()).unwrap();
         sink.abort(handle).unwrap(); // second abort must not error
+    }
+
+    /// A handle whose staging file is gone but whose commit was never logged
+    /// (crash between the rename and the log claim) is a lost write: commit
+    /// must say so, not answer Ok.
+    #[test]
+    fn delta_two_phase_commit_of_an_unlogged_lost_handle_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(4, &batch(&[7])).unwrap();
+        // Simulate the crash: the file left staging, the log never learned.
+        std::fs::rename(&handle.staging_path, dir.path().join("part-orphan.parquet")).unwrap();
+        let err = sink
+            .commit(handle)
+            .expect_err("an unlogged handle is not committed");
+        assert!(err.to_string().contains("no log entry"), "{err}");
     }
 
     #[test]

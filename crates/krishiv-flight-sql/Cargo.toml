@@ -44,6 +44,11 @@ jemalloc = ["dep:tikv-jemallocator"]
 # in-process engine at daemon startup via KRISHIV_ICEBERG_REST_* env vars.
 rest-catalog = ["krishiv-sql/rest-catalog", "krishiv-sql/iceberg-datafusion"]
 
+[dev-dependencies]
+futures = { workspace = true }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.0" }
+tokio = { workspace = true, features = ["rt", "macros"] }
+
 [lib]
 path = "src/lib.rs"
 
