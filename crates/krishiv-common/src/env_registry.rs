@@ -1438,6 +1438,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Enable the broadcast-dimension reducer (physical). Opt-in: the logical form of this rule was cleared by a three-query A/B, shipped on, and cost q10 18x.",
     ),
     rt(
+        "KRISHIV_JOIN_REORDER",
+        FlagKind::Bool,
+        "true",
+        "Reorder inner-join chains smallest-connected-first from the engine's row-count registry. DataFusion has no join reordering, so join order is FROM-clause order; TPC-DS SF1 q72 is 10.2x on this and the 99-query suite 15%. Set 0/false to disable.",
+    ),
+    rt(
         "KRISHIV_SEMI_JOIN_DIMENSION",
         FlagKind::Bool,
         "false",

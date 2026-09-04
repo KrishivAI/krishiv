@@ -15,7 +15,7 @@ as a TPC-DS score.
 | field | value |
 |---|---|
 | date | 2026-09-04 |
-| commit | 93cd52796ff59f00b054ab9e9c85ee5c19485a4c |
+| commit | `1a9451e` plus the join-reorder change committed alongside this document |
 | scale factor | 1 |
 | dataset | 24 tables, Parquet, `target/tpcds-sf1`, 371 MB |
 | generator | DuckDB 1.5.5 `INSTALL tpcds; CALL dsdgen(sf=1)` |
@@ -49,23 +49,46 @@ times, best of three, for both engines.
 
 | | krishiv | duckdb |
 |---|---|---|
-| total, 99 queries | 21.4 s | 7.2 s |
-| median query | 116 ms | 49 ms |
-| median ratio | **2.6x slower** | — |
-| slowest | 2.80 s (q72) | 0.42 s (q67) |
+| total, 99 queries | 17.0 s | 6.6 s |
+| median query | 111 ms | 43 ms |
+| median ratio | **2.68x slower** | — |
+| slowest | 1.05 s (q14) | 0.41 s (q67) |
 
-The engine is slower on all 99 and faster on none. The spread is 1.4x (q87, q35,
-q43) to 10.8x (q16, q72, q94).
+The engine is faster on one query (q72, 0.83x) and slower on the other 98. The
+spread is 1.4x to 5.6x (q27).
 
-Ten queries account for 43% of total suite time: q72, q14, q64, q67, q95, q23,
-q4, q47, q22, q11.
+Ten queries account for 38% of total suite time: q14, q64, q95, q23, q4, q67,
+q22, q47, q27, q11.
 
-Parquet filter pushdown, measured as a third arm: enabling it globally is a
-wash (21.3 s vs 21.4 s) because it wins on 30 of 99 and loses on the rest.
-Choosing it per query would give 18.3 s, a 15% suite-wide saving. Largest single
-win is q72 at 2.04 s; largest loss is q64 at 0.46 s.
+### What changed since the first warm run
 
-Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-2026-09-04.csv` and `.json`.
+Two optimizer fixes, each verified to leave all 99 results identical:
+
+| | suite total |
+|---|---|
+| first warm run | 21.4 s |
+| + semi-join pushdown declines a probe that removes no rows | 19.8 s |
+| + greedy join reordering (`KRISHIV_JOIN_REORDER`, on by default) | **17.0 s** |
+
+The second is q72 almost entirely. DataFusion 54 has no join-reordering rule, so
+join order is `FROM`-clause order; q72 names `catalog_sales JOIN inventory` — a
+fact-to-fact join on a non-key column — first, below every selective filter,
+building a 15.29 M row intermediate that later joins reduce to 380.9 K. Ordering
+the chain smallest-connected-first takes q72 from 2699 ms to 252 ms, past
+DuckDB's 305 ms. Measured across all 99 the rule is +15.0% with 7 wins >10%,
+4 losses >10% (worst 24 ms) and 88 neutral; outside q72 it is neutral.
+
+Parquet filter pushdown, measured as a third arm, is **not** a suite-wide lever:
+enabling `datafusion.execution.parquet.pushdown_filters` globally is worth 1.4%
+(19823 ms → 19538 ms) because **51 of 99 queries lose more than 10% and only 10
+win**, and the win was almost entirely q72's — which the join reorder now takes
+by a different route. An earlier version of this document claimed a 15%
+per-query saving; that figure was wrong.
+
+Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-joinreorder-2026-09-04.csv`
+and `.json`, which also carry the no-reorder timing and the per-query
+result-identity check. The previous warm run is retained as
+`benchmarks/tpcds-sf1-99q-warm-2026-09-04.*`.
 
 ## Reproducing
 

@@ -8322,3 +8322,201 @@ Knobs measured and rejected as dead ends: `target_partitions` 12→24 and
 Planning time is not the bottleneck either (q72 plans in 60 ms and runs in
 4.67 s); q64 is the only query where planning is a visible share, 210 ms of
 1.19 s.
+
+## §90 — TPC-DS q72: DataFusion has no join reordering, and the row-count registry that would fix it was never populated
+
+Continues §89. The worklist there ranked q72 first by absolute time lost
+(2476 ms behind DuckDB, 9.1x, ~14% of the whole 19.8 s suite). It is fixed.
+Three candidate explanations were refuted by measurement before the real one
+was found, and each refutation is recorded because each was plausible enough
+to have been shipped on argument alone.
+
+### The diagnosis
+
+`EXPLAIN ANALYZE` (via `krishiv explain --analyze --local`, which does execute
+and report per-operator metrics — the `EXPLAIN ANALYZE` *SQL statement* does
+not, see the open item at the end) puts q72's cost precisely:
+
+```text
+  HashJoinExec on=(cs_item_sk, inv_item_sk)  output_rows=15.29 M  join_time=6.15 s
+    DataSourceExec catalog_sales   368.6 K
+    DataSourceExec inventory        11.74 M
+  ...five joins above it whittle 15.29 M down to 380.9 K
+```
+
+`cs_item_sk = inv_item_sk` is a join between two **facts** on a column that is
+a key of neither, and q72's `FROM` clause names it first, below every selective
+filter (`cd_marital_status`, `hd_buy_potential`, `d_year = 1999`). Every
+operator above it carries 15.29 M rows.
+
+It is in that position because **DataFusion 54 has no join-reordering rule at
+all.** Its logical rule list contains `EliminateCrossJoin`, which rewrites a
+cross join plus a predicate into an inner join *in place*, and nothing else
+that touches join order. Join order is `FROM`-clause order, whatever the sizes.
+
+Reordering the `FROM` clause by hand, nothing else changed:
+
+```text
+  q72 as written                     2655 ms
+  q72 hand-reordered                  280 ms   byte-identical result
+  q72 pure size-greedy order          294 ms   byte-identical result
+  DuckDB                              307 ms
+```
+
+The third line is what made this implementable: picking the smallest
+*connected* relation next, from base-table row counts alone, reproduces the
+hand-tuned plan. No selectivity model needed for this shape.
+
+### R4-1 (fixed) — `table_row_counts` was empty for every Parquet table
+
+`SqlEngine` already keeps a `table_row_counts` registry, and
+`register_parquet_with_primary_key` already ended with
+
+```rust
+    if let Ok(provider) = self.context.table_provider(table_name).await
+        && let Some(stats) = provider.statistics()
+```
+
+`TableProvider::statistics()` is a trait method whose default is `None`, and
+DataFusion's `ListingTable` — the provider behind every `--parquet` table and
+every `CREATE EXTERNAL TABLE … STORED AS PARQUET` — **does not implement it.**
+The `&&` chain stopped at the second link for exactly the tables the registry
+exists to describe. The registry stayed empty, and `BroadcastAutoRule`, which
+reads it, could never fire for a Parquet table. A guard enforced by nothing —
+the shape this register opens with.
+
+The counts do exist: `collect_statistics` is on in
+`build_single_node_session_config`, so `ListingTable` reads them out of the
+Parquet footers when a scan is planned. `provider_row_count` now falls back to
+planning a scan and reading `partition_statistics`, the accessor
+`spillable_join` and `join_estimates` already use. Planning a scan reads
+footers, not data. Both registration sites use it.
+
+**Test proven RED** (`left: None`, `right: Some(512)`):
+`tests/parquet_registration_records_row_count.rs`. It asserts the count is
+*exact*, so an `Absent` estimate coerced to 0 cannot pass.
+
+### R4-2 (fixed) — `join_reorder::JoinReorder`
+
+A greedy left-deep reordering rule over that registry, constructed the way
+`ann_rewrite::AnnTopKPrefilter` is constructed over the vector-index cache, so
+a rule built over an empty registry (the staged planner) is inert. It declines
+unless **every** relation in the chain has a known size: guessing a size for one
+relation is how a reordering rule moves a 150 M row table to the bottom.
+
+Safety is structural, not statistical. Inner joins only and `JoinConstraint::On`
+only; every equijoin pair and every non-equi filter is placed at the first point
+where all the relations it names are present, and an unplaceable predicate
+abandons the whole rewrite rather than dropping it; the rebuilt chain is
+re-projected to the original schema; a step with no equijoin edge to what is
+already placed abandons rather than inventing a cross join. `Join::try_new`
+rather than `LogicalPlanBuilder::join_on`, because the builder's expression form
+parks equalities in `filter` and the physical planner then picks a nested loop —
+the mechanism that once made q2 eighteen times slower.
+
+Flattening sees through **column-pruning projections**. `OptimizeProjections`
+runs before this rule in every pass and inserts one between join levels, so
+without that a three-relation chain looks like two and is declined; the first
+version of the rule was inert for exactly that reason.
+
+### The sweep, and the guard it forced
+
+Measured on all 99 TPC-DS queries at SF1, embedded, warm, best of three, paired
+and interleaved, with per-query result hashes. The greedy alone:
+
+```text
+  suite      18972 ms -> 17385 ms   (+8.4%)   99/99 rows identical
+  wins >10%  14        losses >10%  15
+  q72         2717 ms ->   265 ms   10.2x
+  q24          205 ms ->   805 ms    4.0x SLOWER
+```
+
+A net win that is *entirely* q72 — on the other 98 queries it lost 865 ms. The
+regressions are one shape: `store_sales ⋈ store_returns`, a near-1:1
+fact-to-fact join that **reduces**. Base-table size cannot tell it from q72's
+fact-to-fact join that **multiplies**.
+
+So the rule only reorders a chain whose written order is demonstrably inverted:
+some relation must be larger than the anchor. Where everything is smaller than
+the anchor the query is already written fact-first and moving anything is a bet
+on selectivity this rule cannot estimate. With that guard:
+
+```text
+  suite      18935 ms -> 16467 ms   (+15.0%)  99/99 rows identical
+  wins >10%   7        losses >10%   4        neutral 88
+  q72         2680 ms ->   263 ms   10.2x  (DuckDB 307 ms — now faster)
+  worst loss    80 ms ->   104 ms   (q6, 24 ms)
+  excluding q72            16255 ms -> 16204 ms  — neutral
+```
+
+**On by default** (`KRISHIV_JOIN_REORDER=off` disables), on the strength of a
+*full* sweep rather than a chosen regression set — the failure that this file
+already blames for `KRISHIV_SEMI_JOIN_DIMENSION`'s q10 regression.
+
+**Tests, all proven RED against the reverted production line:**
+`the_largest_relation_is_joined_last` (revert: greedy picks lowest index, i.e.
+FROM order), `an_unsized_relation_declines_the_whole_chain` (revert: unknown
+size defaults to 0), `a_chain_already_written_largest_first_is_left_alone`
+(revert: drop the inversion guard). Plus
+`from_clause_order_is_what_datafusion_leaves_behind`, which pins the DataFusion
+behaviour being changed, and `the_reordered_plan_returns_the_same_rows`.
+
+### Refuted by measurement, recorded so they are not re-argued
+
+**`KRISHIV_SEMI_JOIN_DIMENSION` does not fix q72 — it is catastrophic.** The
+rule's documented SF100 pathology reproduces at TPC-DS SF1 in seconds rather
+than hours: q47 439 ms → **16227 ms (37x)**, q72 exceeds a 20 s cap against a
+2.6 s baseline. Mixed elsewhere (q14 1.39x faster, q4 1.22x, q64 0.74x, q23
+0.75x). This is a much cheaper reproduction than the SF100 loop that first
+found it, and any future attempt at that rule should start here.
+
+**Hand-written semi-join reducers on q72 are 15x slower.** Rewriting q72 with
+explicit `cs_bill_hdemo_sk IN (…)`, `cs_sold_date_sk IN (…)`,
+`cs_bill_cdemo_sk IN (…)` produces byte-identical results in **39380 ms**
+against 2655 ms. The reducer machinery is itself the cost, which is why the fix
+is reordering the joins that exist rather than adding reducers.
+
+**§89's R3-2 figure was wrong and is corrected here.** It records per-scan
+`pushdown_filters` as worth "a further 15%". Re-measured across the queries
+where both arms succeed: **19823 ms → 19538 ms, 1.4%**, with **51 queries
+losing >10% and only 10 winning** — and the win is almost entirely q72's 2.04 s,
+which the join reorder now takes by a different route. R3-2 is not a suite-wide
+lever and should not be prioritised as one.
+
+### Open items (not fixed — need a decision)
+
+**Repeated scans of the same table dominate the rest of the tail.** Scanning,
+not joining, is where the remaining time goes: q27 is ~96% `DataSourceExec`
+time, q23 82%, q64 81%. The cause is that DataFusion **inlines CTEs** instead of
+materialising them, so a `WITH` clause referenced N times is planned and
+executed N times:
+
+```text
+  q23  store_sales scanned 5x   2.87 + 2.84 + 0.68 + 0.50 + 0.49 s
+  q27  store_sales scanned 3x   1.68 + 1.27 + 0.91 s  (of 4.63 s total scan)
+  q64  store_sales 2x, catalog_sales 2x
+```
+
+DuckDB materialises a CTE referenced more than once. DataFusion 54 has no
+materialised-CTE node outside `RecursiveQuery`, so this is a design question —
+execute-and-register, or a new logical node — not a rule tweak. **Not guessed
+at.**
+
+**`EXPLAIN ANALYZE` as a SQL statement does not analyze.**
+`introspection_sql::explain_query` handles `ExplainSqlMode::Analyze` by
+returning the *physical* explain text plus the literal string
+`"ANALYZE: execute the query and call DataFrame::explain_with(Analyze) for
+runtime statistics."` — an instruction to the reader, emitted where the metrics
+should be. `explain_query` is sync and cannot execute, which is why the stub
+exists; the interception site in `SqlEngine::sql` is async and has the
+`SessionContext`, so the fix is to run it there. The `krishiv explain --analyze`
+CLI subcommand is a genuinely working, separate path — which is why the SQL
+statement's silence went unnoticed. Related: plain `EXPLAIN <query>` through the
+SQL surface returns krishiv's own one-node plan envelope
+(`nodes: - sql [batch] sql: SELECT …` / `optimizer: no rules applied`), never
+the DataFusion plan that executes the query.
+
+**The join reorder is unmeasured at scale.** SF1, embedded, one machine. The
+distributed path and SF100 are exactly where a bad join order becomes a bad
+shuffle, the mechanism behind every large regression in this file. Re-run the
+99-query sweep at SF100 before trusting the default there.

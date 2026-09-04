@@ -102,6 +102,7 @@ pub mod grace_hash_join;
 pub mod grammar;
 pub mod incremental_view;
 pub mod introspection_sql;
+pub mod join_reorder;
 
 /// One reading of a join build side's size estimate, shared by the broadcast
 /// override and the spillable-join choice so the two cannot disagree.
@@ -830,8 +831,9 @@ pub fn with_krishiv_optimizer_rules(
 fn with_krishiv_optimizer_rules_with_vector_cache(
     builder: datafusion::execution::session_state::SessionStateBuilder,
     vector_indexes: crate::vector_search::VectorIndexCache,
+    row_counts: crate::join_reorder::TableRowCounts,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
-    with_krishiv_optimizer_rules_inner(builder, None, vector_indexes)
+    with_krishiv_optimizer_rules_inner(builder, None, vector_indexes, row_counts)
 }
 
 /// As [`with_krishiv_optimizer_rules`], with the spillable-join build-side
@@ -841,7 +843,12 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
     builder: datafusion::execution::session_state::SessionStateBuilder,
     spill_join_build_bytes: Option<u64>,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
-    with_krishiv_optimizer_rules_inner(builder, spill_join_build_bytes, std::sync::Arc::default())
+    with_krishiv_optimizer_rules_inner(
+        builder,
+        spill_join_build_bytes,
+        std::sync::Arc::default(),
+        std::sync::Arc::default(),
+    )
 }
 
 #[must_use]
@@ -849,6 +856,7 @@ fn with_krishiv_optimizer_rules_inner(
     builder: datafusion::execution::session_state::SessionStateBuilder,
     spill_join_build_bytes: Option<u64>,
     vector_indexes: crate::vector_search::VectorIndexCache,
+    row_counts: crate::join_reorder::TableRowCounts,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
     let spillable_join = match spill_join_build_bytes {
         // Deliberately NOT grace-aware: this builder plans the stages the
@@ -934,6 +942,51 @@ fn with_krishiv_optimizer_rules_inner(
         .with_optimizer_rule(std::sync::Arc::new(
             crate::ann_rewrite::AnnTopKPrefilter::new(vector_indexes),
         ))
+        // DataFusion 54 has no join-reordering rule, so a multi-way inner join
+        // executes in FROM-clause order however the relations are sized. This
+        // reorders the chain smallest-connected-first from the engine's own
+        // row-count registry; over an empty registry (the staged planner) it
+        // declines. On unless `KRISHIV_JOIN_REORDER` says otherwise — see
+        // `join_reorder` for the 99-query sweep behind that default, and for
+        // what the sweep does not cover.
+        .with_optimizer_rule(std::sync::Arc::new(crate::join_reorder::JoinReorder::new(
+            row_counts,
+        )))
+}
+
+/// Row count for a table that has just been registered.
+///
+/// `TableProvider::statistics()` is the cheap path, and it is the only path the
+/// registration sites used to take. But it is a trait method whose default is
+/// `None`, and DataFusion's `ListingTable` — the provider behind every
+/// `--parquet` table and every `CREATE EXTERNAL TABLE … STORED AS PARQUET` —
+/// does not implement it. So `table_row_counts` stayed empty for exactly the
+/// tables it exists to describe, and `BroadcastAutoRule`, which reads it, could
+/// never fire for one. The guard was enforced by nothing.
+///
+/// The counts do exist. `collect_statistics` is on in
+/// [`build_single_node_session_config`], so `ListingTable` reads them out of the
+/// Parquet footers when a scan is planned — footers, not data. The fallback
+/// therefore plans a scan and reads `partition_statistics`, the same accessor
+/// `spillable_join` and `join_estimates` already use for build-side estimates.
+///
+/// Returns `None` when neither source has a count, so a provider that genuinely
+/// cannot estimate leaves the registry untouched rather than recording a zero
+/// that reads as "empty table".
+async fn provider_row_count(
+    context: &SessionContext,
+    provider: &std::sync::Arc<dyn datafusion::datasource::TableProvider>,
+) -> Option<u64> {
+    if let Some(rows) = provider
+        .statistics()
+        .and_then(|stats| stats.num_rows.get_value().copied())
+    {
+        return Some(rows as u64);
+    }
+    let state = context.state();
+    let scan = provider.scan(&state, None, &[], None).await.ok()?;
+    let stats = scan.partition_statistics(None).ok()?;
+    stats.num_rows.get_value().copied().map(|rows| rows as u64)
 }
 
 /// Build the DataFusion session config with a configurable parallelism level.
@@ -1370,11 +1423,16 @@ impl SqlEngine {
         // engine share one map (Phase 36 G19): an index built through any
         // engine entry point is immediately visible at plan time.
         let vector_indexes: crate::vector_search::VectorIndexCache = Arc::default();
+        // Same sharing argument as the vector cache: the join-reorder rule and
+        // the engine must read one registry, so a table registered after the
+        // session was built is sized on the next query rather than never.
+        let table_row_counts: crate::join_reorder::TableRowCounts = Arc::default();
 
         let mut state_builder = with_krishiv_optimizer_rules_with_vector_cache(
             datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_default_features(),
             vector_indexes.clone(),
+            Arc::clone(&table_row_counts),
         )
         .with_config(build_single_node_session_config(
             target_partitions,
@@ -1476,7 +1534,7 @@ impl SqlEngine {
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            table_row_counts,
             vector_indexes,
             memory_limit_bytes,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -1494,10 +1552,12 @@ impl SqlEngine {
         let streaming_sources: Arc<RwLock<std::collections::HashSet<String>>> =
             Arc::new(RwLock::new(std::collections::HashSet::new()));
         let vector_indexes: crate::vector_search::VectorIndexCache = Arc::default();
+        let table_row_counts: crate::join_reorder::TableRowCounts = Arc::default();
         let mut state = with_krishiv_optimizer_rules_with_vector_cache(
             datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_default_features(),
             vector_indexes.clone(),
+            Arc::clone(&table_row_counts),
         )
         .with_config(build_single_node_session_config(target_partitions, None))
         .build();
@@ -1520,7 +1580,7 @@ impl SqlEngine {
             plan_cache: Arc::new(Mutex::new(PlanCache::new(resolve_plan_cache_max_entries()))),
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
-            table_row_counts: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            table_row_counts,
             vector_indexes,
             memory_limit_bytes: None,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -2530,13 +2590,14 @@ impl SqlEngine {
         crate::distributed_plan::register_parquet_table(&self.context, &spec).await?;
         // (Re-)registration replaces the rows a vector index described.
         self.invalidate_vector_indexes(table_name);
-        // Extract estimated row count from table provider statistics.
+        // Extract estimated row count from table provider statistics, falling
+        // back to the planned scan — see `provider_row_count` for why the
+        // direct call alone recorded nothing for Parquet.
         if let Ok(provider) = self.context.table_provider(table_name).await
-            && let Some(stats) = provider.statistics()
-            && let Some(n) = stats.num_rows.get_value()
+            && let Some(rows) = provider_row_count(&self.context, &provider).await
             && let Ok(mut counts) = self.table_row_counts.write()
         {
-            counts.insert(table_name.to_string(), *n as u64);
+            counts.insert(table_name.to_string(), rows);
         }
         self.invalidate_plan_cache();
         Ok(())
@@ -3416,13 +3477,11 @@ impl SqlEngine {
             && !table_name.is_empty()
             && let Ok(provider) = self.context.table_provider(&table_name).await
         {
-            let maybe_rows = provider
-                .statistics()
-                .and_then(|s| s.num_rows.get_value().copied());
-            if let Some(n) = maybe_rows
+            let maybe_rows = provider_row_count(&self.context, &provider).await;
+            if let Some(rows) = maybe_rows
                 && let Ok(mut counts) = self.table_row_counts.write()
             {
-                counts.entry(table_name).or_insert(n as u64);
+                counts.entry(table_name).or_insert(rows);
             }
         }
 
