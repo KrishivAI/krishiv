@@ -8209,3 +8209,116 @@ and went red, except where the entry says otherwise.
   rewrite; enumeration errors swallowed), R2-33 (LanceDB payloads never
   persisted), R2-35 (sinks turn unsupported Arrow types into NULLs),
   R2-39 (`ConnectorQualityHook` has no callers).
+
+## §89 — TPC-DS 99-query harness, and the semi-join pushdown that fires where it should not
+
+Not an audit unit. A benchmark build-out that found one live optimizer defect,
+plus one item recorded for a decision.
+
+### The harness
+
+`scripts/bench/tpcds_99q_verify.py` (correctness) and
+`scripts/bench/tpcds_99q_warm.py` (timing). All 99 official TPC-DS query texts,
+taken verbatim from DuckDB 1.5.5's `tpcds_queries()`; 24-table SF1 dataset from
+`scripts/bench/gen_tpcds_sf1.py` (dsdgen). Every query runs through
+`krishiv sql --local` (embedded, in-process) AND through DuckDB over the same
+Parquet files; results are canonicalised and compared row-for-row. **99/99
+match.** Report: `docs/benchmarks-tpcds.md`.
+
+Two methodology notes worth keeping:
+
+- **The first published timing run was cold-cache and wrong.** It read the
+  371 MB dataset off disk for the first time *while timing it*: q72 measured
+  17.5 s cold vs 2.8 s warm, a 6.3x inflation. Superseded numbers are retained
+  as `benchmarks/tpcds-sf1-99q-2026-09-04.*` and marked as such. Warm best-of-3
+  is the one to quote.
+- The harness is negative-controlled: an unknown column exits non-zero and is
+  recorded as an error, so a green run cannot be a harness that measured
+  nothing.
+
+### R3-1 (fixed) — `SemiJoinPushdownThroughInnerJoin` fires when the probe removes nothing
+
+`crates/krishiv-sql/src/semi_join_reduction.rs`. The rule asks whether the
+semi-join *can* be pushed below the inner join, never whether it is *worth*
+pushing. When the probe side is a bare table scan the existence test removes
+almost nothing, so the rewrite buries a full-table hash build underneath
+exactly the selective dimension joins that would have eliminated it.
+
+Measured, embedded, best of three:
+
+```text
+  TPC-DS q16   rule on 0.41 s   rule off 0.09 s   4.5x
+  TPC-DS q94   rule on 0.21 s   rule off 0.07 s   3.0x
+  TPC-H  q21   rule on 0.55 s   rule off 0.30 s   1.8x   (SF1)
+```
+
+This is the same defect shape the `SEMI_JOIN_DIMENSION_ENV` docs in this very
+file already diagnose for the sibling rule — *"the guard asks only whether the
+dimension side carries a Filter — never whether it is small"* — which cost 18.1x
+on TPC-H q10. Here the missing question is whether the probe reduces rows at
+all, and that one IS answerable at the logical level.
+
+**Fix:** `probe_reduces_rows()` declines the pushdown when the probe is a bare
+scan with no pushed predicate and no fetch limit. Row-preserving wrappers
+(Projection/SubqueryAlias/Sort) recurse; Filter/Aggregate/Distinct/Limit/Join
+count as reducing; unmodelled node kinds answer `true` so they keep today's
+behaviour rather than silently losing the rule.
+
+TPC-H q18 — the query the rule was written for, and the one that does not merely
+slow but **fails** at SF100 with the rule off — probes an `Aggregate` under a
+`HAVING` filter, so it keeps its pushdown. Verified by the existing
+`the_verbatim_q18_shape_is_also_pushed_down` and
+`q18_results_are_identical_with_and_without_the_rule`.
+
+**Tests, both proven RED against the reverted guard:**
+`a_bare_scan_probe_is_not_pushed_below_the_inner_join` (new) and
+`q21s_bare_scan_semi_join_is_not_pushed_below_the_inner_join` (rewritten).
+
+**One existing test changed expectation, deliberately.** It was named
+`the_q21_semi_and_anti_joins_are_pushed_below_the_inner_join` and asserted the
+0.55 s plan shape. It now asserts the 0.30 s one. An assertion that pins the
+slower plan is not a regression test, it is a regression.
+
+**Suite effect (99 queries, warm, best of 3): 21.4 s → 19.8 s (-7.4%);**
+median ratio vs DuckDB 2.60x → 2.49x. q16 309→71 ms, q94 178→53 ms,
+q44 312→114 ms, q40 157→59 ms, q47 646→448 ms. Five queries moved the other way
+by 25–80 ms (largest q14, 961→1040 ms) — inside the noise floor this repo
+already requires paired interleaved A/B to call. **Correctness re-verified after
+the optimizer change: 99/99 still match DuckDB.**
+
+### R3-2 (not fixed — needs a decision) — per-scan `parquet.pushdown_filters`
+
+`datafusion.execution.parquet.pushdown_filters` is one global bit, defaulted OFF
+in `build_single_node_session_config` on the strength of a single measurement
+(TPC-H q6 SF1, 268→121 ms). Across the 99 it is a wash — 21.3 s on vs 21.4 s
+off — because it **wins on 30 queries and loses on 69**. Choosing per query
+would give 18.3 s, a further **15%**.
+
+The obvious discriminator does not survive contact with the data:
+
+```text
+  q72  WINS 2.04 s   widest scan: catalog_sales, 8 cols
+  q4   WINS 0.26 s   widest scan: customer,      8 cols
+  q64  LOSES 0.46 s  widest scan: store_sales,  12 cols   <- widest in the suite
+  q9   LOSES 0.34 s  widest scan: store_sales, 1-2 cols
+```
+
+Projection width predicts q9 and contradicts q64. Table size separates nothing
+(q72 and q64 both scan multi-million-row fact tables). The missing input is
+**predicate selectivity**, which is not estimated where this decision would be
+made — the same gap, one level down, that this file already blames for the q10
+regression.
+
+Two candidate designs, neither measured: (a) a physical rule that flips
+`ParquetSource::with_pushdown_filters` per `DataSourceExec` from a selectivity
+estimate, sited beside `distributed_plan::redistribute_unsplittable_broadcast_
+joins` where `partition_statistics()` is already read; (b) a runtime adaptive
+switch that samples the first N batches. **Not guessed at:** a width-keyed rule
+would buy q72's 2.04 s at the cost of q64's 0.46 s regression, which is trading
+a known loss for a known win with no model behind it.
+
+Knobs measured and rejected as dead ends: `target_partitions` 12→24 and
+`batch_size` 8192→32768 both landed inside noise on all ten slowest queries.
+Planning time is not the bottleneck either (q72 plans in 60 ms and runs in
+4.67 s); q64 is the only query where planning is a visible share, 210 ms of
+1.19 s.

@@ -1,0 +1,893 @@
+[
+ {
+  "query": 1,
+  "duckdb_ms": 289.1,
+  "duckdb_rows": 100,
+  "krishiv_ms": 422.6,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 2,
+  "duckdb_ms": 366.0,
+  "duckdb_rows": 2513,
+  "krishiv_ms": 556.2,
+  "rc": 0,
+  "krishiv_rows": 2513,
+  "status": "match"
+ },
+ {
+  "query": 3,
+  "duckdb_ms": 193.0,
+  "duckdb_rows": 89,
+  "krishiv_ms": 500.9,
+  "rc": 0,
+  "krishiv_rows": 89,
+  "status": "match"
+ },
+ {
+  "query": 4,
+  "duckdb_ms": 1481.8,
+  "duckdb_rows": 6,
+  "krishiv_ms": 3485.2,
+  "rc": 0,
+  "krishiv_rows": 6,
+  "status": "match"
+ },
+ {
+  "query": 5,
+  "duckdb_ms": 404.0,
+  "duckdb_rows": 100,
+  "krishiv_ms": 647.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 6,
+  "duckdb_ms": 314.2,
+  "duckdb_rows": 46,
+  "krishiv_ms": 538.9,
+  "rc": 0,
+  "krishiv_rows": 46,
+  "status": "match"
+ },
+ {
+  "query": 7,
+  "duckdb_ms": 398.7,
+  "duckdb_rows": 100,
+  "krishiv_ms": 796.0,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 8,
+  "duckdb_ms": 136.4,
+  "duckdb_rows": 5,
+  "krishiv_ms": 158.0,
+  "rc": 0,
+  "krishiv_rows": 5,
+  "status": "match"
+ },
+ {
+  "query": 9,
+  "duckdb_ms": 318.2,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1447.9,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 10,
+  "duckdb_ms": 330.2,
+  "duckdb_rows": 6,
+  "krishiv_ms": 862.6,
+  "rc": 0,
+  "krishiv_rows": 6,
+  "status": "match"
+ },
+ {
+  "query": 11,
+  "duckdb_ms": 884.5,
+  "duckdb_rows": 90,
+  "krishiv_ms": 2443.7,
+  "rc": 0,
+  "krishiv_rows": 90,
+  "status": "match"
+ },
+ {
+  "query": 12,
+  "duckdb_ms": 161.9,
+  "duckdb_rows": 100,
+  "krishiv_ms": 368.4,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 13,
+  "duckdb_ms": 721.8,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1108.4,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 14,
+  "duckdb_ms": 1335.3,
+  "duckdb_rows": 100,
+  "krishiv_ms": 2603.8,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 15,
+  "duckdb_ms": 56.1,
+  "duckdb_rows": 100,
+  "krishiv_ms": 92.1,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 16,
+  "duckdb_ms": 48.9,
+  "duckdb_rows": 1,
+  "krishiv_ms": 456.5,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 17,
+  "duckdb_ms": 95.8,
+  "duckdb_rows": 0,
+  "krishiv_ms": 342.4,
+  "rc": 0,
+  "krishiv_rows": 0,
+  "status": "match"
+ },
+ {
+  "query": 18,
+  "duckdb_ms": 111.2,
+  "duckdb_rows": 100,
+  "krishiv_ms": 252.6,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 19,
+  "duckdb_ms": 57.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 104.4,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 20,
+  "duckdb_ms": 22.2,
+  "duckdb_rows": 100,
+  "krishiv_ms": 75.8,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 21,
+  "duckdb_ms": 20.6,
+  "duckdb_rows": 100,
+  "krishiv_ms": 62.5,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 22,
+  "duckdb_ms": 274.1,
+  "duckdb_rows": 100,
+  "krishiv_ms": 761.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 23,
+  "duckdb_ms": 325.8,
+  "duckdb_rows": 4,
+  "krishiv_ms": 952.5,
+  "rc": 0,
+  "krishiv_rows": 4,
+  "status": "match"
+ },
+ {
+  "query": 24,
+  "duckdb_ms": 116.1,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1847.1,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 25,
+  "duckdb_ms": 336.8,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1393.8,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 26,
+  "duckdb_ms": 416.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 960.1,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 27,
+  "duckdb_ms": 780.7,
+  "duckdb_rows": 100,
+  "krishiv_ms": 3380.4,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 28,
+  "duckdb_ms": 615.8,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1031.4,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 29,
+  "duckdb_ms": 429.8,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1770.7,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 30,
+  "duckdb_ms": 335.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 457.0,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 31,
+  "duckdb_ms": 439.5,
+  "duckdb_rows": 44,
+  "krishiv_ms": 917.6,
+  "rc": 0,
+  "krishiv_rows": 44,
+  "status": "match"
+ },
+ {
+  "query": 32,
+  "duckdb_ms": 115.1,
+  "duckdb_rows": 1,
+  "krishiv_ms": 531.1,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 33,
+  "duckdb_ms": 279.9,
+  "duckdb_rows": 100,
+  "krishiv_ms": 564.0,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 34,
+  "duckdb_ms": 286.1,
+  "duckdb_rows": 455,
+  "krishiv_ms": 628.9,
+  "rc": 0,
+  "krishiv_rows": 455,
+  "status": "match"
+ },
+ {
+  "query": 35,
+  "duckdb_ms": 662.0,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1016.2,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 36,
+  "duckdb_ms": 368.2,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1319.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 37,
+  "duckdb_ms": 91.4,
+  "duckdb_rows": 1,
+  "krishiv_ms": 309.9,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 38,
+  "duckdb_ms": 513.1,
+  "duckdb_rows": 1,
+  "krishiv_ms": 772.2,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 39,
+  "duckdb_ms": 406.8,
+  "duckdb_rows": 243,
+  "krishiv_ms": 576.1,
+  "rc": 0,
+  "krishiv_rows": 243,
+  "status": "match"
+ },
+ {
+  "query": 40,
+  "duckdb_ms": 194.9,
+  "duckdb_rows": 100,
+  "krishiv_ms": 392.9,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 41,
+  "duckdb_ms": 86.2,
+  "duckdb_rows": 4,
+  "krishiv_ms": 280.1,
+  "rc": 0,
+  "krishiv_rows": 4,
+  "status": "match"
+ },
+ {
+  "query": 42,
+  "duckdb_ms": 204.8,
+  "duckdb_rows": 10,
+  "krishiv_ms": 321.5,
+  "rc": 0,
+  "krishiv_rows": 10,
+  "status": "match"
+ },
+ {
+  "query": 43,
+  "duckdb_ms": 219.5,
+  "duckdb_rows": 6,
+  "krishiv_ms": 599.3,
+  "rc": 0,
+  "krishiv_rows": 6,
+  "status": "match"
+ },
+ {
+  "query": 44,
+  "duckdb_ms": 395.1,
+  "duckdb_rows": 10,
+  "krishiv_ms": 692.4,
+  "rc": 0,
+  "krishiv_rows": 10,
+  "status": "match"
+ },
+ {
+  "query": 45,
+  "duckdb_ms": 302.6,
+  "duckdb_rows": 19,
+  "krishiv_ms": 483.0,
+  "rc": 0,
+  "krishiv_rows": 19,
+  "status": "match"
+ },
+ {
+  "query": 46,
+  "duckdb_ms": 605.6,
+  "duckdb_rows": 100,
+  "krishiv_ms": 753.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 47,
+  "duckdb_ms": 809.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 3159.5,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 48,
+  "duckdb_ms": 582.2,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1205.7,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 49,
+  "duckdb_ms": 267.3,
+  "duckdb_rows": 34,
+  "krishiv_ms": 1286.5,
+  "rc": 0,
+  "krishiv_rows": 34,
+  "status": "match"
+ },
+ {
+  "query": 50,
+  "duckdb_ms": 317.1,
+  "duckdb_rows": 6,
+  "krishiv_ms": 1220.7,
+  "rc": 0,
+  "krishiv_rows": 6,
+  "status": "match"
+ },
+ {
+  "query": 51,
+  "duckdb_ms": 1400.6,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1784.9,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 52,
+  "duckdb_ms": 133.1,
+  "duckdb_rows": 100,
+  "krishiv_ms": 553.2,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 53,
+  "duckdb_ms": 282.9,
+  "duckdb_rows": 100,
+  "krishiv_ms": 463.0,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 54,
+  "duckdb_ms": 423.9,
+  "duckdb_rows": 1,
+  "krishiv_ms": 712.2,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 55,
+  "duckdb_ms": 207.4,
+  "duckdb_rows": 100,
+  "krishiv_ms": 386.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 56,
+  "duckdb_ms": 377.2,
+  "duckdb_rows": 100,
+  "krishiv_ms": 586.8,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 57,
+  "duckdb_ms": 651.1,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1690.2,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 58,
+  "duckdb_ms": 397.9,
+  "duckdb_rows": 5,
+  "krishiv_ms": 555.2,
+  "rc": 0,
+  "krishiv_rows": 5,
+  "status": "match"
+ },
+ {
+  "query": 59,
+  "duckdb_ms": 510.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1328.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 60,
+  "duckdb_ms": 341.6,
+  "duckdb_rows": 100,
+  "krishiv_ms": 442.4,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 61,
+  "duckdb_ms": 535.4,
+  "duckdb_rows": 1,
+  "krishiv_ms": 961.9,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 62,
+  "duckdb_ms": 258.2,
+  "duckdb_rows": 100,
+  "krishiv_ms": 429.5,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 63,
+  "duckdb_ms": 265.5,
+  "duckdb_rows": 100,
+  "krishiv_ms": 466.9,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 64,
+  "duckdb_ms": 1022.4,
+  "duckdb_rows": 2,
+  "krishiv_ms": 5136.1,
+  "rc": 0,
+  "krishiv_rows": 2,
+  "status": "match"
+ },
+ {
+  "query": 65,
+  "duckdb_ms": 247.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 827.4,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 66,
+  "duckdb_ms": 496.6,
+  "duckdb_rows": 5,
+  "krishiv_ms": 948.2,
+  "rc": 0,
+  "krishiv_rows": 5,
+  "status": "match"
+ },
+ {
+  "query": 67,
+  "duckdb_ms": 2457.0,
+  "duckdb_rows": 100,
+  "krishiv_ms": 4386.9,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 68,
+  "duckdb_ms": 486.6,
+  "duckdb_rows": 100,
+  "krishiv_ms": 784.8,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 69,
+  "duckdb_ms": 492.5,
+  "duckdb_rows": 100,
+  "krishiv_ms": 957.1,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 70,
+  "duckdb_ms": 459.5,
+  "duckdb_rows": 3,
+  "krishiv_ms": 885.3,
+  "rc": 0,
+  "krishiv_rows": 3,
+  "status": "match"
+ },
+ {
+  "query": 71,
+  "duckdb_ms": 368.1,
+  "duckdb_rows": 1031,
+  "krishiv_ms": 648.3,
+  "rc": 0,
+  "krishiv_rows": 1031,
+  "status": "match"
+ },
+ {
+  "query": 72,
+  "duckdb_ms": 1770.1,
+  "duckdb_rows": 100,
+  "krishiv_ms": 17535.4,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 73,
+  "duckdb_ms": 283.8,
+  "duckdb_rows": 1,
+  "krishiv_ms": 569.9,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 74,
+  "duckdb_ms": 930.8,
+  "duckdb_rows": 92,
+  "krishiv_ms": 1632.9,
+  "rc": 0,
+  "krishiv_rows": 92,
+  "status": "match"
+ },
+ {
+  "query": 75,
+  "duckdb_ms": 614.8,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1644.0,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 76,
+  "duckdb_ms": 259.9,
+  "duckdb_rows": 100,
+  "krishiv_ms": 551.2,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 77,
+  "duckdb_ms": 324.4,
+  "duckdb_rows": 44,
+  "krishiv_ms": 592.5,
+  "rc": 0,
+  "krishiv_rows": 44,
+  "status": "match"
+ },
+ {
+  "query": 78,
+  "duckdb_ms": 1171.5,
+  "duckdb_rows": 100,
+  "krishiv_ms": 2380.8,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 79,
+  "duckdb_ms": 452.4,
+  "duckdb_rows": 100,
+  "krishiv_ms": 861.5,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 80,
+  "duckdb_ms": 506.3,
+  "duckdb_rows": 100,
+  "krishiv_ms": 2073.7,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 81,
+  "duckdb_ms": 405.6,
+  "duckdb_rows": 100,
+  "krishiv_ms": 512.3,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 82,
+  "duckdb_ms": 184.0,
+  "duckdb_rows": 2,
+  "krishiv_ms": 474.9,
+  "rc": 0,
+  "krishiv_rows": 2,
+  "status": "match"
+ },
+ {
+  "query": 83,
+  "duckdb_ms": 233.0,
+  "duckdb_rows": 24,
+  "krishiv_ms": 433.5,
+  "rc": 0,
+  "krishiv_rows": 24,
+  "status": "match"
+ },
+ {
+  "query": 84,
+  "duckdb_ms": 230.1,
+  "duckdb_rows": 16,
+  "krishiv_ms": 462.7,
+  "rc": 0,
+  "krishiv_rows": 16,
+  "status": "match"
+ },
+ {
+  "query": 85,
+  "duckdb_ms": 634.5,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1398.5,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 86,
+  "duckdb_ms": 221.5,
+  "duckdb_rows": 100,
+  "krishiv_ms": 348.9,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 87,
+  "duckdb_ms": 498.2,
+  "duckdb_rows": 1,
+  "krishiv_ms": 949.3,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 88,
+  "duckdb_ms": 662.4,
+  "duckdb_rows": 1,
+  "krishiv_ms": 1929.2,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 89,
+  "duckdb_ms": 316.5,
+  "duckdb_rows": 100,
+  "krishiv_ms": 596.8,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 90,
+  "duckdb_ms": 102.9,
+  "duckdb_rows": 1,
+  "krishiv_ms": 321.0,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 91,
+  "duckdb_ms": 279.6,
+  "duckdb_rows": 2,
+  "krishiv_ms": 651.1,
+  "rc": 0,
+  "krishiv_rows": 2,
+  "status": "match"
+ },
+ {
+  "query": 92,
+  "duckdb_ms": 149.7,
+  "duckdb_rows": 1,
+  "krishiv_ms": 347.8,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 93,
+  "duckdb_ms": 369.3,
+  "duckdb_rows": 100,
+  "krishiv_ms": 1167.2,
+  "rc": 0,
+  "krishiv_rows": 100,
+  "status": "match"
+ },
+ {
+  "query": 94,
+  "duckdb_ms": 151.5,
+  "duckdb_rows": 1,
+  "krishiv_ms": 979.1,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 95,
+  "duckdb_ms": 1166.7,
+  "duckdb_rows": 1,
+  "krishiv_ms": 5246.2,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 96,
+  "duckdb_ms": 180.0,
+  "duckdb_rows": 1,
+  "krishiv_ms": 416.5,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 97,
+  "duckdb_ms": 528.0,
+  "duckdb_rows": 1,
+  "krishiv_ms": 739.3,
+  "rc": 0,
+  "krishiv_rows": 1,
+  "status": "match"
+ },
+ {
+  "query": 98,
+  "duckdb_ms": 273.4,
+  "duckdb_rows": 2521,
+  "krishiv_ms": 511.0,
+  "rc": 0,
+  "krishiv_rows": 2521,
+  "status": "match"
+ },
+ {
+  "query": 99,
+  "duckdb_ms": 233.0,
+  "duckdb_rows": 90,
+  "krishiv_ms": 352.7,
+  "rc": 0,
+  "krishiv_rows": 90,
+  "status": "match"
+ }
+]

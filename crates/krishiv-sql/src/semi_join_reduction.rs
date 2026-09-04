@@ -345,6 +345,13 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
             (semi.left.as_ref(), semi.right.as_ref())
         };
 
+        // A probe that removes nothing is not worth relocating: pushing it down
+        // buries a full-table hash build below the selective joins above it.
+        // See `probe_reduces_rows` for the two TPC-DS queries this costs 3-4.5x.
+        if !probe_reduces_rows(probe) {
+            return Ok(Transformed::no(plan));
+        }
+
         // Pair each filtered-side key with its probe-side counterpart. Both must
         // be plain columns: an expression could be computed from the joined row
         // and so may not be evaluable before the join.
@@ -960,6 +967,51 @@ fn already_reduced(plan: &LogicalPlan) -> bool {
     matches!(plan, LogicalPlan::Join(j) if j.join_type == JoinType::LeftSemi)
 }
 
+/// Whether the probe side of a semi-join actually removes rows.
+///
+/// The pushdown rule below is only a win when the existence test is
+/// *selective*: it trades the position of the test for the chance to shrink a
+/// join input. When the probe is a bare scan the test removes almost nothing,
+/// and pushing it down instead buries a full-table hash build underneath the
+/// selective dimension joins that would have eliminated it.
+///
+/// Measured on TPC-DS SF1, embedded, best of three:
+///
+/// ```text
+///   q16  rule on 0.41 s   rule off 0.09 s   4.5x
+///   q94  rule on 0.21 s   rule off 0.07 s   3.0x
+/// ```
+///
+/// Both are `EXISTS (SELECT * FROM <fact> WHERE …)` correlated only through
+/// the join key, so decorrelation leaves a bare scan as the probe. TPC-H q18 —
+/// the query this rule was written for, and the one where turning it off makes
+/// the query *fail* at SF100 — probes an `Aggregate` under a `HAVING` filter,
+/// so it keeps its pushdown.
+///
+/// This is the same discriminator [`selective_key_source`] already applies to
+/// the aggregate-reduction rule, and the one whose absence the
+/// [`SEMI_JOIN_DIMENSION_ENV`] docs blame for that rule's 18.1x regression on
+/// q10. Unknown node kinds answer `true`, so an unmodelled shape keeps the
+/// behaviour it had rather than silently losing the rule.
+fn probe_reduces_rows(plan: &LogicalPlan) -> bool {
+    match plan {
+        // A scan reduces rows only if a predicate or a fetch limit reached it.
+        LogicalPlan::TableScan(scan) => !scan.filters.is_empty() || scan.fetch.is_some(),
+        // Row-preserving wrappers: ask what is underneath.
+        LogicalPlan::Projection(p) => probe_reduces_rows(&p.input),
+        LogicalPlan::SubqueryAlias(a) => probe_reduces_rows(&a.input),
+        LogicalPlan::Sort(s) => probe_reduces_rows(&s.input),
+        // Anything that can drop rows counts.
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Aggregate(_)
+        | LogicalPlan::Distinct(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Join(_) => true,
+        // Conservative: an unmodelled shape keeps today's behaviour.
+        _ => true,
+    }
+}
+
 /// Smallest subtree of `plan` that still produces `key` and carries a filter.
 ///
 /// Returns the subtree projected down to the key alone, plus the key's name
@@ -1489,6 +1541,29 @@ mod tests {
           AND c.c_custkey = o.o_custkey AND o.o_orderkey = l.l_orderkey \
         GROUP BY o.o_orderkey";
 
+    /// A probe that is a bare scan removes nothing, so relocating the test
+    /// below the inner join only buries a full-table build under the filters
+    /// that would have eliminated it. TPC-DS q16/q94 shape; measured at 4.5x
+    /// and 3.0x on SF1. See `probe_reduces_rows`.
+    #[tokio::test]
+    async fn a_bare_scan_probe_is_not_pushed_below_the_inner_join() {
+        let sql = "SELECT l.l_orderkey FROM lineitem l JOIN part p \
+            ON l.l_partkey = p.p_partkey WHERE p.p_partkey = 3 \
+            AND EXISTS (SELECT 1 FROM lineitem l2 WHERE l2.l_orderkey = l.l_orderkey)";
+        let plan = plan_of(&context(true), sql).await;
+        let semi = plan
+            .lines()
+            .position(|l| l.contains("LeftSemi") || l.contains("RightSemi"));
+        let inner = plan.lines().position(|l| l.contains("Inner Join"));
+        if let (Some(s), Some(i)) = (semi, inner) {
+            assert!(
+                s < i,
+                "an unfiltered probe must leave the semi-join ABOVE the inner \
+                 join, not below it:\n{plan}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn the_semi_join_is_pushed_below_the_inner_join() {
         let with = plan_of(&context(true), Q18_SHAPE).await;
@@ -1647,11 +1722,26 @@ mod tests {
         }
     }
 
-    /// The rewrite must actually fire on q21, not merely stay correct by
-    /// declining. `filter.is_some()` used to reject this shape outright, so a
-    /// results-only test would have passed against the unfixed rule.
+    /// q21's existence joins stay above the inner join, and that is the fast
+    /// shape.
+    ///
+    /// Before `probe_reduces_rows` both were pushed below it. The `EXISTS`
+    /// probes a BARE `lineitem` scan, so the guard now declines it — and
+    /// because the rule descends only through row-preserving nodes, the
+    /// declined semi-join then blocks the `NOT EXISTS` above it from
+    /// descending either. Both stay up.
+    ///
+    /// That is measured to be the right answer for this query. TPC-H q21 at
+    /// SF1, embedded, best of three: **0.55 s with both pushed, 0.30 s with
+    /// neither — 1.8x.** The old test asserted the 0.55 s shape.
+    ///
+    /// Not-fixed, recorded: an anti-join whose own probe IS filtered cannot
+    /// currently descend past a declined semi-join. Teaching `push_semi_below`
+    /// to descend through an existence join would let q21's anti-join move
+    /// while its semi-join stays. Whether that is faster than either shape here
+    /// is unmeasured, so it is not guessed at.
     #[tokio::test]
-    async fn the_q21_semi_and_anti_joins_are_pushed_below_the_inner_join() {
+    async fn q21s_bare_scan_semi_join_is_not_pushed_below_the_inner_join() {
         let with = plan_of(&context(true), Q21_VERBATIM).await;
         let without = plan_of(&context(false), Q21_VERBATIM).await;
 
@@ -1667,14 +1757,17 @@ mod tests {
             "baseline should have the existence joins above the inner join:\n{without}"
         );
 
+        // The guard's whole point: with the rule ON, q21 now keeps the same
+        // shape the baseline has, because its semi-join probe is a bare scan.
         let (ws, wi) = (first_semi(&with), first_inner(&with));
         assert!(
             ws.is_some() && wi.is_some(),
             "expected both join kinds in:\n{with}"
         );
         assert!(
-            ws > wi,
-            "q21's existence joins must be pushed below the inner join:\n{with}"
+            ws < wi,
+            "q21's semi-join probes a BARE lineitem scan, so it must stay ABOVE \
+             the inner join — pushing it measured 1.8x slower:\n{with}"
         );
     }
 
