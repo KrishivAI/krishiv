@@ -1,28 +1,22 @@
 # krishiv-sql
 
-SQL parsing, planning, and execution engine built on DataFusion.
+DataFusion integration: `SqlEngine` and its registries, the `sql()`
+pipeline with pre-optimizer rewrites (CTE materialisation, ROLLUP/CUBE/
+GROUPING SETS), intercepted statements (DDL, DML, `ANALYZE`, `EXPLAIN`,
+streaming and incremental view DDL, `SET`), Krishiv's optimizer rules
+(`JoinReorder`, semi-join pushdown, `SpillableJoinSelection`,
+`CooperativeAmplifiers`, `LateMaterializeTopKAggregate`,
+`AnnTopKPrefilter`), session configuration, distributed plan encoding,
+catalogs (local, REST, Postgres, Glue, Unity, Hive, Nessie, Polaris),
+information schema, Spark SQL extensions, streaming window compilation,
+Python UDF hosting.
 
-## Overview
+Features: `iceberg`, `iceberg-datafusion`, `local-catalog`,
+`postgres-catalog`, `rest-catalog`, plus connector forwarders. `default = []`
+so an embedded build stays lean.
 
-`krishiv-sql` extends DataFusion with Krishiv-specific capabilities:
+Documentation: `docs/architecture/02-sql-engine.md`,
+`docs/architecture/03-planning-and-optimization.md`,
+`docs/reference/sql-feature-matrix.md` (generated).
 
-- SQL parsing via `sqlparser`
-- DDL handling (CREATE TABLE, CREATE SINK, INSERT INTO)
-- Iceberg catalog integration (REST, Glue, Unity)
-- Delta Lake and Hudi support
-- Information schema for metadata queries
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `iceberg` | Apache Iceberg catalog support (default) |
-| `delta` | Delta Lake table support |
-| `hudi` | Apache Hudi table support |
-| `local-catalog` | Local filesystem catalog |
-| `postgres-catalog` | PostgreSQL-backed Iceberg catalog |
-| `rest-catalog` | REST Iceberg catalog |
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

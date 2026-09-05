@@ -214,14 +214,14 @@ undeploy-k8s:
 #
 # Required-tier companion recipes (Phase 51 CI honesty — the PR gate is
 # `test` + `test-integration` + `test-doc`; the tier map with a named
-# rationale per exclusion lives in docs/implementation/ci-tiers.md):
+# rationale per exclusion lives in docs/architecture/17-testing-and-quality.md):
 test:
     {{ sccache_env }} {{ cargo_test }} --workspace --lib --bins \
         --exclude krishiv-python \
         --exclude krishiv-chaos
 
 # All crates' tests/*.rs integration suites. External-service tests inside
-# them are `#[ignore = "requires …"]`-gated and stay opt-in (see ci-tiers.md).
+# them are `#[ignore = "requires …"]`-gated and stay opt-in (see docs/architecture/17-testing-and-quality.md).
 test-integration:
     {{ sccache_env }} {{ cargo_test }} --workspace --tests \
         --exclude krishiv-python \
@@ -240,7 +240,7 @@ test-doc:
 # (docker compose: postgres :5439, MinIO :9102, OTLP collector :4319); every
 # endpoint below can be overridden with the same env var the test reads.
 # The two live-cluster tests (mode_conformance :9090, api :50051) stay out
-# until Phase 58's real multi-executor harness exists (docs/implementation/ci-tiers.md).
+# until Phase 58's real multi-executor harness exists (docs/architecture/17-testing-and-quality.md).
 test-external:
     KRISHIV_TEST_DATABASE_URL="${KRISHIV_TEST_DATABASE_URL:-postgres://krishiv:krishiv@127.0.0.1:5439/krishiv_test}" \
         {{ sccache_env }} {{ cargo }} test -p krishiv-sql --features postgres-catalog --lib -- --ignored postgres_catalog
@@ -329,7 +329,7 @@ test-sql:
 # `just test-integration` (--tests). Reading this as one is how a new
 # integration test was once believed covered by a green `just test` that never
 # ran it. python/chaos/bench excluded
-# (see docs/implementation/ci-tiers.md). Prints the per-crate summary table;
+# (see docs/architecture/17-testing-and-quality.md). Prints the per-crate summary table;
 # coverage.yml runs this nightly and publishes the number to the job summary.
 # Install: cargo binstall cargo-llvm-cov
 coverage:
@@ -417,7 +417,7 @@ lint:
 # that own the feature graph. Installs cargo-hack on demand.
 #
 # Quarantined features (pre-existing dependency-API rot in optional, non-preset
-# integrations; tracked in docs/feature-graph.md → "Quarantined features"):
+# integrations; tracked in docs/architecture/15-configuration.md, "Cargo features"):
 #   connectors: pulsar-source, cassandra, elasticsearch, vortex, cloud
 #   sql:        rest-catalog, unity-catalog, glue-catalog
 #   (postgres-catalog un-quarantined 2026-07-11: fixed against iceberg 0.9.1,

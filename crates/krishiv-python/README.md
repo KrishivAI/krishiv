@@ -1,48 +1,30 @@
 # krishiv-python
 
-Python bindings for Krishiv via PyO3.
+PyO3 bindings (`pip install krishiv`) over the same `Session` the Rust API
+uses: `Session`, `BlockingSession`, `DataFrame`, `StreamingDataFrame`,
+`IncrementalDataFrame`, `IvmJob`, `DeltaBatch`, `Pipeline`, `QueryHandle`,
+`PreparedStatement`, `Column`, keyed process state, connector sources and
+sinks, Rust and Python UDFs, and a PySpark-compatible surface
+(`krishiv.sql.functions`, `Row`). Python is sync-convenience plus asyncio.
 
-## Overview
-
-`krishiv-python` exposes Krishiv's SQL engine, DataFrame API, and connector
-framework to Python. Install via pip:
+Optional native features: `kafka`, `iceberg`, `kinesis`, `pulsar`,
+`cassandra`, `elasticsearch`, `hbase`, `vector-sinks`, `qdrant`, `pgvector`.
 
 ```bash
-pip install krishiv
+maturin develop --manifest-path crates/krishiv-python/Cargo.toml --release
 ```
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `kafka` | Kafka source/sink |
-| `iceberg` | Apache Iceberg support |
-| `kinesis` | AWS Kinesis source |
-| `pulsar` | Apache Pulsar source |
-| `cassandra` | Cassandra sink |
-| `elasticsearch` | Elasticsearch sink |
-| `hbase` | HBase sink |
-| `vector-sinks` | Vector database sinks |
-| `qdrant` | Qdrant vector sink |
-| `pgvector` | pgvector sink |
-
-## Usage
 
 ```python
 import krishiv as ks
-
 session = ks.Session()
-df = session.sql("SELECT 42 as answer")
-print(df.collect().pretty())
+print(session.sql("SELECT 42 AS answer").collect().pretty())
 ```
 
-## Building
+Excluded from the workspace `cargo test`/clippy runs (needs a Python
+toolchain); tested by the required `test-python` CI job. Lint with
+`cargo check -p krishiv-python`.
 
-```bash
-cd crates/krishiv-python
-maturin develop --release
-```
+Documentation: `docs/architecture/11-public-interfaces.md`,
+`docs/reference/pyspark-parity.md` (generated).
 
-## License
-
-Apache-2.0
+License: Apache-2.0.

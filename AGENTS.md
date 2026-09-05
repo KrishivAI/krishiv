@@ -10,8 +10,9 @@ pipelines, and lakehouse-oriented data work.
 
 Use the current codebase as the source of truth. The minimal docs are:
 
-- `docs/README.md` - architecture, crate map, runtime modes, commands, and rules.
-- `docs/implementation/status.md` - short session handoff note only.
+- `docs/README.md` - the documentation index; `docs/architecture/00-overview.md` and the
+  numbered documents beside it are the architecture reference (every feature and crate).
+- `docs/engineering-log/status.md` - short session handoff note only.
 
 ## Core Defaults
 
@@ -38,21 +39,22 @@ Use the current codebase as the source of truth. The minimal docs are:
 
 ## Workflow
 
-1. Read `docs/README.md` and `docs/implementation/status.md`.
+1. Read `docs/README.md`, the relevant `docs/architecture/NN-*.md`, and
+   `docs/engineering-log/status.md`.
 2. Inspect the relevant crate before planning edits.
 3. Keep changes scoped to the crate that owns the behavior.
 4. Add or update focused tests with behavior changes.
 5. Run the narrowest useful validation command before final response.
-6. For substantial sessions, update `docs/implementation/status.md` with:
+6. For substantial sessions, update `docs/engineering-log/status.md` with:
    completed work, validation, blockers, and the next useful command.
 
 ## Claude Code Session
 
 - **Skill**: `/krishiv-engine implement the requested Krishiv task`
-- **Session start**: read `AGENTS.md`, `docs/README.md`, and
-  `docs/implementation/status.md`; inspect the relevant crate; pick one
+- **Session start**: read `AGENTS.md`, `docs/README.md`, the relevant `docs/architecture/` document, and
+  `docs/engineering-log/status.md`; inspect the relevant crate; pick one
   concrete task and one validation command.
-- **Session end**: for substantial work, update `docs/implementation/status.md`
+- **Session end**: for substantial work, update `docs/engineering-log/status.md`
   with completed work, validation, blockers, and the next useful command.
 
 ## Rust Standards

@@ -1,13 +1,12 @@
 # krishiv-sql-gateway
 
-Separately versioned SQL gateway facade for JDBC/ODBC-compatible clients.
+An in-process library facade over `BlockingSession` with SQLSTATE error
+mapping, connection pooling, and a gateway-style API (`GatewaySession`,
+`SessionPool`, `GatewayQueryResult`) for tools that embed Krishiv. It is
+**not** a JDBC/ODBC wire server: external drivers connect through Arrow
+Flight SQL (`krishiv-flight-sql`).
 
-## Overview
+Documentation: `docs/architecture/11-public-interfaces.md`,
+`docs/reference/jdbc-connectivity.md`.
 
-`krishiv-sql-gateway` provides a thin facade over `krishiv-api` and
-`krishiv-sql` for JDBC/ODBC client compatibility. It enables external tools
-(Tableau, dbt, etc.) to connect to Krishiv using standard SQL interfaces.
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

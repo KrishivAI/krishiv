@@ -44,7 +44,7 @@ For library use, add the specific crates you need:
 
 ```toml
 [dependencies]
-krishiv-api     = "0.1"   # Session, DataFrame, IncrementalFlow
+krishiv-api     = "0.1"   # Session, DataFrame, IncrementalDataFrame
 krishiv-delta   = "0.1"   # DeltaBatch, IVM operators
 krishiv-connectors = { version = "0.1", features = ["iceberg"] }
 ```
@@ -69,20 +69,19 @@ pip install "krishiv[all]"         # everything
 
 ### Batch SQL
 
-**Rust**
+**Rust** (`Session` is sync-friendly; every method has an `_async` twin)
 
 ```rust
 use krishiv_api::Session;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> krishiv_api::Result<()> {
     let session = Session::new();
-    session.register_record_batch("orders", orders_batch)?;
+    session.register_record_batches("orders", vec![orders_batch])?;
 
     let result = session
-        .sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")
-        .await?;
-    println!("{result:?}");
+        .sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")?
+        .collect()?;
+    println!("{}", result.pretty()?);
     Ok(())
 }
 ```
@@ -91,57 +90,81 @@ async fn main() -> anyhow::Result<()> {
 
 ```python
 import pyarrow as pa
-import krishiv
+import krishiv as ks
 
-session = krishiv.Session()
-session.register_table("orders", pa.table({"status": ["a", "b", "a"], "amount": [10.0, 25.0, 5.0]}))
+session = ks.Session()
+session.register_record_batches("orders", [pa.record_batch(
+    {"status": ["a", "b", "a"], "amount": [10.0, 25.0, 5.0]})])
 
-result = session.sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status")
-print(result.to_pandas())
+result = session.sql("SELECT status, COUNT(*) AS n FROM orders GROUP BY status").collect()
+print(result.pretty())
 ```
 
 **CLI**
 
 ```bash
 krishiv sql --query "SELECT 1 AS value"
-krishiv explain --query "SELECT 1 AS value"
+krishiv explain --analyze --query "SELECT 1 AS value"
 ```
 
 ### Streaming
 
 ```python
-import krishiv
+import krishiv as ks
 
-stream = krishiv.StreamSession()
-stream.register_window("orders_1m", "orders", tumbling="60s")
-stream.register_view("totals", "SELECT window_start, SUM(amount) AS total FROM orders_1m GROUP BY window_start")
+session = ks.Session()
+events = session.sql("SELECT 1 AS n, 100 AS val, 1000 AS ts UNION ALL SELECT 1, 200, 2000")
 
-for batch in stream.start():
-    print(f"window: {batch.num_rows()} rows")
+windowed = (
+    events.to_streaming()
+    .with_event_time("ts")
+    .key_by("n")
+    .tumbling_window(1000)      # ms
+)
+
+async for batch in await windowed.execute_stream_async():
+    print(batch)
 ```
+
+Windowed SQL (`TUMBLE` / `HOP` / `SESSION`) over an unbounded source compiles
+to the same operators; `krishiv stream` runs it from the CLI.
 
 ### Incremental View Maintenance (IVM)
 
 ```python
 import pyarrow as pa
-import krishiv
+import krishiv as ks
 
-flow = krishiv.IncrementalFlow()
-flow.register_view(
-    "order_counts",
-    "SELECT status, COUNT(*) AS n FROM orders GROUP BY status",
-    pa.schema([pa.field("status", pa.utf8()), pa.field("n", pa.int64())]),
+session = ks.Session()
+job = session.ivm("sales_pipeline")
+
+class Revenue(ks.Schema):
+    region: str
+    total: float
+
+job.register_view(
+    "revenue",
+    "SELECT region, SUM(amount) AS total FROM sales GROUP BY region",
+    Revenue,
+    is_materialized=True,
 )
 
-# Tick 1 — new data arrives
-flow.feed_source("orders", krishiv.DeltaBatch.from_inserts(orders_batch))
-flow.step()
+# Tick 1 — inserts
+job.feed("sales", ks.DeltaBatch.from_inserts(
+    pa.RecordBatch.from_pydict({"region": ["us", "eu"], "amount": [100.0, 200.0]})))
+print(job.step().total_output_rows, job.snapshot("revenue"))
 
-# Get the incremental delta
-delta = flow.watch_view("order_counts")
-print(delta.filter_positive().to_pandas())   # new rows
-print(delta.filter_negative().to_pandas())   # retracted rows
+# Tick 2 — an update is a retraction plus an insertion
+before = pa.RecordBatch.from_pydict({"region": ["us"], "amount": [100.0]})
+after = pa.RecordBatch.from_pydict({"region": ["us"], "amount": [250.0]})
+job.feed("sales", ks.DeltaBatch.from_update(before, after))
+job.step()
+print(job.snapshot("revenue"))          # us=250, eu=200
+
+ckpt = job.checkpoint()                 # bytes; job.restore(ckpt) later
 ```
+
+`examples/` has complete programs for every mode (`docs/guides/running-examples.md`).
 
 ---
 
@@ -173,7 +196,7 @@ print(delta.filter_negative().to_pandas())   # retracted rows
 | Crate | Purpose |
 |---|---|
 | `krishiv` | CLI binary (`sql`, `explain`, `jobs`, `local start`) |
-| `krishiv-api` | `Session`, `DataFrame`, `IncrementalFlow` |
+| `krishiv-api` | `Session`, `DataFrame`, `StreamingDataFrame`, `IncrementalDataFrame` |
 | `krishiv-delta` | `DeltaBatch`, IVM operators, `IntegrateOp` |
 | `krishiv-sql` | DataFusion SQL integration, DDL, catalog |
 | `krishiv-connectors` | Source/sink SDK, Iceberg, Kafka, Parquet |
@@ -217,12 +240,17 @@ docker build -f deploy/docker/Dockerfile.prod -t krishiv:prod .
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) — engine internals and crate boundaries
-- [Engine Contracts](docs/contracts/engine-semantics.md) — batch, streaming, delivery guarantees
-- [Connector SDK](docs/connector-sdk.md) — building source/sink connectors
-- [Roadmap](docs/ROADMAP.md) — compute-engine priorities
-- [Compatibility](docs/COMPATIBILITY.md) — API and metadata upgrade policy
-- [Contributing](CONTRIBUTING.md) — how to open a change
+The architecture set in [`docs/architecture/`](docs/README.md) covers every
+feature and every crate:
+
+- [Overview](docs/architecture/00-overview.md) · [Execution modes](docs/architecture/01-execution-modes.md) · [SQL engine](docs/architecture/02-sql-engine.md) · [Planning and optimization](docs/architecture/03-planning-and-optimization.md)
+- [Scheduler and coordinator](docs/architecture/04-scheduler-and-coordinator.md) · [Executor and data plane](docs/architecture/05-executor-and-data-plane.md) · [Shuffle](docs/architecture/06-shuffle.md) · [State, checkpoints, savepoints](docs/architecture/07-state-checkpoints-savepoints.md)
+- [Streaming](docs/architecture/08-streaming.md) · [Incremental view maintenance](docs/architecture/09-incremental-view-maintenance.md) · [Connectors and lakehouse](docs/architecture/10-connectors-and-lakehouse.md) · [Public interfaces](docs/architecture/11-public-interfaces.md)
+- [Security](docs/architecture/12-security.md) · [Observability](docs/architecture/13-observability.md) · [Deployment and durability](docs/architecture/14-deployment-and-durability.md) · [Configuration](docs/architecture/15-configuration.md)
+- [Performance](docs/architecture/16-performance.md) · [Testing and quality](docs/architecture/17-testing-and-quality.md) · [Compatibility and versioning](docs/architecture/18-compatibility-and-versioning.md)
+
+Also: [Engine contracts](docs/contracts/engine-semantics.md), [Connector SDK](docs/connector-sdk.md),
+[Roadmap](docs/ROADMAP.md), [Compatibility](docs/COMPATIBILITY.md), [Contributing](CONTRIBUTING.md).
 
 ---
 

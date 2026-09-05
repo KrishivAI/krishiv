@@ -1,42 +1,20 @@
 # krishiv-scheduler
 
-Job scheduling and coordination for single-node and distributed Krishiv.
+The control plane: `Coordinator` (cluster control plane) and
+`JobCoordinator` (per-job), leader election with fencing tokens
+(`SingleNodeLeader`, etcd lease), admission and queues, placement
+(`StaticScheduler`, `SlotAwareScheduler`, `LocalityScheduler`,
+`FairScheduler`), the executor registry and heartbeats, staged batch
+planning and adaptive execution, checkpoint coordination, restore
+directives, the `IvmJobRegistry`, metadata stores (memory, RocksDB, etcd),
+result spools, and the gRPC + HTTP `/api/v1` control surfaces with bearer
+auth.
 
-## Overview
+Binaries: `krishiv-clusterd` (coordinator daemon; `krishiv clusterd`),
+`krishiv-coordinator` (alias), `krishiv-job-coordinator`. Feature `etcd`
+enables the etcd metadata store (`just test-etcd` runs its tests).
 
-`krishiv-scheduler` manages job lifecycle, stage planning, and resource
-allocation:
+Documentation: `docs/architecture/04-scheduler-and-coordinator.md`,
+`docs/architecture/12-security.md`, `docs/engineering-log/crate-audit-register.md`.
 
-- Single-node scheduler with embedded state
-- Distributed scheduler with etcd-backed metadata
-- Stage DAG planning and task assignment
-- Checkpoint coordination for exactly-once recovery
-- JWT-based authentication
-
-## Binaries
-
-| Binary | Description |
-|--------|-------------|
-| `krishiv-coordinator` | Single-node coordinator |
-| `krishiv-clusterd` | Distributed coordinator (requires `etcd` feature) |
-| `krishiv-job-coordinator` | Per-job coordinator |
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `etcd` | etcd metadata backend for distributed mode |
-
-## Usage
-
-```bash
-# Single-node
-krishiv-coordinator --grpc-addr 0.0.0.0:50051 --insecure
-
-# Distributed
-krishiv-clusterd --etcd-endpoints http://localhost:2379 --insecure
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

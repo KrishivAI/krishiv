@@ -674,7 +674,7 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   that fixed setup cost (~650-700ms) dominates the true O(Δ) aggregate
   work at these scales. Extrapolating measured full-recompute scaling, the
   crossover (where a full recompute costs as much as one current IVM tick)
-  is ~23M rows. See `docs/implementation/status.md` for the full
+  is ~23M rows. See `docs/engineering-log/status.md` for the full
   methodology, numbers, and root-cause read of `flow.rs`. Not fixed here —
   reusing a job-scoped `SessionContext` across ticks is the natural
   follow-up and is flagged for the engine team, not attempted this session.

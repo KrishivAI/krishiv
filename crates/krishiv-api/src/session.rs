@@ -3382,7 +3382,7 @@ impl Session {
     /// not reach this job, and neither does `krishiv ivm run --mode single-node`
     /// as a way to attach to it. Whether SingleNode IVM *should* route to the
     /// daemon is an open decision, recorded in
-    /// `docs/implementation/ivm-audit-register.md`; until it is taken, this doc
+    /// `docs/engineering-log/ivm-audit-register.md`; until it is taken, this doc
     /// is the whole of the contract.
     /// Auto-partitions: if the job's first view is key-shardable it is spread
     /// across shards. Fast for a single view, and **cannot host a view-DAG** —

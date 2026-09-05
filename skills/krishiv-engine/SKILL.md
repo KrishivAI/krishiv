@@ -38,7 +38,7 @@ Rust-native hybrid compute framework — batch SQL, streaming pipelines, lakehou
 
 ## Workflow
 
-1. Read `docs/implementation/status.md` for current handoff.
+1. Read `docs/engineering-log/status.md` for current handoff.
 2. Inspect the relevant crate before editing.
 3. Keep changes scoped to the owning crate.
 4. Add focused tests with behavior changes.
@@ -84,5 +84,5 @@ GCC 15: prepend `CXXFLAGS="-include cstdint"` to any command linking rocksdb.
 
 ## Session Handoff
 
-For substantial sessions, update `docs/implementation/status.md` with:
+For substantial sessions, update `docs/engineering-log/status.md` with:
 completed work, validation, blockers, and the next useful command.

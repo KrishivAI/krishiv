@@ -562,7 +562,7 @@ async fn execute_window_fragment(
 /// is one coalesce group, not one partition.
 ///
 /// This is recorded here, and not only in
-/// `docs/implementation/crate-audit-register.md`, because the register has now
+/// `docs/engineering-log/crate-audit-register.md`, because the register has now
 /// caught two separate attempts to "fix" the materialisation below: the memory
 /// characteristics look alarming (a whole partition as Arrow batches, plus a
 /// second full copy as IPC bytes when a push store is wired) and nothing in the

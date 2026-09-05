@@ -1,15 +1,15 @@
 # Repository Layout
 
 Where things live in the Krishiv repo. Read this first if you are new here;
-`AGENTS.md`, `docs/README.md`, and `docs/implementation/status.md` are the
+`AGENTS.md`, `docs/README.md`, and `docs/engineering-log/status.md` are the
 authoritative source for rules, crate ownership, and session handoff.
 
 ## Top-level directories
 
 | Path | Role |
 |---|---|
-| `crates/` | Rust workspace — 24 crates, one per engine/feature boundary. See `docs/README.md` for the full map. |
-| `docs/` | Architecture, contracts, decisions, implementation notes, governance, roadmap. |
+| `crates/` | Rust workspace — 24 crates, one per engine/feature boundary. See `docs/architecture/00-overview.md` for the crate ownership map. |
+| `docs/` | `architecture/` (numbered reference set), `contracts/`, `decisions/` (ADRs), `reference/` (generated matrices), `guides/`, `engineering-log/` (audits, status, evidence), governance, roadmap. |
 | `examples/` | Runnable example programs in Rust, Python, and Enterprise layouts. |
 | `python/` | First-party Python packages (PyO3 bindings + vendor integrations). |
 | `deploy/k8s/` | Kubernetes manifests, Helm chart, CRDs, deployment yamls. |
@@ -40,14 +40,15 @@ authoritative source for rules, crate ownership, and session handoff.
 | `rust-toolchain.toml` | Pinned Rust toolchain version. |
 | `deny.toml` | `cargo-deny` policy (licenses, bans, advisories). |
 | `REPOSITORY_LAYOUT.md` | This file. |
-| `RELEASE.md`, `RUNNING.md` (in docs/) | Per-task guides. |
+| `docs/RELEASE.md`, `docs/guides/running-examples.md` | Per-task guides. |
 
 ## "I want to X" cheat sheet
 
 - **Add a new feature to the engine** → touch one crate under `crates/`; see
-  the crate map in `docs/README.md` to find the right owner.
+  the crate ownership map in `docs/architecture/00-overview.md` to find the right owner.
 - **Add a new connector** → `crates/krishiv-connectors/src/`, implement
-  `SourceProvider` / `SinkProvider`, add a maturity label and a test.
+  `Source` / `Sink` plus a registry driver, declare capabilities and maturity,
+  add a test (`docs/architecture/10-connectors-and-lakehouse.md`).
 - **Add a new Python binding** → `crates/krishiv-python/src/`, regenerate
   `python-public.json` via `just api-inventory`.
 - **Run benchmarks** → `just bench-*` recipes; see `docs/BENCHMARKING.md`.
@@ -55,7 +56,7 @@ authoritative source for rules, crate ownership, and session handoff.
   `target/api-change-report.json` and add to `api/approved-breaking.toml`
   if needed.
 - **Cut a release** → follow `skills/release/SKILL.md` step by step.
-- **Investigate a production issue** → start at `docs/implementation/status.md`
+- **Investigate a production issue** → start at `docs/engineering-log/status.md`
   for the latest session note + validation command.
 
 ## Why some things look the way they do
@@ -79,7 +80,7 @@ authoritative source for rules, crate ownership, and session handoff.
   fallback that uses pre-staged binaries, and `Dockerfile.prod` is the
   CI/release image. They share builder logic but split runtime by
   deployment mode; consolidating them into one Dockerfile is intentionally
-  not done (see `docs/implementation/status.md`). All five live under
+  not done (see `docs/engineering-log/status.md`). All five live under
   `deploy/docker/`.
 - **Three ignore files is intentional**: `.gitignore` (Rust + Python),
   `.dockerignore` (container build context), `web/.gitignore` (Next.js

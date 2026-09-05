@@ -1,23 +1,14 @@
 # krishiv-delta
 
-Delta Lake protocol implementation for Krishiv.
+The Z-set algebra for incremental computing (DBSP-style), **not** Delta Lake
+(that lives in `krishiv-connectors::lakehouse`): `DeltaBatch` (weighted
+Arrow batch), `Trace` (8-level Spine with per-batch key index),
+`SourceState` (materialised relation plus deficit), `LatenessSpec` /
+`WatermarkTracker`, `LogicFingerprint`, `CoalescingMap`, and the operators —
+map/project, filter, consolidate (linear); join (bilinear); aggregate,
+distinct, top-N (stateful). Z-set laws are property-tested
+(`tests/proptest_zset.rs`).
 
-## Overview
+Documentation: `docs/architecture/09-incremental-view-maintenance.md`.
 
-`krishiv-delta` provides Delta Lake table support:
-
-- Log protocol parsing and replay
-- Transaction log ACID semantics
-- Schema evolution and enforcement
-- Time travel via versioned snapshots
-- Integration with Arrow/Parquet I/O
-
-## Usage
-
-```rust
-use krishiv_delta::DeltaTable;
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

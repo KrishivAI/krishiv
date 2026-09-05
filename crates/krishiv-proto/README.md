@@ -1,23 +1,14 @@
 # krishiv-proto
 
-Protobuf definitions and generated gRPC types for Krishiv's control-plane and
-data-plane APIs.
+Typed identifiers and the coordinator/executor wire contracts: `JobId`,
+`StageId`, `TaskId`, `ExecutorId`, `AttemptId`, `LeaseGeneration`,
+`FencingToken`, `KeyGroupRange`; `JobSpec`/`StageSpec`/`TaskSpec`,
+`JobState`/`TaskState`/`StageKind`, `ExecutorDescriptor`/`ExecutorHeartbeat`,
+`PlanFragment`, shuffle read/write configs, checkpoint ack and restore
+messages; the prost/tonic-generated gRPC services (`wire`, `services`).
+Feature `serde` derives `Serialize`/`Deserialize` on the types.
 
-## Overview
+Documentation: `docs/architecture/04-scheduler-and-coordinator.md`,
+`docs/architecture/18-compatibility-and-versioning.md`.
 
-`krishiv-proto` compiles `.proto` files into Rust types via `prost` and
-`tonic`. It defines the wire format for:
-
-- Job scheduling and lifecycle RPCs
-- Data-plane shuffle and fetch protocols
-- Metadata operations
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `serde` | Enable `Serialize`/`Deserialize` on proto types |
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

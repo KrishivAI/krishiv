@@ -1,313 +1,103 @@
-# Krishiv Docs
+# Krishiv documentation
 
-This is the minimal project documentation surface. Treat the Rust workspace as
-the source of truth; update this file only when code, crate ownership, commands,
-or supported deployment modes change.
+The Rust workspace is the source of truth; these documents explain it. Start
+with the architecture set, which covers every feature and every crate, then
+use the contracts, decisions, and references as needed.
 
-## Current Architecture
+## Architecture (read in order, or jump by topic)
 
-Krishiv is a Rust-native compute framework for batch SQL, streaming pipelines,
-and lakehouse-oriented data work.
+| # | Document | Covers |
+|---|---|---|
+| 00 | [Overview](architecture/00-overview.md) | the three axes (engine × placement × surface), the ten invariants, component map, crate ownership, an end-to-end request, what Krishiv is not |
+| 01 | [Execution modes](architecture/01-execution-modes.md) | `Embedded` / `SingleNode` / `Distributed`, placement, `SessionBuilder`, `from_env`, the fail-closed rule, the sync/async seam, CLI routing |
+| 02 | [SQL engine](architecture/02-sql-engine.md) | `SqlEngine`, the `sql()` pipeline, pre-optimizer rewrites (CTE materialisation, grouping sets), intercepted statements, functions, optimizer rules, session config, catalogs, UDFs |
+| 03 | [Planning and optimization](architecture/03-planning-and-optimization.md) | the two plan layers, `krishiv-plan` rules, DataFusion facts, plan → stages → tasks, adaptive execution, statistics, `EXPLAIN` |
+| 04 | [Scheduler and coordinator](architecture/04-scheduler-and-coordinator.md) | CCP/JCP, leadership and fencing, job/task lifecycle, placement policies, failure handling, metadata stores, result spools, checkpoint coordination, control surfaces |
+| 05 | [Executor and data plane](architecture/05-executor-and-data-plane.md) | task intake and execution models, batch tasks, the capacity model, streaming loops in-process, resident IVM, reporting |
+| 06 | [Shuffle](architecture/06-shuffle.md) | store contract, backends and tiering, lease fencing, writers and indexes, reclamation, runtime filters, the shuffle service |
+| 07 | [State, checkpoints, savepoints](architecture/07-state-checkpoints-savepoints.md) | state backends, key groups and rescaling, timers, migrations, checkpoint layout and integrity, the barrier protocol, exactly-once sinks, savepoints, restore |
+| 08 | [Streaming](architecture/08-streaming.md) | front doors, watermarks, window operators, the operator library, the driver policy, the loops, dials, delivery guarantees |
+| 09 | [Incremental view maintenance](architecture/09-incremental-view-maintenance.md) | Z-set algebra, planning and decomposition, the flow, partitioning, hosting and the resident protocol, surfaces, streaming versus incremental |
+| 10 | [Connectors and lakehouse](architecture/10-connectors-and-lakehouse.md) | source/sink/2PC contracts, capabilities and guarantees, the registry and inventory, Iceberg/Delta/Hudi, CDC, data quality |
+| 11 | [Public interfaces](architecture/11-public-interfaces.md) | Rust API, Python, CLI, Flight SQL, HTTP control plane, web console, MCP, Kubernetes CRDs |
+| 12 | [Security](architecture/12-security.md) | production mode, authentication per surface, RBAC and policy hooks, TLS, fencing and integrity, input validation, supply chain |
+| 13 | [Observability](architecture/13-observability.md) | metrics families, traces, logs, coordinator signals, per-query metrics, console, health |
+| 14 | [Deployment and durability](architecture/14-deployment-and-durability.md) | durability profiles, placements (embedded, single node, bare metal, Kubernetes), HA, upgrades |
+| 15 | [Configuration](architecture/15-configuration.md) | Cargo features and presets, the `KRISHIV_*` registry, session settings, precedence |
+| 16 | [Performance](architecture/16-performance.md) | benchmarks, current numbers, the decisions measurements drove, measurement discipline, capacity guidance |
+| 17 | [Testing and quality](architecture/17-testing-and-quality.md) | the standing rule, CI tiers, lint policy, the async contract, generated documents and blessing, property suites, conformance |
+| 18 | [Compatibility and versioning](architecture/18-compatibility-and-versioning.md) | what is versioned, policy, dependency baseline, deprecation |
 
-Core implementation choices:
+## Contracts and decisions
 
-- Rust 2024 with Tokio for async runtime work.
-- Apache Arrow `RecordBatch` as the in-memory and IPC data model.
-- DataFusion for SQL parsing, planning, expressions, and local execution.
-- One runtime model across embedded, single-node, and distributed execution.
-- Exactly one active job coordinator per job; executors are replaceable workers.
-- Shuffle, state, checkpoint, metadata, and connector behavior live behind crate
-  APIs rather than being hard-coded into one engine file.
-- Checkpoint storage exposes async primitives for Tokio scheduler/executor paths
-  plus sync compatibility wrappers for tests and blocking call sites.
-- Durability is selected through explicit profiles: `dev-local`,
-  `single-node-durable`, and `distributed-durable`.
+- [`contracts/engine-semantics.md`](contracts/engine-semantics.md) — batch and
+  streaming semantics, delivery guarantees, the exactly-once matrix, operator
+  identity, the Iceberg-first policy. Normative.
+- [`contracts/connectors.md`](contracts/connectors.md) — source/sink
+  obligations and maturity labels for every in-tree connector. Normative.
+- [`decisions/`](decisions/README.md) — architecture decision records:
+  [0001](decisions/0001-record-architecture-decisions.md) recording decisions,
+  [0002](decisions/0002-public-api-shape-and-execution-semantics.md) public API
+  shape and execution semantics, [0003](decisions/0003-task-fragment-encoding.md)
+  task fragment encoding, [0004](decisions/0004-wire-protocol-front-door.md)
+  Flight SQL as the wire front door.
 
-## Workspace Map
+## Reference (generated — do not edit by hand)
 
-| Crate | Current responsibility |
-|---|---|
-| `krishiv` | User-facing facade and CLI binary. |
-| `krishiv-common` | Shared utilities used across runtime and engine crates. |
-| `krishiv-api` | Session, DataFrame, Stream, and public Rust API surface. |
-| `krishiv-sql` | DataFusion integration, SQL execution helpers, SQL policy hooks, catalog and table-provider abstractions (`catalog` module). |
-| `krishiv-plan` | Logical/physical plans, the versioned public expression/type AST, UDF contracts, governance/audit/policy, CEP pattern matcher, and optimizer rules. |
-| `krishiv-runtime` | Embedded, single-node, and remote runtime routing. |
-| `krishiv-dataflow` | Arrow operator runtime, queues, barriers, windows, joins, stateful ops. |
-| `krishiv-scheduler` | Coordinator, job/task lifecycle, metadata stores, leadership, gRPC server. |
-| `krishiv-executor` | Executor process, task runner, task assignment receiver, shuffle/checkpoint hooks. |
-| `krishiv-proto` | Typed IDs and coordinator/executor wire contracts. |
-| `krishiv-shuffle` | In-memory, local disk, object-store, and Flight-oriented shuffle support. |
-| `krishiv-state` | In-memory and RocksDB-backed keyed state, TTL, migration, incremental state, and checkpoint/savepoint storage. |
-| `krishiv-connectors` | Source/sink contracts, capability and maturity metadata, Parquet/Kafka/S3 paths, and Iceberg-first lakehouse helpers. Delta/Hudi/vector integrations are optional and experimental. |
-| `krishiv-operator` | Kubernetes CRD and operator integration. |
-| `krishiv-ui` | Status API and web UI assets. |
-| `krishiv-flight-sql` | Arrow Flight SQL service. |
-| `krishiv-sql-gateway` | Separately versioned JDBC/ODBC SQL gateway facade. |
-| `krishiv-python` | PyO3 Python bindings. |
-| `krishiv-mcp` | Model Context Protocol frontend over the public `Session` API. |
-| `krishiv-metrics` | Metrics, tracing, and debug report structures. |
-| `krishiv-chaos` | Cross-crate chaos and fault-injection integration tests. |
-| `krishiv-bench` | Benchmarks (on-demand; excluded from default workspace builds). Schema registry helpers live in `krishiv-connectors`'s `schema-registry` feature. |
+| Document | Generated from | Regenerate |
+|---|---|---|
+| [`reference/env-flags.md`](reference/env-flags.md) | `krishiv_common::env_registry` | `KRISHIV_BLESS_ENV_FLAGS=1` |
+| [`reference/sql-feature-matrix.md`](reference/sql-feature-matrix.md) | SQL feature registry | `KRISHIV_BLESS_SQL_MATRIX=1` |
+| [`reference/pyspark-parity.md`](reference/pyspark-parity.md) | `krishiv_api::pyspark_parity` | `KRISHIV_BLESS_PYSPARK_PARITY=1` |
+| [`reference/certification-matrix.md`](reference/certification-matrix.md) | `krishiv_connectors::cert_matrix` | `KRISHIV_BLESS_CERT_MATRIX=1` |
+| [`reference/connector-reachability-matrix.md`](reference/connector-reachability-matrix.md) | connector registry | bless switch in its test |
+| [`reference/krishiv-vs-spark-sql.md`](reference/krishiv-vs-spark-sql.md) | conformance results | bless switch in its test |
+| [`reference/jdbc-connectivity.md`](reference/jdbc-connectivity.md) | hand-written | — |
 
-## Runtime Modes
+## Guides and operations
 
-```text
-SQL / API / Flight / MCP
-  -> Session + catalog
-  -> DataFusion + Krishiv plan
-  -> ExecutionRuntime
-       Embedded + LocalInProcess: in-process cluster
-       SingleNode + SingleNodeDaemon: local Flight/gRPC daemon
-       Distributed + RemoteClusterRequired: remote Flight/gRPC cluster
-  -> Coordinator
-  -> ExecutorTaskRunner
-  -> Arrow/DataFusion operators, shuffle, state, checkpoint, connectors
-```
+- [`guides/running-examples.md`](guides/running-examples.md) — running the
+  examples in each mode.
+- [`connector-sdk.md`](connector-sdk.md) — building a connector.
+- [`BENCHMARKING.md`](BENCHMARKING.md) and
+  [`benchmarks-tpcds.md`](benchmarks-tpcds.md) — how to benchmark and the
+  TPC-DS record.
+- [`grafana/`](grafana/README.md) — the dashboard.
+- [`COMPATIBILITY.md`](COMPATIBILITY.md), [`RELEASE.md`](RELEASE.md),
+  [`ROADMAP.md`](ROADMAP.md), [`GOVERNANCE.md`](GOVERNANCE.md).
+- [`../deploy/k8s/README.md`](../deploy/k8s/README.md) — Kubernetes manifests.
 
-`krishiv-runtime` exposes a mixed sync/async `ExecutionRuntime` surface.  The
-primary sync methods (`collect_batch_sql`, `accept_plan`, etc.) are complemented
-by async variants (`collect_batch_sql_async`) that callers in async contexts
-should prefer.  Remote runtimes drive Flight/gRPC calls directly in the async
-variants (no blocking thread), while in-process runtimes off-load DataFusion
-work to the blocking pool via `spawn_blocking`.  The sync methods delegate to
-the async variants via `block_on` at a single sync/async seam.  Checkpoint
-storage is async-capable; scheduler gRPC checkpoint acks use the async path.
+## Engineering log (evidence, not reference)
 
-`RuntimeMode` and `ExecutionPlacement` are intentionally separate. `RuntimeMode`
-is the user-visible mode; `ExecutionPlacement` says where data-plane work may
-actually run. Distributed sessions require an explicit remote Flight endpoint
-and must not silently fall back to in-process execution.
+`engineering-log/` holds the durable working records. They are kept because
+the architecture documents cite them; they are not the place to learn the
+system.
 
-## MCP Frontend
+- [`status.md`](engineering-log/status.md) — the session handoff note (what
+  is in flight, how it was validated, the next command).
+- [`crate-audit-register.md`](engineering-log/crate-audit-register.md) — the
+  read-every-file audit: per crate, per fix, with revert-proven tests and
+  commit hashes; open items marked "needs a decision".
+- [`ivm-audit-register.md`](engineering-log/ivm-audit-register.md) — the same
+  for the incremental engine.
+- Dated evidence: [production readiness audit](engineering-log/production-readiness-audit-2026-07.md),
+  [honesty audit](engineering-log/honesty-audit-2026-07-25.md),
+  [wire-or-delete review](engineering-log/wire-or-delete-2026-07.md),
+  [distributed batch review](engineering-log/distributed-batch-review-2026-07-27.md),
+  [SOTA practices survey](engineering-log/sota-distributed-engine-practices-2026-07-27.md),
+  [HA chaos gate log](engineering-log/ha-chaos-gate-log.md),
+  [GA soak report](engineering-log/ga-soak-report-2026-08-10.md).
 
-`krishiv-mcp` exposes Krishiv through Model Context Protocol without adding a
-second engine path. The server is built over `SessionBuilder::from_env`, so the
-same embedded, single-node, and distributed routing rules apply to MCP clients.
+Superseded phase plans and design notes were removed from the tree in the
+2026-09 documentation rewrite; they remain in git history.
 
-Current MCP tool families:
+## Conventions
 
-- runtime/ops: health, runtime info, deployment capabilities, executor
-  listing, metrics summary
-- SQL/catalog: execute, explain, list catalogs/tables, describe, sample
-- jobs: submit SQL jobs, list jobs, inspect status, fetch coordinator batch SQL
-  results or local submitted-job metadata, cancel coordinator jobs or local
-  background submissions
-- streaming: submit bounded streaming pipelines, register/list/feed/drain
-  continuous stream jobs, inspect streaming job status, and export continuous
-  stream checkpoints, and restore continuous stream snapshots through the
-  active runtime or coordinator control plane
-- IVM: create, feed, step, snapshot, full-checkpoint, delta-checkpoint, and
-  restore incremental jobs/views
-- connectors: list connectors with SQL-job execution metadata, validate configs,
-  and register supported sources/sinks; registered `parquet`,
-  `parquet-directory`, `csv`, `json`/`ndjson`, `s3`, and `s3-prefix` sources
-  plus `parquet`, `csv`, `json`/`ndjson`, and `s3` sinks can be referenced by
-  name in SQL job scripts submitted through MCP
-
-`runtime_info` and `deployment_capabilities` expose whether the current session
-has a coordinator HTTP control plane. MCP job/executor tools use that
-capability, not just the mode enum, so single-node daemon sessions and
-distributed sessions share the same coordinator-backed management path when it
-is configured. IVM checkpoint tools use the same mode-aware `Session::ivm`
-handle: embedded/single-node sessions use the local registry and distributed
-sessions use coordinator IVM checkpoint APIs.
-
-For bounded SQL jobs, supported non-parquet sources still read through the
-submitting process's connector configuration, then spill to temporary parquet
-registrations that are shipped to the configured single-node or distributed
-runtime for compute. Connector-native distributed source ownership remains the
-follow-up for streaming/unbounded providers such as Kafka, JDBC, and lakehouse
-table scans.
-
-Continuous streaming MCP tools use the same `Session::stream` /
-`push_stream_job_input` / `poll_stream_job` seam as the Rust API. Windowed SQL
-is compiled to `LocalWindowExecutionSpec` once, then registered against the
-embedded registry or the coordinator continuous-stream HTTP API depending on
-the configured mode.
-
-MCP transports:
-
-- line-delimited JSON-RPC over stdio: `krishiv mcp --stdio`
-- HTTP JSON-RPC: `krishiv mcp --http --addr 127.0.0.1:8765`
-
-## Deployment Modes
-
-Embedded:
-
-- Runs inside the caller process.
-- Best for tests, examples, and local API use.
-- Uses in-process runtime paths.
-
-Single-node:
-
-- Runs all core engine pieces on one host.
-- May use an in-process cluster or local coordinator/Flight endpoints.
-- Uses local filesystem/state by default.
-
-Distributed:
-
-- Uses remote coordinator/executor transport.
-- Requires an explicit Flight coordinator URL; local fallback is rejected at
-  session build/runtime construction.
-- Run `krishiv clusterd` for distributed control-plane deployments. It
-  co-locates coordinator gRPC, HTTP status/jobs API, and optional Flight SQL.
-  The standalone `flight-server` command is for embedded/local use and is not a
-  replacement for a distributed coordinator.
-- Executors must advertise routable task, barrier, and shuffle endpoints. In
-  Kubernetes this means binding task/barrier/shuffle services on stable ports
-  and advertising the pod IP, not `0.0.0.0`.
-- Production coordinator and executor task-control gRPC require bearer-token
-  auth via `KRISHIV_COORDINATOR_BEARER_TOKEN` and
-  `KRISHIV_EXECUTOR_TASK_BEARER_TOKEN`; anonymous gRPC is for dev-local only.
-- Coordinators may accept a startup-time rotation window of comma/newline
-  separated server tokens via `KRISHIV_COORDINATOR_BEARER_TOKENS`; clients still
-  send the active `KRISHIV_COORDINATOR_BEARER_TOKEN`.
-- Long-lived coordinator servers can also reload mounted token files using
-  `KRISHIV_COORDINATOR_BEARER_TOKEN_FILE`,
-  `KRISHIV_COORDINATOR_BEARER_TOKENS_FILE`, and a positive
-  `KRISHIV_COORDINATOR_AUTH_RELOAD_INTERVAL_SECS`.
-- Kubernetes manifests and CRDs live in `deploy/k8s/`.
-- Bare-metal/VM operation is process-managed: run coordinator and executors
-  directly and point clients at the configured endpoints.
-
-## Build Feature Matrix
-
-Execution mode is selected at runtime through `RuntimeMode`,
-`ExecutionPlacement`, session builders, and environment variables. Cargo
-features select compiled capabilities and optional dependency families only.
-Because Cargo features are additive, do not use them as mutually exclusive mode
-switches.
-
-Rust `krishiv` facade feature presets:
-
-| Feature | Purpose |
-|---|---|
-| `minimal` | Smallest facade surface; no optional deployment capabilities. |
-| `local` | Default developer build; embedded plus single-node capabilities. |
-| `embedded` | In-process API use; intentionally has no optional dependencies. |
-| `single-node` | Local daemon/in-process cluster support with Flight SQL, shuffle, and RocksDB metadata. |
-| `distributed` | Bare remote cluster support with Flight SQL, shuffle, and etcd metadata. |
-| `bare-metal` | Alias for distributed process-managed deployments. |
-| `cluster` | Compatibility alias for `distributed`. |
-| `k8s` | Distributed support plus Kubernetes operator/CRD capability. |
-| `full` | Standard compute-engine build: distributed/Kubernetes, Kafka, and primary Iceberg support; excludes AI/vector and secondary lakehouse formats. |
-
-Rust optional integration features:
-
-| Feature | Purpose |
-|---|---|
-| `flight-sql` | Arrow Flight SQL transport/server support. |
-| `shuffle` | Shuffle service/store support. |
-| `etcd` | etcd-backed scheduler metadata and coordination. |
-| `kafka` | Kafka connector support. |
-| `state` | Connector/state integration. |
-| `iceberg` | Primary/default lakehouse platform. |
-| `delta` | Optional experimental Delta compatibility. |
-| `ui` | Operator UI integration. |
-
-Recommended Rust build commands (`just` is the project command runner):
-
-```bash
-just check              # verify all four modes compile
-just check-embedded
-just check-single-node
-just check-distributed
-just check-k8s
-
-just build-single-node  # debug binary for local dev
-just build-bare-metal   # release binary for VMs
-just build-k8s          # release binary + operator for Kubernetes
-
-just docker-local       # multi-stage build → load into k3s
-just deploy-k8s         # kubectl apply -k deploy/k8s/operator
-```
-
-Python bindings default to the lean local/remote API surface. Optional native
-extension features are enabled only for integration families:
-
-| Python feature | Purpose |
-|---|---|
-| `kafka` | Kafka sources/connectors. |
-| `iceberg` | Iceberg lakehouse bindings. |
-| `ai` | Deprecated compatibility feature for optional vector sinks; no RAG/LLM engine functionality. |
-| `vector-sinks` | Optional platform-adjacent vector sink compatibility. |
-| `qdrant` | Experimental Qdrant vector sink. |
-| `pgvector` | Experimental pgvector sink. |
-
-Recommended Python build commands:
-
-```bash
-maturin develop --manifest-path crates/krishiv-python/Cargo.toml
-maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features iceberg
-maturin develop --manifest-path crates/krishiv-python/Cargo.toml --features kafka
-```
-
-
-## Published Engine Contracts
-
-The normative Phase 1 contracts are:
-
-- `docs/contracts/engine-semantics.md` — batch/streaming semantics, delivery
-  guarantees, exactly-once matrix, metadata compatibility, operator identity,
-  and the Iceberg-first policy.
-- `docs/contracts/connectors.md` — source/sink obligations and maturity labels
-  for every in-tree connector.
-- `docs/implementation/phase-1-engine-contract.md` — implementation resolution,
-  completed contract work, and certification follow-ups.
-- `docs/implementation/phase-4-user-apis.md` — implemented Rust/Python user API
-  surface, compatibility rules, and remaining distributed/protocol work.
-
-Apache Iceberg is the primary lakehouse platform. New lakehouse correctness and
-certification work targets Iceberg before Delta Lake or Hudi.
-
-## Durability Profiles
-
-`DurabilityProfile` is shared by shuffle, state, checkpoint, and scheduler
-configuration:
-
-- `dev-local`: in-memory metadata/shuffle/state with ephemeral local
-  checkpoints; not restart durable.
-- `single-node-durable`: local RocksDB metadata, local disk shuffle, local
-  RocksDB state, and local filesystem checkpoints; restart durable on one host.
-- `distributed-durable`: etcd metadata, tiered (local + object store) shuffle,
-  object-store checkpoints, local RocksDB state restored from checkpoints, and
-  fenced coordination for multi-node deployments.
-
-## Commands
-
-```bash
-cargo check --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets
-cargo fmt --check
-
-cargo run -p krishiv -- sql --query "select 1 as value"
-cargo run -p krishiv -- explain --query "select 1 as value"
-cargo run -p krishiv -- jobs
-cargo run -p krishiv -- mcp --stdio
-cargo run -p krishiv -- mcp --http --addr 127.0.0.1:8765
-```
-
-Use narrower package tests while iterating, for example:
-
-```bash
-cargo test -p krishiv-runtime
-cargo test -p krishiv-scheduler --lib
-cargo test -p krishiv-executor --lib
-```
-
-## Engineering Rules
-
-- Keep changes scoped to the crate that owns the behavior.
-- Prefer typed IDs, typed plans, typed errors, and capability flags over string
-  routing at public boundaries.
-- Avoid panics in library code except for impossible invariants.
-- Do not hide blocking filesystem or database work inside async tasks.
-- Add focused tests with behavior changes.
-- Update `docs/implementation/status.md` only as a short handoff note; do not
-  rebuild large planning documents.
-
-## Current Handoff
-
-Use `docs/implementation/status.md` for the latest durable session note.
+- Architecture documents describe the code as it is. When behaviour changes,
+  the document changes in the same PR; when a document and the code disagree,
+  the code is right and the document is a bug.
+- Generated references are never hand-edited; run the bless switch.
+- `scripts/check_markdown_links.py .` validates every repo-local link and runs
+  in `just project-check`.
+- `docs/engineering-log/status.md` receives a short handoff note per
+  substantial session, not planning prose.

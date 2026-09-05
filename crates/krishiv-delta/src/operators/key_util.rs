@@ -42,7 +42,7 @@
 //! Arrow's `RowConverter` — the canonical columnar row encoding already used
 //! by `differentiate` — which would be both faster and structurally immune to
 //! this defect class. That is a refactor of the four call sites, tracked in
-//! `docs/implementation/ivm-audit-register.md`.
+//! `docs/engineering-log/ivm-audit-register.md`.
 
 use arrow::array::{
     Array, BinaryArray, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,

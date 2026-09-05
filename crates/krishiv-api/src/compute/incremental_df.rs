@@ -56,7 +56,7 @@ impl IncrementalDataFrame {
     /// [`Session::submit`](crate::Session::submit) routes a job to the local
     /// daemon with on-disk checkpoints. That divergence is deliberate only in
     /// the sense that nobody has decided otherwise; it is recorded as an open
-    /// decision in `docs/implementation/ivm-audit-register.md`.
+    /// decision in `docs/engineering-log/ivm-audit-register.md`.
     pub(crate) async fn from_view_sql(
         name: &str,
         body_sql: String,

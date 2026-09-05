@@ -98,7 +98,7 @@ impl IcebergCatalogBridge {
     /// DataFusion's `CatalogProvider::schema_names` / `SchemaProvider::
     /// table_names` are synchronous but the Iceberg catalog is async, which
     /// makes this a genuine sync-surface boundary per
-    /// `docs/implementation/async-contract.md`.
+    /// `docs/architecture/17-testing-and-quality.md`.
     ///
     /// This used to hand-roll the bridge as
     /// `block_in_place(|| handle.block_on(fut))` for *any* current runtime.

@@ -4,9 +4,9 @@
 # bindings, sync-trait-over-async-client adapters) — those files carry a
 # `#![allow(clippy::disallowed_methods)]` with a justification. Everything
 # else must stay async end-to-end. Threading contract:
-# docs/implementation/async-contract.md
+# docs/architecture/17-testing-and-quality.md
 disallowed-methods = [
-  { path = "krishiv_common::async_util::block_on", reason = "sync-over-async bridge: only allow-listed boundary modules may call this; async code must await instead (docs/implementation/async-contract.md)" },
+  { path = "krishiv_common::async_util::block_on", reason = "sync-over-async bridge: only allow-listed boundary modules may call this; async code must await instead (docs/architecture/17-testing-and-quality.md)" },
   # The rule above only policed the *helper*. Four sites hand-rolled the bridge
   # with a raw `block_in_place` instead and so were policed by nothing:
   # `IcebergCatalogBridge` (every CatalogProvider method), RocksDB
@@ -15,7 +15,7 @@ disallowed-methods = [
   # latent abort rather than a style question. Route blocking-work-from-async
   # through `async_util::run_blocking`, which picks the right strategy per
   # runtime flavor.
-  { path = "tokio::task::block_in_place", reason = "panics on a current-thread runtime: use krishiv_common::async_util::run_blocking (blocking work from async) or async_util::block_on (driving a future from sync) (docs/implementation/async-contract.md)" },
+  { path = "tokio::task::block_in_place", reason = "panics on a current-thread runtime: use krishiv_common::async_util::run_blocking (blocking work from async) or async_util::block_on (driving a future from sync) (docs/architecture/17-testing-and-quality.md)" },
 ]
 
 # The workspace denies unwrap/expect/panic/indexing_slicing (Cargo.toml

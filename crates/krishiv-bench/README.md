@@ -1,31 +1,20 @@
 # krishiv-bench
 
-Criterion-based benchmarks for Krishiv's SQL and runtime performance.
+Benchmark harnesses and corpora gates: TPC-H (embedded and distributed),
+NEXMark streaming, TPC-DS smoke, the IVM O(Δ) plan-coverage gate over the
+TPC-H/NEXMark corpus, and Criterion micro-benchmarks. Binaries under
+`src/bin/` (`tpch_corpus`, `tpch_verify`, `nexmark_*`, `stage_dump`,
+`lateness_soak`) drive datasets pointed to by `KRISHIV_TPCH_DATA_DIR*`.
 
-## Overview
-
-`krishiv-bench` contains performance benchmarks:
-
-- TPC-H (SF 10) — analytical query throughput
-- TPC-H distributed — multi-executor scaling
-- Nexmark — streaming window aggregation
-- TPC-DS smoke — additional query coverage
-
-## Usage
+Excluded from `just test-integration`; runs in `bench.yml` / `nightly.yml`.
 
 ```bash
-# Run all benchmarks
 cargo bench -p krishiv-bench
-
-# Save a baseline
-cargo bench -p krishiv-bench -- --save-baseline main
-
-# Compare against baseline
-cargo bench -p krishiv-bench -- --baseline main
+just bench-tpch
+just bench-nexmark
 ```
 
-This crate is for testing only and is excluded from production builds.
+Documentation: `docs/BENCHMARKING.md`, `docs/benchmarks-tpcds.md`,
+`docs/architecture/16-performance.md`.
 
-## License
-
-Apache-2.0
+License: Apache-2.0.

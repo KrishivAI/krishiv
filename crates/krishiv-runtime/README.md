@@ -1,23 +1,14 @@
 # krishiv-runtime
 
-Unified runtime that wires together planning, scheduling, and execution.
+Where work runs: `RuntimeMode` (`Embedded`, `SingleNode`, `Distributed`) and
+the deliberately separate `ExecutionPlacement` (`LocalInProcess`,
+`SingleNodeDaemon`, `RemoteClusterRequired`); `ExecutionRuntime` with its
+async-canonical surface and one sync seam; the in-process cluster
+(coordinator + executor over channels); `local_streaming`; the distributed
+backend (Flight SQL client, gRPC management client, coordinator HTTP
+client). A distributed session with no routable coordinator is rejected —
+never silently local.
 
-## Overview
+Documentation: `docs/architecture/01-execution-modes.md`.
 
-`krishiv-runtime` is the high-level orchestration layer:
-
-- Connects SQL planning to scheduler and executor
-- Manages session state and transaction lifecycle
-- Handles Flight SQL protocol for client connections
-- Coordinates embedded and distributed execution paths
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `kafka` | Kafka connector support |
-| `vector-sinks` | Vector database sink support |
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

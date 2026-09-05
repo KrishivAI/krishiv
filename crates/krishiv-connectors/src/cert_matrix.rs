@@ -144,7 +144,7 @@ pub fn capability_matrix() -> Vec<CapabilityCell> {
                     the durable-checkpoint property that distinguishes single-node from \
                     embedded for the streaming engine does not exist for this one, and none of \
                     the evidence above restarts a job. Whether this row should be downgraded \
-                    is an open decision recorded in docs/implementation/ivm-audit-register.md.",
+                    is an open decision recorded in docs/engineering-log/ivm-audit-register.md.",
         },
         CapabilityCell {
             compute: Ivm,

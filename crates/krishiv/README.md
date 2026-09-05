@@ -1,38 +1,30 @@
 # krishiv
 
-Krishiv — hybrid batch and streaming compute engine.
+The user-facing facade and the `krishiv` command-line binary.
 
-## Overview
+- Re-exports the public Rust API (`krishiv::Session`, `DataFrame`, …) from
+  `krishiv-api`.
+- The CLI: `sql`, `explain [--analyze]`, `stream`, `ivm`, `table`, `submit`,
+  `jobs`, `state`, `savepoint`, `restore`, `checkpoints`, `pipeline`,
+  `doctor`, `capabilities`, and the daemons `local`, `clusterd`
+  (`coordinator`), `job-coordinator`, `executor`, `flight-server`,
+  `shuffle-svc`, `mcp`. Invoked as `krishiv-<name>` the binary dispatches to
+  the matching subcommand.
+- Deployment feature presets live only on this crate: `local` (default),
+  `embedded`, `single-node`, `distributed` (= `bare-metal`), `k8s`, `prod`,
+  `full`. Features select compiled dependency families; execution mode is a
+  runtime choice.
 
-Krishiv is a Rust-native framework for batch SQL, streaming pipelines, and
-lakehouse-oriented data work. It provides a single runtime model across
-embedded, single-node, and distributed modes.
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `embedded` | In-process library (default) |
-| `single-node` | Flight SQL + local shuffle + SQLite metadata |
-| `distributed` | etcd metadata backend |
-| `k8s` | Kubernetes operator + CRD support |
-| `kafka` | Kafka source/sink connectors |
-| `iceberg` | Apache Iceberg catalog integration |
-| `delta` | Delta Lake table support |
-
-## Quick Start
+Documentation: `docs/architecture/01-execution-modes.md` (routing and flags),
+`docs/architecture/11-public-interfaces.md` (the CLI),
+`docs/architecture/15-configuration.md` (presets).
 
 ```rust
 use krishiv::Session;
 
-#[tokio::main]
-async fn main() {
-    let session = Session::new();
-    let df = session.sql("SELECT 42 as answer").await.unwrap();
-    let batches = df.collect().await.unwrap();
-}
+let session = Session::new();
+let df = session.sql("SELECT 42 AS answer")?;
+let batches = df.collect()?;          // or df.collect_async().await?
 ```
 
-## License
-
-Apache-2.0
+License: Apache-2.0.

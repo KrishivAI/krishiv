@@ -1,16 +1,14 @@
 # krishiv-state
 
-Durable state storage for streaming operators, checkpoints, and metadata.
+Keyed operator state and its durability: the `StateBackend` trait with
+in-memory, RocksDB (per-write or per-epoch fsync), TTL, disaggregated
+(DFS-primary with local cache), broadcast, and queryable backends; key
+groups (32 768) and rescaling; event- and processing-time timers; state
+schema migrations and `OperatorStateDescriptor`; checkpoint storage
+(ephemeral, local filesystem, object store) with SHA-256 integrity
+manifests and incremental SST checkpoints; savepoints. Property-tested
+kill/restore (`tests/proptest_checkpoint_kill.rs`).
 
-## Overview
+Documentation: `docs/architecture/07-state-checkpoints-savepoints.md`.
 
-`krishiv-state` provides:
-
-- Key-value state backend (RocksDB)
-- Object store integration (local FS, S3)
-- Checkpoint read/write for exactly-once recovery
-- Two-party hash-based state verification
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

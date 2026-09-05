@@ -8,7 +8,7 @@ every surface has the same stability.
 
 The pre-1.0 migration from the current preview surface to the intended stable
 Rust, Python, and SQL contracts follows
-[`implementation/stable-public-api-plan.md`](implementation/stable-public-api-plan.md)
+the stability inventory in [`api/stable-api.toml`](../api/stable-api.toml)
 and [ADR-0002](decisions/0002-public-api-shape-and-execution-semantics.md).
 Items are not stable merely because they are public today.
 

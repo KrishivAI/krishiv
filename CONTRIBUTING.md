@@ -6,7 +6,7 @@ participating, you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Before starting
 
 1. Read [`docs/README.md`](docs/README.md),
-   [`docs/architecture.md`](docs/architecture.md), and the relevant engine
+   [`docs/architecture/00-overview.md`](docs/architecture/00-overview.md), and the relevant engine
    contract.
 2. Search existing issues and pull requests.
 3. Open a design issue or ADR before changing a public contract, durable format,
@@ -54,7 +54,7 @@ the limitation in the pull request.
   delivery guarantees or maturity.
 - Include benchmark evidence for performance claims using
   `docs/BENCHMARKING.md`.
-- Update `docs/implementation/status.md` only with a concise handoff for a
+- Update `docs/engineering-log/status.md` only with a concise handoff for a
   substantial implementation session.
 
 ## Pull requests

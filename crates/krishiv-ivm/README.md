@@ -1,22 +1,16 @@
 # krishiv-ivm
 
-Incremental View Maintenance (IVM) engine for keeping derived tables up to date.
+The incremental view maintenance driver over `krishiv-delta`:
+`IncrementalFlow` (sources, views in topological order, dirty-bit
+scheduling, dedup, lateness, delta checkpoints, watch subscribers),
+`plan` (O(Δ) plans for aggregate / join / distinct / top-N with a
+`DiffBased` fallback), `decompose` (single-source multi-operator queries cut
+into single-operator hops), `PartitionedIncrementalFlow` (key-sharded flows,
+`KRISHIV_IVM_SHARDS`), the resident-executor wire codec (`IVMD1`/`IVMD2`),
+and the memory budget. Property-tested against a diff-based oracle and a
+plain-Rust model (`tests/proptest_ivm.rs`).
 
-## Overview
+Documentation: `docs/architecture/09-incremental-view-maintenance.md`,
+`docs/engineering-log/ivm-audit-register.md`.
 
-`krishiv-ivm` implements incremental computation of views:
-
-- Tracks changes to base tables
-- Propagates deltas through view definitions
-- Maintains materialized views with minimal recomputation
-- Integrates with DataFusion for query planning
-
-## Usage
-
-```rust
-use krishiv_ivm::IncrementalView;
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

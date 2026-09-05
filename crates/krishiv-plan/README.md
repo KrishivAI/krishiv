@@ -1,22 +1,16 @@
 # krishiv-plan
 
-Query planning and logical/physical plan representation for Krishiv.
+The engine-owned plan IR that crosses crate and wire boundaries without
+exposing DataFusion types: `LogicalPlan`/`PhysicalPlan`/`NodeOp`, the
+versioned public expression and scalar-type AST, deterministic lowering,
+`TypedTaskFragment` (the single wire carrier for work, ADR-0003), streaming
+task specs (`WindowExecutionSpec`, `StreamingTaskSpec`, interval joins), the
+IR optimizer (predicate pushdown, constant folding, join reorder, broadcast,
+statistics registry, AQE rules), UDF contracts, the CEP pattern builder, and
+the `governance` auth/policy interfaces.
 
-## Overview
+Documentation: `docs/architecture/03-planning-and-optimization.md`,
+`docs/decisions/0002-public-api-shape-and-execution-semantics.md`,
+`docs/decisions/0003-task-fragment-encoding.md`.
 
-`krishiv-plan` defines:
-
-- Logical plan nodes (scan, filter, project, aggregate, join, sink)
-- Physical plan operators with cost-based optimization
-- SQL-to-plan translation via `sqlparser`
-- Secret management for connector credentials
-
-## Usage
-
-```rust
-use krishiv_plan::{LogicalPlan, PhysicalPlan};
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

@@ -1,32 +1,19 @@
 # krishiv-executor
 
-Task execution engine for running dataflow stages on worker nodes.
-
-## Overview
-
-`krishiv-executor` executes assigned tasks:
-
-- Reads partitioned input from shuffle or connectors
-- Runs dataflow operators (filter, project, aggregate, join)
-- Writes output to sinks or shuffle
-- Reports metrics and heartbeats to the scheduler
-
-## Binary
-
-`krishiv-executor`
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `kafka` | Kafka sink support |
-
-## Usage
+The data-plane worker (`krishiv-executor` binary; `krishiv executor`):
+receives typed task assignments, classifies them (`ExecutionModel::{Batch,
+Streaming, DeltaBatch}`), runs DataFusion plan partitions with shuffle
+read/write, hosts the long-lived streaming run-loops (`stream:rloop:` and the
+classed loops) with key-group parallelism and credit-gated peer exchange,
+holds resident IVM flows, spools large results, and reports heartbeats,
+task status, and checkpoint acks. Capacity (slots, memory pool, parallelism)
+derives from the cgroup via `krishiv_common::executor_capacity`.
 
 ```bash
-krishiv-executor --coordinator http://localhost:50051 --slots 4
+krishiv executor --coordinator http://coordinator:50051 --slots 4
 ```
 
-## License
+Documentation: `docs/architecture/05-executor-and-data-plane.md`,
+`docs/architecture/08-streaming.md`, `docs/architecture/06-shuffle.md`.
 
-Apache-2.0
+License: Apache-2.0.

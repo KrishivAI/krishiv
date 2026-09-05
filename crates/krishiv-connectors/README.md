@@ -1,38 +1,22 @@
 # krishiv-connectors
 
-Source and sink connectors for external data systems.
+Every way data enters or leaves the engine: `Source`/`Sink` contracts,
+`CheckpointSource`, `Offset`/`OffsetCommitter`, `TwoPhaseCommitSink` and
+`TransactionalSinkParticipant`, `ConnectorCapabilities` /
+`DeliveryGuarantee` / `ConnectorMaturity`, the driver registry
+(`ConnectorKind`, `ConnectorRole`, `default_registry()`), CDC (Debezium →
+Iceberg), data-quality rules, vector sinks, and the lakehouse module
+(Iceberg native two-phase commit and streaming sink, Delta Lake, Hudi).
 
-## Overview
+Parquet and CSV are unconditional. Leaf feature flags are **defined here and
+forwarded upward**: `cloud`, `kafka`, `schema-registry`, `avro`, `lakehouse`,
+`iceberg`, `state`, `two-phase`, `vortex`, `kinesis`, `pulsar-source`,
+`elasticsearch`, `cassandra`, `hbase`, `jdbc`, `vector-sinks`, `qdrant`,
+`pgvector`. There are no presets on this crate.
 
-`krishiv-connectors` provides a unified connector framework with 20+
-integrations:
+Documentation: `docs/architecture/10-connectors-and-lakehouse.md`,
+`docs/contracts/connectors.md`, `docs/connector-sdk.md`, and the generated
+`docs/reference/certification-matrix.md` /
+`docs/reference/connector-reachability-matrix.md`.
 
-| Category | Connectors |
-|----------|------------|
-| Lakehouse | Parquet, Iceberg, Delta Lake, Hudi |
-| Streaming | Kafka, Kinesis, Pulsar |
-| Databases | PostgreSQL (pgvector), Cassandra, Scylla, HBase |
-| Search | Elasticsearch, Qdrant |
-| Object Store | Local FS, S3 |
-| Format | Avro, Vortex |
-
-## Features
-
-Enable connectors via Cargo features:
-
-```toml
-[dependencies]
-krishiv-connectors = { version = "0.2", features = ["kafka", "iceberg", "s3"] }
-```
-
-### Presets
-
-| Preset | Includes |
-|--------|----------|
-| `local` | parquet, s3, kafka, two-phase |
-| `full` | local + avro, iceberg, schema-registry, state |
-| `extended` | full + delta, hudi, vector-sinks, qdrant, pgvector |
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

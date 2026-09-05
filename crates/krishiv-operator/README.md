@@ -1,34 +1,12 @@
 # krishiv-operator
 
-Kubernetes operator for managing Krishiv clusters and jobs via CRDs.
+Kubernetes operator: the `KrishivJob`, `KrishivQueue`, and
+`KrishivExecutorPool` CRD types and the reconciler that turns them into
+coordinator submissions, tracks status (conditions, phases, task counters),
+adds a finalizer so deletion cancels the job, and reports executor pod launch
+failures. Manifests and CRDs live in `deploy/k8s/`.
 
-## Overview
+Documentation: `docs/architecture/14-deployment-and-durability.md`,
+`docs/architecture/11-public-interfaces.md`, `deploy/k8s/README.md`.
 
-`krishiv-operator` provides:
-
-- Custom Resource Definitions for KrishivJob, KrishivCluster
-- Controller loop for reconciling desired vs actual state
-- Automatic failover and stale coordinator detection
-- Optional embedded web UI
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `k8s` | Kubernetes API integration |
-| `ui` | Embedded web dashboard |
-| `cluster` | Full cluster mode (k8s + ui) |
-
-## Usage
-
-```bash
-# Apply CRDs
-kubectl apply -k k8s/operator
-
-# Run the operator
-krishiv-operator --in-cluster
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

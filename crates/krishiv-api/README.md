@@ -1,32 +1,18 @@
 # krishiv-api
 
-Public API surface for interacting with Krishiv programmatically.
+The public Rust API: `SessionBuilder`/`Session`, `DataFrame` (the canonical
+relational type), the versioned `Expr` facade, `QueryHandle`,
+`PreparedStatement`, `StreamingDataFrame`, `IncrementalDataFrame`,
+`Pipeline`, catalog operations, typed I/O options, `BlockingSession`, and the
+`ComputeEngine`/`CompiledJob` re-exports. Rust is async-first; every sync
+method is a documented convenience over an async one.
 
-## Overview
+Features: `kafka`, `iceberg-catalog`, and the connector forwarders (see
+`docs/architecture/15-configuration.md`).
 
-`krishiv-api` provides the user-facing API for:
+Documentation: `docs/architecture/11-public-interfaces.md`,
+`docs/architecture/01-execution-modes.md` (session building and routing),
+`docs/architecture/18-compatibility-and-versioning.md` (stability labels,
+`api/stable-api.toml`).
 
-- Session management and SQL execution
-- DataFrame operations (select, filter, join, write)
-- Catalog operations (list tables, describe, drop)
-- Streaming pipeline management
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `kafka` | Kafka connector support |
-| `iceberg-catalog` | Iceberg catalog API support |
-
-## Usage
-
-```rust
-use krishiv_api::Session;
-
-let session = Session::new();
-let result = session.sql("SELECT * FROM orders WHERE amount > 100").await?;
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

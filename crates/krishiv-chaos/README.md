@@ -1,25 +1,13 @@
 # krishiv-chaos
 
-Cross-crate chaos and fault-injection integration tests.
+Cross-crate fault-injection tests: executor loss and re-registration,
+coordinator failover, shuffle regeneration, checkpoint kill/restore, state
+corruption. Long-running; excluded from the per-PR tier and from the
+workspace clippy run, executed by `nightly.yml` and `just test-chaos`. Lint
+it directly (`cargo clippy -p krishiv-chaos --all-targets`) so breakage is
+not invisible.
 
-## Overview
+Documentation: `docs/architecture/17-testing-and-quality.md`,
+`docs/architecture/14-deployment-and-durability.md` (the HA chaos gate).
 
-`krishiv-chaos` validates system resilience by injecting faults at crate
-boundaries:
-
-- Network partition simulation
-- Executor crash/recovery
-- State backend corruption
-- Scheduler failover under load
-
-This crate is for testing only and is excluded from production builds.
-
-## Usage
-
-```bash
-cargo test -p krishiv-chaos
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

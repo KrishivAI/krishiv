@@ -17,7 +17,7 @@
 //!
 //! Whether to wire it or delete it is a product decision about how much Spark
 //! surface the SQL front door should carry, so it is recorded in
-//! `docs/implementation/crate-audit-register.md` rather than decided here. What
+//! `docs/engineering-log/crate-audit-register.md` rather than decided here. What
 //! *is* fixed here is everything that would have been wrong the moment it was
 //! wired — the rewrites used to emit SQL naming functions and relations that do
 //! not exist:

@@ -133,4 +133,4 @@ RC releases skip PyPI/crates.io publishing.
 
 ## Post-release
 
-Update `docs/implementation/status.md` with a short handoff note.
+Update `docs/engineering-log/status.md` with a short handoff note.

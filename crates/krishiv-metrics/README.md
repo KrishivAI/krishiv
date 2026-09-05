@@ -1,22 +1,12 @@
 # krishiv-metrics
 
-OpenTelemetry-based metrics collection and export for Krishiv components.
+OpenTelemetry metrics, traces, and structured logs for every Krishiv process:
+`init(MetricsConfig)`, the `krishiv_*` metric families (`KrishivMetrics`,
+Prometheus text renderer), gRPC trace-context propagation, the in-process log
+ring, system metrics (CPU, memory, threads), and the observability report
+used by `krishiv doctor`.
 
-## Overview
+Documentation: `docs/architecture/13-observability.md`,
+`docs/grafana/README.md`.
 
-`krishiv-metrics` provides:
-
-- Prometheus-compatible metrics via OpenTelemetry
-- OTLP and stdout export
-- Per-component metric registration (scheduler, executor, connectors)
-- System-level metrics (CPU, memory) via `sysinfo`
-
-## Usage
-
-```rust
-use krishiv_metrics::MetricsCollector;
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.

@@ -1,33 +1,15 @@
 # krishiv-flight-sql
 
-Arrow Flight SQL server implementation for Krishiv.
+Arrow Flight SQL service over the `Session` API — the wire front door for
+JDBC (Arrow Flight SQL driver), ADBC, and dbt (ADR-0004). Statements and
+prepared statements, parameter binding, table upload, catalog metadata
+commands, transactions, bounded sessions (`SessionRegistry`), API-key
+authentication and table policy hooks. `FlightExecutionHost` binds the
+service to an embedded engine, a local daemon, or a distributed coordinator.
+Binary: `krishiv-flight-server` (`krishiv flight-server`).
 
-## Overview
+Documentation: `docs/architecture/11-public-interfaces.md`,
+`docs/architecture/12-security.md`, `docs/reference/jdbc-connectivity.md`,
+`docs/decisions/0004-wire-protocol-front-door.md`.
 
-`krishiv-flight-sql` exposes Krishiv's SQL engine over the Arrow Flight SQL
-protocol, enabling JDBC/ODBC clients and tools like `adbc` to connect.
-
-- Statement execution (query, DDL, DML)
-- Parameter binding
-- Transaction support
-- Prepared statement caching
-
-## Binary
-
-`krishiv-flight-server`
-
-## Features
-
-| Feature | Description |
-|---------|-------------|
-| `kafka` | Kafka connector support |
-
-## Usage
-
-```bash
-krishiv-flight-server --listen 0.0.0.0:50051 --coordinator http://localhost:50051
-```
-
-## License
-
-Apache-2.0
+License: Apache-2.0.
