@@ -8905,3 +8905,104 @@ it, for at most 5.6% of the suite. Not guessed at, and not worth a guess.
 (One measurement artefact: the feature extraction ran with the CTE cache on,
 so fact scans inside a cached CTE body are not in the final plan; q14 shows
 "no fact scans" for that reason. It does not change the shape of the result.)
+
+## §96 — The tail is parallel efficiency, not work: three findings and two fixes
+
+With the CTE, rollup and pushdown levers settled, the remaining gap (q64, q4,
+q11, q78, q24, q7) profiled as "scan time". It is not. A bare eight-column
+scan-and-aggregate of `store_sales` is 76 ms wall, **85 ms single-threaded**;
+the 935 ms of "scanning" in q7's profile is wall time under CPU contention. The
+real numbers, from `/usr/bin/time`:
+
+```text
+  q7    wall 0.19 s   user 0.43 s   271% CPU     (12 cores available)
+  q64   wall 0.72 s   user 1.76 s   274% CPU
+```
+
+q64's total CPU is ~1.5x what DuckDB spends; the engine uses under three
+cores of twelve. The whole tail is parallel efficiency.
+
+### Ruled out by measurement
+
+- **Serial hash-table builds.** 35 joins in q64 sum to 41 ms of `build_time`.
+  Forcing `Partitioned` mode (`hash_join_single_partition_threshold = 0`) is
+  slower (q64 720 -> 770 ms, q4 700 -> 1280 ms).
+- **Too few partitions.** `target_partitions = 24` is slower everywhere.
+- **The runtime.** Sixteen `tokio-rt-worker` threads exist and carry all the
+  CPU; the CLI's `block_on` fallback is multi-thread.
+- **Planning, as DataFusion does it.** In-process, q64 is 68 ms end to end
+  (2 ms parse, 26 ms optimize, 40 ms physical); krishiv's rules add ~2 ms.
+
+### R4-10 (fixed) — small files were never split across partitions
+
+`repartition_file_scans` splits a file only above
+`repartition_file_min_size`, DataFusion's default 10 MiB. At SF1 every
+dimension is below it: `customer_demographics` (1.92 M rows, 7.8 MB) is
+decoded on **one thread** while the other eleven wait, and a `CollectLeft`
+join cannot start its probe until that build side is done — q7's fact scan
+shows `time_elapsed_scanning_until_data = 148 ms` in a 180 ms query. Now
+1 MiB in `build_single_node_session_config`. All 99, warm, paired:
+
+```text
+  14670 -> 14233 ms   +3.1%   16 wins >10%   7 losses (worst 23 ms)   99/99 identical
+```
+
+CPU utilisation rises to ~320%. Above 10 MiB nothing changes, so a
+scale-100 fact table is unaffected. Test
+`small_files_are_split_across_partitions`, proven RED against the reverted
+setting.
+
+### R4-11 (fixed) — `KRISHIV_TARGET_PARALLELISM` was ignored by the CLI
+
+`query_cli::build_session` constructs `Session::builder()` explicitly, and
+the variable is read only in `Session::from_env`. The session docs promise it;
+`KRISHIV_TARGET_PARALLELISM=1 krishiv sql` ran twelve partitions. This is why
+the parallelism probe earlier in this section showed identical timings at
+"p=1" and "p=12" — the flag did nothing, which was itself the finding. Fixed
+through `target_parallelism_from`, a pure parser shared with the env path's
+rules (positive integer, `0` rejected), tested as
+`target_parallelism_env_is_parsed_and_zero_is_rejected`.
+
+### R4-12 (fixed) — the semi-join pushdown fires on a probe that is itself a join
+
+Found by an in-process probe that could not have been found from the CLI.
+`SqlEngine::sql` plus `collect()` in a test process, best of five:
+
+```text
+                              semi-join rules on    off
+  q95  (ws_wh, a self-join)         682 ms         126 ms   5.4x
+  q14  (cross_items, 3-way)        1017 ms         392 ms   2.6x
+```
+
+And across all 99 in the CLI: 14109 ms off vs 14058 ms on — nothing past
+30 ms. The two agree: in the CLI the CTE cache turns those probes into
+`MemTable` scans and R3-1's `probe_reduces_rows` declines them; in any
+process that has not called `declare_single_query_process()` — the Python
+bindings, `krishiv mcp`, the coordinator's staged planning — the cache is off,
+the probe is the join, and the pushdown puts an expensive hash build beneath
+the selective joins so that every fact row probes it. `probe_contains_join`
+now declines that shape. TPC-H q18's aggregate-over-scan probe keeps its
+pushdown. Test `a_join_bearing_probe_is_not_pushed_below_the_inner_join`,
+asserted on plan shape so the non-CLI path is what is covered, proven RED.
+
+### Recorded, not fixed — the published comparison carries a fixed cost DuckDB does not pay
+
+The same in-process probe: q41 executes in 24 ms in-process and measures
+59 ms through the CLI; q7 124 vs 180; q64 622 vs 720. The difference is
+process start (17 ms), registering 24 Parquet tables (9 ms) and planning
+(7–68 ms), paid once per query by the harness and never by the in-process
+DuckDB oracle. For the median query (~100 ms) it is a third of the number.
+The comparison in `docs/benchmarks-tpcds.md` is what a CLI user experiences
+and is labelled as such; an engine-against-engine table needs an in-process
+harness that calls `declare_single_query_process()` so the cache and rollup
+paths are live. Not yet built.
+
+### Open — where the other nine cores go
+
+After R4-10 the engine still runs at ~320% CPU on a 12-core box. Not the
+builds, not the partition count, not the runtime, not planning. The remaining
+candidates are phase latency (each pipeline stage is short and every
+`CollectLeft` join serialises build-then-probe across the whole tree, 35
+times in q64) and scheduling granularity. `perf` is unavailable on this
+machine (`perf_event_paranoid = 4`, no sudo), so the next step is an
+in-process timeline of per-partition activity rather than a profiler.

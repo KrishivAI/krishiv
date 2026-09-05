@@ -15,7 +15,7 @@ as a TPC-DS score.
 | field | value |
 |---|---|
 | date | 2026-09-04, timings re-run 2026-09-05 |
-| commit | `49249f4` plus the change committed alongside this document |
+| commit | `f2a01a6` plus the change committed alongside this document |
 | scale factor | 1 |
 | dataset | 24 tables, Parquet, `target/tpcds-sf1`, 371 MB |
 | generator | DuckDB 1.5.5 `INSTALL tpcds; CALL dsdgen(sf=1)` |
@@ -49,16 +49,16 @@ times, best of three, for both engines.
 
 | | krishiv | duckdb |
 |---|---|---|
-| total, 99 queries | 14.4 s | 6.6 s |
-| median query | 107 ms | 44 ms |
-| median ratio | **2.55x slower** | — |
-| slowest | 0.79 s (q64) | 0.40 s (q67) |
+| total, 99 queries | 14.1 s | 6.6 s |
+| median query | 99 ms | 44 ms |
+| median ratio | **2.34x slower** | — |
+| slowest | 0.69 s (q64) | 0.41 s (q67) |
 
-The engine is faster on three queries (q22 0.83x, q72, q95) and slower on the
-other 96. The spread is 1.2x to 5.1x (q25).
+The engine is faster on two queries (q72 0.79x, q22) and within 5% of DuckDB
+on q95; slower on the other 96. The spread is 1.1x to 5.6x (q41).
 
-Ten queries account for 30% of total suite time: q64, q4, q67, q11, q23, q51,
-q78, q14, q28, q72.
+Ten queries account for 31% of total suite time: q64, q4, q67, q11, q23, q51,
+q78, q14, q80, q88.
 
 ### What changed since the first warm run
 
@@ -71,7 +71,8 @@ Three optimizer changes, each verified to leave all 99 results identical:
 | + greedy join reordering (`KRISHIV_JOIN_REORDER`, on by default) | 17.0 s |
 | + CTE materialisation (`KRISHIV_CTE_MATERIALIZE`, on by default) | 16.5 s |
 | + CTE materialisation reaching subqueries, filters traced to the body | 14.9 s |
-| + ROLLUP/CUBE/GROUPING SETS as one aggregate plus re-aggregation | **14.4 s** |
+| + ROLLUP/CUBE/GROUPING SETS as one aggregate plus re-aggregation | 14.4 s |
+| + files split across partitions from 1 MiB, not 10 MiB | **14.1 s** |
 
 The second is q72 almost entirely. DataFusion 54 has no join-reordering rule, so
 join order is `FROM`-clause order; q72 names `catalog_sales JOIN inventory` — a
@@ -105,9 +106,25 @@ aggregated once, shared through the CTE cache, and each set re-aggregated from
 it (`sum` of sums, `sum` of counts, `min`/`max`, `avg` as sum over count;
 decimal averages and anything with `DISTINCT` decline). q22 3.14x, q67 1.29x.
 
-Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-rollup-2026-09-05.csv` and
-`.json`, which also carry the timing with neither the cache nor the rewrite
-and the per-query result-identity check. Earlier runs are retained as
+The fifth: DataFusion splits a Parquet file across partitions only above
+10 MiB, and every dimension table at SF1 is smaller — `customer_demographics`
+(1.92 M rows) was decoded on one thread while eleven waited, and no join could
+probe until it finished. The threshold is now 1 MiB. +3.1% across the suite
+(16 wins, 7 losses, worst 23 ms); the median ratio moved from 2.55x to 2.34x
+because it is the small queries that were waiting.
+
+**What this table measures.** Each krishiv number is one `krishiv sql`
+process: start (~17 ms), registering 24 Parquet tables (~9 ms), planning
+(7–70 ms) and execution. The DuckDB oracle runs in-process with its views
+already registered. In-process, krishiv's q41 executes in 24 ms against the
+59 ms shown here, q7 in 124 ms against 180. This is what a CLI user gets and
+is labelled as such; an engine-against-engine table would need an in-process
+harness and has not been built.
+
+Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-split1mib-2026-09-05.csv`
+and `.json`, which also carry the timing at the 10 MiB threshold and the
+per-query result-identity check. Earlier runs are retained as
+`benchmarks/tpcds-sf1-99q-warm-rollup-2026-09-05.*`,
 `benchmarks/tpcds-sf1-99q-warm-ctemat2-2026-09-05.*`,
 `benchmarks/tpcds-sf1-99q-warm-ctemat-2026-09-05.*`,
 `benchmarks/tpcds-sf1-99q-warm-joinreorder-2026-09-04.*` and

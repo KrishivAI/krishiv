@@ -261,8 +261,34 @@ pub fn parse_query_command(args: &[&str]) -> Result<QueryCommand, String> {
     })
 }
 
+/// `KRISHIV_TARGET_PARALLELISM`, parsed the way `Session::from_env` parses it.
+///
+/// `build_session` constructs its builder explicitly rather than through
+/// `Session::from_env`, so the variable the session docs promise was read by
+/// the daemon and never by the CLI: `KRISHIV_TARGET_PARALLELISM=1 krishiv sql`
+/// ran twelve partitions, silently. Pure over the raw value so the parse and
+/// the rejection of `0` are testable without touching the process environment.
+pub fn target_parallelism_from(
+    value: Option<&str>,
+) -> Result<Option<std::num::NonZeroUsize>, String> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let n: usize = raw.trim().parse().map_err(|_| {
+        format!("KRISHIV_TARGET_PARALLELISM must be a positive integer, got '{raw}'")
+    })?;
+    std::num::NonZeroUsize::new(n)
+        .map(Some)
+        .ok_or_else(|| String::from("KRISHIV_TARGET_PARALLELISM must be greater than 0"))
+}
+
 pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
     let mut builder = Session::builder().with_execution_mode(command.mode);
+    if let Some(parallelism) =
+        target_parallelism_from(std::env::var("KRISHIV_TARGET_PARALLELISM").ok().as_deref())?
+    {
+        builder = builder.with_target_parallelism(parallelism);
+    }
     // The explicit `-c/--coordinator` flag wins over the env var
     // (`KRISHIV_COORDINATOR_URL`, or its deprecated aliases).
     let coordinator = command
@@ -675,5 +701,26 @@ mod timeout_tests {
             "stderr must name the timeout: {}",
             response.stderr
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The CLI must read the variable the session docs promise, and reject `0`.
+    #[test]
+    fn target_parallelism_env_is_parsed_and_zero_is_rejected() {
+        use super::target_parallelism_from as parse;
+        assert_eq!(parse(None).expect("unset"), None);
+        assert_eq!(
+            parse(Some(" 4 "))
+                .expect("four")
+                .map(std::num::NonZeroUsize::get),
+            Some(4)
+        );
+        assert!(
+            parse(Some("0")).is_err(),
+            "zero partitions is not a parallelism"
+        );
+        assert!(parse(Some("twelve")).is_err());
     }
 }

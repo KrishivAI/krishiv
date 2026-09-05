@@ -351,6 +351,13 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
         if !probe_reduces_rows(probe) {
             return Ok(Transformed::no(plan));
         }
+        // A probe that is itself a join is the same mistake from the other
+        // side: its build is expensive, and pushing the semi-join beneath the
+        // selective inner joins makes every fact row probe it instead of the
+        // few that survive those joins. See `probe_contains_join`.
+        if probe_contains_join(probe) {
+            return Ok(Transformed::no(plan));
+        }
 
         // Pair each filtered-side key with its probe-side counterpart. Both must
         // be plain columns: an expression could be computed from the joined row
@@ -967,6 +974,36 @@ fn already_reduced(plan: &LogicalPlan) -> bool {
     matches!(plan, LogicalPlan::Join(j) if j.join_type == JoinType::LeftSemi)
 }
 
+/// Does the probe side contain a join of its own?
+///
+/// TPC-DS q95 probes `ws_wh`, a self-join of `web_sales` on order number, from
+/// two `IN` subqueries; q14 probes `cross_items`, a three-way intersection of
+/// item joins. In a one-shot CLI process the CTE cache turns each of those into
+/// a scan of a `MemTable` and `probe_reduces_rows` declines the pushdown. In
+/// any process that has not declared itself single-query — the Python
+/// bindings, `krishiv mcp`, the coordinator's staged planning — the cache is
+/// off, the probe is the join itself, and pushing the semi-join beneath the
+/// selective inner joins is measured in-process at SF1, embedded, best of five:
+///
+/// ```text
+///   q95   pushed 682 ms   declined 126 ms   5.4x
+///   q14   pushed 1017 ms  declined 392 ms   2.6x
+/// ```
+///
+/// The one-shot CLI is unmoved either way (14109 ms off vs 14058 ms on across
+/// all 99, no query past 30 ms), which is how this stayed hidden: the path the
+/// benchmark measures is the one path where it cannot fire.
+///
+/// TPC-H q18 — the query the rule exists for, and the one that fails at SF100
+/// without it — probes an aggregate over a scan with no join beneath it, and
+/// keeps its pushdown.
+fn probe_contains_join(plan: &LogicalPlan) -> bool {
+    if matches!(plan, LogicalPlan::Join(_)) {
+        return true;
+    }
+    plan.inputs().iter().any(|child| probe_contains_join(child))
+}
+
 /// Whether the probe side of a semi-join actually removes rows.
 ///
 /// The pushdown rule below is only a win when the existence test is
@@ -1540,6 +1577,37 @@ mod tests {
           (SELECT l_orderkey FROM lineitem GROUP BY l_orderkey HAVING sum(l_quantity) > 100) \
           AND c.c_custkey = o.o_custkey AND o.o_orderkey = l.l_orderkey \
         GROUP BY o.o_orderkey";
+
+    /// A probe that is itself a join must stay above the inner join.
+    ///
+    /// q95's `ws_wh` is a self-join of `web_sales`; pushed beneath the
+    /// selective inner joins it is probed by every fact row rather than the
+    /// survivors, 5.4x slower in-process. Asserted on plan shape, so a
+    /// process without the CTE cache is covered and not only the CLI.
+    #[tokio::test]
+    async fn a_join_bearing_probe_is_not_pushed_below_the_inner_join() {
+        let ctx = context(true);
+        let plan = plan_of(
+            &ctx,
+            "SELECT o.o_orderkey FROM orders o JOIN lineitem l ON l.l_orderkey = o.o_orderkey \
+             WHERE l.l_suppkey = 1 \
+               AND o.o_orderkey IN (SELECT a.l_orderkey FROM lineitem a JOIN lineitem b \
+                                    ON a.l_orderkey = b.l_orderkey WHERE a.l_suppkey <> b.l_suppkey)",
+        )
+        .await;
+        let semi = plan
+            .lines()
+            .position(|l| l.contains("LeftSemi"))
+            .unwrap_or_else(|| panic!("no semi join:\n{plan}"));
+        let inner = plan
+            .lines()
+            .position(|l| l.contains("Inner Join"))
+            .unwrap_or_else(|| panic!("no inner join:\n{plan}"));
+        assert!(
+            semi < inner,
+            "a probe that is a join must not be pushed beneath the inner join:\n{plan}"
+        );
+    }
 
     /// A probe that is a bare scan removes nothing, so relocating the test
     /// below the inner join only buries a full-table build under the filters

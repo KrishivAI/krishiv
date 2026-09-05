@@ -1004,6 +1004,35 @@ async fn provider_row_count(
 /// failing outright because the reservation itself doesn't fit. Pools at or
 /// above `4 * DEFAULT_SORT_SPILL_RESERVATION_BYTES` (40MB) are unaffected —
 /// this only kicks in for genuinely memory-constrained deployments.
+/// Byte size from which a single file is split across partitions. See the
+/// comment at its use in [`build_single_node_session_config`].
+pub const REPARTITION_FILE_MIN_SIZE: usize = 1 << 20;
+
+#[cfg(test)]
+mod session_config_tests {
+    use super::*;
+
+    /// Small files must be split across partitions.
+    ///
+    /// DataFusion's 10 MiB default leaves every TPC-DS SF1 dimension table on
+    /// one thread; the constant this asserts is the measured +3.1% across the
+    /// suite. A silent revert to the default would pass every correctness
+    /// test and lose it.
+    #[test]
+    fn small_files_are_split_across_partitions() {
+        let config =
+            build_single_node_session_config(NonZeroUsize::new(12).expect("nonzero"), None);
+        assert_eq!(
+            config.options().optimizer.repartition_file_min_size,
+            1 << 20
+        );
+        assert!(
+            config.options().optimizer.repartition_file_scans,
+            "the threshold is meaningless with file-scan repartitioning off"
+        );
+    }
+}
+
 pub(crate) fn build_single_node_session_config(
     target_partitions: NonZeroUsize,
     memory_limit_bytes: Option<usize>,
@@ -1046,6 +1075,17 @@ pub(crate) fn build_single_node_session_config(
     // `[...]` array literals; it changes only parse syntax, not semantics, and
     // is validated against the full krishiv-sql suite.
     config.options_mut().sql_parser.dialect = datafusion::common::config::Dialect::DuckDB;
+    // Split a file into per-partition byte ranges from 1 MiB, not DataFusion's
+    // 10 MiB. Below the threshold a file is one partition, and every table
+    // scanned that way is decoded on one thread while the other eleven wait —
+    // at TPC-DS SF1 that is every dimension (customer_demographics: 1.92 M
+    // rows, 7.8 MB, one thread), and a `CollectLeft` join cannot begin its
+    // probe until its build side has finished. Measured on all 99 queries at
+    // SF1, warm, paired and interleaved, results hashed: 14670 -> 14233 ms
+    // (+3.1%), 16 wins over 10%, 7 losses (worst 23 ms), 99/99 identical.
+    // Above 10 MiB nothing changes, so a scale-100 fact table sees no
+    // difference; a file with one row group still yields one non-empty range.
+    config.options_mut().optimizer.repartition_file_min_size = REPARTITION_FILE_MIN_SIZE;
     // Parquet scan options stay at DataFusion's defaults (`pushdown_filters`
     // off, `enable_page_index` on). Forcing `pushdown_filters = true` here
     // cost ~2.2× on scan-heavy queries (Phase 52 #194 attribution probe,
