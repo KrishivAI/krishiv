@@ -15,7 +15,6 @@ on:
 permissions:
   contents: read
   security-events: write  # SARIF upload to GitHub Security tab
-  checks: write           # audit-check annotations
 
 jobs:
   # ── Trivy filesystem scan → GitHub Security tab ──────────────────────────────
@@ -69,21 +68,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-audit
       # deny.toml is the single source of truth for accepted advisories (each
-      # entry carries its rationale there). cargo-audit does not read it, so
-      # without this the two gates disagreed: cargo-deny passed and audit-check
-      # failed on the same lockfile (quick-xml RUSTSEC-2026-0194/0195, pinned
-      # transitively by datafusion/object_store).
-      - name: Read accepted advisories from deny.toml
-        id: accepted
+      # entry carries its rationale there); cargo-audit does not read it, so
+      # the same ignore list is derived from it here. Plain `cargo audit` is
+      # used instead of rustsec/audit-check so the result is in the job log
+      # rather than behind the Checks API.
+      - name: cargo audit (ignores from deny.toml)
         run: |
-          IDS=$(python3 -c 'import tomllib; d=tomllib.load(open("deny.toml","rb")); print(",".join(e["id"] for e in d.get("advisories",{}).get("ignore",[])))')
-          echo "ids=${IDS}" >> "$GITHUB_OUTPUT"
-          echo "accepted advisories: ${IDS}"
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: ${{ steps.accepted.outputs.ids }}
+          set -euo pipefail
+          IGNORES=$(python3 -c 'import tomllib; d=tomllib.load(open("deny.toml","rb")); print(" ".join("--ignore "+e["id"] for e in d.get("advisories",{}).get("ignore",[])))')
+          echo "accepted advisories: ${IGNORES}"
+          # shellcheck disable=SC2086
+          cargo audit ${IGNORES}
 
   # ── cargo deny: license, banned crates, duplicate versions ───────────────────
   deny:
