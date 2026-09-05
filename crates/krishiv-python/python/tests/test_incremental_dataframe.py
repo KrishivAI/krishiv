@@ -497,12 +497,18 @@ def test_a_view_that_cannot_be_evaluated_raises_instead_of_going_quiet():
     iv.insert(pa.record_batch({"k": ["a"], "v": [10]}))
     assert _totals(iv) == {"a": 10}
 
-    with pytest.raises(RuntimeError, match="failed to evaluate"):
-        # a delta whose columns the view's operators cannot read
+    # A delta whose columns are not the source's is refused at ingestion,
+    # naming the source and both column lists. It used to be accepted and
+    # fail later inside DataFusion ("Mismatch between schema and batches"),
+    # after which every tick failed the same way.
+    with pytest.raises(RuntimeError, match="source 'orders' schema mismatch"):
         iv.insert(pa.record_batch({"kk": ["a"], "vv": [1]}))
 
-    # and the snapshot is unchanged, which is exactly why silence was wrong
+    # the snapshot is unchanged, which is exactly why silence was wrong …
     assert _totals(iv) == {"a": 10}
+    # … and the view is still maintainable afterwards
+    iv.insert(pa.record_batch({"k": ["a"], "v": [5]}))
+    assert _totals(iv) == {"a": 15}
 
 
 def test_a_sibling_views_failure_is_reported_not_raised():

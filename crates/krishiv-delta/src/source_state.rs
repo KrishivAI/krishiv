@@ -387,6 +387,20 @@ impl SourceState {
             // accumulated batch had no rows: an empty state may be carrying a
             // placeholder schema that the real data does not match.
             self.schema = new_rows.schema();
+        } else if !same_columns(&self.schema, &new_rows.schema()) {
+            // Branch (a) of `apply` pushes a chunk without touching what is
+            // already accumulated — which also means nothing compared the new
+            // chunk's columns to the relation's. A delta with the wrong
+            // columns was therefore accepted here and only failed later, when
+            // the tick registered the chunks as one `MemTable` ("Mismatch
+            // between schema and batches"), by which point the bad chunk was
+            // part of the state and every subsequent tick failed the same
+            // way. Refuse it here, before it is retained.
+            return Err(DeltaError::SchemaMismatch(format!(
+                "cannot append rows with columns {} to a relation with columns {}",
+                describe_columns(&new_rows.schema()),
+                describe_columns(&self.schema)
+            )));
         }
         self.positive.push(new_rows);
         self.positive_rows += rows;
@@ -490,6 +504,28 @@ impl SourceState {
 /// True when every weight is exactly `+1` — the append-only shape that gets
 /// the concat fast path. An empty delta qualifies vacuously, exactly as it did
 /// in `apply_delta`.
+/// Whether two schemas describe the same columns: same names in the same
+/// order with the same data types. Nullability and metadata are ignored — a
+/// nullable column fed with a non-nullable batch is the same relation.
+pub fn same_columns(expected: &SchemaRef, got: &SchemaRef) -> bool {
+    expected.fields().len() == got.fields().len()
+        && expected
+            .fields()
+            .iter()
+            .zip(got.fields().iter())
+            .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type())
+}
+
+/// `[name: Type, …]` for error messages.
+pub fn describe_columns(schema: &SchemaRef) -> String {
+    let cols: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| format!("{}: {}", f.name(), f.data_type()))
+        .collect();
+    format!("[{}]", cols.join(", "))
+}
+
 fn all_unit_inserts(delta: &DeltaBatch) -> bool {
     delta.weights().iter().all(|w| w == Some(1))
 }
@@ -682,6 +718,40 @@ mod tests {
         assert_eq!(
             state.positive_batch().expect("empty batch").schema(),
             test_schema()
+        );
+    }
+
+    #[test]
+    fn a_chunk_with_different_columns_is_refused_and_the_state_is_unchanged() {
+        // Branch (a) — all-+1 delta, no deficit — is the O(Δ) push path that
+        // used to accept anything. Revert the `same_columns` guard in
+        // `push_positive` and this test fails: the mismatched chunk is retained
+        // and `positive_batch` (concat) errors instead of `apply`.
+        let mut state = SourceState::from_positive(rows(1, 2));
+        let wrong_schema = Arc::new(Schema::new(vec![Field::new("vv", DataType::Utf8, false)]));
+        let wrong = RecordBatch::try_new(
+            wrong_schema,
+            vec![Arc::new(arrow::array::StringArray::from(vec!["x"]))],
+        )
+        .unwrap();
+        let delta = DeltaBatch::from_inserts(wrong).unwrap();
+
+        let err = state
+            .apply(&delta)
+            .expect_err("mismatched columns must be refused");
+        assert!(
+            matches!(err, DeltaError::SchemaMismatch(_)),
+            "expected SchemaMismatch, got {err:?}"
+        );
+        assert_eq!(
+            state.num_rows(),
+            2,
+            "the refused chunk must not be retained"
+        );
+        assert_eq!(
+            state.positive_batch().unwrap().num_rows(),
+            2,
+            "the relation must still concatenate after the refusal"
         );
     }
 }

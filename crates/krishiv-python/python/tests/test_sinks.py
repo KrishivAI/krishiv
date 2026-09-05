@@ -10,6 +10,14 @@ import krishiv.ai as ai
 
 ksinks = ks.sinks
 
+# The vector-sink classes live behind the native `vector-sinks` Cargo feature.
+# CI's default `maturin develop --release` does not enable it, so those tests
+# skip (loudly, with the reason) instead of failing at import time.
+requires_ai = pytest.mark.skipif(
+    not hasattr(ai, "InMemoryVectorSink"),
+    reason="native `vector-sinks` feature not built (maturin develop --features vector-sinks)",
+)
+
 
 # ---------------------------------------------------------------------------
 # ParquetSink
@@ -166,11 +174,13 @@ def test_hbase_sink_repr():
 # ---------------------------------------------------------------------------
 
 
+@requires_ai
 def test_in_memory_vector_sink_construction():
     sink = ai.InMemoryVectorSink()
     assert sink is not None
 
 
+@requires_ai
 def test_in_memory_vector_sink_sink_name():
     sink = ai.InMemoryVectorSink()
     name = sink.sink_name()
@@ -178,6 +188,7 @@ def test_in_memory_vector_sink_sink_name():
     assert len(name) > 0
 
 
+@requires_ai
 def test_in_memory_vector_sink_repr():
     sink = ai.InMemoryVectorSink()
     r = repr(sink)
@@ -185,6 +196,7 @@ def test_in_memory_vector_sink_repr():
     assert "InMemoryVectorSink" in r
 
 
+@requires_ai
 def test_in_memory_vector_sink_upsert_and_query():
     sink = ai.InMemoryVectorSink()
     sink.upsert_batch(
@@ -199,6 +211,7 @@ def test_in_memory_vector_sink_upsert_and_query():
     assert results[0].score > 0.9
 
 
+@requires_ai
 def test_in_memory_vector_sink_delete_by_ids():
     sink = ai.InMemoryVectorSink()
     sink.upsert_batch(
@@ -216,6 +229,7 @@ def test_in_memory_vector_sink_delete_by_ids():
     assert isinstance(results_after, list)
 
 
+@requires_ai
 def test_in_memory_vector_sink_query_with_filter():
     sink = ai.InMemoryVectorSink()
     sink.upsert_batch(
@@ -235,6 +249,7 @@ def test_in_memory_vector_sink_query_with_filter():
         assert r.doc_id in ("d1", "d3")
 
 
+@requires_ai
 def test_in_memory_vector_sink_upsert_empty():
     sink = ai.InMemoryVectorSink()
     sink.upsert_batch(doc_ids=[], vectors=[], epoch=0)
@@ -247,6 +262,7 @@ def test_in_memory_vector_sink_upsert_empty():
 # ---------------------------------------------------------------------------
 
 
+@requires_ai
 def test_pinecone_sink_construction():
     try:
         sink = ai.PineconeSink("index.svc.pinecone.io", "api-key-123")
@@ -255,6 +271,7 @@ def test_pinecone_sink_construction():
     assert sink is not None
 
 
+@requires_ai
 def test_pinecone_sink_repr():
     try:
         sink = ai.PineconeSink("index.svc.pinecone.io", "api-key-123")
@@ -265,6 +282,7 @@ def test_pinecone_sink_repr():
     assert "PineconeSink" in r
 
 
+@requires_ai
 def test_pinecone_sink_sink_name():
     try:
         sink = ai.PineconeSink("index.svc.pinecone.io", "api-key-123")
@@ -275,6 +293,7 @@ def test_pinecone_sink_sink_name():
     assert len(name) > 0
 
 
+@requires_ai
 def test_pinecone_sink_with_namespace():
     try:
         sink = ai.PineconeSink(
@@ -291,6 +310,7 @@ def test_pinecone_sink_with_namespace():
 # ---------------------------------------------------------------------------
 
 
+@requires_ai
 def test_weaviate_sink_construction():
     try:
         sink = ai.WeaviateSink("http://localhost:8080", "Document")
@@ -299,6 +319,7 @@ def test_weaviate_sink_construction():
     assert sink is not None
 
 
+@requires_ai
 def test_weaviate_sink_repr():
     try:
         sink = ai.WeaviateSink("http://localhost:8080", "Document")
@@ -309,6 +330,7 @@ def test_weaviate_sink_repr():
     assert "WeaviateSink" in r
 
 
+@requires_ai
 def test_weaviate_sink_sink_name():
     try:
         sink = ai.WeaviateSink("http://localhost:8080", "Document")
@@ -324,6 +346,7 @@ def test_weaviate_sink_sink_name():
 # ---------------------------------------------------------------------------
 
 
+@requires_ai
 def test_lancedb_sink_construction():
     try:
         sink = ai.LanceDbSink.open(
@@ -336,6 +359,7 @@ def test_lancedb_sink_construction():
     assert sink is not None
 
 
+@requires_ai
 def test_lancedb_sink_repr():
     try:
         sink = ai.LanceDbSink.open(
@@ -350,6 +374,7 @@ def test_lancedb_sink_repr():
     assert "LanceDbSink" in r
 
 
+@requires_ai
 def test_lancedb_sink_sink_name():
     try:
         sink = ai.LanceDbSink.open(
@@ -369,6 +394,7 @@ def test_lancedb_sink_sink_name():
 # ---------------------------------------------------------------------------
 
 
+@requires_ai
 def test_qdrant_sink_construction():
     try:
         sink = ai.QdrantSink.connect(
@@ -381,6 +407,7 @@ def test_qdrant_sink_construction():
     assert sink is not None
 
 
+@requires_ai
 def test_qdrant_sink_sink_name():
     try:
         sink = ai.QdrantSink.connect(
@@ -400,6 +427,7 @@ def test_qdrant_sink_sink_name():
 # ---------------------------------------------------------------------------
 
 
+@requires_ai
 def test_pgvector_sink_construction():
     try:
         sink = ai.PgvectorSink.connect(
@@ -412,6 +440,7 @@ def test_pgvector_sink_construction():
     assert sink is not None
 
 
+@requires_ai
 def test_pgvector_sink_sink_name():
     try:
         sink = ai.PgvectorSink.connect(

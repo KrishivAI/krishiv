@@ -2,9 +2,9 @@
 # TEST-6): every `#[ignore = "requires …"]` external-service test gets a
 # provisioned backend so the tier actually runs instead of being false-green.
 #
-#   scripts/dev/external-test-services.sh up     # start + create bucket
+#   scripts/external-test-services.sh up     # start + create bucket
 #   just test-external                           # run the ignored tests
-#   scripts/dev/external-test-services.sh down   # tear down
+#   scripts/external-test-services.sh down   # tear down
 #
 # Host ports are chosen to avoid the local k3s stack (MinIO :9000/:9001/:9100,
 # OTLP :4317) and any local Postgres (:5432).

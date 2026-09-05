@@ -68,6 +68,6 @@ pub use operators::filter::{FilterOp, FilterValue, filter_batch};
 pub use operators::join::{IncrJoinType, IncrementalJoinOp};
 pub use operators::map::{ProjectOp, map_batch, project_batch};
 pub use operators::stream::{IntegrateOp, apply_delta, differentiate};
-pub use source_state::SourceState;
+pub use source_state::{SourceState, describe_columns, same_columns};
 pub use trace::Trace;
 pub use view::{IncrementalView, IncrementalViewRegistry, IncrementalViewSpec};

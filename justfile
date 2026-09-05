@@ -268,7 +268,7 @@ test-external:
 # etcd; all 19 run in ~0.2s. The one test that does need a server stays
 # `#[ignore]`d.
 test-etcd:
-    {{ sccache_env }} {{ cargo }} test -p krishiv-scheduler --lib --features etcd
+    {{ sccache_env }} {{ cargo_test }} -p krishiv-scheduler --lib --features etcd
 
 # Tests that must pass with only embedded features enabled
 test-embedded:

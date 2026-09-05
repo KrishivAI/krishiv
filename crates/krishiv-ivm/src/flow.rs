@@ -1106,6 +1106,7 @@ impl IncrementalFlow {
         let source_name = source_name.into();
         let mut inner = self.inner.lock().map_err(lock_err)?;
         validate_feed_target(&inner, &source_name)?;
+        validate_feed_schema(&inner, &source_name, &batch)?;
 
         // Content-addressed dedup: filter out re-delivered insertion rows.
         let batch = if inner.input_dedup_enabled {
@@ -1176,6 +1177,7 @@ impl IncrementalFlow {
         let source_name = source_name.into();
         let mut inner = self.inner.lock().map_err(lock_err)?;
         validate_feed_target(&inner, &source_name)?;
+        validate_feed_schema(&inner, &source_name, &batch)?;
         if batch.is_empty() {
             return Ok(());
         }
@@ -3814,6 +3816,42 @@ fn dedup_filter(
         .collect::<IvmResult<arrow::array::BooleanArray>>()?;
     let filtered = batch.filter_mask(&mask).map_err(delta_err)?;
     Ok((filtered, evicted))
+}
+
+/// Reject a delta whose columns differ from the source's established relation.
+///
+/// The first delta a source ever receives defines its columns (an empty
+/// `SourceState` adopts the schema of the first rows, see
+/// `SourceState::push_positive`). Every later delta must match — same names,
+/// same order, same types; nullability is not compared. Without this check a
+/// delta with the wrong columns was accepted into `pending`, and the tick then
+/// failed at `MemTable::try_new` ("Mismatch between schema and batches") — a
+/// DataFusion planning error that named neither the source nor the columns,
+/// and that recurred on every tick because the step's custody returns a failed
+/// tick's pending deltas to the queue. Rejecting here means the bad delta
+/// never enters the queue and the flow stays usable.
+fn validate_feed_schema(
+    inner: &IncrementalFlowInner,
+    source_name: &str,
+    batch: &DeltaBatch,
+) -> IvmResult<()> {
+    let Some(state) = inner.source_snapshots.get(source_name) else {
+        return Ok(());
+    };
+    if state.num_rows() == 0 || batch.is_empty() {
+        return Ok(());
+    }
+    let expected = state.schema();
+    let got = batch.data_schema();
+    if krishiv_delta::same_columns(expected, got) {
+        return Ok(());
+    }
+    Err(IvmError::execution(format!(
+        "source '{source_name}' schema mismatch: the delta's columns {} do not match \
+         the source's columns {}; a source's columns are fixed by its first delta",
+        krishiv_delta::describe_columns(got),
+        krishiv_delta::describe_columns(expected),
+    )))
 }
 
 fn validate_feed_target(inner: &IncrementalFlowInner, source_name: &str) -> IvmResult<()> {

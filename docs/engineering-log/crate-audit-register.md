@@ -9051,3 +9051,77 @@ inferred the scan might not parallelise. The variable was being ignored
 (R4-11); measured properly in-process, the bare `store_sales` scan goes
 212 -> 121 -> 98 -> 57 ms at 1, 2, 4 and 12 partitions. The scan
 parallelises; the serial phase was the repartition above it.
+
+## §98 — CI was red for two weeks, and the test tier behind it had not run at all
+
+2026-09-05/06. Reviewing `main`'s Actions after the documentation rewrite.
+Every workflow had failed on every push since at least 2026-08-26 (the API
+holds no older runs). None of it was one bug; it was eight independent
+ones, and the worst of them hid the others: the `Format & Lint` job failed
+first and every test job `needs` it, so **no unit, integration, Python or
+external-service test had run in CI since before 08-26**. Local gates were
+the only green anyone had.
+
+| # | Gate | Cause | Fix |
+|---|---|---|---|
+| 1 | Format & Lint (→ all tests skipped) | `just lint` compiles `krishiv-connectors`/`krishiv-python` `--all-features`; `pulsar 6.8.0`'s build script runs `prost_build::compile_protos` with no vendored `protoc`; the job installed none (the `check`/feature-guard jobs did) | `extra-apt: protobuf-compiler` on `fmt-lint` |
+| 2 | cargo-deny (CI + Security) | `krishiv-conformance` declared `BUSL-1.1`; `h2 0.4.15` RUSTSEC-2026-0258; yanked `chacha20 0.10.1` | Apache-2.0; `h2` → 0.4.19; `chacha20` → 0.10.2 |
+| 3 | Dependency Audit | `rustsec/audit-check` does not read `deny.toml`'s accepted advisories (quick-xml 0.194/0195, pinned by datafusion/object_store) and failed even when handed the list; its verdict is behind the Checks API, not the log | plain `cargo audit` with the ignore list derived from `deny.toml` |
+| 4 | publish-main-image, nightly Docker | Dockerfiles pinned `rust:1.92-slim`; workspace `rust-version = 1.94.1` since `bf7d88f` (08-13) | `rust:1.94-slim` ×4 |
+| 5 | nightly macOS wheels | `sed -i "s/…/"` needs a suffix on BSD sed | portable Python stamp |
+| 6 | bench dataset tier | `tpcds_q12` was a hand-written `item⋈web_sales⋈catalog_sales⋈store_sales` fan-out (130–180 s), not TPC-DS q12 (~80 ms) | the real q12; budget note records the discontinuity |
+| 7 | External-service Tests | `scripts/external-test-services.sh` committed as `100644` → "Permission denied" on `up` and `down` | executable bit |
+| 8 | Python Tests | see below | see below |
+
+Nightly is now a dry run unless the repository variable `NIGHTLY_PUBLISH`
+is `"true"`: crates `cargo publish --dry-run`, images built but not pushed,
+manifest/Docker Hub/PyPI jobs skipped, no tag. `just test-etcd` now runs
+through nextest so the scheduler crate has the same CI retry quarantine
+under `--features etcd` as under `just test` (its CI failure on `a14ce6f`
+did not reproduce: 645/645 locally, plain and nextest).
+
+### Python Tests: two defects the skipped tier had been hiding
+
+**8a — `krishiv.ai` was a self-import.** `python/krishiv/ai/__init__.py`
+did `from krishiv.ai import MarkdownSectionChunker, …, rag_index, …` — from
+itself — and none of those names exist anywhere in the crate. It worked
+only when the native extension was built with `vector-sinks`, whose
+`register_ai_module` pre-registers `sys.modules["krishiv.ai"]` so the
+package file never runs. CI's default `maturin develop --release` has no
+such feature, so `import krishiv.ai` raised the circular-import
+`ImportError` at collection and took the whole of `test_sinks.py` with it
+(35 tests, most of them not about vector sinks). The package now stands in
+honestly: `__all__` names the seven classes that do exist natively and
+`__getattr__` explains how to build them (an `AttributeError`, so
+`hasattr` probes work); the 21 vector-sink tests carry a `skipif` with the
+reason. Reproduced in a `python:3.12` container running CI's exact recipe.
+
+**8b — a wrong-columns delta poisoned the source.** `test_a_view_that_
+cannot_be_evaluated_raises_instead_of_going_quiet` expected "failed to
+evaluate"; the current engine raised `Error during planning: Mismatch
+between schema and batches` from DataFusion — the message that had been
+right when the test was written (08-24) but not since the chunked
+`SourceState` (PERF-1). The mechanism: `SourceState::apply` branch (a) —
+all-+1 delta, no deficit — pushes a chunk and compares nothing, so a delta
+with columns `[kk, vv]` was retained beside `[k, v]`; the tick then failed
+at `MemTable::try_new`, the step's custody returned the pending delta to
+the queue, and every later tick failed identically. Two guards:
+`SourceState::push_positive` refuses a chunk whose columns differ
+(`DeltaError::SchemaMismatch`, state untouched), and
+`IncrementalFlow::feed`/`feed_coalesced` refuse it at ingestion with a
+message naming the source and both column lists, before it enters
+`pending`. Tests: `a_chunk_with_different_columns_is_refused_and_the_
+state_is_unchanged` (krishiv-delta) — RED with the `push_positive` guard
+reverted; `a_delta_with_the_wrong_columns_is_refused_at_feed_and_the_flow_
+stays_usable` (krishiv-ivm, `tests/feed_schema_guard.rs`) — RED with the
+feed check reverted (the error moves to the tick and the test's
+`expect_err` at feed panics). The Python test now asserts the new contract
+and that the view is still maintainable afterwards.
+
+### Not fixed — watching
+
+- CI's `Supply-chain (cargo-deny)` failed on `a14ce6f` at the same minute
+  the identical action passed in `security.yml` on the same commit, and
+  `cargo deny check` is clean locally. One data point; judged on the next
+  push.
+- `just test-etcd` on `a14ce6f`: not reproducible locally (above).
