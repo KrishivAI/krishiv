@@ -8853,3 +8853,55 @@ one row, so `count` of partials and `sum` of partials agreed. A fifth row
 duplicating a group made them differ. The fixture also carries a real `NULL`
 group value so a rolled-up `NULL` and a real one are both present in every
 comparison.
+
+## §95 — R3-2 closed: per-scan `pushdown_filters` is not structurally decidable, and its ceiling is 5.6%
+
+§89 left per-scan `parquet.pushdown_filters` as "needs a decision" and §90
+corrected its estimated value from 15% to 1.4%. Re-measured on the current
+binary (after the join reorder, the CTE cache and the rollup rewrite), all 99
+at SF1, warm, best of three, paired and interleaved, rows hashed:
+
+```text
+  global off (default)   14065 ms
+  global on              16142 ms   0.871x   11 wins >10%   47 losses >10%
+  per-query oracle       13272 ms   1.060x   (the best of the two arms, every query)
+```
+
+So the whole prize, with a perfect discriminator, is **5.6%** — and the
+discriminator would have to be perfect: the wins are concentrated (q4 +228 ms,
+q11 +138, q80 +114, q78 +67) and so are the losses (q64 −383, q9 −339,
+q72 −224, q18 −203, q24 −187).
+
+Then every plan-structural feature was tried. From the physical plan of each
+query: per scan, the table, the projection width, whether the predicate is a
+`DynamicFilter` (a join build side), whether it is static.
+
+```text
+  choose "on" when …                                   suite      losses among chosen
+  fact scans dynamic-only, no static                   0.920x     35 of 73
+    … and some dynamic-only fact scan width >= 4       0.932x     22 of 43
+    … and some dynamic-only fact scan width >= 6       0.957x     11 of 20
+    … and some dynamic-only fact scan width >= 8       0.938x      7 of  9
+  no static predicate on any scan                      0.994x      2 of  8
+```
+
+Nothing beats leaving it off. The winners and the losers have the *same*
+features: q4 (1.55x) and q64 (0.66x) are both "six fact scans, every predicate
+dynamic, widths 6 and 12"; q80 (1.78x) and q72 (0.55x) are "dynamic-only,
+width 7–8". What separates them is how many rows the dynamic filter *removes*
+— q4's `d_year = 2001` keeps a fifth of `store_sales`, q64's three date
+dimensions keep most of it — and that is a runtime quantity: the build side's
+key range is not known until the build side has run.
+
+**Decision: closed, not implemented.** A structural rule cannot make this
+choice, a cost-model rule would need selectivity this engine does not
+estimate, and the only design that can decide correctly is a runtime one
+inside the Parquet opener — evaluate the dynamic filter's key range against
+each row group's statistics when the build side is done, and enable row-level
+filtering only when the estimated survival is low. That is a change to
+`datafusion-datasource-parquet`'s opener, or a krishiv `FileSource` that wraps
+it, for at most 5.6% of the suite. Not guessed at, and not worth a guess.
+
+(One measurement artefact: the feature extraction ran with the CTE cache on,
+so fact scans inside a cached CTE body are not in the final plan; q14 shows
+"no fact scans" for that reason. It does not change the shape of the result.)
