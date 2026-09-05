@@ -20,7 +20,7 @@ ARG BASE_IMAGE=debian:trixie-slim
 # ── Stage 1: Build binaries (reuse Dockerfile.build logic) ────────────────────
 # This stage is optional — if binaries are already built, use Dockerfile.fast.
 # For CI, we build from source to ensure reproducibility.
-FROM rust:1.92-slim AS builder
+FROM rust:1.94-slim AS builder
 
 ARG FEATURES=full
 

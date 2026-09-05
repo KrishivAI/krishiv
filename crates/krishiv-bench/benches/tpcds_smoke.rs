@@ -4,7 +4,7 @@
 //! `SqlEngine` so the planner, AQE, CBO, and connector layers see
 //! real star-schema / snowflake-schema workloads. Used as a
 //! regression gate by `scripts/bench-tpcds-gate.sh` (see
-//! `docs/benchmarks/tpcds-gate.md`).
+//! `docs/BENCHMARKING.md`).
 //!
 //! To run: `cargo bench -p krishiv-bench --bench tpcds_smoke`
 //! Data path: `KRISHIV_TPCDS_DATA_DIR` env var pointing to the

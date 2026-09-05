@@ -69,31 +69,38 @@ LIMIT 10";
 
 pub const Q6_TABLES: &[&str] = &["store_sales", "store", "date_dim"];
 
-/// TPC-DS Q12: web/catalog/channel sales rollup by item category.
+/// TPC-DS Q12 (the real one, query template 12 with the standard
+/// substitution): web revenue by item for three categories over a 30-day
+/// window, plus each item's share of its class's revenue via a window
+/// aggregate.
+///
+/// Until 2026-09-05 this constant held a hand-written query that joined
+/// `item` to `web_sales`, `catalog_sales` **and** `store_sales` on
+/// `i_item_sk` before any date filter — a three-fact-table fan-out per item
+/// that took 130–180 s at SF1 on the ci-shared runner and breached its 60 s
+/// budget every night for nine nights. The CLI suite runs the genuine q12 in
+/// ~55 ms on the same data. The recorded `tpcds_q12_sf1_p50` history before
+/// that date measures the old query, not this one.
 pub const Q12: &str = "SELECT \
-    i.i_category, \
-    SUM(ws.ws_sales_price) AS web_sales, \
-    SUM(cs.cs_sales_price) AS catalog_sales, \
-    SUM(ss.ss_sales_price) AS store_sales \
-FROM item i \
-JOIN web_sales ws ON ws.ws_item_sk = i.i_item_sk \
-JOIN catalog_sales cs ON cs.cs_item_sk = i.i_item_sk \
-JOIN store_sales ss ON ss.ss_item_sk = i.i_item_sk \
-JOIN date_dim d ON ws.ws_sold_date_sk = d.d_date_sk \
-                  AND cs.cs_sold_date_sk = d.d_date_sk \
-                  AND ss.ss_sold_date_sk = d.d_date_sk \
-WHERE d.d_year = 2001 \
-  AND d.d_moy = 12 \
-GROUP BY i.i_category \
-ORDER BY i.i_category";
+    i_item_id, \
+    i_item_desc, \
+    i_category, \
+    i_class, \
+    i_current_price, \
+    SUM(ws_ext_sales_price) AS itemrevenue, \
+    SUM(ws_ext_sales_price) * 100 / SUM(SUM(ws_ext_sales_price)) \
+        OVER (PARTITION BY i_class) AS revenueratio \
+FROM web_sales, item, date_dim \
+WHERE ws_item_sk = i_item_sk \
+  AND i_category IN ('Sports', 'Books', 'Home') \
+  AND ws_sold_date_sk = d_date_sk \
+  AND d_date BETWEEN CAST('1999-02-22' AS DATE) \
+                 AND CAST('1999-02-22' AS DATE) + INTERVAL '30' DAY \
+GROUP BY i_item_id, i_item_desc, i_category, i_class, i_current_price \
+ORDER BY i_category, i_class, i_item_id, i_item_desc, revenueratio \
+LIMIT 100";
 
-pub const Q12_TABLES: &[&str] = &[
-    "item",
-    "web_sales",
-    "catalog_sales",
-    "store_sales",
-    "date_dim",
-];
+pub const Q12_TABLES: &[&str] = &["web_sales", "item", "date_dim"];
 
 /// TPC-DS Q27: store monthly returns and profit by state and year.
 pub const Q27: &str = "SELECT \

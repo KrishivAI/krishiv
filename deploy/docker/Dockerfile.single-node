@@ -18,7 +18,7 @@
 # uses host-compiled dev binaries and skips the multi-stage build.
 
 # ── Stage 0: cargo-chef base ──────────────────────────────────────────────────
-FROM rust:1.92-slim AS chef
+FROM rust:1.94-slim AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 

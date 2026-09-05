@@ -1,5 +1,13 @@
 name: Nightly
 
+# ── Publish gate ──────────────────────────────────────────────────────────────
+# Nightly is a DRY RUN unless the repository variable NIGHTLY_PUBLISH is set
+# to "true" (Settings → Secrets and variables → Actions → Variables). In dry
+# run the workflow still builds every artifact — crates (`cargo publish
+# --dry-run`), all Docker images, all wheels — so build breakage is caught,
+# but nothing is pushed to crates.io, GHCR, Docker Hub or PyPI and no tag is
+# created. Flip the variable to publish; no workflow edit needed.
+
 # Publishes a fresh build from main every night.
 # Crates published to crates.io with READMEs generated from doc comments.
 # Python wheels built as artifacts (14-day retention).
@@ -110,6 +118,7 @@ jobs:
         if: steps.changes.outputs.has_changes == 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          NIGHTLY_PUBLISH: ${{ vars.NIGHTLY_PUBLISH }}
         run: |
           set -e
           # Topological order — each crate's deps are published before it.
@@ -143,12 +152,17 @@ jobs:
             # Some crates (krishiv-runtime, krishiv-api) have circular dev-dependencies
             # through krishiv-flight-sql that make verification impossible; CI already
             # validates builds before publish.
-            cargo publish -p "${crate}" --allow-dirty --no-verify 2>&1 || true
+            if [ "${NIGHTLY_PUBLISH}" = "true" ]; then
+              cargo publish -p "${crate}" --allow-dirty --no-verify 2>&1 || true
+            else
+              echo "(dry run — NIGHTLY_PUBLISH is not 'true'; nothing is uploaded)"
+              cargo publish -p "${crate}" --allow-dirty --no-verify --dry-run 2>&1 || true
+            fi
             echo "---"
             sleep 30
           done
       - name: Tag nightly
-        if: steps.changes.outputs.has_changes == 'true'
+        if: steps.changes.outputs.has_changes == 'true' && vars.NIGHTLY_PUBLISH == 'true'
         # GITHUB_TOKEN cannot push tags that point to commits modifying
         # .github/workflows/ — GitHub blocks it without a PAT with 'workflow'
         # scope. Use continue-on-error so a tag push failure does not fail
@@ -223,6 +237,7 @@ jobs:
         run: echo "IMAGE_NAME=$(echo '${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: vars.NIGHTLY_PUBLISH == 'true'
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -234,16 +249,19 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
-          push: true
+          # Dry run (NIGHTLY_PUBLISH != 'true'): build only, nothing leaves the runner.
+          push: ${{ vars.NIGHTLY_PUBLISH == 'true' }}
           build-args: FEATURES=${{ matrix.features }}
-          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=${{ vars.NIGHTLY_PUBLISH == 'true' }},name-canonical=true,push=${{ vars.NIGHTLY_PUBLISH == 'true' }}
           cache-from: type=gha,scope=docker-nightly-${{ matrix.variant }}-${{ matrix.arch }}
           cache-to: type=gha,scope=docker-nightly-${{ matrix.variant }}-${{ matrix.arch }},mode=max
       - name: Export digest
+        if: vars.NIGHTLY_PUBLISH == 'true'
         run: |
           mkdir -p /tmp/digests
           echo "${{ steps.build.outputs.digest }}" > /tmp/digests/${{ matrix.variant }}-${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
+        if: vars.NIGHTLY_PUBLISH == 'true'
         with:
           name: digest-${{ matrix.variant }}-${{ matrix.arch }}
           path: /tmp/digests/${{ matrix.variant }}-${{ matrix.arch }}
@@ -252,6 +270,7 @@ jobs:
   docker-nightly-merge:
     name: Docker Nightly manifest (${{ matrix.variant }})
     needs: docker-nightly-build
+    if: vars.NIGHTLY_PUBLISH == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -304,6 +323,7 @@ jobs:
   dockerhub-description:
     name: Docker Hub README
     needs: docker-nightly-merge
+    if: vars.NIGHTLY_PUBLISH == 'true'
     runs-on: ubuntu-latest
     env:
       DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -369,7 +389,14 @@ jobs:
           STAMP="$(date +%Y%m%d%H%M)"
           PEP440_VER="0.1.0a${STAMP}"
           echo "PEP440 version: ${PEP440_VER}"
-          sed -i "s/^version = \"0\.1\.0\"/version = \"${PEP440_VER}\"/" crates/krishiv-python/pyproject.toml
+          # Portable in-place edit: BSD sed (macOS) requires a suffix after -i,
+          # so a bare `sed -i "s/…/"` parsed the script as the suffix and failed
+          # every macOS wheel build.
+          python3 - "$PEP440_VER" <<'PY'
+          import re, sys, pathlib
+          p = pathlib.Path("crates/krishiv-python/pyproject.toml")
+          p.write_text(re.sub(r'^version = "0\.1\.0"', f'version = "{sys.argv[1]}"', p.read_text(), count=1, flags=re.M))
+          PY
           # Export for the maturin step
           echo "PEP440_VER=${PEP440_VER}" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5
@@ -434,6 +461,7 @@ jobs:
   pypi-nightly:
     name: Publish to PyPI
     needs: wheels-nightly
+    if: vars.NIGHTLY_PUBLISH == 'true'
     runs-on: ubuntu-latest
     environment: pypi-publish
     permissions:

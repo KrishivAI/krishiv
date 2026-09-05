@@ -35,6 +35,12 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt,clippy
+          # `just lint` runs krishiv-connectors/krishiv-python with --all-features,
+          # which enables `pulsar-source`; pulsar's build script calls
+          # prost_build::compile_protos and needs a system protoc (no vendored
+          # binary). Without this the job failed on every push and, because
+          # every test job `needs` it, skipped the whole test tier.
+          extra-apt: protobuf-compiler
       - uses: taiki-e/install-action@just
       - run: just fmt
       - run: just lint

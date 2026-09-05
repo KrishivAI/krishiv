@@ -195,7 +195,7 @@
    "budget_ms": 60000,
    "tier": "datasets",
    "benchmark": "scripts/bench-datasets-tier.sh (tpcds_smoke/query/q12)",
-   "note": "bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
+   "note": "2026-09-05: the query behind this row was replaced \u2014 the old constant was a hand-written item\u00d7web_sales\u00d7catalog_sales\u00d7store_sales fan-out (130\u2013180 s), not TPC-DS q12; rows before that date measure the old query. bootstrap budget = the 60s QUERY_TIMEOUT_MS contract in krishiv-bench/src/tpcds.rs (the only recorded TPC-DS SLO) \u2014 a completes-within-timeout gate, deliberately loose because no TPC-DS measurement exists on any recorded host yet. Tighten to ~1.5x the observed ci-shared median once the first committed week of history exists."
   },
   {
    "path": "tpcds_q27_sf1_p50",

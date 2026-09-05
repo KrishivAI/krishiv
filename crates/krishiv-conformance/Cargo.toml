@@ -2,7 +2,7 @@
 name = "krishiv-conformance"
 version = "0.1.0"
 edition = "2024"
-license = "BUSL-1.1"
+license = "Apache-2.0"
 publish = false
 description = "SQL correctness corpus (sqllogictest) run across the three execution placements"
 

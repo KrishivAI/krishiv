@@ -12,7 +12,7 @@
 #   docker build --build-arg FEATURES=full -f Dockerfile.build -t krishiv:latest .
 
 # ── Stage 0: cargo-chef base (shared between planner and builder) ─────────────
-FROM rust:1.92-slim AS chef
+FROM rust:1.94-slim AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
