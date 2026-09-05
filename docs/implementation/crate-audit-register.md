@@ -8520,3 +8520,128 @@ the DataFusion plan that executes the query.
 distributed path and SF100 are exactly where a bad join order becomes a bad
 shuffle, the mechanism behind every large regression in this file. Re-run the
 99-query sweep at SF100 before trusting the default there.
+
+## §91 — CTE materialisation: correct, measured, and not shipped
+
+Continues §90's first open item. §90 recorded that repeated scans of the same
+table dominate what is left of the TPC-DS tail, and that the cause is DataFusion
+inlining CTEs. That is confirmed and quantified here, a working implementation
+exists, and the sweep says do not turn it on.
+
+### The gap
+
+DataFusion 54 inlines every CTE: `WITH x AS (…)` referenced N times is planned
+as N copies and executed N times. DuckDB and PostgreSQL materialise a CTE
+referenced more than once. Counting `DataSourceExec` nodes per table in
+`EXPLAIN ANALYZE` at SF1, after §90's join-reorder fix:
+
+```text
+  q23  store_sales x6                      5.45 s of 7.25 s scan CPU duplicate
+  q14  store_sales x5, catalog_sales x5,
+       web_sales x5                        3.30 s duplicate
+  q27  store_sales x3                      2.86 s duplicate
+  q64  store_sales x2, catalog_sales x2    2.17 s duplicate
+  q4   store_sales x2, web_sales x2        1.66 s duplicate
+  q47  store_sales x3                      1.47 s duplicate
+```
+
+q27's `results` CTE is referenced three times by three `UNION ALL` branches; the
+plan carries three copies of the whole five-way join beneath it.
+
+Materialising by hand — the CTE bodies lifted into `CREATE TABLE … AS`, the
+query pointed at the tables, results byte-identical:
+
+```text
+  q27  414 ms -> 195 ms   2.12x
+  q23  631 ms -> 353 ms   1.79x
+```
+
+### An implementation constraint worth recording
+
+The N copies are identical in the **unoptimized** plan and stop being identical
+as soon as `OptimizeProjections` runs, because it prunes each copy to the
+columns its own consumer needs. A rewrite that matches on the optimized plan
+finds nothing. `cte_materialize` therefore operates on the plan
+`SessionContext::sql` returns, before optimization — which is why it lives at
+the `SqlEngine::sql` seam rather than in the optimizer rule list.
+
+### R4-3 (implemented, OFF by default) — `cte_materialize`
+
+Collects the body of a repeated `SubqueryAlias` into a partitioned `MemTable`,
+registers it, and rewrites every occurrence to read it. Guards: single-query
+process only; no streaming sources; row and byte caps past which the original
+plan runs unchanged; the replacement keeps the original alias so every column
+above resolves by the same qualified name, and the rewrite is abandoned if the
+schema does not match.
+
+It reproduces the hand result exactly — q27 426 ms -> 191 ms, rows identical.
+
+**And it is a net loss across the suite.** All 99 at SF1, warm, best of three,
+paired and interleaved, results hashed per query:
+
+```text
+  first version    16177 ms -> 18224 ms   0.888x    5 wins >10%, 18 losses
+  with the guard   31561 ms -> 33365 ms   0.946x   11 wins >10%, 20 losses
+```
+
+(The second sweep ran against a machine loaded by an unrelated build, which is
+why the absolute numbers are near double. The arms are interleaved, so the ratio
+holds; this is the noise-floor discipline this file already requires.)
+**99/99 rows identical in both sweeps.** The rewrite is correct; it is not a win.
+
+Two mechanisms behind the losses, one fixed:
+
+**Fixed — caching a bare scan forfeits pushdown.** The first version cached
+anything repeated, including `SubqueryAlias: ss1` over an unfiltered
+`store_sales`. TPC-DS q44 has no `WITH` clause at all; its repeated alias is
+exactly that, in two branches that each filter `ss_store_sk = 4`. Materialising
+held **2.88 M rows, all columns**, and forfeited both the predicate pushdown and
+the projection pruning that made each inlined copy cheap: 111 ms -> 428 ms,
+3.9x slower. `reduces_its_input` now requires a `Filter`, `Aggregate`,
+`Distinct`, `Limit`, `Join` or `Window` in the body. q44 went to 0.89x and left
+the loss list. A single-partition `MemTable` was investigated first and was
+*not* the cause — the partitioning fix is kept because it is right, but it moved
+nothing.
+
+**Not fixed — needs a decision.** What remains is
+`WITH cs AS (…) … WHERE cs1.syear = 2000 … cs2.syear = 2001`: q64 0.63x,
+q39 0.38x, q2 0.58x, q75 0.62x, q59 0.69x. Each *inlined* copy receives its
+consumer's predicate through `PushDownFilter` and computes only the rows that
+consumer wants. Materialising computes the union of what every consumer wants,
+once. When the consumers' predicates are selective and disjoint, N cheap copies
+beat one expensive shared one — and no structural property of the CTE body
+separates that from q27, where the consumers filter nothing and one shared copy
+wins 2.1x.
+
+The missing input is a **cost comparison** between "the body, whole" and "the
+body, N times, each with its consumer's predicate pushed in". That is not a
+guard, it is an estimate, and this engine does not have it. **Not guessed at.**
+A shippable version needs either that estimate, or an explicit
+`WITH … AS MATERIALIZED` hint — which DataFusion's parser rejects today
+(`ParserError("Expected: (, found: MATERIALIZED")`), so it would be a parser
+change as well.
+
+Kept behind `KRISHIV_CTE_MATERIALIZE` rather than deleted, on the same footing
+as `KRISHIV_SEMI_JOIN_DIMENSION`: correct when enabled, a real 2.1x for a
+workload whose repeated CTEs are consumed unfiltered, and documented so that
+anyone enabling it knows the shape it requires.
+
+**Tests, all proven RED against the reverted production line:**
+`a_cte_referenced_twice_reads_a_cache_from_both_references` (revert: require
+three references), `a_cte_referenced_once_is_left_alone` (revert: require one),
+`a_body_over_the_cap_is_abandoned` (revert: drop the cap check),
+`the_materialized_plan_returns_the_same_rows` (revert: replace every
+`SubqueryAlias`, not the candidate), `a_repeated_alias_over_a_bare_scan_is_left_alone`
+(revert: treat an unmodelled body as worth caching). Plus
+`datafusion_inlines_a_cte_once_per_reference`, which pins the behaviour being
+changed.
+
+One test fixture is worth noting: the first version of
+`a_repeated_alias_over_a_bare_scan_is_left_alone` put its two aliases inside
+scalar subqueries and stayed green against every revert, because
+`LogicalPlan::inputs` does not descend into subquery *expressions* — the aliases
+were never candidates and the test was asserting nothing. Rewritten to q44's
+actual shape (two derived tables in the `FROM` clause) it goes red. That
+limitation is real and is documented on the module: repeats reachable only
+through a subquery expression are not found, which makes the rule do less,
+never something wrong.

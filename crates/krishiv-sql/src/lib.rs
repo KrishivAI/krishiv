@@ -97,6 +97,7 @@ pub mod cep_sql;
 pub mod connector_table;
 pub mod coop_amplifiers;
 pub mod create_function_ddl;
+pub mod cte_materialize;
 pub mod distributed_plan;
 pub mod grace_hash_join;
 pub mod grammar;
@@ -3431,6 +3432,7 @@ impl SqlEngine {
                 .cloned();
             if let Some(plan) = cached_plan {
                 let dataframe = self.context.execute_logical_plan(plan).await?;
+                let dataframe = self.materialize_repeated_ctes(dataframe).await?;
                 return Ok(self.attach_query_metadata(
                     self.make_sql_df("sql-query", dataframe)
                         .with_shuffle_partitions(shuffle_override),
@@ -3485,7 +3487,11 @@ impl SqlEngine {
             }
         }
 
-        // Cache the logical plan for future repeated calls.
+        // Cache the logical plan for future repeated calls. The plan cached is
+        // the one DataFusion produced, never a materialised rewrite: the rewrite
+        // references temporary tables whose lifetime is this statement, so a
+        // cached copy of it would outlive what it reads. Materialisation runs
+        // after the insert here, and again on the cache-hit path above.
         if can_cache {
             let plan = dataframe.logical_plan().clone();
             match self.plan_cache.lock() {
@@ -3494,11 +3500,28 @@ impl SqlEngine {
             }
         }
 
+        let dataframe = self.materialize_repeated_ctes(dataframe).await?;
+
         Ok(self.attach_query_metadata(
             self.make_sql_df("sql-query", dataframe)
                 .with_shuffle_partitions(shuffle_override),
             &rewritten,
         ))
+    }
+
+    /// Materialise any CTE this statement references more than once.
+    ///
+    /// Declines outright when the engine has streaming sources: the rewrite
+    /// collects the CTE body, and an unbounded input does not finish. See
+    /// [`crate::cte_materialize`] for the rest of the guards and the numbers.
+    async fn materialize_repeated_ctes(
+        &self,
+        dataframe: DataFusionDataFrame,
+    ) -> SqlResult<DataFusionDataFrame> {
+        if self.has_streaming_sources.load(Ordering::Acquire) {
+            return Ok(dataframe);
+        }
+        cte_materialize::materialize_repeated_ctes(&self.context, dataframe).await
     }
 
     /// Execute a SQL query with a timeout.

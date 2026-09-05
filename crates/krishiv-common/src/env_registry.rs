@@ -1438,6 +1438,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Enable the broadcast-dimension reducer (physical). Opt-in: the logical form of this rule was cleared by a three-query A/B, shipped on, and cost q10 18x.",
     ),
     rt(
+        "KRISHIV_CTE_MATERIALIZE",
+        FlagKind::Bool,
+        "false",
+        "Materialise a CTE referenced more than once instead of letting DataFusion inline it per reference. Opt-in: it executes part of the query eagerly inside an API whose contract is lazy. TPC-DS SF1 q27 2.1x, q23 1.8x by hand.",
+    ),
+    rt(
         "KRISHIV_JOIN_REORDER",
         FlagKind::Bool,
         "true",
