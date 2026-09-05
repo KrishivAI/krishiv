@@ -27,7 +27,7 @@
 //!   q23  631 ms -> 353 ms   1.79x   (DuckDB 253 ms)
 //! ```
 //!
-//! # On by default, and the three sweeps behind that
+//! # On by default, and the four sweeps behind that
 //!
 //! All 99 TPC-DS queries at SF1, warm, best of three, paired and interleaved,
 //! results hashed per query. **99/99 rows identical in every sweep.**
@@ -37,12 +37,16 @@
 //!   2. + body must reduce input     31561 -> 33365 ms   0.946x   11 wins  20 losses
 //!   3. + consumers must not filter,
 //!      + schema check fixed         16448 -> 16036 ms   1.026x   11 wins   8 losses
+//!   4. + subquery expressions,
+//!      + filters traced to the body 16628 -> 14388 ms   1.156x   13 wins  10 losses
 //! ```
 //!
 //! (Sweep 2 ran on a machine loaded by an unrelated build, hence the doubled
-//! absolutes; the arms interleave, so the ratio holds.) In sweep 3 the largest
-//! loss is 27 ms (q9, 0.89x) and every loss is a sub-120 ms query; the wins are
-//! q36 2.16x, q27 1.90x, q23 1.23x.
+//! absolutes; the arms interleave, so the ratio holds.) In sweep 4, on a quiet
+//! machine, the largest loss is 32 ms (q88, 0.88x) and every loss is under 15%;
+//! the wins are q95 4.11x, q14 3.57x, q57 2.19x, q36 2.05x, q27 1.92x, q23
+//! 1.79x, q47 1.75x. Against DuckDB the suite went 16498 -> 14891 ms and q95
+//! joined q72 as faster than it.
 //!
 //! What each step found:
 //!
@@ -65,8 +69,18 @@
 //!   run. Found by a probe that printed `cached=0` for an unfiltered, repeated,
 //!   aggregate-bearing CTE; fixed by comparing fields and qualifiers.
 //!
+//! What sweep 4 added, each from a query the rule had declined or mishandled:
+//! references inside `EXISTS`/`IN`/scalar subqueries are found and rewritten
+//! (`apply_with_subqueries`; q95, q14); a predicate is traced through alias
+//! bodies to the candidate rather than matched one alias up (q39 had cached the
+//! derived table *inside* the CTE its consumers filtered, 0.51x); and a conjunct
+//! counts only when every column it names traces to the candidate through one
+//! alias and is pushable there — so a correlation, a join predicate, a self-join
+//! and a filter above a window no longer block (q95, q47). See
+//! [`consumers_filter`].
+//!
 //! Still unmodelled: a filter that reaches the alias through a join with a
-//! filtered dimension is invisible to [`consumers_filter`]; sweep 3 says what is
+//! filtered dimension is invisible to [`consumers_filter`]; sweep 4 says what is
 //! left of that is inside noise at SF1. **SF100 and the distributed path are
 //! unmeasured** — the rule declines outside a single-query process regardless.
 //! `KRISHIV_CTE_MATERIALIZE=off` disables it.
@@ -113,9 +127,10 @@
 //!   rather than to an out-of-memory.
 
 use crate::{SqlError, SqlResult};
-use datafusion::common::tree_node::{Transformed, TreeNode};
+use datafusion::common::tree_node::{Transformed, TreeNodeRecursion};
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::MemTable;
+use datafusion::logical_expr::Expr;
 use datafusion::logical_expr::{LogicalPlan, SubqueryAlias};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -215,14 +230,17 @@ pub async fn materialize_repeated_ctes_forced(
 /// repeat inside it; picking the smallest would cache a leaf and leave the
 /// expensive joins above it duplicated.
 fn largest_repeated_alias(plan: &LogicalPlan) -> Option<SubqueryAlias> {
-    let mut counts: HashMap<&SubqueryAlias, usize> = HashMap::new();
-    let mut stack = vec![plan];
-    while let Some(node) = stack.pop() {
+    // `apply_with_subqueries`, not `inputs()`: a CTE referenced from an
+    // `EXISTS` or a scalar subquery lives in a *expression*, and `inputs()`
+    // never sees it. TPC-DS q95's `ws_wh` is joined once and probed by two
+    // `EXISTS`; q14's `avg_sales` is a scalar subquery in three `HAVING`s.
+    let mut counts: HashMap<SubqueryAlias, usize> = HashMap::new();
+    let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::SubqueryAlias(alias) = node {
-            *counts.entry(alias).or_insert(0) += 1;
+            *counts.entry(alias.clone()).or_insert(0) += 1;
         }
-        stack.extend(node.inputs());
-    }
+        Ok(TreeNodeRecursion::Continue)
+    });
     counts
         .into_iter()
         .filter(|(alias, count)| {
@@ -232,48 +250,182 @@ fn largest_repeated_alias(plan: &LogicalPlan) -> Option<SubqueryAlias> {
                 && !consumers_filter(plan, alias)
         })
         .max_by_key(|(alias, _)| node_count(&alias.input))
-        .map(|(alias, _)| alias.clone())
+        .map(|(alias, _)| alias)
 }
 
-/// Does any predicate above the alias name one of its columns?
+/// Does any consumer filter the alias in a way its own inlined copy could
+/// have pushed into the body?
 ///
 /// This is the q64 signature: `WITH cs AS (…) … WHERE cs1.syear = 2000 AND
-/// cs2.syear = 2001`. Each inlined copy receives its own predicate through
+/// cs2.syear = 2001`. Each inlined copy receives its predicate through
 /// `PushDownFilter` and computes only that year; the shared copy has to compute
 /// both. When the predicates are selective, N cheap copies beat one expensive
 /// one — q64 0.63x, q39 0.38x, q2 0.58x with this check absent. Where no
 /// predicate names the alias, pushdown had nothing to give the copies and the
 /// shared copy is pure saving — q27 2.1x.
 ///
-/// Structural, not a cost model: it cannot see a filter that arrives through a
-/// join with a filtered dimension. It is the part of the decision that *is*
-/// visible in the plan, measured across the suite rather than argued.
-fn consumers_filter(plan: &LogicalPlan, alias: &SubqueryAlias) -> bool {
-    // The alias's own name, plus every alias that wraps it directly:
-    // `FROM r a, r b WHERE a.k = 1` filters `r` through `a`.
-    let mut names = vec![alias.alias.table().to_owned()];
-    let mut predicates = Vec::new();
-    let mut stack = vec![plan];
-    while let Some(node) = stack.pop() {
+/// A conjunct counts only when **every column it references traces to the
+/// candidate through one alias**, and at least one of them could be pushed
+/// beneath the body's top operator. That excludes, deliberately:
+///
+/// - **A correlation.** `EXISTS (SELECT 1 FROM r WHERE r.k = outer_ref(s.k))`
+///   becomes a join key when decorrelated; the copy still computes all of `r`.
+/// - **A join predicate.** `wr_order_number = ws_wh.ws_order_number` names the
+///   alias and another relation; the copy is one side of a join and computes
+///   all of itself. q95's `ws_wh` is consumed exactly so, three times — 3.55x
+///   by hand, declined by a guard that counted this.
+/// - **A self-join.** `inv1.i_item_sk = inv2.i_item_sk` names the candidate
+///   twice through two aliases; neither copy computes less for it.
+/// - **One the copy could not push.** `WITH v1 AS (… rank() OVER (…) …) …
+///   WHERE v1.d_year = 1999`: no pushdown through a window except on partition
+///   columns, nor through an aggregate except on group keys, so each copy
+///   computes the whole body regardless. q47, 2.04x by hand.
+///
+/// Columns are **traced through alias bodies**, not matched by name one level
+/// up. q39's `WITH inv AS (SELECT … FROM (SELECT … GROUP BY …, d_moy) foo
+/// WHERE …) … FROM inv inv1, inv inv2 WHERE inv1.d_moy = 1`: the candidate the
+/// rule reaches is `foo` — `inv` is declined for this very predicate — and
+/// `inv1.d_moy` is `foo.d_moy` two projections down, a group key the copy
+/// pushes into. Matching one level up let `foo` be cached whole, all twelve
+/// months for consumers that each wanted one: q39 0.51x.
+fn consumers_filter(plan: &LogicalPlan, candidate: &SubqueryAlias) -> bool {
+    use datafusion::logical_expr::utils::split_conjunction;
+    let mut aliases: HashMap<String, SubqueryAlias> = HashMap::new();
+    let mut predicates: Vec<Expr> = Vec::new();
+    let _ = plan.apply_with_subqueries(|node| {
         match node {
-            LogicalPlan::SubqueryAlias(outer) if matches!(outer.input.as_ref(), LogicalPlan::SubqueryAlias(inner) if inner == alias) =>
-            {
-                names.push(outer.alias.table().to_owned());
+            LogicalPlan::SubqueryAlias(alias) => {
+                aliases
+                    .entry(alias.alias.table().to_owned())
+                    .or_insert_with(|| alias.clone());
             }
-            LogicalPlan::Filter(filter) => predicates.push(&filter.predicate),
-            LogicalPlan::Join(join) => predicates.extend(join.filter.as_ref()),
+            LogicalPlan::Filter(filter) => predicates.push(filter.predicate.clone()),
+            LogicalPlan::Join(join) => predicates.extend(join.filter.iter().cloned()),
             _ => {}
         }
-        stack.extend(node.inputs());
-    }
-    predicates.iter().any(|expr| {
-        expr.column_refs().iter().any(|column| {
-            column
-                .relation
-                .as_ref()
-                .is_some_and(|r| names.iter().any(|n| n == r.table()))
+        Ok(TreeNodeRecursion::Continue)
+    });
+    predicates
+        .iter()
+        .flat_map(|expr| split_conjunction(expr))
+        .filter(|conjunct| !conjunct.contains_outer())
+        .any(|conjunct| {
+            let refs = conjunct.column_refs();
+            if refs.is_empty() {
+                return false;
+            }
+            let mut through: Option<&str> = None;
+            let mut pushable = false;
+            for column in refs {
+                let Some(relation) = column.relation.as_ref() else {
+                    return false;
+                };
+                let Some(alias) = aliases.get(relation.table()) else {
+                    return false;
+                };
+                let Some(traced) = trace_to(alias, candidate, &column.name) else {
+                    return false;
+                };
+                match through {
+                    None => through = Some(relation.table()),
+                    Some(name) if name == relation.table() => {}
+                    Some(_) => return false,
+                }
+                pushable |= pushable_into(&candidate.input, &traced);
+            }
+            pushable
         })
-    })
+}
+
+/// Follow output column `name` of `alias` down through row-preserving nodes
+/// and projections until it reaches `candidate`; the column's name there.
+///
+/// `None` when the column is computed on the way (an aggregate, a window,
+/// arithmetic), when a node that changes the row set is crossed before the
+/// candidate is reached, or when the chain bottoms out elsewhere.
+fn trace_to(alias: &SubqueryAlias, candidate: &SubqueryAlias, name: &str) -> Option<String> {
+    if alias == candidate {
+        return Some(name.to_owned());
+    }
+    let mut node = alias.input.as_ref();
+    let mut name = name.to_owned();
+    loop {
+        match node {
+            LogicalPlan::SubqueryAlias(inner) => {
+                if inner == candidate {
+                    return Some(name);
+                }
+                node = inner.input.as_ref();
+            }
+            LogicalPlan::Projection(projection) => {
+                let expr = projection.expr.iter().find(|expr| match expr {
+                    Expr::Column(column) => column.name == name,
+                    Expr::Alias(alias) => alias.name == name,
+                    other => other.schema_name().to_string() == name,
+                })?;
+                name = match expr {
+                    Expr::Column(column) => column.name.clone(),
+                    Expr::Alias(alias) => match alias.expr.as_ref() {
+                        Expr::Column(column) => column.name.clone(),
+                        _ => return None,
+                    },
+                    _ => return None,
+                };
+                node = projection.input.as_ref();
+            }
+            LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
+            LogicalPlan::Sort(sort) => node = sort.input.as_ref(),
+            LogicalPlan::Limit(limit) => node = limit.input.as_ref(),
+            LogicalPlan::Distinct(distinct) => node = distinct.input(),
+            _ => return None,
+        }
+    }
+}
+
+/// Could a predicate on the body's output column `name` be pushed beneath the
+/// body's top operator, so that an inlined copy computes less?
+///
+/// Through a projection the column is followed to what produced it: a bare
+/// column keeps its name, anything computed (an aggregate, a window, an
+/// arithmetic) is not pushable. Beneath, a `Window` admits only its partition
+/// columns and an `Aggregate` only its group keys — the same rule
+/// `PushDownFilter` applies. Everything else lets the predicate through.
+fn pushable_into(body: &LogicalPlan, name: &str) -> bool {
+    match body {
+        LogicalPlan::Projection(projection) => {
+            let Some(expr) = projection.expr.iter().find(|expr| match expr {
+                Expr::Column(column) => column.name == name,
+                Expr::Alias(alias) => alias.name == name,
+                other => other.schema_name().to_string() == name,
+            }) else {
+                return false;
+            };
+            match expr {
+                Expr::Column(column) => pushable_into(&projection.input, &column.name),
+                Expr::Alias(alias) => match alias.expr.as_ref() {
+                    Expr::Column(column) => pushable_into(&projection.input, &column.name),
+                    _ => false,
+                },
+                _ => false,
+            }
+        }
+        LogicalPlan::SubqueryAlias(alias) => pushable_into(&alias.input, name),
+        LogicalPlan::Aggregate(aggregate) => aggregate
+            .group_expr
+            .iter()
+            .any(|expr| matches!(expr, Expr::Column(c) if c.name == name)),
+        LogicalPlan::Window(window) => window.window_expr.iter().all(|expr| {
+            let Expr::WindowFunction(function) = expr else {
+                return false;
+            };
+            function
+                .params
+                .partition_by
+                .iter()
+                .any(|expr| matches!(expr, Expr::Column(c) if c.name == name))
+        }),
+        _ => true,
+    }
 }
 
 /// Does this body actually shrink what it reads?
@@ -394,7 +546,7 @@ async fn materialize_one(
 
     let rewritten = plan
         .clone()
-        .transform_down(|node| {
+        .transform_down_with_subqueries(|node| {
             Ok(match &node {
                 LogicalPlan::SubqueryAlias(alias) if alias == candidate => {
                     Transformed::yes(replacement.clone())
@@ -501,6 +653,12 @@ mod tests {
         ctx
     }
 
+    /// Cache reads in a rendered plan — scans only, not the qualified column
+    /// references the optimizer prints above them.
+    fn cached_scans(plan: &str) -> usize {
+        plan.matches(&format!("TableScan: {TEMP_PREFIX}")).count()
+    }
+
     async fn optimized(ctx: &SessionContext, frame: DataFrame) -> String {
         let _ = ctx;
         format!(
@@ -537,7 +695,7 @@ mod tests {
             "the CTE body is collected eagerly, so no scan of it should remain:\n{plan}"
         );
         assert_eq!(
-            plan.matches(TEMP_PREFIX).count(),
+            cached_scans(&plan),
             2,
             "both references must read the cache:\n{plan}"
         );
@@ -600,7 +758,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            plan.matches(TEMP_PREFIX).count(),
+            cached_scans(&plan),
             0,
             "an unfiltered scan must not be cached — the consumers' predicates \
              push into it and the cache would forfeit that:\n{plan}"
@@ -632,10 +790,170 @@ mod tests {
         )
         .await;
         assert_eq!(
-            plan.matches(TEMP_PREFIX).count(),
+            cached_scans(&plan),
             2,
             "a GROUP BY body carries a functional dependency the cache lacks; \
              that must not decline the rewrite:\n{plan}"
+        );
+    }
+
+    /// A CTE probed from `EXISTS` subqueries must be found and cached.
+    ///
+    /// q95's `ws_wh` is joined once and probed by two `EXISTS`; the references
+    /// live in filter *expressions*, which `LogicalPlan::inputs` never visits,
+    /// and their `r.k = outer_ref(…)` correlation is a join key after
+    /// decorrelation, not a filter the copy could push. 3.55x by hand.
+    #[tokio::test]
+    async fn a_cte_probed_from_exists_subqueries_is_cached() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH r AS (SELECT ss_item_sk k, sum(ss_quantity) q FROM store_sales GROUP BY ss_item_sk) \
+                 SELECT count(*) FROM store_sales s \
+                 WHERE EXISTS (SELECT 1 FROM r WHERE r.k = s.ss_item_sk) \
+                   AND NOT EXISTS (SELECT 1 FROM r WHERE r.q = s.ss_quantity)",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            cached_scans(&plan),
+            2,
+            "both EXISTS probes must read the cache; the correlation is not a \
+             consumer filter:\n{plan}"
+        );
+    }
+
+    /// A consumer filter that could not push through the body does not block.
+    ///
+    /// q47's `v1` ends in `rank() OVER (PARTITION BY i_category …)` and its
+    /// consumers filter `v1.d_year = 1999`; `d_year` is not a partition column,
+    /// so each inlined copy computes the whole window anyway. 2.04x by hand.
+    #[tokio::test]
+    async fn a_filter_the_copy_could_not_push_does_not_block_caching() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH r AS (SELECT ss_item_sk, ss_quantity, \
+                            rank() OVER (PARTITION BY ss_item_sk ORDER BY ss_quantity) rn \
+                            FROM store_sales) \
+                 SELECT a.rn, b.rn FROM r a, r b WHERE a.ss_quantity = 10 AND b.ss_quantity = 20",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            cached_scans(&plan),
+            2,
+            "ss_quantity is not a partition column, so the filter cannot push \
+             below the window and the copies gain nothing from it:\n{plan}"
+        );
+    }
+
+    /// A filter that reaches the candidate through an enclosing alias counts.
+    ///
+    /// q39: the rule reaches `foo`, the derived table inside `inv`, because
+    /// `inv` itself is declined for `inv1.d_moy = 1`. That same predicate is
+    /// `foo.d_moy` two projections down — a group key the copy pushes into —
+    /// and matching one level up cached all twelve months for consumers that
+    /// each wanted one: 0.51x.
+    #[tokio::test]
+    async fn a_filter_reaching_the_candidate_through_an_outer_alias_counts() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH inv AS (SELECT k, q, q * 2 AS q2 FROM \
+                    (SELECT ss_item_sk k, sum(ss_quantity) q FROM store_sales GROUP BY ss_item_sk) foo \
+                  WHERE q > 0) \
+                 SELECT a.q2, b.q2 FROM inv a, inv b WHERE a.k = 1 AND b.k = 2 AND a.q = b.q",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            cached_scans(&plan),
+            0,
+            "`a.k = 1` is `foo.k` beneath `inv`, a group key each copy pushes \
+             into; neither `inv` nor `foo` may be cached:\n{plan}"
+        );
+    }
+
+    /// A join predicate naming the alias is not a consumer filter.
+    ///
+    /// q95 consumes `ws_wh` through `IN (SELECT wr_order_number FROM web_returns,
+    /// ws_wh WHERE wr_order_number = ws_wh.ws_order_number)`; the copy is one
+    /// side of that join and computes all of itself. 3.55x by hand.
+    #[tokio::test]
+    async fn a_join_predicate_on_the_alias_does_not_block_caching() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH r AS (SELECT ss_item_sk k, sum(ss_quantity) q FROM store_sales GROUP BY ss_item_sk) \
+                 SELECT count(*) FROM store_sales s \
+                 WHERE s.ss_item_sk IN (SELECT k FROM r) \
+                   AND s.ss_quantity IN (SELECT t.ss_quantity FROM store_sales t, r WHERE t.ss_item_sk = r.k)",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            cached_scans(&plan),
+            2,
+            "`t.ss_item_sk = r.k` is a join, not a filter the copy could push:\n{plan}"
+        );
+    }
+
+    /// A self-join between two references is not a consumer filter.
+    ///
+    /// `inv1.i_item_sk = inv2.i_item_sk` names the candidate twice through two
+    /// aliases; neither copy computes less for it, and the shared copy serves
+    /// both sides of the join.
+    #[tokio::test]
+    async fn a_self_join_between_two_references_does_not_block_caching() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH r AS (SELECT ss_item_sk k, sum(ss_quantity) q FROM store_sales GROUP BY ss_item_sk) \
+                 SELECT a.q, b.q FROM r a, r b WHERE a.k = b.k",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            cached_scans(&plan),
+            2,
+            "a join between two references of the same CTE pushes nothing into \
+             either copy:\n{plan}"
         );
     }
 
@@ -663,7 +981,7 @@ mod tests {
         )
         .await;
         assert_eq!(
-            plan.matches(TEMP_PREFIX).count(),
+            cached_scans(&plan),
             0,
             "consumers push predicates into their own copies; caching would \
              compute both and serve neither cheaply:\n{plan}"

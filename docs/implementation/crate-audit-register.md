@@ -8714,3 +8714,74 @@ ignore the guard), on its third fixture; and
 `a_cte_whose_body_aggregates_is_still_cached` (revert: restore whole-`DFSchema`
 equality) — the aggregate-bearing positive fixture the module lacked, which is
 exactly how R4-4 hid behind a green suite.
+
+## §93 — CTE materialisation, continued: subqueries, and filters traced to the body
+
+Continues §92. Two ceilings measured by hand after §92 shipped:
+
+```text
+  q95  600 ms -> 169 ms   3.55x   ws_wh joined once, probed by two IN-subqueries
+  q47  422 ms -> 207 ms   2.04x   v1 ends in rank() OVER (…); consumers filter d_year
+```
+
+Neither fired under §92's rule, for two different reasons, and fixing them
+exposed a third defect in a query that had been neutral.
+
+### R4-6 (fixed) — references inside subquery expressions were invisible
+
+`largest_repeated_alias` walked `LogicalPlan::inputs`, which does not descend
+into the `Subquery` held by an `EXISTS`, `IN` or scalar-subquery *expression*.
+q95's `ws_wh` and q14's `avg_sales` (a scalar subquery in three `HAVING`s)
+were never candidates. Now `apply_with_subqueries` for the search and
+`transform_down_with_subqueries` for the rewrite. q14 1024 -> 287 ms.
+
+### R4-7 (fixed) — a join predicate counted as a consumer filter
+
+§92's `consumers_filter` counted any predicate naming the alias. q95's
+`wr_order_number = ws_wh.ws_order_number` is a join: the copy is one side of
+it and computes all of itself. Likewise a correlation (`r.k = outer_ref(s.k)`,
+a join key after decorrelation), a self-join between two references, and a
+filter above a window or an aggregate on a column the copy could not push
+(q47's `v1.d_year` beneath `rank() OVER (PARTITION BY i_category …)`).
+
+A conjunct now counts only when **every column it names traces to the
+candidate through one alias** and at least one is pushable beneath the body's
+top operator — the same rule `PushDownFilter` applies: group keys through an
+`Aggregate`, partition columns through a `Window`, anything through the rest.
+
+### R4-8 (fixed) — the filter was matched one alias up, not traced to the body
+
+Fixing R4-7 first made q39 0.51x (159 -> 309 ms). Its `inv` CTE wraps a
+derived table `foo` that does the `GROUP BY … d_moy`; consumers filter
+`inv1.d_moy = 1`. `inv` was correctly declined for that predicate — and then
+the rule reached `foo`, the next-largest repeat, whose only visible predicate
+was the `HAVING`-shaped one on computed columns, and cached all twelve months
+for consumers that each wanted one. `trace_to` now follows a predicate's
+column down through projections, filters and enclosing aliases to the
+candidate, so `inv1.d_moy` is `foo.d_moy`, a group key, and `foo` is declined
+too. q39 113 -> 119 ms.
+
+### The sweep, on a quiet machine (load 3.8 at start)
+
+```text
+  §92  consumers must not filter, schema fixed   16448 -> 16036 ms  1.026x  11 wins   8 losses
+  §93  + subqueries, filters traced to the body  16628 -> 14388 ms  1.156x  13 wins  10 losses
+```
+
+99/99 rows identical. Largest loss 32 ms (q88, 0.88x), every loss under 15%.
+Against DuckDB: 16498 -> **14891 ms**, 2.24x overall, median 2.53x; q95 joins
+q72 as faster than DuckDB; **99/99 match re-verified.**
+
+Two earlier measurements in this thread were contaminated and are recorded as
+such rather than quietly replaced: a vs-DuckDB run taken while `just test` was
+running showed DuckDB itself 15% slower and thirty CTE-free queries "regressed"
+15–40% — machine noise, not the rule; and q50/q51 read as losses in the
+contended sweep and are neutral (off ≈ on) in the quiet one. The chain now
+waits for the build and the gates to finish before it times anything.
+
+**Tests proven RED:** `a_cte_probed_from_exists_subqueries_is_cached`
+(revert: count correlations), `a_filter_the_copy_could_not_push_does_not_block_caching`
+(revert: ignore pushability), `a_filter_reaching_the_candidate_through_an_outer_alias_counts`
+(revert: stop tracing at an enclosing alias), `a_join_predicate_on_the_alias_does_not_block_caching`
+(revert: let a foreign column pass), `a_self_join_between_two_references_does_not_block_caching`
+(revert: allow two aliases).

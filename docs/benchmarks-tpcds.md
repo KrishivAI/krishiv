@@ -15,7 +15,7 @@ as a TPC-DS score.
 | field | value |
 |---|---|
 | date | 2026-09-04, timings re-run 2026-09-05 |
-| commit | `09cf545` plus the CTE-materialisation change committed alongside this document |
+| commit | `91ac9a3` plus the change committed alongside this document |
 | scale factor | 1 |
 | dataset | 24 tables, Parquet, `target/tpcds-sf1`, 371 MB |
 | generator | DuckDB 1.5.5 `INSTALL tpcds; CALL dsdgen(sf=1)` |
@@ -49,16 +49,16 @@ times, best of three, for both engines.
 
 | | krishiv | duckdb |
 |---|---|---|
-| total, 99 queries | 16.5 s | 6.6 s |
-| median query | 107 ms | 43 ms |
-| median ratio | **2.62x slower** | — |
-| slowest | 1.01 s (q14) | 0.41 s (q67) |
+| total, 99 queries | 14.9 s | 6.6 s |
+| median query | 103 ms | 46 ms |
+| median ratio | **2.53x slower** | — |
+| slowest | 0.79 s (q64) | 0.39 s (q67) |
 
-The engine is faster on one query (q72, 0.93x) and slower on the other 98. The
-spread is 1.3x to 5.0x (q25).
+The engine is faster on two queries (q72 0.73x, q95 0.94x) and slower on the
+other 97. The spread is 1.2x to 5.0x (q41).
 
-Ten queries account for 37% of total suite time: q14, q64, q4, q95, q23, q67,
-q22, q47, q11, q78.
+Ten queries account for 32% of total suite time: q64, q4, q67, q22, q11, q23,
+q51, q78, q14, q28.
 
 ### What changed since the first warm run
 
@@ -69,7 +69,8 @@ Three optimizer changes, each verified to leave all 99 results identical:
 | first warm run | 21.4 s |
 | + semi-join pushdown declines a probe that removes no rows | 19.8 s |
 | + greedy join reordering (`KRISHIV_JOIN_REORDER`, on by default) | 17.0 s |
-| + CTE materialisation (`KRISHIV_CTE_MATERIALIZE`, on by default) | **16.5 s** |
+| + CTE materialisation (`KRISHIV_CTE_MATERIALIZE`, on by default) | 16.5 s |
+| + CTE materialisation reaching subqueries, filters traced to the body | **14.9 s** |
 
 The second is q72 almost entirely. DataFusion 54 has no join-reordering rule, so
 join order is `FROM`-clause order; q72 names `catalog_sales JOIN inventory` — a
@@ -90,12 +91,17 @@ The third: DataFusion inlines every CTE, so `WITH x AS (…)` referenced N times
 runs N times — q23 scanned `store_sales` six times. A CTE referenced more than
 once is now collected once and read from memory, unless its consumers filter it
 (then each inlined copy's pushed-down predicate wins) or its body is a bare
-scan (then caching forfeits pushdown). q36 2.16x, q27 1.90x, q23 1.23x; across
-all 99, +2.6% with the worst loss 27 ms. Single-query process only.
+scan (then caching forfeits pushdown). A CTE referenced from inside an
+`EXISTS`, `IN` or scalar subquery counts, and a predicate only blocks caching
+when it traces to the CTE's body through one alias and could be pushed into
+it — a correlation, a join predicate or a filter above a window does not.
+q95 4.11x, q14 3.57x, q36 2.05x, q27 1.92x, q23 1.79x, q47 1.75x; across all
+99, +15.6% with the worst loss 32 ms. Single-query process only.
 
-Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-ctemat-2026-09-05.csv` and
+Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-ctemat2-2026-09-05.csv` and
 `.json`, which also carry the no-materialisation timing and the per-query
 result-identity check. Earlier runs are retained as
+`benchmarks/tpcds-sf1-99q-warm-ctemat-2026-09-05.*`,
 `benchmarks/tpcds-sf1-99q-warm-joinreorder-2026-09-04.*` and
 `benchmarks/tpcds-sf1-99q-warm-2026-09-04.*`.
 
