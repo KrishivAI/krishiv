@@ -117,6 +117,7 @@ pub mod pipe_syntax;
 pub mod pipeline_ddl;
 pub mod pivot_sql;
 pub mod python_udf;
+pub mod rollup_rewrite;
 pub mod runtime_filter_exec;
 pub mod scalar_udf;
 pub mod semi_join_reduction;

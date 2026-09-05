@@ -201,8 +201,14 @@ pub async fn materialize_repeated_ctes_forced(
     context: &SessionContext,
     dataframe: DataFrame,
 ) -> SqlResult<DataFrame> {
-    let mut plan = dataframe.logical_plan().clone();
-    let mut materialized = false;
+    // Grouping sets first: the rewrite emits the finest aggregate once per set
+    // as one repeated alias, which is exactly what the loop below caches. See
+    // `rollup_rewrite` for why the two are coupled.
+    let (mut plan, mut materialized) =
+        match crate::rollup_rewrite::rewrite_grouping_sets(dataframe.logical_plan())? {
+            Some(rewritten) => (rewritten, true),
+            None => (dataframe.logical_plan().clone(), false),
+        };
     for _ in 0..MAX_PASSES {
         let Some(candidate) = largest_repeated_alias(&plan) else {
             break;

@@ -8785,3 +8785,71 @@ waits for the build and the gates to finish before it times anything.
 (revert: stop tracing at an enclosing alias), `a_join_predicate_on_the_alias_does_not_block_caching`
 (revert: let a foreign column pass), `a_self_join_between_two_references_does_not_block_caching`
 (revert: allow two aliases).
+
+## §94 — Grouping sets as one aggregate plus re-aggregation
+
+Continues §93. With the CTE lever exhausted — q64's `cross_sales` 731 -> 593 ms
+by hand, q4 and q11 *slower* by hand, so the guard's declines are right — the
+profiles moved on: q22 spends 875 ms of CPU and q67 848 ms in a `Partial`
+aggregate over grouping sets, for 108 K and 1.4 M output groups. DataFusion
+evaluates a grouping set by expanding every input row once per set, so a
+`ROLLUP` of four is 5x the rows into the hash table and a `ROLLUP` of eight is
+9x. DuckDB aggregates the finest set and rolls up.
+
+By hand — the finest `GROUP BY` in a CTE, one re-aggregation per set,
+`UNION ALL` — results identical to two decimals:
+
+```text
+  q22  459 ms -> 160 ms   2.87x   (DuckDB 191 ms)
+  q67  622 ms -> 480 ms   1.30x
+```
+
+### R4-9 (implemented) — `rollup_rewrite`
+
+Runs at the `SqlEngine::sql` seam, *before* `cte_materialize`, on the
+unoptimized plan, and emits the finest aggregate once per set as one repeated
+`SubqueryAlias` — which the materialiser then collects once. The coupling is
+deliberate and tested (`the_finest_aggregate_is_shared_through_the_cache`):
+without the cache the rewrite computes the finest aggregate N+1 times and is
+a loss, so it runs exactly where the cache does and nowhere else.
+
+Decomposition: `sum`/`min`/`max` re-aggregated by themselves, `count` by
+`sum`, `avg` as a `Float64` sum over a count (declined unless the original
+output is `Float64` — a decimal average has its own scale rule), `grouping(x)`
+emitted as a `0`/`1` literal per set. `__grouping_id` is emitted with
+DataFusion's own encoding (bit `n-1-i` set when group expression `i` is
+absent) and the original column's integer type, so the schema round-trips;
+names, qualifiers and types are compared against the original aggregate's and
+any difference abandons the rewrite. Declines `DISTINCT`, `FILTER`, ordered
+or null-treated aggregates, duplicated group expressions (ordinal bits), a
+`CUBE` over more than six columns, more than 64 sets.
+
+### The sweep, quiet machine (load 2.1)
+
+Cache plus rewrite against neither, all 99, warm, paired and interleaved:
+
+```text
+  16940 -> 14125 ms   1.199x   17 wins >10%   8 losses >10%   99/99 identical
+```
+
+The rewrite's own share: q22 501 -> 160 ms (3.14x), q67 664 -> 515 ms
+(1.29x); q18, q70, q86 neutral (q18's `avg` is decimal and declines). Worst
+loss 48 ms (q9, 0.80x — no grouping set, no repeated alias; the previous quiet
+sweep had it neutral, so it is recorded as unexplained rather than as noise).
+Against DuckDB: 14891 -> **14393 ms**, 2.18x overall, median 2.55x; q22 joins
+q72 and q95 as faster than DuckDB. **99/99 match re-verified.**
+
+### Tests, each proven RED
+
+`a_rollup_rewritten_returns_the_same_rows` (revert: invert the `grouping()`
+literal), `a_cube_rewritten_returns_the_same_rows` (revert: `avg` as sum
+alone), `grouping_sets_rewritten_return_the_same_rows` (revert: re-aggregate
+`count` with `count`), `the_finest_aggregate_is_shared_through_the_cache`
+(revert: no shared alias), `a_distinct_count_declines_the_rewrite` (revert:
+drop the `DISTINCT` check).
+
+The `count` revert stayed green on the first fixture: every finest group had
+one row, so `count` of partials and `sum` of partials agreed. A fifth row
+duplicating a group made them differ. The fixture also carries a real `NULL`
+group value so a rolled-up `NULL` and a real one are both present in every
+comparison.
