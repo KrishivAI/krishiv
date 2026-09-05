@@ -9006,3 +9006,48 @@ candidates are phase latency (each pipeline stage is short and every
 times in q64) and scheduling granularity. `perf` is unavailable on this
 machine (`perf_event_paranoid = 4`, no sudo), so the next step is an
 in-process timeline of per-partition activity rather than a profiler.
+
+## §97 — A filtered dimension was never allowed to be a `CollectLeft` build
+
+Continues §96's open item. An in-process per-(operator, partition) timeline
+— `MetricsSet` start/end timestamps and `elapsed_compute`, built because
+`perf` is unavailable — put q7's 168 ms into two phases: 25 ms of build at
+~3.7 cores, then **130 ms at 0.1 cores** while the 2.88 M-row `store_sales`
+side was hash-repartitioned to meet a `Partitioned` join against
+`customer_demographics`. Forcing that join to `CollectLeft` took q7 to 75 ms.
+
+The cause is the estimate, not the data. `JoinSelection::supports_collect_by_
+thresholds` reads the build side's `total_byte_size` and compares it to
+`hash_join_single_partition_threshold` (1 MiB); a `FilterExec` reports its
+input's bytes scaled by a default selectivity, so a 7.8 MB dimension filtered
+to 27 K rows still estimates ~1.5 MB and trips the threshold. Every filtered
+dimension over ~5 MB is planned as if it were a fact table.
+
+### R4-13 (fixed) — the threshold is now 8 MiB / 1 M rows
+
+Three settings measured on all 99 at SF1, warm, paired, hashed, 99/99
+identical in each:
+
+```text
+  always CollectLeft (1 GiB / 10 M)   13465 -> 13256 ms   +1.6%   18 wins   9 losses
+  8 MiB / 1 M rows                    13699 -> 13248 ms   +3.4%   15 wins   6 losses, worst 14 ms
+  32 MiB / 2 M rows                   13848 -> 13174 ms   +5.1%   25 wins   6 losses, q11 -71 ms
+```
+
+"Always" loses q17 0.68x, q25 0.75x, q29 0.79x — under it the
+`catalog_sales ⋈ store_returns` join builds the **1.44 M-row** side
+single-threaded (100 ms of `build_time`) where `Partitioned` had built the
+246 K side in parallel. 32 MiB buys one more point with a 71 ms loss on q11.
+8 MiB keeps fact-sized builds partitioned and every loss inside noise; q64
+1.38x, q7 1.55x, q24 1.34x, q27 1.32x. `spillable_join` still converts a
+build that outgrows its memory share to sort-merge, which is what makes the
+higher threshold safe at scale. Test
+`a_filtered_dimension_can_be_a_collect_left_build`, proven RED.
+
+### Corrected from §96
+
+§96 said `KRISHIV_TARGET_PARALLELISM=1` and `=12` timed identically and
+inferred the scan might not parallelise. The variable was being ignored
+(R4-11); measured properly in-process, the bare `store_sales` scan goes
+212 -> 121 -> 98 -> 57 ms at 1, 2, 4 and 12 partitions. The scan
+parallelises; the serial phase was the repartition above it.

@@ -1008,6 +1008,14 @@ async fn provider_row_count(
 /// comment at its use in [`build_single_node_session_config`].
 pub const REPARTITION_FILE_MIN_SIZE: usize = 1 << 20;
 
+/// Estimated build-side bytes under which a hash join collects its build side
+/// once (`CollectLeft`) instead of hash-partitioning both inputs. See the
+/// comment at its use in [`build_single_node_session_config`].
+pub const HASH_JOIN_SINGLE_PARTITION_THRESHOLD_BYTES: usize = 8 << 20;
+/// Row-count twin of [`HASH_JOIN_SINGLE_PARTITION_THRESHOLD_BYTES`], consulted
+/// only when no byte estimate exists.
+pub const HASH_JOIN_SINGLE_PARTITION_THRESHOLD_ROWS: usize = 1_000_000;
+
 #[cfg(test)]
 mod session_config_tests {
     use super::*;
@@ -1029,6 +1037,31 @@ mod session_config_tests {
         assert!(
             config.options().optimizer.repartition_file_scans,
             "the threshold is meaningless with file-scan repartitioning off"
+        );
+    }
+
+    /// A filtered dimension must be allowed to be a `CollectLeft` build.
+    ///
+    /// DataFusion's 1 MiB default hash-repartitions a 2.88 M-row fact side to
+    /// meet a 27 K-row build whose *estimate* is 1.5 MB; 8 MiB is the measured
+    /// +3.4% with no loss past 14 ms, and 32 MiB's extra point cost q11 71 ms.
+    #[test]
+    fn a_filtered_dimension_can_be_a_collect_left_build() {
+        let config =
+            build_single_node_session_config(NonZeroUsize::new(12).expect("nonzero"), None);
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold,
+            8 << 20
+        );
+        assert_eq!(
+            config
+                .options()
+                .optimizer
+                .hash_join_single_partition_threshold_rows,
+            1_000_000
         );
     }
 }
@@ -1086,6 +1119,31 @@ pub(crate) fn build_single_node_session_config(
     // Above 10 MiB nothing changes, so a scale-100 fact table sees no
     // difference; a file with one row group still yields one non-empty range.
     config.options_mut().optimizer.repartition_file_min_size = REPARTITION_FILE_MIN_SIZE;
+    // Let a filtered dimension be a `CollectLeft` build. DataFusion picks
+    // `Partitioned` whenever the build side's *estimated* bytes exceed 1 MiB,
+    // and a `FilterExec` estimates its output as its input scaled by a default
+    // selectivity — so a 7.8 MB `customer_demographics` filtered to 27 K rows
+    // still estimates over the line, and the 2.88 M-row fact side is hash
+    // repartitioned to meet it. That phase ran at 0.1 cores for 130 ms of q7's
+    // 168 ms (in-process timeline); forcing `CollectLeft` took q7 to 75 ms.
+    // Three thresholds measured on all 99 at SF1, warm, paired, hashed:
+    //
+    //   always (1 GiB / 10 M)   +1.6%   18 wins   9 losses (q17 0.68x: a
+    //                                   1.44 M-row catalog_sales build, serial)
+    //   8 MiB / 1 M rows        +3.4%   15 wins   6 losses, worst 14 ms
+    //   32 MiB / 2 M rows       +5.1%   25 wins   6 losses, q11 -71 ms
+    //
+    // 8 MiB keeps fact-sized builds partitioned and every loss inside noise.
+    // A build that outgrows its memory share is still converted to sort-merge
+    // by `spillable_join`, which is what makes raising this safe at scale.
+    config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold = HASH_JOIN_SINGLE_PARTITION_THRESHOLD_BYTES;
+    config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold_rows = HASH_JOIN_SINGLE_PARTITION_THRESHOLD_ROWS;
     // Parquet scan options stay at DataFusion's defaults (`pushdown_filters`
     // off, `enable_page_index` on). Forcing `pushdown_filters = true` here
     // cost ~2.2× on scan-heavy queries (Phase 52 #194 attribution probe,
