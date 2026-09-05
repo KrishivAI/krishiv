@@ -1,5 +1,0 @@
-{
-  "title": "Guides",
-  "defaultOpen": false,
-  "pages": ["batch-sql", "streaming", "incremental", "single-node"]
-}

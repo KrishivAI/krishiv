@@ -1,5 +1,0 @@
-{
-  "title": "Core concepts",
-  "defaultOpen": false,
-  "pages": ["architecture", "execution-modes", "batch", "streaming", "incremental"]
-}

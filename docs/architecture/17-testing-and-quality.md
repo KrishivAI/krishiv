@@ -119,9 +119,9 @@ each has a `KRISHIV_BLESS_*` switch that regenerates it:
 | `api/stable-api.toml` inventories | `just api-inventory` | |
 
 `docs/COMPATIBILITY.md` is hand-written but parsed by
-`scripts/compatibility_gate.py`; keep its version phrasing. The web site
-(`web/`) has its own content (`web/lib/docs-content/*.ts`,
-`web/PRODUCT_FACTS.md`) checked by `scripts/check_docs.sh`.
+`scripts/compatibility_gate.py`; keep its version phrasing. The public
+website lives in its own repository (`KrishivAI/Krishiv-web`) with its own
+content checks; `PRODUCT_FACTS.md` there cites paths in this repository.
 
 ## Property suites
 

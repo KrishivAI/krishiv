@@ -14,9 +14,11 @@ authoritative source for rules, crate ownership, and session handoff.
 | `python/` | First-party Python packages (PyO3 bindings + vendor integrations). |
 | `deploy/k8s/` | Kubernetes manifests, Helm chart, CRDs, deployment yamls. |
 | `deploy/docker/` | Container image definitions (multi-stage build, distributed, single-node, fast, prod). |
-| `web/` | Next.js marketing + documentation site. |
 | `tests/` | Workspace-wide integration test artifacts (golden files, placeholders). |
 | `scripts/` | Python + shell helpers — mix of CI/release gates and dev/operator scripts. |
+
+The public website lives in its own repository, `KrishivAI/Krishiv-web`
+(formerly `web/` here).
 | `skills/` | Canonical location for AI-agent skills (`krishiv-engine`, `release`). |
 | `deploy/systemd/` | Bare-metal / systemd service units. |
 | `api/` | Versioned snapshots of the public Rust, Python, and SQL surfaces + the stable-API phase table. |
@@ -82,10 +84,9 @@ authoritative source for rules, crate ownership, and session handoff.
   deployment mode; consolidating them into one Dockerfile is intentionally
   not done (see `docs/engineering-log/status.md`). All five live under
   `deploy/docker/`.
-- **Three ignore files is intentional**: `.gitignore` (Rust + Python),
-  `.dockerignore` (container build context), `web/.gitignore` (Next.js
-  build artifacts). Each co-locates with the tool that produces the
-  artifacts.
+- **Two ignore files is intentional**: `.gitignore` (Rust + Python) and
+  `.dockerignore` (container build context). Each co-locates with the tool
+  that produces the artifacts.
 - **`.cargo/config.toml` is checked in intentionally**: it pins the
   linker (mold), the GCC 15 `cstdint` workaround, and the `cargo check-*`
   / `cargo build-*` mode aliases. Delete it only if you have a different

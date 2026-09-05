@@ -692,24 +692,6 @@ publish-helm version=env_var_or_default("VERSION", ""):
     helm push dist/helm/krishiv-{{ version }}.tgz oci://$(echo {{ registry_image }} | cut -d/ -f1-2)/charts
     @echo "✓ pushed helm chart krishiv-{{ version }}.tgz"
 
-# ── Web docs site ─────────────────────────────────────────────────────────────
-
-# Install dependencies for the Fumadocs/Next.js public website.
-web-install:
-    cd web && npm install
-
-# Start the public website locally.
-web-dev:
-    cd web && npm run dev
-
-# Build the public website.
-web-build:
-    cd web && npm run build
-
-# Type-check the public website.
-web-typecheck:
-    cd web && npm run typecheck
-
 # Build the embedded engine console (crates/krishiv-ui/console/dist is
 # COMMITTED — rebuild + commit after changing console/src; CI enforces
 # freshness with a diff gate).
