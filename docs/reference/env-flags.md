@@ -194,7 +194,7 @@ Regenerate with:
 | `KRISHIV_WATERMARK_IDLE_MS` | uint | `30000` | Run-loop per-split watermark idleness timeout: a silent split is excluded from the min-combine after this long (Phase 55 watermarks v2). |
 | `KRISHIV_WAREHOUSE_ROOT` | path | `.` | Root path for connector-table warehouse storage. |
 | `KRISHIV_DIMENSION_REDUCTION` | bool | `false` | Enable the broadcast-dimension reducer (physical). Opt-in: the logical form of this rule was cleared by a three-query A/B, shipped on, and cost q10 18x. |
-| `KRISHIV_CTE_MATERIALIZE` | bool | `false` | Materialise a CTE referenced more than once instead of letting DataFusion inline it per reference. Opt-in: it executes part of the query eagerly inside an API whose contract is lazy. TPC-DS SF1 q27 2.1x, q23 1.8x by hand. |
+| `KRISHIV_CTE_MATERIALIZE` | bool | `true` | Materialise a CTE referenced more than once instead of letting DataFusion inline it per reference, unless its consumers filter it. Single-query process only. TPC-DS SF1: q36 2.2x, q27 1.9x, suite +2.6%, 99/99 identical. Set 0/false to disable. |
 | `KRISHIV_JOIN_REORDER` | bool | `true` | Reorder inner-join chains smallest-connected-first from the engine's row-count registry. DataFusion has no join reordering, so join order is FROM-clause order; TPC-DS SF1 q72 is 10.2x on this and the 99-query suite 15%. Set 0/false to disable. |
 | `KRISHIV_SEMI_JOIN_DIMENSION` | bool | `false` | Enable the selective-dimension semi-join reducer, which reduces a fact stream by a filtered dimension before the large joins (q7). |
 | `KRISHIV_ELASTIC_DF_SHARE` | bool | `true` | Let a task slot borrow idle DataFusion partitions from other slots. Set 0/false to disable; an explicit KRISHIV_TARGET_PARALLELISM pin disables it outright. |

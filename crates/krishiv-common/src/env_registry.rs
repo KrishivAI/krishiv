@@ -1440,8 +1440,8 @@ pub static FLAGS: &[FlagSpec] = &[
     rt(
         "KRISHIV_CTE_MATERIALIZE",
         FlagKind::Bool,
-        "false",
-        "Materialise a CTE referenced more than once instead of letting DataFusion inline it per reference. Opt-in: it executes part of the query eagerly inside an API whose contract is lazy. TPC-DS SF1 q27 2.1x, q23 1.8x by hand.",
+        "true",
+        "Materialise a CTE referenced more than once instead of letting DataFusion inline it per reference, unless its consumers filter it. Single-query process only. TPC-DS SF1: q36 2.2x, q27 1.9x, suite +2.6%, 99/99 identical. Set 0/false to disable.",
     ),
     rt(
         "KRISHIV_JOIN_REORDER",

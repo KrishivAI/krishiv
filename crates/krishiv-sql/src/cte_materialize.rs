@@ -27,44 +27,49 @@
 //!   q23  631 ms -> 353 ms   1.79x   (DuckDB 253 ms)
 //! ```
 //!
-//! # OFF by default, and the two sweeps that made it so
+//! # On by default, and the three sweeps behind that
 //!
-//! This rule reproduces the q27 hand result exactly — 426 ms -> 191 ms, rows
-//! identical — and is still a **net loss across the suite**. Measured on all 99
-//! TPC-DS queries at SF1, warm, best of three, paired and interleaved, results
-//! hashed per query:
+//! All 99 TPC-DS queries at SF1, warm, best of three, paired and interleaved,
+//! results hashed per query. **99/99 rows identical in every sweep.**
 //!
 //! ```text
-//!   first version    16177 ms -> 18224 ms   0.888x    5 wins >10%, 18 losses
-//!   with the guard   31561 ms -> 33365 ms   0.946x   11 wins >10%, 20 losses
+//!   1. any repeated alias           16177 -> 18224 ms   0.888x    5 wins  18 losses
+//!   2. + body must reduce input     31561 -> 33365 ms   0.946x   11 wins  20 losses
+//!   3. + consumers must not filter,
+//!      + schema check fixed         16448 -> 16036 ms   1.026x   11 wins   8 losses
 //! ```
 //!
-//! (The second sweep ran against a loaded machine, which is why its absolute
-//! numbers are near double; the arms are interleaved, so the ratio holds.)
-//! **99/99 rows identical in both.** The rewrite is correct. It is not a win.
+//! (Sweep 2 ran on a machine loaded by an unrelated build, hence the doubled
+//! absolutes; the arms interleave, so the ratio holds.) In sweep 3 the largest
+//! loss is 27 ms (q9, 0.89x) and every loss is a sub-120 ms query; the wins are
+//! q36 2.16x, q27 1.90x, q23 1.23x.
 //!
-//! Two mechanisms, one fixed and one not:
+//! What each step found:
 //!
-//! - **Fixed.** The first version cached anything repeated, including
-//!   `SubqueryAlias: ss1` over a bare `store_sales` scan — 2.88 M rows, all
-//!   columns, in q44, which each consumer would otherwise have filtered to
-//!   `ss_store_sk = 4` in the scan itself. q44 ran 3.9x slower. See
-//!   [`reduces_its_input`].
+//! - **Caching a bare scan forfeits pushdown.** Sweep 1 cached anything
+//!   repeated, including `SubqueryAlias: ss1` over an unfiltered `store_sales`
+//!   in q44 — 2.88 M rows, all columns, where each consumer would otherwise have
+//!   pushed `ss_store_sk = 4` into the scan. 111 -> 428 ms. [`reduces_its_input`].
 //!
-//! - **Not fixed, and the reason this stays off.** What remains is
-//!   `WITH cs AS (…) … WHERE cs1.syear = 2000 … cs2.syear = 2001` — q64, q39,
-//!   q2, q75, q59. Each *inlined* copy receives its consumer's predicate through
-//!   `PushDownFilter` and computes only the rows that consumer wants;
-//!   materialising computes the union of what every consumer wants, once. When
-//!   the consumers' predicates are selective and disjoint, N cheap copies beat
-//!   one expensive shared one, and no structural property of the CTE body can
-//!   tell that from q27, where the consumers filter nothing and one shared copy
-//!   wins 2.1x. The missing input is a **cost comparison** between "the body,
-//!   whole" and "the body, N times, each with its consumer's predicate pushed
-//!   in" — an estimate this engine does not have. It is not guessed at here.
+//! - **Consumers that filter the alias want their own copies.** `WITH cs AS (…)
+//!   … WHERE cs1.syear = 2000 AND cs2.syear = 2001` gives each inlined copy its
+//!   own year through `PushDownFilter`; the shared copy computes both. q64 0.63x,
+//!   q39 0.38x, q2 0.58x in sweep 2, all gone in sweep 3. [`consumers_filter`].
 //!
-//! So: off by default, correct when enabled, and worth enabling for a workload
-//! whose repeated CTEs are consumed unfiltered.
+//! - **The schema check was declining most real CTEs silently.** The rewrite
+//!   compared the replacement's `DFSchema` to the candidate's for equality, and
+//!   `DFSchema` equality includes functional dependencies — which a `GROUP BY`
+//!   body has and a `MemTable` scan does not. Every aggregate-bearing CTE was
+//!   declined without a trace; q27 fired in sweeps 1–2 only because its body has
+//!   no `GROUP BY`. Sweeps 1 and 2 therefore measured a rule that mostly did not
+//!   run. Found by a probe that printed `cached=0` for an unfiltered, repeated,
+//!   aggregate-bearing CTE; fixed by comparing fields and qualifiers.
+//!
+//! Still unmodelled: a filter that reaches the alias through a join with a
+//! filtered dimension is invisible to [`consumers_filter`]; sweep 3 says what is
+//! left of that is inside noise at SF1. **SF100 and the distributed path are
+//! unmeasured** — the rule declines outside a single-query process regardless.
+//! `KRISHIV_CTE_MATERIALIZE=off` disables it.
 //!
 //! # Why this runs before the optimizer, and must
 //!
@@ -118,12 +123,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Environment switch for CTE materialisation.
+/// Environment switch for CTE materialisation. See the module docs for the
+/// three sweeps behind the default.
 ///
-/// Opt-*in*. The rewrite executes part of the query eagerly inside a call whose
-/// contract is lazy, which is a change of *when* work happens for every caller
-/// of `SqlEngine::sql`, not only for the ones it speeds up. It stays behind a
-/// switch until a full 99-query sweep says otherwise.
+/// The rewrite executes part of the query eagerly inside a call whose contract
+/// is lazy. That is confined to a single-query process — the CLI and the
+/// embedded engine, where `sql()` is followed by a collect — and never reaches
+/// the coordinator or an executor.
 pub const CTE_MATERIALIZE_ENV: &str = "KRISHIV_CTE_MATERIALIZE";
 
 /// Rows past which a CTE is left inlined.
@@ -143,15 +149,16 @@ const TEMP_PREFIX: &str = "__krishiv_cte_";
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
-/// Whether CTE materialisation is enabled (default: **no**).
+/// Whether CTE materialisation is enabled (default: **yes**). Opt-out parsing,
+/// matching `join_reorder_enabled`.
 pub fn cte_materialize_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var(CTE_MATERIALIZE_ENV)
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase()
             .as_str(),
-        "1" | "on" | "true" | "yes"
+        "0" | "off" | "false" | "no"
     )
 }
 
@@ -219,10 +226,54 @@ fn largest_repeated_alias(plan: &LogicalPlan) -> Option<SubqueryAlias> {
     counts
         .into_iter()
         .filter(|(alias, count)| {
-            *count >= 2 && reduces_its_input(&alias.input) && !already_materialized(&alias.input)
+            *count >= 2
+                && reduces_its_input(&alias.input)
+                && !already_materialized(&alias.input)
+                && !consumers_filter(plan, alias)
         })
         .max_by_key(|(alias, _)| node_count(&alias.input))
         .map(|(alias, _)| alias.clone())
+}
+
+/// Does any predicate above the alias name one of its columns?
+///
+/// This is the q64 signature: `WITH cs AS (…) … WHERE cs1.syear = 2000 AND
+/// cs2.syear = 2001`. Each inlined copy receives its own predicate through
+/// `PushDownFilter` and computes only that year; the shared copy has to compute
+/// both. When the predicates are selective, N cheap copies beat one expensive
+/// one — q64 0.63x, q39 0.38x, q2 0.58x with this check absent. Where no
+/// predicate names the alias, pushdown had nothing to give the copies and the
+/// shared copy is pure saving — q27 2.1x.
+///
+/// Structural, not a cost model: it cannot see a filter that arrives through a
+/// join with a filtered dimension. It is the part of the decision that *is*
+/// visible in the plan, measured across the suite rather than argued.
+fn consumers_filter(plan: &LogicalPlan, alias: &SubqueryAlias) -> bool {
+    // The alias's own name, plus every alias that wraps it directly:
+    // `FROM r a, r b WHERE a.k = 1` filters `r` through `a`.
+    let mut names = vec![alias.alias.table().to_owned()];
+    let mut predicates = Vec::new();
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        match node {
+            LogicalPlan::SubqueryAlias(outer) if matches!(outer.input.as_ref(), LogicalPlan::SubqueryAlias(inner) if inner == alias) =>
+            {
+                names.push(outer.alias.table().to_owned());
+            }
+            LogicalPlan::Filter(filter) => predicates.push(&filter.predicate),
+            LogicalPlan::Join(join) => predicates.extend(join.filter.as_ref()),
+            _ => {}
+        }
+        stack.extend(node.inputs());
+    }
+    predicates.iter().any(|expr| {
+        expr.column_refs().iter().any(|column| {
+            column
+                .relation
+                .as_ref()
+                .is_some_and(|r| names.iter().any(|n| n == r.table()))
+        })
+    })
 }
 
 /// Does this body actually shrink what it reads?
@@ -326,7 +377,18 @@ async fn materialize_one(
         .map_err(|error| SqlError::DataFusion {
             message: format!("CTE materialisation: alias: {error}"),
         })?;
-    if *replacement.schema() != candidate.schema {
+    // Field-level equality, not `DFSchema` equality. A body with a `GROUP BY`
+    // carries a functional dependency in its schema that a `MemTable` scan does
+    // not, and whole-schema equality declined every such CTE silently — which
+    // is most of them. Losing the dependency costs the optimizer above an
+    // opportunity, never a row.
+    if replacement.schema().fields() != candidate.schema.fields()
+        || replacement
+            .schema()
+            .iter()
+            .map(|(qualifier, _)| qualifier)
+            .ne(candidate.schema.iter().map(|(qualifier, _)| qualifier))
+    {
         return Ok(None);
     }
 
@@ -542,6 +604,69 @@ mod tests {
             0,
             "an unfiltered scan must not be cached — the consumers' predicates \
              push into it and the cache would forfeit that:\n{plan}"
+        );
+    }
+
+    /// A CTE whose body aggregates must be cached like any other.
+    ///
+    /// The first version of this module compared schemas with `DFSchema`
+    /// equality, which includes the functional dependency a `GROUP BY` body
+    /// carries and a `MemTable` scan does not — so every aggregate-bearing CTE
+    /// was declined silently, and the positive fixture above, having no
+    /// `GROUP BY`, could not tell. This one can.
+    #[tokio::test]
+    async fn a_cte_whose_body_aggregates_is_still_cached() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH r AS (SELECT ss_item_sk, sum(ss_quantity) q FROM store_sales GROUP BY ss_item_sk) \
+                 SELECT a.q, b.q FROM r a, r b",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            plan.matches(TEMP_PREFIX).count(),
+            2,
+            "a GROUP BY body carries a functional dependency the cache lacks; \
+             that must not decline the rewrite:\n{plan}"
+        );
+    }
+
+    /// A CTE whose consumers filter it must stay inlined.
+    ///
+    /// q64's `WHERE cs1.syear = 2000 AND cs2.syear = 2001`: each inlined copy
+    /// gets its own year through `PushDownFilter`; the shared copy has to compute
+    /// both. 0.63x when this was materialised.
+    #[tokio::test]
+    async fn a_cte_filtered_by_its_consumers_is_left_alone() {
+        let ctx = context();
+        let frame = ctx
+            .sql(
+                "WITH r AS (SELECT ss_item_sk, sum(ss_quantity) q FROM store_sales GROUP BY ss_item_sk) \
+                 SELECT a.q, b.q FROM (SELECT q FROM r WHERE r.ss_item_sk = 1) a, \
+                                      (SELECT q FROM r WHERE r.ss_item_sk = 2) b",
+            )
+            .await
+            .expect("plan");
+        let plan = optimized(
+            &ctx,
+            materialize_repeated_ctes_forced(&ctx, frame)
+                .await
+                .expect("materialize"),
+        )
+        .await;
+        assert_eq!(
+            plan.matches(TEMP_PREFIX).count(),
+            0,
+            "consumers push predicates into their own copies; caching would \
+             compute both and serve neither cheaply:\n{plan}"
         );
     }
 

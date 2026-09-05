@@ -8645,3 +8645,72 @@ actual shape (two derived tables in the `FROM` clause) it goes red. That
 limitation is real and is documented on the module: repeats reachable only
 through a subquery expression are not found, which makes the rule do less,
 never something wrong.
+
+## §92 — CTE materialisation, continued: the rule §91 measured was mostly not running
+
+§91 recorded `cte_materialize` as correct and a net loss, and left it off.
+That conclusion was drawn from a rule that silently declined most real CTEs.
+It is corrected here; §91's sweep numbers stand as what was measured, and its
+"not fixed" mechanism is now fixed.
+
+### R4-4 (fixed) — the schema check declined every aggregate-bearing CTE
+
+`materialize_one` compared the replacement `SubqueryAlias` schema to the
+candidate's with `DFSchema` equality. `DFSchema` equality includes
+**functional dependencies**, and a body with `GROUP BY k` carries one that a
+`MemTable` scan does not. So the rewrite was abandoned — returning `None`,
+no error, no log — for every CTE whose body aggregates, which is most of them.
+q27 fired in §91's sweeps only because its `results` body has no `GROUP BY`.
+
+Found by writing a probe rather than reasoning: three fixtures, the unfiltered
+aggregate-bearing one printed `cached=0`. Fixed by comparing fields and
+qualifiers. Losing the dependency costs the optimizer above an opportunity,
+never a row.
+
+This is the register's opening shape again — a guard that returns "decline"
+on a condition nobody meant it to test — and it was masked by the tests, whose
+one positive fixture (`TWICE`) had no `GROUP BY` either.
+
+### R4-5 (fixed) — consumers that filter the alias keep their own copies
+
+§91's remaining loss class: `WITH cs AS (…) … WHERE cs1.syear = 2000 AND
+cs2.syear = 2001`. `consumers_filter` now declines an alias when any `Filter`
+or join filter above it names one of its columns — through the alias's own
+name or through an alias that wraps it directly (`FROM r a, r b WHERE
+a.k = 1` filters `r` through `a`). Structural: it cannot see a predicate that
+arrives through a join with a filtered dimension. The sweep says what is left
+of that is inside noise at SF1.
+
+Two test fixtures for this were wrong before one was right. The first put its
+aliases in scalar subqueries (never candidates — `inputs()` does not descend
+into subquery expressions); the second used `FROM r a, r b`, which the planner
+turns into `SubqueryAlias: a → SubqueryAlias: r`, so the filter names `a` and
+the first version of the guard, checking only `r`, missed it. Both stayed green
+against the reverted guard. The third fixture goes red.
+
+### The sweep
+
+```text
+  §91  any repeated alias           16177 -> 18224 ms   0.888x    5 wins  18 losses
+  §91  + body must reduce input     31561 -> 33365 ms   0.946x   11 wins  20 losses
+  §92  + consumers must not filter,
+       + schema check fixed         16448 -> 16036 ms   1.026x   11 wins   8 losses
+```
+
+99/99 rows identical in all three. In the last, the largest loss is 27 ms
+(q9, 0.89x) and every loss is on a sub-120 ms query; wins are q36 2.16x,
+q27 1.90x, q23 1.23x. §91's q64 0.63x, q39 0.38x, q2 0.58x, q75 0.62x are
+gone, and q75 is now a win.
+
+**On by default** (`KRISHIV_CTE_MATERIALIZE=off` disables), on the same footing
+as §90's join reorder: a full sweep, bounded losses, results identical. The
+same caveat applies — SF1, embedded, one machine, and this sweep ran under
+load from an unrelated build (the arms interleave, so the ratio holds, but the
+eight small losses may be noise in either direction). The rule declines outside
+a single-query process regardless, so the distributed path is untouched.
+
+**Tests proven RED:** `a_cte_filtered_by_its_consumers_is_left_alone` (revert:
+ignore the guard), on its third fixture; and
+`a_cte_whose_body_aggregates_is_still_cached` (revert: restore whole-`DFSchema`
+equality) — the aggregate-bearing positive fixture the module lacked, which is
+exactly how R4-4 hid behind a green suite.

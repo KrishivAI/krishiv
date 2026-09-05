@@ -14,8 +14,8 @@ as a TPC-DS score.
 
 | field | value |
 |---|---|
-| date | 2026-09-04 |
-| commit | `1a9451e` plus the join-reorder change committed alongside this document |
+| date | 2026-09-04, timings re-run 2026-09-05 |
+| commit | `09cf545` plus the CTE-materialisation change committed alongside this document |
 | scale factor | 1 |
 | dataset | 24 tables, Parquet, `target/tpcds-sf1`, 371 MB |
 | generator | DuckDB 1.5.5 `INSTALL tpcds; CALL dsdgen(sf=1)` |
@@ -49,26 +49,27 @@ times, best of three, for both engines.
 
 | | krishiv | duckdb |
 |---|---|---|
-| total, 99 queries | 17.0 s | 6.6 s |
-| median query | 111 ms | 43 ms |
-| median ratio | **2.68x slower** | — |
-| slowest | 1.05 s (q14) | 0.41 s (q67) |
+| total, 99 queries | 16.5 s | 6.6 s |
+| median query | 107 ms | 43 ms |
+| median ratio | **2.62x slower** | — |
+| slowest | 1.01 s (q14) | 0.41 s (q67) |
 
-The engine is faster on one query (q72, 0.83x) and slower on the other 98. The
-spread is 1.4x to 5.6x (q27).
+The engine is faster on one query (q72, 0.93x) and slower on the other 98. The
+spread is 1.3x to 5.0x (q25).
 
-Ten queries account for 38% of total suite time: q14, q64, q95, q23, q4, q67,
-q22, q47, q27, q11.
+Ten queries account for 37% of total suite time: q14, q64, q4, q95, q23, q67,
+q22, q47, q11, q78.
 
 ### What changed since the first warm run
 
-Two optimizer fixes, each verified to leave all 99 results identical:
+Three optimizer changes, each verified to leave all 99 results identical:
 
 | | suite total |
 |---|---|
 | first warm run | 21.4 s |
 | + semi-join pushdown declines a probe that removes no rows | 19.8 s |
-| + greedy join reordering (`KRISHIV_JOIN_REORDER`, on by default) | **17.0 s** |
+| + greedy join reordering (`KRISHIV_JOIN_REORDER`, on by default) | 17.0 s |
+| + CTE materialisation (`KRISHIV_CTE_MATERIALIZE`, on by default) | **16.5 s** |
 
 The second is q72 almost entirely. DataFusion 54 has no join-reordering rule, so
 join order is `FROM`-clause order; q72 names `catalog_sales JOIN inventory` — a
@@ -85,9 +86,17 @@ win**, and the win was almost entirely q72's — which the join reorder now take
 by a different route. An earlier version of this document claimed a 15%
 per-query saving; that figure was wrong.
 
-Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-joinreorder-2026-09-04.csv`
-and `.json`, which also carry the no-reorder timing and the per-query
-result-identity check. The previous warm run is retained as
+The third: DataFusion inlines every CTE, so `WITH x AS (…)` referenced N times
+runs N times — q23 scanned `store_sales` six times. A CTE referenced more than
+once is now collected once and read from memory, unless its consumers filter it
+(then each inlined copy's pushed-down predicate wins) or its body is a bare
+scan (then caching forfeits pushdown). q36 2.16x, q27 1.90x, q23 1.23x; across
+all 99, +2.6% with the worst loss 27 ms. Single-query process only.
+
+Per-query numbers: `benchmarks/tpcds-sf1-99q-warm-ctemat-2026-09-05.csv` and
+`.json`, which also carry the no-materialisation timing and the per-query
+result-identity check. Earlier runs are retained as
+`benchmarks/tpcds-sf1-99q-warm-joinreorder-2026-09-04.*` and
 `benchmarks/tpcds-sf1-99q-warm-2026-09-04.*`.
 
 ## Reproducing
