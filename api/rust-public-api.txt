@@ -1,17 +1,24 @@
 crates/krishiv-api/src/blocking.rs::fn::close::pub fn close(self)
 crates/krishiv-api/src/blocking.rs::fn::collect::pub fn collect(&self, df: DataFrame) -> Result<QueryResult>
 crates/krishiv-api/src/blocking.rs::fn::connect::pub fn connect(coordinator_url: impl Into<String>) -> Result<Self>
-crates/krishiv-api/src/blocking.rs::fn::create_live_table::pub fn create_live_table(
 crates/krishiv-api/src/blocking.rs::fn::deregister_table::pub fn deregister_table(&self, name: &str) -> Result<()>
 crates/krishiv-api/src/blocking.rs::fn::embedded::pub fn embedded() -> Result<Self>
 crates/krishiv-api/src/blocking.rs::fn::from_env::pub fn from_env() -> Result<Self>
 crates/krishiv-api/src/blocking.rs::fn::read_csv::pub fn read_csv(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>
+crates/krishiv-api/src/blocking.rs::fn::read_csv_with_options::pub fn read_csv_with_options(
+crates/krishiv-api/src/blocking.rs::fn::read_delta::pub fn read_delta(&self, path: impl AsRef<str>, version: Option<i64>) -> Result<DataFrame>
+crates/krishiv-api/src/blocking.rs::fn::read_hudi::pub fn read_hudi(
 crates/krishiv-api/src/blocking.rs::fn::read_json::pub fn read_json(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>
 crates/krishiv-api/src/blocking.rs::fn::read_parquet::pub fn read_parquet(&self, path: impl AsRef<std::path::Path>) -> Result<DataFrame>
+crates/krishiv-api/src/blocking.rs::fn::read_parquet_with_options::pub fn read_parquet_with_options(
+crates/krishiv-api/src/blocking.rs::fn::register_parquet::pub fn register_parquet(
 crates/krishiv-api/src/blocking.rs::fn::register_record_batches::pub fn register_record_batches(
 crates/krishiv-api/src/blocking.rs::fn::runtime::pub fn runtime(&self) -> &Runtime
 crates/krishiv-api/src/blocking.rs::fn::session::pub fn session(&self) -> &Session
 crates/krishiv-api/src/blocking.rs::fn::sql::pub fn sql(&self, query: &str) -> Result<QueryResult>
+crates/krishiv-api/src/blocking.rs::fn::sql_as::pub fn sql_as(&self, api_key: &str, query: &str) -> Result<QueryResult>
+crates/krishiv-api/src/blocking.rs::fn::write_hudi_append::pub fn write_hudi_append(
+crates/krishiv-api/src/blocking.rs::fn::write_hudi_upsert::pub fn write_hudi_upsert(
 crates/krishiv-api/src/blocking.rs::struct::BlockingSession::pub struct BlockingSession
 crates/krishiv-api/src/catalog.rs::fn::as_str::pub fn as_str(&self) -> &str
 crates/krishiv-api/src/catalog.rs::fn::create_temp_view::pub fn create_temp_view(&self, identifier: &ViewIdentifier, query: &str) -> Result<()>
@@ -38,32 +45,44 @@ crates/krishiv-api/src/catalog.rs::struct::TableIdentifier::#[derive(Debug, Clon
 crates/krishiv-api/src/catalog.rs::struct::TableMetadata::#[derive(Debug, Clone)] pub struct TableMetadata
 crates/krishiv-api/src/catalog.rs::type::FunctionIdentifier::pub type FunctionIdentifier = TableIdentifier
 crates/krishiv-api/src/catalog.rs::type::ViewIdentifier::pub type ViewIdentifier = TableIdentifier
+crates/krishiv-api/src/compute/incremental_df.rs::fn::apply::pub async fn apply(&self, source: Option<&str>, delta: &DeltaBatch) -> Result<()>
+crates/krishiv-api/src/compute/incremental_df.rs::fn::close::pub async fn close(&self) -> Result<bool>
+crates/krishiv-api/src/compute/incremental_df.rs::fn::last_output::pub fn last_output(&self) -> Result<Option<DeltaBatch>>
+crates/krishiv-api/src/compute/incremental_df.rs::fn::name::pub fn name(&self) -> &str
+crates/krishiv-api/src/compute/incremental_df.rs::fn::output_schema::pub fn output_schema(&self) -> SchemaRef
+crates/krishiv-api/src/compute/incremental_df.rs::fn::shared_job::pub fn shared_job(&self) -> IvmJob
+crates/krishiv-api/src/compute/incremental_df.rs::fn::snapshot::pub async fn snapshot(&self) -> Result<Option<RecordBatch>>
+crates/krishiv-api/src/compute/incremental_df.rs::fn::source_names::pub fn source_names(&self) -> &[String]
+crates/krishiv-api/src/compute/incremental_df.rs::fn::step::pub async fn step(&self) -> Result<StepReport>
+crates/krishiv-api/src/compute/incremental_df.rs::struct::IncrementalDataFrame::pub struct IncrementalDataFrame
 crates/krishiv-api/src/compute/ivm.rs::enum::IvmJob::#[derive(Debug, Clone)] pub enum IvmJob
+crates/krishiv-api/src/compute/ivm.rs::fn::close::pub async fn close(&self) -> Result<bool>
 crates/krishiv-api/src/compute/ivm.rs::fn::embedded::pub fn embedded(registry: &SharedIvmJobRegistry, name: &str) -> Result<Self>
+crates/krishiv-api/src/compute/ivm.rs::fn::embedded_unpartitioned::pub fn embedded_unpartitioned(registry: &SharedIvmJobRegistry, name: &str) -> Result<Self>
 crates/krishiv-api/src/compute/ivm.rs::fn::enable_delta_checkpoints::pub fn enable_delta_checkpoints(&self) -> Result<()>
 crates/krishiv-api/src/compute/ivm.rs::fn::enable_input_dedup::pub fn enable_input_dedup(&self) -> Result<()>
+crates/krishiv-api/src/compute/ivm.rs::fn::is_partitioned::pub fn is_partitioned(&self) -> Result<Option<bool>>
 crates/krishiv-api/src/compute/ivm.rs::fn::register_view::pub async fn register_view(&self, spec: IncrementalViewSpec) -> Result<()>
 crates/krishiv-api/src/compute/ivm.rs::fn::remote::pub async fn remote(coordinator_http: &str, name: &str) -> Result<Self>
+crates/krishiv-api/src/compute/ivm.rs::fn::remote_unpartitioned::pub async fn remote_unpartitioned(coordinator_http: &str, name: &str) -> Result<Self>
+crates/krishiv-api/src/compute/ivm.rs::fn::view_output::pub fn view_output(&self, view: &str) -> Result<Option<DeltaBatch>>
 crates/krishiv-api/src/compute/job.rs::enum::JobKind::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum JobKind
 crates/krishiv-api/src/compute/job.rs::enum::ViewErrorKind::#[derive(Debug, Clone, PartialEq, Eq)] pub enum ViewErrorKind
+crates/krishiv-api/src/compute/job.rs::enum::ViewHealth::#[derive(Debug, Clone, PartialEq, Eq)] pub enum ViewHealth
+crates/krishiv-api/src/compute/job.rs::fn::is_complete::pub fn is_complete(&self) -> bool
+crates/krishiv-api/src/compute/job.rs::fn::is_reported::pub fn is_reported(&self) -> bool
 crates/krishiv-api/src/compute/job.rs::struct::StepReport::#[derive(Debug, Default, Clone, PartialEq, Eq)] pub struct StepReport
 crates/krishiv-api/src/compute/job.rs::struct::ViewError::#[derive(Debug, Clone, PartialEq, Eq)] pub struct ViewError
 crates/krishiv-api/src/compute/job.rs::trait::Checkpointable::#[async_trait] pub trait Checkpointable: Job
 crates/krishiv-api/src/compute/job.rs::trait::FeedableJob::#[async_trait] pub trait FeedableJob: Job
 crates/krishiv-api/src/compute/job.rs::trait::Job::pub trait Job
-crates/krishiv-api/src/compute/stream.rs::enum::StreamJob::#[derive(Clone)] pub enum StreamJob
-crates/krishiv-api/src/compute/stream.rs::fn::drain::pub async fn drain(&self) -> Result<Vec<RecordBatch>>
-crates/krishiv-api/src/compute/stream.rs::fn::drain::pub async fn drain(&self) -> Result<Vec<RecordBatch>>#2
-crates/krishiv-api/src/compute/stream.rs::fn::job_id::pub fn job_id(&self) -> &str
-crates/krishiv-api/src/compute/stream.rs::fn::push::pub async fn push(&self, batches: Vec<RecordBatch>) -> Result<()>
-crates/krishiv-api/src/compute/stream.rs::fn::push::pub fn push(&self, batches: Vec<RecordBatch>) -> Result<()>
-crates/krishiv-api/src/compute/stream.rs::struct::EmbeddedStreamJob::#[derive(Clone)] pub struct EmbeddedStreamJob
 crates/krishiv-api/src/connector_runtime.rs::fn::durable_engine_runtime::pub fn durable_engine_runtime(
 crates/krishiv-api/src/connector_runtime.rs::fn::embedded_connector_runtime::pub fn embedded_connector_runtime() -> EngineRuntime
 crates/krishiv-api/src/connector_runtime.rs::fn::embedded_consolidating_runtime::pub fn embedded_consolidating_runtime() -> EngineRuntime
 crates/krishiv-api/src/connector_runtime.rs::fn::insert::pub fn insert(&self, name: impl Into<String>, envelopes: Vec<String>)
 crates/krishiv-api/src/connector_runtime.rs::fn::new::pub fn new() -> Self
 crates/krishiv-api/src/connector_runtime.rs::fn::run_incremental_job_via_ivm::pub async fn run_incremental_job_via_ivm(
+crates/krishiv-api/src/connector_runtime.rs::fn::run_incremental_job_via_ivm_with::pub async fn run_incremental_job_via_ivm_with(
 crates/krishiv-api/src/connector_runtime.rs::fn::run_streaming_job_via_runtime::pub async fn run_streaming_job_via_runtime(
 crates/krishiv-api/src/connector_runtime.rs::fn::runtime_backed_engine_runtime::pub fn runtime_backed_engine_runtime(
 crates/krishiv-api/src/connector_runtime.rs::struct::ConnectorSinkProvider::#[derive(Debug, Clone, Copy, Default)] pub struct ConnectorSinkProvider
@@ -84,6 +103,7 @@ crates/krishiv-api/src/dataframe.rs::fn::collect::pub fn collect(&self) -> Resul
 crates/krishiv-api/src/dataframe.rs::fn::collect_as_delta_batch::pub fn collect_as_delta_batch(&self) -> Result<krishiv_delta::DeltaBatch>
 crates/krishiv-api/src/dataframe.rs::fn::collect_async::pub async fn collect_async(&self) -> Result<QueryResult>
 crates/krishiv-api/src/dataframe.rs::fn::collect_with_stats::pub fn collect_with_stats(&self) -> Result<(QueryResult, QueryExecutionStats)>
+crates/krishiv-api/src/dataframe.rs::fn::columns::pub fn columns(&self) -> Result<Vec<String>>
 crates/krishiv-api/src/dataframe.rs::fn::count::pub fn count(&self) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::create_or_replace_temp_view::pub fn create_or_replace_temp_view(&self, name: &str) -> Result<()>
 crates/krishiv-api/src/dataframe.rs::fn::describe::pub fn describe(&self) -> Result<DataFrame>
@@ -96,6 +116,7 @@ crates/krishiv-api/src/dataframe.rs::fn::except_distinct::pub fn except_distinct
 crates/krishiv-api/src/dataframe.rs::fn::execute::pub async fn execute(self) -> Result<ExecutionResult>
 crates/krishiv-api/src/dataframe.rs::fn::execute_stream_async::pub async fn execute_stream_async(&self) -> Result<crate::streaming_dataframe::KrishivStream>
 crates/krishiv-api/src/dataframe.rs::fn::explain::pub fn explain(&self) -> Result<String>
+crates/krishiv-api/src/dataframe.rs::fn::explain_analyze_async::pub async fn explain_analyze_async(&self) -> Result<String>
 crates/krishiv-api/src/dataframe.rs::fn::explain_async::pub async fn explain_async(&self) -> Result<String>
 crates/krishiv-api/src/dataframe.rs::fn::explain_logical::pub fn explain_logical(&self) -> String
 crates/krishiv-api/src/dataframe.rs::fn::explain_with::pub fn explain_with(&self, mode: ExplainMode) -> Result<String>
@@ -117,6 +138,7 @@ crates/krishiv-api/src/dataframe.rs::fn::limit::pub fn limit(&self, n: usize) ->
 crates/krishiv-api/src/dataframe.rs::fn::logical_plan::pub fn logical_plan(&self) -> &LogicalPlan
 crates/krishiv-api/src/dataframe.rs::fn::new::pub fn new(logical_plan: LogicalPlan) -> Result<Self>
 crates/krishiv-api/src/dataframe.rs::fn::new::pub fn new(value: crate::ScalarValue, alias: impl Into<String>) -> Self
+crates/krishiv-api/src/dataframe.rs::fn::num_rows::pub fn num_rows(&self) -> Result<usize>
 crates/krishiv-api/src/dataframe.rs::fn::order_by::pub fn order_by(&self, columns: &[&str]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::persist::pub fn persist(&self) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::pivot::pub fn pivot(
@@ -135,16 +157,19 @@ crates/krishiv-api/src/dataframe.rs::fn::sliding_window::pub fn sliding_window(
 crates/krishiv-api/src/dataframe.rs::fn::sort::pub fn sort(&self, columns: &[&str], descending: &[bool]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::stream::pub fn stream(&self) -> crate::streaming_dataframe::StreamingDataFrame
 crates/krishiv-api/src/dataframe.rs::fn::submit_async::pub fn submit_async(self) -> crate::query::QueryHandle
+crates/krishiv-api/src/dataframe.rs::fn::to_incremental::pub async fn to_incremental(&self, name: &str) -> Result<crate::IncrementalDataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::to_table::pub fn to_table(self, session: &crate::Session, name: &str) -> Result<()>
 crates/krishiv-api/src/dataframe.rs::fn::tumbling_window::pub fn tumbling_window(
 crates/krishiv-api/src/dataframe.rs::fn::union::pub fn union(&self, right: &DataFrame) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::union_by_name::pub fn union_by_name(&self, right: &DataFrame) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::union_distinct::pub fn union_distinct(&self, right: &DataFrame) -> Result<DataFrame>
+crates/krishiv-api/src/dataframe.rs::fn::unnest::pub fn unnest(&self, columns: &[&str]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::unpersist::pub fn unpersist(&self) -> Result<()>
 crates/krishiv-api/src/dataframe.rs::fn::unpivot::pub fn unpivot(
 crates/krishiv-api/src/dataframe.rs::fn::with_column::pub fn with_column(&self, name: &str, expr: &str) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::with_columns_renamed::pub fn with_columns_renamed(&self, renames: &[(&str, &str)]) -> Result<DataFrame>
 crates/krishiv-api/src/dataframe.rs::fn::with_event_time::pub fn with_event_time(
+crates/krishiv-api/src/dataframe.rs::fn::with_ivm_parent::pub fn with_ivm_parent(mut self, parent: crate::IvmJob) -> Self
 crates/krishiv-api/src/dataframe.rs::fn::write::pub fn write(&self) -> DataFrameWriter
 crates/krishiv-api/src/dataframe.rs::fn::write_csv::pub fn write_csv(&self, path: &str) -> Result<()>
 crates/krishiv-api/src/dataframe.rs::fn::write_csv_with_options::pub fn write_csv_with_options(
@@ -168,10 +193,12 @@ crates/krishiv-api/src/expression.rs::fn::and::pub fn and(self, right: Expr) -> 
 crates/krishiv-api/src/expression.rs::fn::as_sql::pub fn as_sql(&self) -> &str
 crates/krishiv-api/src/expression.rs::fn::asc::pub fn asc(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::avg::pub fn avg(expr: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::between::pub fn between(self, low: Expr, high: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::cast::pub fn cast(self, data_type: ExprDataType) -> Self
 crates/krishiv-api/src/expression.rs::fn::ceil::pub fn ceil(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::coalesce::pub fn coalesce(arguments: Vec<Expr>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::col::pub fn col(name: &str) -> Expr
+crates/krishiv-api/src/expression.rs::fn::contains::pub fn contains(self, substring: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::count::pub fn count(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::count_all::pub fn count_all() -> Expr
 crates/krishiv-api/src/expression.rs::fn::cume_dist::pub fn cume_dist() -> Expr
@@ -180,7 +207,9 @@ crates/krishiv-api/src/expression.rs::fn::dense_rank::pub fn dense_rank() -> Exp
 crates/krishiv-api/src/expression.rs::fn::desc::pub fn desc(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::divide::pub fn divide(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::encode_versioned::pub fn encode_versioned(&self) -> Result<Vec<u8>, PlanError>
+crates/krishiv-api/src/expression.rs::fn::ends_with::pub fn ends_with(self, suffix: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::eq::pub fn eq(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::eq_null_safe::pub fn eq_null_safe(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::first_value::pub fn first_value(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::floor::pub fn floor(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::frame::pub fn frame(self, frame: WindowFrame) -> Self
@@ -188,14 +217,18 @@ crates/krishiv-api/src/expression.rs::fn::from_node::pub fn from_node(node: kris
 crates/krishiv-api/src/expression.rs::fn::function::pub fn function(name: impl Into<String>, arguments: Vec<Expr>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::gt::pub fn gt(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::gt_eq::pub fn gt_eq(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::ilike::pub fn ilike(self, pattern: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::into_node::pub fn into_node(self) -> krishiv_plan::expression::Expr
+crates/krishiv-api/src/expression.rs::fn::is_in::pub fn is_in(self, list: Vec<Expr>, negated: bool) -> Self
 crates/krishiv-api/src/expression.rs::fn::is_not_null::pub fn is_not_null(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::is_null::pub fn is_null(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::lag::pub fn lag(expr: Expr, offset: i64, default: Option<Expr>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::last_value::pub fn last_value(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::lead::pub fn lead(expr: Expr, offset: i64, default: Option<Expr>) -> Expr
 crates/krishiv-api/src/expression.rs::fn::length::pub fn length(expr: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::like::pub fn like(self, pattern: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::lit::pub fn lit(value: impl Into<Literal>) -> Expr
+crates/krishiv-api/src/expression.rs::fn::logical_not::pub fn logical_not(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::lower::pub fn lower(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::lt::pub fn lt(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::lt_eq::pub fn lt_eq(self, right: Expr) -> Self
@@ -203,30 +236,40 @@ crates/krishiv-api/src/expression.rs::fn::ltrim::pub fn ltrim(expr: Expr) -> Exp
 crates/krishiv-api/src/expression.rs::fn::max::pub fn max(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::min::pub fn min(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::minus::pub fn minus(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::modulo::pub fn modulo(self, right: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::multiply::pub fn multiply(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::negate::pub fn negate(self) -> Self
 crates/krishiv-api/src/expression.rs::fn::node::pub fn node(&self) -> &krishiv_plan::expression::Expr
 crates/krishiv-api/src/expression.rs::fn::normalize_json::pub fn normalize_json(&self) -> Result<String, PlanError>
 crates/krishiv-api/src/expression.rs::fn::not_eq::pub fn not_eq(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::not_like::pub fn not_like(self, pattern: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::nth_value::pub fn nth_value(expr: Expr, n: i64) -> Expr
 crates/krishiv-api/src/expression.rs::fn::ntile::pub fn ntile(n: i64) -> Expr
 crates/krishiv-api/src/expression.rs::fn::nvl::pub fn nvl(expr: Expr, default: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::or::pub fn or(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::otherwise::pub fn otherwise(self, value: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::over::pub fn over(self, partition_by: Vec<Expr>, order_by: Vec<Expr>) -> Self
 crates/krishiv-api/src/expression.rs::fn::percent_rank::pub fn percent_rank() -> Expr
 crates/krishiv-api/src/expression.rs::fn::plus::pub fn plus(self, right: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::power::pub fn power(self, exponent: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::rank::pub fn rank() -> Expr
 crates/krishiv-api/src/expression.rs::fn::raw::pub fn raw(sql: impl Into<String>) -> Self
 crates/krishiv-api/src/expression.rs::fn::row_number::pub fn row_number() -> Expr
 crates/krishiv-api/src/expression.rs::fn::rtrim::pub fn rtrim(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::sqrt::pub fn sqrt(expr: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::starts_with::pub fn starts_with(self, prefix: Expr) -> Self
+crates/krishiv-api/src/expression.rs::fn::substr::pub fn substr(self, pos: Expr, len: Expr) -> Self
 crates/krishiv-api/src/expression.rs::fn::substring::pub fn substring(expr: Expr, pos: i64, len: i64) -> Expr
 crates/krishiv-api/src/expression.rs::fn::sum::pub fn sum(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::trim::pub fn trim(expr: Expr) -> Expr
 crates/krishiv-api/src/expression.rs::fn::try_cast::pub fn try_cast(self, data_type: ExprDataType) -> Self
 crates/krishiv-api/src/expression.rs::fn::upper::pub fn upper(expr: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::when::pub fn when(condition: Expr, value: Expr) -> Expr
+crates/krishiv-api/src/expression.rs::fn::when::pub fn when(self, condition: Expr, value: Expr) -> Self
 crates/krishiv-api/src/expression.rs::struct::Expr::#[derive(Debug, Clone, PartialEq, Eq, Hash)] pub struct Expr
 crates/krishiv-api/src/io.rs::enum::FileReadOptions::#[derive(Debug, Clone, PartialEq, Eq)] pub enum FileReadOptions
 crates/krishiv-api/src/io.rs::enum::MalformedRecordPolicy::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum MalformedRecordPolicy
+crates/krishiv-api/src/io.rs::fn::connector::pub fn connector<I, K, V>(mut self, kind: &str, options: I) -> Result<Self>
 crates/krishiv-api/src/io.rs::fn::csv::pub fn csv(mut self, options: CsvReadOptions) -> Self
 crates/krishiv-api/src/io.rs::fn::database::pub fn database(mut self, options: DatabaseIoOptions) -> Result<Self>
 crates/krishiv-api/src/io.rs::fn::database::pub fn database(mut self, options: DatabaseIoOptions) -> Result<Self>#2
@@ -250,6 +293,7 @@ crates/krishiv-api/src/io.rs::fn::option::pub fn option(mut self, key: impl Into
 crates/krishiv-api/src/io.rs::fn::parquet::pub fn parquet(mut self, options: ParquetReadOptions) -> Self
 crates/krishiv-api/src/io.rs::fn::save::pub fn save(self, path: &str) -> Result<()>
 crates/krishiv-api/src/io.rs::fn::save_async::pub async fn save_async(mut self, path: impl AsRef<Path>) -> Result<()>
+crates/krishiv-api/src/io.rs::fn::save_target::pub fn save_target(self) -> Result<()>
 crates/krishiv-api/src/io.rs::fn::save_target_async::pub async fn save_target_async(mut self) -> Result<()>
 crates/krishiv-api/src/io.rs::fn::schema_evolution::pub fn schema_evolution(mut self, mode: SchemaEvolutionMode) -> Self
 crates/krishiv-api/src/io.rs::struct::CsvReadOptions::#[derive(Debug, Clone, PartialEq, Eq)] pub struct CsvReadOptions
@@ -299,7 +343,6 @@ crates/krishiv-api/src/pipeline/driver.rs::struct::StreamingCheckpoint::#[derive
 crates/krishiv-api/src/pipeline/driver.rs::struct::StreamingSource::pub struct StreamingSource
 crates/krishiv-api/src/pipeline/mod.rs::enum::OnViolation::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum OnViolation
 crates/krishiv-api/src/pipeline/mod.rs::enum::PipelineMode::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum PipelineMode
-crates/krishiv-api/src/pipeline/mod.rs::enum::StreamingExecutionProfile::#[derive(Debug, Clone)] pub enum StreamingExecutionProfile
 crates/krishiv-api/src/pipeline/mod.rs::fn::build::pub fn build(self) -> Pipeline
 crates/krishiv-api/src/pipeline/mod.rs::fn::engine_kind::pub fn engine_kind(&self) -> EngineKind
 crates/krishiv-api/src/pipeline/mod.rs::fn::engine_kind::pub fn engine_kind(self) -> EngineKind
@@ -324,7 +367,6 @@ crates/krishiv-api/src/pipeline/mod.rs::fn::view::pub fn view(
 crates/krishiv-api/src/pipeline/mod.rs::fn::view_with_lateness::pub fn view_with_lateness(
 crates/krishiv-api/src/pipeline/mod.rs::struct::BackpressureConfig::#[derive(Debug, Clone)] pub struct BackpressureConfig
 crates/krishiv-api/src/pipeline/mod.rs::struct::Expectation::#[derive(Clone)] pub struct Expectation
-crates/krishiv-api/src/pipeline/mod.rs::struct::OutputBufferPolicy::#[derive(Debug, Clone)] pub struct OutputBufferPolicy
 crates/krishiv-api/src/pipeline/mod.rs::struct::Pipeline::pub struct Pipeline
 crates/krishiv-api/src/pipeline/mod.rs::struct::PipelineBuilder::pub struct PipelineBuilder
 crates/krishiv-api/src/pipeline/mod.rs::struct::StreamingConfig::#[derive(Debug, Clone)] pub struct StreamingConfig
@@ -341,7 +383,7 @@ crates/krishiv-api/src/prepared.rs::fn::parameter_count::pub fn parameter_count(
 crates/krishiv-api/src/prepared.rs::fn::prepare::pub fn prepare(&self, sql: impl Into<String>) -> Result<PreparedStatement>
 crates/krishiv-api/src/prepared.rs::fn::sql::pub fn sql(&self) -> &str
 crates/krishiv-api/src/prepared.rs::struct::PreparedStatement::#[derive(Clone)] pub struct PreparedStatement
-crates/krishiv-api/src/process.rs::fn::apply_async_io::pub fn apply_async_io<F, Fut>(input: KrishivStream, _batch_size: usize, lookup: F) -> KrishivStream
+crates/krishiv-api/src/process.rs::fn::apply_async_io::pub fn apply_async_io<F, Fut>(input: KrishivStream, concurrency: usize, lookup: F) -> KrishivStream
 crates/krishiv-api/src/process.rs::fn::apply_process_function::pub fn apply_process_function(
 crates/krishiv-api/src/pyspark_parity.rs::enum::Namespace::#[derive(Clone, Copy, PartialEq, Eq, Debug)] pub enum Namespace
 crates/krishiv-api/src/pyspark_parity.rs::enum::ParityStatus::#[derive(Clone, Copy, PartialEq, Eq, Debug)] pub enum ParityStatus
@@ -386,7 +428,6 @@ crates/krishiv-api/src/session.rs::fn::configs::pub fn configs(&self) -> std::co
 crates/krishiv-api/src/session.rs::fn::continuous_stream_status::pub async fn continuous_stream_status(
 crates/krishiv-api/src/session.rs::fn::coordinator_grpc_url::pub fn coordinator_grpc_url(&self) -> Option<&str>
 crates/krishiv-api/src/session.rs::fn::coordinator_http_url::pub fn coordinator_http_url(&self) -> Option<&str>
-crates/krishiv-api/src/session.rs::fn::create_live_table::pub fn create_live_table(&self, name: &str, query: &str, refresh: Refresh) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::create_view::pub fn create_view(&self, name: &str, query: &str) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::cycle_in_flight::pub fn cycle_in_flight(&self) -> Option<bool>
 crates/krishiv-api/src/session.rs::fn::declared_pipeline_sinks::pub fn declared_pipeline_sinks(&self) -> Result<Vec<String>>
@@ -403,6 +444,7 @@ crates/krishiv-api/src/session.rs::fn::execute_remote_async::pub async fn execut
 crates/krishiv-api/src/session.rs::fn::execution_runtime::pub fn execution_runtime(&self) -> Arc<dyn ExecutionRuntime>
 crates/krishiv-api/src/session.rs::fn::failed_task_count::pub fn failed_task_count(&self) -> Option<usize>
 crates/krishiv-api/src/session.rs::fn::feed_ivm_from_sql::pub async fn feed_ivm_from_sql(
+crates/krishiv-api/src/session.rs::fn::flush_stream_job::pub fn flush_stream_job(&self, job_id: &str) -> Result<Vec<RecordBatch>>
 crates/krishiv-api/src/session.rs::fn::from_env::pub fn from_env() -> Result<Self>
 crates/krishiv-api/src/session.rs::fn::from_env::pub fn from_env() -> Result<Self>#2
 crates/krishiv-api/src/session.rs::fn::get_config::pub fn get_config(&self, key: &str) -> Option<String>
@@ -413,6 +455,7 @@ crates/krishiv-api/src/session.rs::fn::into_spec::pub fn into_spec(self) -> Loca
 crates/krishiv-api/src/session.rs::fn::is_streaming_query::pub fn is_streaming_query(&self, sql: &str) -> Result<bool>
 crates/krishiv-api/src/session.rs::fn::is_terminal::pub fn is_terminal(self) -> bool
 crates/krishiv-api/src/session.rs::fn::ivm::pub async fn ivm(&self, name: &str) -> Result<crate::IvmJob>
+crates/krishiv-api/src/session.rs::fn::ivm_unpartitioned::pub async fn ivm_unpartitioned(&self, name: &str) -> Result<crate::IvmJob>
 crates/krishiv-api/src/session.rs::fn::job_id::pub fn job_id(&self) -> &str
 crates/krishiv-api/src/session.rs::fn::job_id::pub fn job_id(&self) -> &str#2
 crates/krishiv-api/src/session.rs::fn::job_id::pub fn job_id(&self) -> &str#3
@@ -422,7 +465,6 @@ crates/krishiv-api/src/session.rs::fn::list_continuous_stream_statuses::pub asyn
 crates/krishiv-api/src/session.rs::fn::list_executors_remote::pub async fn list_executors_remote(&self) -> Result<Vec<krishiv_scheduler::LiveExecutorView>>
 crates/krishiv-api/src/session.rs::fn::list_jobs_remote::pub async fn list_jobs_remote(&self) -> Result<Vec<krishiv_scheduler::LiveJobView>>
 crates/krishiv-api/src/session.rs::fn::list_tables::pub fn list_tables(&self) -> Result<Vec<String>>
-crates/krishiv-api/src/session.rs::fn::live_table_registry::pub fn live_table_registry(&self) -> &Arc<krishiv_sql::live_table::LiveTableRegistry>
 crates/krishiv-api/src/session.rs::fn::local_cluster::pub fn local_cluster(&self) -> &InProcessCluster
 crates/krishiv-api/src/session.rs::fn::memory_stream::pub fn memory_stream(
 crates/krishiv-api/src/session.rs::fn::memory_stream_batches::pub fn memory_stream_batches(&self, name: &str) -> Option<Vec<RecordBatch>>
@@ -449,6 +491,7 @@ crates/krishiv-api/src/session.rs::fn::read_parquet::pub fn read_parquet(&self, 
 crates/krishiv-api/src/session.rs::fn::read_parquet_async::pub async fn read_parquet_async(&self, path: impl AsRef<Path>) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::read_parquet_with_options::pub fn read_parquet_with_options(
 crates/krishiv-api/src/session.rs::fn::read_parquet_with_options_async::pub async fn read_parquet_with_options_async(
+crates/krishiv-api/src/session.rs::fn::read_state::pub fn read_state(
 crates/krishiv-api/src/session.rs::fn::read_stream::pub fn read_stream(&self) -> crate::streaming_builder::DataStreamReader
 crates/krishiv-api/src/session.rs::fn::register_aggregate_udf::pub fn register_aggregate_udf(&self, udf: Arc<dyn AggregateUdf>) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::register_bounded::pub fn register_bounded(&self, name: &str, path: &Path) -> Result<()>
@@ -457,13 +500,20 @@ crates/krishiv-api/src/session.rs::fn::register_memory_stream::pub fn register_m
 crates/krishiv-api/src/session.rs::fn::register_parquet::pub fn register_parquet(
 crates/krishiv-api/src/session.rs::fn::register_parquet_async::pub async fn register_parquet_async(
 crates/krishiv-api/src/session.rs::fn::register_parquet_stream::pub fn register_parquet_stream(&self, name: &str, path: &Path) -> Result<()>
+crates/krishiv-api/src/session.rs::fn::register_parquet_with_primary_key::pub fn register_parquet_with_primary_key<S: AsRef<str>>(
+crates/krishiv-api/src/session.rs::fn::register_python_udaf_bytes::pub fn register_python_udaf_bytes(
+crates/krishiv-api/src/session.rs::fn::register_python_udf_bytes::pub fn register_python_udf_bytes(
 crates/krishiv-api/src/session.rs::fn::register_record_batches::pub fn register_record_batches(
+crates/krishiv-api/src/session.rs::fn::register_record_batches_async::pub async fn register_record_batches_async(
+crates/krishiv-api/src/session.rs::fn::register_remote_parquet::pub fn register_remote_parquet(
+crates/krishiv-api/src/session.rs::fn::register_scalar_sql_function::pub fn register_scalar_sql_function(
 crates/krishiv-api/src/session.rs::fn::register_scalar_udf::pub fn register_scalar_udf(&self, udf: Arc<dyn ScalarUdf>) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::register_sink_config::pub fn register_sink_config(&self, config: ConnectorConfig) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::register_source_config::pub fn register_source_config(&self, config: ConnectorConfig) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::register_stream_job_sql::pub async fn register_stream_job_sql(
 crates/krishiv-api/src/session.rs::fn::register_table_udf::pub fn register_table_udf(&self, udf: Arc<dyn TableUdf>) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::register_unbounded::pub fn register_unbounded(&self, name: &str, schema: SchemaRef) -> Result<()>
+crates/krishiv-api/src/session.rs::fn::register_unbounded_source::pub fn register_unbounded_source(
 crates/krishiv-api/src/session.rs::fn::register_unbounded_with_capacity::pub fn register_unbounded_with_capacity(
 crates/krishiv-api/src/session.rs::fn::registered_sink_configs::pub fn registered_sink_configs(&self) -> Vec<ConnectorConfig>
 crates/krishiv-api/src/session.rs::fn::registered_source_configs::pub fn registered_source_configs(&self) -> Vec<ConnectorConfig>
@@ -497,12 +547,17 @@ crates/krishiv-api/src/session.rs::fn::state::pub fn state(&self) -> &str
 crates/krishiv-api/src/session.rs::fn::state::pub fn state(&self) -> SubmittedSqlJobState
 crates/krishiv-api/src/session.rs::fn::state_ttl::pub fn state_ttl(&self) -> Option<StateTtlConfig>
 crates/krishiv-api/src/session.rs::fn::state_ttl_config::pub fn state_ttl_config(&self) -> Option<krishiv_state::TtlConfig>
+crates/krishiv-api/src/session.rs::fn::stop_stream_job::pub fn stop_stream_job(&self, job_id: &str) -> Result<()>
 crates/krishiv-api/src/session.rs::fn::stream::pub fn stream(
 crates/krishiv-api/src/session.rs::fn::stream_async::pub async fn stream_async(
+crates/krishiv-api/src/session.rs::fn::stream_sql::pub fn stream_sql(&self, sql: &str) -> Result<crate::streaming_dataframe::StreamingDataFrame>
+crates/krishiv-api/src/session.rs::fn::stream_sql_with_sides::pub fn stream_sql_with_sides(
+crates/krishiv-api/src/session.rs::fn::stream_with_options_async::pub async fn stream_with_options_async(
 crates/krishiv-api/src/session.rs::fn::submit::pub async fn submit(&self, job: crate::CompiledJob) -> Result<crate::JobHandle>
 crates/krishiv-api/src/session.rs::fn::submit_sql::pub async fn submit_sql(&self, sql: &str) -> Result<crate::JobHandle>
 crates/krishiv-api/src/session.rs::fn::submit_sql_background::pub fn submit_sql_background(&self, sql: &str) -> Result<SubmittedSqlJobStatus>
 crates/krishiv-api/src/session.rs::fn::submit_stream_job::pub fn submit_stream_job(
+crates/krishiv-api/src/session.rs::fn::submit_stream_job_with_options::pub fn submit_stream_job_with_options(
 crates/krishiv-api/src/session.rs::fn::submit_streaming::pub fn submit_streaming(&self, job: crate::CompiledJob) -> Result<crate::RunningJob>
 crates/krishiv-api/src/session.rs::fn::submitted_sql_job_status::pub fn submitted_sql_job_status(&self, job_id: &str) -> Option<SubmittedSqlJobStatus>
 crates/krishiv-api/src/session.rs::fn::submitted_sql_jobs::pub fn submitted_sql_jobs(&self) -> Vec<SubmittedSqlJobStatus>
@@ -517,6 +572,7 @@ crates/krishiv-api/src/session.rs::fn::unset_config::pub fn unset_config(&self, 
 crates/krishiv-api/src/session.rs::fn::uses_remote_execution::pub fn uses_remote_execution(&self) -> bool
 crates/krishiv-api/src/session.rs::fn::uses_remote_execution::pub fn uses_remote_execution(&self) -> bool#2
 crates/krishiv-api/src/session.rs::fn::validate_pipeline::pub fn validate_pipeline(&self, sink_name: &str) -> Result<()>
+crates/krishiv-api/src/session.rs::fn::view::pub fn view(&self, iv: &crate::IncrementalDataFrame) -> Result<DataFrame>
 crates/krishiv-api/src/session.rs::fn::watermark_ms::pub fn watermark_ms(&self) -> Option<i64>
 crates/krishiv-api/src/session.rs::fn::with_auth::pub fn with_auth(mut self, auth: Arc<dyn AuthProvider>) -> Self
 crates/krishiv-api/src/session.rs::fn::with_config::pub fn with_config(mut self, key: impl Into<String>, value: impl Into<String>) -> Self
@@ -539,6 +595,7 @@ crates/krishiv-api/src/session.rs::struct::CompiledContinuousStreamJob::#[derive
 crates/krishiv-api/src/session.rs::struct::ContinuousStreamCheckpoint::#[derive(Debug, Clone)] pub struct ContinuousStreamCheckpoint
 crates/krishiv-api/src/session.rs::struct::ContinuousStreamStatus::#[derive(Debug, Clone)] pub struct ContinuousStreamStatus
 crates/krishiv-api/src/session.rs::struct::RegisteredContinuousStreamJob::#[derive(Debug, Clone)] pub struct RegisteredContinuousStreamJob
+crates/krishiv-api/src/session.rs::struct::RegisteredParquet::#[derive(Debug, Clone, PartialEq, Eq)] pub struct RegisteredParquet
 crates/krishiv-api/src/session.rs::struct::Session::#[derive(Clone)] pub struct Session
 crates/krishiv-api/src/session.rs::struct::SessionBuilder::#[derive(Clone)] pub struct SessionBuilder
 crates/krishiv-api/src/session.rs::struct::SubmittedSqlJobStatus::#[derive(Debug, Clone, PartialEq, Eq)] pub struct SubmittedSqlJobStatus
@@ -562,6 +619,15 @@ crates/krishiv-api/src/stream.rs::fn::push_batch_async::pub async fn push_batch_
 crates/krishiv-api/src/stream.rs::fn::try_push_batch::pub fn try_push_batch(&self, batch: RecordBatch) -> Result<()>
 crates/krishiv-api/src/stream.rs::fn::with_state_ttl::pub fn with_state_ttl(mut self, ttl_ms: u64) -> Self
 crates/krishiv-api/src/stream.rs::struct::Stream::#[derive(Clone)] pub struct Stream
+crates/krishiv-api/src/stream_write.rs::fn::checkpoint::pub fn checkpoint(mut self, interval_ms: u64, storage_path: impl Into<String>) -> Self
+crates/krishiv-api/src/stream_write.rs::fn::format::pub fn format(mut self, name: impl Into<String>) -> Self
+crates/krishiv-api/src/stream_write.rs::fn::option::pub fn option(mut self, key: impl Into<String>, value: impl Into<String>) -> Self
+crates/krishiv-api/src/stream_write.rs::fn::output_mode::pub fn output_mode(mut self, mode: impl Into<String>) -> Self
+crates/krishiv-api/src/stream_write.rs::fn::parallelism::pub fn parallelism(mut self, parallelism: u32) -> Self
+crates/krishiv-api/src/stream_write.rs::fn::start::pub fn start(self, session: &Session, job_name: impl Into<String>) -> Result<StreamingJob>
+crates/krishiv-api/src/stream_write.rs::fn::trigger::pub fn trigger(mut self, trigger: impl Into<String>, interval_ms: u64) -> Self
+crates/krishiv-api/src/stream_write.rs::fn::write::pub fn write(&self) -> StreamWriter
+crates/krishiv-api/src/stream_write.rs::struct::StreamWriter::pub struct StreamWriter
 crates/krishiv-api/src/streaming_builder.rs::enum::StreamSinkFormat::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum StreamSinkFormat
 crates/krishiv-api/src/streaming_builder.rs::enum::StreamingOutputMode::#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)] pub enum StreamingOutputMode
 crates/krishiv-api/src/streaming_builder.rs::enum::StreamingQueryState::#[derive(Debug, Clone)] pub enum StreamingQueryState
@@ -571,16 +637,18 @@ crates/krishiv-api/src/streaming_builder.rs::fn::active_ids::pub fn active_ids(&
 crates/krishiv-api/src/streaming_builder.rs::fn::add_listener::pub fn add_listener(&self, listener: Arc<dyn StreamingQueryListener>)
 crates/krishiv-api/src/streaming_builder.rs::fn::await_termination::pub async fn await_termination(&self) -> Result<()>
 crates/krishiv-api/src/streaming_builder.rs::fn::await_termination_timeout::pub async fn await_termination_timeout(&self, dur: Duration) -> Result<()>
+crates/krishiv-api/src/streaming_builder.rs::fn::carries_streaming_pipeline::pub fn carries_streaming_pipeline(&self) -> bool
 crates/krishiv-api/src/streaming_builder.rs::fn::exception::pub fn exception(&self) -> Option<String>
 crates/krishiv-api/src/streaming_builder.rs::fn::file_stream::pub fn file_stream(self, path: impl AsRef<std::path::Path>) -> Result<crate::DataFrame>
+crates/krishiv-api/src/streaming_builder.rs::fn::for_streaming::pub fn for_streaming(sdf: crate::streaming_dataframe::StreamingDataFrame) -> Self
 crates/krishiv-api/src/streaming_builder.rs::fn::foreach_batch::pub fn foreach_batch(mut self, f: ForeachBatchFn) -> Self
 crates/krishiv-api/src/streaming_builder.rs::fn::format::pub fn format(&self) -> Option<StreamSinkFormat>
 crates/krishiv-api/src/streaming_builder.rs::fn::format::pub fn format(mut self, name: impl AsRef<str>) -> Self
 crates/krishiv-api/src/streaming_builder.rs::fn::format_option::pub fn format_option(mut self, key: &str, value: impl Into<String>) -> Self
 crates/krishiv-api/src/streaming_builder.rs::fn::from_name::pub fn from_name(name: &str) -> Option<Self>
 crates/krishiv-api/src/streaming_builder.rs::fn::from_stream::pub fn from_stream(self, stream: crate::stream::Stream) -> Result<crate::DataFrame>
-crates/krishiv-api/src/streaming_builder.rs::fn::get::pub fn get(&self, id: &str) -> Option<Arc<StreamingQuery>>
-crates/krishiv-api/src/streaming_builder.rs::fn::get_by_name::pub fn get_by_name(&self, name: &str) -> Option<Arc<StreamingQuery>>
+crates/krishiv-api/src/streaming_builder.rs::fn::get::pub fn get(&self, id: &str) -> Option<StreamingQuery>
+crates/krishiv-api/src/streaming_builder.rs::fn::get_by_name::pub fn get_by_name(&self, name: &str) -> Option<StreamingQuery>
 crates/krishiv-api/src/streaming_builder.rs::fn::id::pub fn id(&self) -> &QueryId
 crates/krishiv-api/src/streaming_builder.rs::fn::is_active::pub fn is_active(&self) -> bool
 crates/krishiv-api/src/streaming_builder.rs::fn::kafka_transactional_config::pub fn kafka_transactional_config(&self) -> Option<&KafkaTransactionalConfig>
@@ -605,7 +673,7 @@ crates/krishiv-api/src/streaming_builder.rs::struct::DataStreamReader::pub struc
 crates/krishiv-api/src/streaming_builder.rs::struct::DataStreamWriter::pub struct DataStreamWriter
 crates/krishiv-api/src/streaming_builder.rs::struct::KafkaTransactionalConfig::#[derive(Debug, Clone, PartialEq, Eq)] pub struct KafkaTransactionalConfig
 crates/krishiv-api/src/streaming_builder.rs::struct::QueryTerminatedEvent::#[derive(Debug, Clone)] pub struct QueryTerminatedEvent
-crates/krishiv-api/src/streaming_builder.rs::struct::StreamingQuery::pub struct StreamingQuery
+crates/krishiv-api/src/streaming_builder.rs::struct::StreamingQuery::#[derive(Clone)] pub struct StreamingQuery
 crates/krishiv-api/src/streaming_builder.rs::struct::StreamingQueryManager::#[derive(Clone)] pub struct StreamingQueryManager
 crates/krishiv-api/src/streaming_builder.rs::struct::StreamingQueryProgress::#[derive(Debug, Clone)] pub struct StreamingQueryProgress
 crates/krishiv-api/src/streaming_builder.rs::struct::StreamingQueryStatus::#[derive(Debug, Clone)] pub struct StreamingQueryStatus
@@ -613,29 +681,55 @@ crates/krishiv-api/src/streaming_builder.rs::trait::StreamingQueryListener::pub 
 crates/krishiv-api/src/streaming_builder.rs::type::ForeachBatchFn::pub type ForeachBatchFn = Arc<dyn Fn(Vec<RecordBatch>, i64) -> Result<()> + Send + Sync>
 crates/krishiv-api/src/streaming_dataframe.rs::enum::DedupStateMode::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum DedupStateMode
 crates/krishiv-api/src/streaming_dataframe.rs::fn::agg::pub fn agg(mut self, exprs: Vec<AggExpr>) -> Self
+crates/krishiv-api/src/streaming_dataframe.rs::fn::collect_bounded::pub async fn collect_bounded(&self) -> Result<Vec<RecordBatch>>
+crates/krishiv-api/src/streaming_dataframe.rs::fn::drop_columns::pub fn drop_columns(mut self, columns: &[&str]) -> Result<Self>
 crates/krishiv-api/src/streaming_dataframe.rs::fn::drop_duplicates::pub fn drop_duplicates(mut self, subset: impl IntoIterator<Item = impl Into<String>>) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::drop_duplicates_with_state::pub fn drop_duplicates_with_state(
 crates/krishiv-api/src/streaming_dataframe.rs::fn::execute_stream_async::pub async fn execute_stream_async(self) -> Result<KrishivStream>
 crates/krishiv-api/src/streaming_dataframe.rs::fn::execute_stream_with_side_output_async::pub async fn execute_stream_with_side_output_async(self) -> Result<StreamingOutputStreams>
+crates/krishiv-api/src/streaming_dataframe.rs::fn::execution_spec::pub fn execution_spec(&self) -> Result<Option<LocalWindowExecutionSpec>>
+crates/krishiv-api/src/streaming_dataframe.rs::fn::filter::pub fn filter(mut self, predicate: &str) -> Result<Self>
 crates/krishiv-api/src/streaming_dataframe.rs::fn::interval_join::pub fn interval_join(
 crates/krishiv-api/src/streaming_dataframe.rs::fn::into_parts::pub fn into_parts(self) -> (KrishivStream, NamedSideOutputStream)
 crates/krishiv-api/src/streaming_dataframe.rs::fn::into_stream::pub fn into_stream(self) -> KrishivStream
 crates/krishiv-api/src/streaming_dataframe.rs::fn::key_by::pub fn key_by(mut self, column: impl Into<String>) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::name::pub fn name(&self) -> &str
+crates/krishiv-api/src/streaming_dataframe.rs::fn::select::pub fn select(mut self, columns: &[&str]) -> Result<Self>
 crates/krishiv-api/src/streaming_dataframe.rs::fn::session_window::pub fn session_window(mut self, gap_ms: u64) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::sliding_window::pub fn sliding_window(mut self, window_size_ms: u64, slide_ms: u64) -> Self
+crates/krishiv-api/src/streaming_dataframe.rs::fn::source_df::pub fn source_df(&self) -> DataFrame
 crates/krishiv-api/src/streaming_dataframe.rs::fn::stream_stream_join::pub fn stream_stream_join(
 crates/krishiv-api/src/streaming_dataframe.rs::fn::stream_table_join::pub fn stream_table_join(
+crates/krishiv-api/src/streaming_dataframe.rs::fn::task_override::pub fn task_override(&self) -> Option<&krishiv_plan::stream_task::StreamingTaskSpec>
 crates/krishiv-api/src/streaming_dataframe.rs::fn::temporal_join::pub fn temporal_join(
+crates/krishiv-api/src/streaming_dataframe.rs::fn::transform_with_state::pub async fn transform_with_state(
 crates/krishiv-api/src/streaming_dataframe.rs::fn::tumbling_window::pub fn tumbling_window(mut self, window_size_ms: u64) -> Self
+crates/krishiv-api/src/streaming_dataframe.rs::fn::with_column::pub fn with_column(mut self, name: &str, expr: &str) -> Result<Self>
 crates/krishiv-api/src/streaming_dataframe.rs::fn::with_event_time::pub fn with_event_time(mut self, column: impl Into<String>) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::with_side_output::pub fn with_side_output(mut self, name: impl Into<String>, lateness_threshold_ms: u64) -> Self
+crates/krishiv-api/src/streaming_dataframe.rs::fn::with_source_id_column::pub fn with_source_id_column(mut self, column: impl Into<String>) -> Self
+crates/krishiv-api/src/streaming_dataframe.rs::fn::with_source_watermark::pub fn with_source_watermark(mut self, source_id: impl Into<String>, lag_ms: u64) -> Self
+crates/krishiv-api/src/streaming_dataframe.rs::fn::with_state_ttl::pub fn with_state_ttl(mut self, ttl_ms: Option<u64>) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::with_watermark_lag::pub fn with_watermark_lag(mut self, lag_ms: u64) -> Self
 crates/krishiv-api/src/streaming_dataframe.rs::fn::write_stream::pub fn write_stream(self) -> crate::streaming_builder::DataStreamWriter
 crates/krishiv-api/src/streaming_dataframe.rs::struct::NamedSideOutputStream::pub struct NamedSideOutputStream
 crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingDataFrame::#[derive(Clone)] pub struct StreamingDataFrame
 crates/krishiv-api/src/streaming_dataframe.rs::struct::StreamingOutputStreams::pub struct StreamingOutputStreams
 crates/krishiv-api/src/streaming_dataframe.rs::type::KrishivStream::pub type KrishivStream =
+crates/krishiv-api/src/streaming_job.rs::fn::apply::pub fn apply(&mut self, deltas: &[RecordBatch]) -> Result<()>
+crates/krishiv-api/src/streaming_job.rs::fn::attach::pub fn attach(coordinator_http: impl Into<String>, job_id: impl Into<String>) -> Self
+crates/krishiv-api/src/streaming_job.rs::fn::drain::pub async fn drain(&self) -> Result<Vec<RecordBatch>>
+crates/krishiv-api/src/streaming_job.rs::fn::flush::pub async fn flush(&self) -> Result<Vec<RecordBatch>>
+crates/krishiv-api/src/streaming_job.rs::fn::from_session_job::pub fn from_session_job(session: Session, job_id: impl Into<String>) -> Self
+crates/krishiv-api/src/streaming_job.rs::fn::id::pub fn id(&self) -> String
+crates/krishiv-api/src/streaming_job.rs::fn::new::pub fn new(key_columns: Vec<String>) -> Self
+crates/krishiv-api/src/streaming_job.rs::fn::push::pub async fn push(&self, batches: Vec<RecordBatch>) -> Result<()>
+crates/krishiv-api/src/streaming_job.rs::fn::push_side::pub async fn push_side(&self, side: &str, batches: &[RecordBatch]) -> Result<()>
+crates/krishiv-api/src/streaming_job.rs::fn::snapshot::pub fn snapshot(&self) -> Result<Vec<RecordBatch>>
+crates/krishiv-api/src/streaming_job.rs::fn::stop::pub async fn stop(&self) -> Result<()>
+crates/krishiv-api/src/streaming_job.rs::fn::with_complete_view::pub fn with_complete_view(mut self, key_columns: Vec<String>) -> Self
+crates/krishiv-api/src/streaming_job.rs::struct::CompleteModeView::pub struct CompleteModeView
+crates/krishiv-api/src/streaming_job.rs::struct::StreamingJob::pub struct StreamingJob
 crates/krishiv-api/src/timers.rs::fn::build_in_memory_timer_service::pub fn build_in_memory_timer_service() -> InMemoryTimerService
 crates/krishiv-api/src/timers.rs::fn::schedule_event_time_timer::pub fn schedule_event_time_timer(
 crates/krishiv-api/src/types.rs::enum::DeploymentTarget::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum DeploymentTarget
@@ -651,6 +745,7 @@ crates/krishiv-api/src/types.rs::fn::new::pub fn new(sequence: u64, batch: Recor
 crates/krishiv-api/src/types.rs::fn::pretty::pub fn pretty(&self) -> Result<String, crate::error::KrishivError>
 crates/krishiv-api/src/types.rs::fn::row_count::pub fn row_count(&self) -> usize
 crates/krishiv-api/src/types.rs::fn::sequence::pub fn sequence(&self) -> u64
+crates/krishiv-api/src/types.rs::fn::to_json_lines::pub fn to_json_lines(&self) -> Result<String, crate::error::KrishivError>
 crates/krishiv-api/src/types.rs::struct::QueryResult::#[derive(Debug, Clone, Default)] pub struct QueryResult
 crates/krishiv-api/src/types.rs::struct::StreamBatch::#[derive(Debug, Clone)] pub struct StreamBatch
 crates/krishiv-api/src/window.rs::fn::collect::pub fn collect(&self) -> Result<Vec<StreamBatch>>
@@ -727,6 +822,7 @@ crates/krishiv/src/cluster_cmd.rs::struct::ClusterConfig::#[derive(Debug, Clone,
 crates/krishiv/src/daemon_cmd.rs::fn::daemon_help_section::pub fn daemon_help_section() -> String
 crates/krishiv/src/daemon_cmd.rs::fn::daemons_help::pub fn daemons_help() -> String
 crates/krishiv/src/daemon_cmd.rs::fn::help_daemons::pub fn help_daemons() -> CliResponse
+crates/krishiv/src/daemon_cmd.rs::fn::is_daemon_subcommand::#[must_use] pub fn is_daemon_subcommand(sub: &str) -> bool
 crates/krishiv/src/daemon_cmd.rs::fn::try_run_daemon::pub fn try_run_daemon(args: &[String]) -> Option<i32>
 crates/krishiv/src/doctor_cmd.rs::fn::doctor_help::pub fn doctor_help() -> &'static str
 crates/krishiv/src/doctor_cmd.rs::fn::run_doctor::pub fn run_doctor(args: &[&str], coordinator: &CoordinatorMode) -> CliResponse
@@ -745,6 +841,7 @@ crates/krishiv/src/process_util.rs::fn::krishiv_daemon_command::pub fn krishiv_d
 crates/krishiv/src/process_util.rs::fn::krishiv_executable::pub fn krishiv_executable() -> OsString
 crates/krishiv/src/process_util.rs::fn::spawn_krishiv_daemon::pub fn spawn_krishiv_daemon(subcommand: &str, args: &[&str]) -> Result<u32, String>
 crates/krishiv/src/process_util.rs::fn::spawn_krishiv_daemon_with_env::pub fn spawn_krishiv_daemon_with_env(
+crates/krishiv/src/query_cli.rs::enum::OutputFormat::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum OutputFormat
 crates/krishiv/src/query_cli.rs::enum::QueryExecution::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum QueryExecution
 crates/krishiv/src/query_cli.rs::fn::build_session::pub fn build_session(command: &QueryCommand) -> Result<Session, String>
 crates/krishiv/src/query_cli.rs::fn::explain_help::pub fn explain_help() -> String
@@ -752,6 +849,8 @@ crates/krishiv/src/query_cli.rs::fn::parse_query_command::pub fn parse_query_com
 crates/krishiv/src/query_cli.rs::fn::run_explain::pub fn run_explain(command: &QueryCommand) -> CliResponse
 crates/krishiv/src/query_cli.rs::fn::run_sql::pub fn run_sql(command: &QueryCommand) -> CliResponse
 crates/krishiv/src/query_cli.rs::fn::sql_help::pub fn sql_help() -> String
+crates/krishiv/src/query_cli.rs::fn::target_parallelism_from::pub fn target_parallelism_from(
+crates/krishiv/src/query_cli.rs::struct::ParquetTableArg::#[derive(Debug, Clone, PartialEq, Eq)] pub struct ParquetTableArg
 crates/krishiv/src/query_cli.rs::struct::QueryCommand::#[derive(Debug, Clone)] pub struct QueryCommand
 crates/krishiv/src/relation.rs::enum::EmitMode::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub enum EmitMode
 crates/krishiv/src/relation.rs::enum::WindowSpec::#[derive(Debug, Clone, PartialEq, Eq)] pub enum WindowSpec

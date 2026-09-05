@@ -2,7 +2,7 @@
   "items": [
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/analyze.rs#L42",
+      "documentation": "crates/krishiv-sql/src/analyze.rs#L47",
       "id": "crates/krishiv-sql/src/analyze.rs::fn::analyze_batch::pub fn analyze_batch(batch: &RecordBatch) -> ColumnStatistics",
       "kind": "fn",
       "name": "analyze_batch",
@@ -12,7 +12,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/analyze.rs#L115",
+      "documentation": "crates/krishiv-sql/src/analyze.rs#L120",
       "id": "crates/krishiv-sql/src/analyze.rs::fn::analyze_batch_per_column::pub fn analyze_batch_per_column(batch: &RecordBatch) -> Vec<ColumnStatistics>",
       "kind": "fn",
       "name": "analyze_batch_per_column",
@@ -22,7 +22,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/analyze.rs#L52",
+      "documentation": "crates/krishiv-sql/src/analyze.rs#L57",
       "id": "crates/krishiv-sql/src/analyze.rs::fn::analyze_record_batches::pub fn analyze_record_batches<'a, I>(batches: I) -> ColumnStatistics",
       "kind": "fn",
       "name": "analyze_record_batches",
@@ -32,7 +32,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L119",
+      "documentation": "crates/krishiv-sql/src/ann_rewrite.rs#L76",
+      "id": "crates/krishiv-sql/src/ann_rewrite.rs::struct::AnnTopKPrefilter::#[derive(Debug)] pub struct AnnTopKPrefilter",
+      "kind": "struct",
+      "name": "AnnTopKPrefilter",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct AnnTopKPrefilter",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L142",
       "id": "crates/krishiv-sql/src/catalog/glue_catalog.rs::fn::as_rest_catalog::pub fn as_rest_catalog(&self) -> &KrishivRestCatalog",
       "kind": "fn",
       "name": "as_rest_catalog",
@@ -42,7 +52,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L114",
+      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L137",
       "id": "crates/krishiv-sql/src/catalog/glue_catalog.rs::fn::database::pub fn database(&self) -> &str",
       "kind": "fn",
       "name": "database",
@@ -52,7 +62,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L95",
+      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L126",
       "id": "crates/krishiv-sql/src/catalog/glue_catalog.rs::fn::from_env::pub async fn from_env() -> Result<Self, CatalogError>",
       "kind": "fn",
       "name": "from_env",
@@ -62,7 +72,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L68",
+      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L99",
       "id": "crates/krishiv-sql/src/catalog/glue_catalog.rs::fn::new::pub async fn new(",
       "kind": "fn",
       "name": "new",
@@ -72,7 +82,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L109",
+      "documentation": "crates/krishiv-sql/src/catalog/glue_catalog.rs#L132",
       "id": "crates/krishiv-sql/src/catalog/glue_catalog.rs::fn::region::pub fn region(&self) -> &str",
       "kind": "fn",
       "name": "region",
@@ -422,7 +432,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/local_catalog.rs#L95",
+      "documentation": "crates/krishiv-sql/src/catalog/local_catalog.rs#L98",
       "id": "crates/krishiv-sql/src/catalog/local_catalog.rs::fn::warehouse::pub fn warehouse(&self) -> &Path",
       "kind": "fn",
       "name": "warehouse",
@@ -472,7 +482,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L389",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L390",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::equality_selectivity::pub fn equality_selectivity(&self) -> Option<f64>",
       "kind": "fn",
       "name": "equality_selectivity",
@@ -512,7 +522,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L690",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L699",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::invalidate::pub fn invalidate(&self, name: &str)",
       "kind": "fn",
       "name": "invalidate",
@@ -522,7 +532,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L404",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L405",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::is_fresh::pub fn is_fresh(&self, now_secs: u64, max_age_secs: u64) -> bool",
       "kind": "fn",
       "name": "is_fresh",
@@ -542,7 +552,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L442",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L443",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::name::pub fn name(&self) -> &str#2",
       "kind": "fn",
       "name": "name",
@@ -562,7 +572,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L524",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L525",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new() -> Self#2",
       "kind": "fn",
       "name": "new",
@@ -572,7 +582,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L608",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L609",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new() -> Self#3",
       "kind": "fn",
       "name": "new",
@@ -582,7 +592,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L672",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L673",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new(catalog: Arc<RwLock<super::InMemoryCatalog>>) -> Self",
       "kind": "fn",
       "name": "new",
@@ -612,7 +622,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L426",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L427",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::new::pub fn new(name: impl Into<String>, schema: TableSchema) -> Self",
       "kind": "fn",
       "name": "new",
@@ -632,7 +642,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L532",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L533",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::register_table_with_batches::pub fn register_table_with_batches(",
       "kind": "fn",
       "name": "register_table_with_batches",
@@ -642,7 +652,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L447",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L448",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::schema::pub fn schema(&self) -> &TableSchema",
       "kind": "fn",
       "name": "schema",
@@ -652,7 +662,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L452",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L453",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::statistics::pub fn statistics(&self) -> Option<&ColumnStatistics>",
       "kind": "fn",
       "name": "statistics",
@@ -662,7 +672,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L546",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L547",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::table_batches::pub fn table_batches(",
       "kind": "fn",
       "name": "table_batches",
@@ -702,7 +712,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L380",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L381",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_collected_at_secs::pub fn with_collected_at_secs(mut self, secs: u64) -> Self",
       "kind": "fn",
       "name": "with_collected_at_secs",
@@ -762,7 +772,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L436",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L437",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::fn::with_stats::pub fn with_stats(mut self, stats: ColumnStatistics) -> Self",
       "kind": "fn",
       "name": "with_stats",
@@ -792,7 +802,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L657",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L658",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::DataFusionCatalogBridge::pub struct DataFusionCatalogBridge",
       "kind": "struct",
       "name": "DataFusionCatalogBridge",
@@ -802,7 +812,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L516",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L517",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::InMemoryCatalog::pub struct InMemoryCatalog",
       "kind": "struct",
       "name": "InMemoryCatalog",
@@ -812,7 +822,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L602",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L603",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::InMemorySchemaRegistry::#[derive(Debug, Default)] pub struct InMemorySchemaRegistry",
       "kind": "struct",
       "name": "InMemorySchemaRegistry",
@@ -822,7 +832,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L417",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L418",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::struct::TableMetadata::#[derive(Debug, Clone)] pub struct TableMetadata",
       "kind": "struct",
       "name": "TableMetadata",
@@ -842,7 +852,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L478",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L479",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::trait::CatalogProvider::pub trait CatalogProvider",
       "kind": "trait",
       "name": "CatalogProvider",
@@ -852,7 +862,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L592",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L593",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::trait::SchemaRegistry::pub trait SchemaRegistry: Send + Sync",
       "kind": "trait",
       "name": "SchemaRegistry",
@@ -862,7 +872,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L462",
+      "documentation": "crates/krishiv-sql/src/catalog/mod.rs#L463",
       "id": "crates/krishiv-sql/src/catalog/mod.rs::trait::TableProvider::pub trait TableProvider",
       "kind": "trait",
       "name": "TableProvider",
@@ -922,7 +932,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs#L68",
+      "documentation": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs#L73",
       "id": "crates/krishiv-sql/src/catalog/rest_catalog_wrapper.rs::fn::inner::pub fn inner(&self) -> &RestCatalog",
       "kind": "fn",
       "name": "inner",
@@ -962,7 +972,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L107",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L110",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::as_iceberg::pub fn as_iceberg(&self) -> Arc<dyn Catalog + Send + Sync>",
       "kind": "fn",
       "name": "as_iceberg",
@@ -972,7 +982,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L153",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L156",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::create_table::pub async fn create_table(",
       "kind": "fn",
       "name": "create_table",
@@ -982,7 +992,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L192",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L195",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::drop_table::pub async fn drop_table(&self, namespace: &str, table: &str) -> Result<(), CatalogError>",
       "kind": "fn",
       "name": "drop_table",
@@ -992,7 +1002,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L119",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L122",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::list_namespaces::pub async fn list_namespaces(&self) -> Result<Vec<String>, CatalogError>",
       "kind": "fn",
       "name": "list_namespaces",
@@ -1002,7 +1012,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L132",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L135",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::list_tables::pub async fn list_tables(&self, namespace: &str) -> Result<Vec<String>, CatalogError>",
       "kind": "fn",
       "name": "list_tables",
@@ -1012,7 +1022,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L143",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L146",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::load_table::pub async fn load_table(&self, namespace: &str, table: &str) -> Result<Table, CatalogError>",
       "kind": "fn",
       "name": "load_table",
@@ -1022,7 +1032,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L82",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L85",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::local::pub async fn local(warehouse: &Path) -> Result<Self, CatalogError>",
       "kind": "fn",
       "name": "local",
@@ -1042,7 +1052,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L89",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L92",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::postgres::pub async fn postgres(database_url: &str, warehouse: &str) -> Result<Self, CatalogError>",
       "kind": "fn",
       "name": "postgres",
@@ -1052,7 +1062,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L96",
+      "documentation": "crates/krishiv-sql/src/catalog/unified.rs#L99",
       "id": "crates/krishiv-sql/src/catalog/unified.rs::fn::rest::pub async fn rest(",
       "kind": "fn",
       "name": "rest",
@@ -1062,7 +1072,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L101",
+      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L123",
       "id": "crates/krishiv-sql/src/catalog/unity_catalog.rs::fn::as_rest_catalog::pub fn as_rest_catalog(&self) -> &KrishivRestCatalog",
       "kind": "fn",
       "name": "as_rest_catalog",
@@ -1072,7 +1082,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L96",
+      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L118",
       "id": "crates/krishiv-sql/src/catalog/unity_catalog.rs::fn::catalog_name::pub fn catalog_name(&self) -> &str",
       "kind": "fn",
       "name": "catalog_name",
@@ -1082,7 +1092,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L83",
+      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L112",
       "id": "crates/krishiv-sql/src/catalog/unity_catalog.rs::fn::from_env::pub async fn from_env() -> Result<Self, CatalogError>",
       "kind": "fn",
       "name": "from_env",
@@ -1092,7 +1102,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L63",
+      "documentation": "crates/krishiv-sql/src/catalog/unity_catalog.rs#L92",
       "id": "crates/krishiv-sql/src/catalog/unity_catalog.rs::fn::new::pub async fn new(",
       "kind": "fn",
       "name": "new",
@@ -1112,7 +1122,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L138",
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L155",
       "id": "crates/krishiv-sql/src/cep_sql.rs::fn::execute_match_recognize::pub fn execute_match_recognize(",
       "kind": "fn",
       "name": "execute_match_recognize",
@@ -1122,7 +1132,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L279",
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L296",
       "id": "crates/krishiv-sql/src/cep_sql.rs::fn::execute_streaming_match_recognize::pub fn execute_streaming_match_recognize(",
       "kind": "fn",
       "name": "execute_streaming_match_recognize",
@@ -1142,7 +1152,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L103",
+      "documentation": "crates/krishiv-sql/src/cep_sql.rs#L120",
       "id": "crates/krishiv-sql/src/cep_sql.rs::fn::plan_match_recognize::pub fn plan_match_recognize(stmt: MatchRecognizeStatement, query: &str) -> LogicalPlan",
       "kind": "fn",
       "name": "plan_match_recognize",
@@ -1162,7 +1172,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/connector_table.rs#L185",
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L258",
       "id": "crates/krishiv-sql/src/connector_table.rs::fn::bounded::pub fn bounded(connector_kind: &'static str, registry: Arc<ConnectorRegistry>) -> Self",
       "kind": "fn",
       "name": "bounded",
@@ -1172,7 +1182,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/connector_table.rs#L86",
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L128",
       "id": "crates/krishiv-sql/src/connector_table.rs::fn::connector_config_from_ddl::pub fn connector_config_from_ddl(",
       "kind": "fn",
       "name": "connector_config_from_ddl",
@@ -1182,7 +1192,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/connector_table.rs#L55",
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L76",
       "id": "crates/krishiv-sql/src/connector_table.rs::fn::register_connector_table_factories::pub fn register_connector_table_factories(",
       "kind": "fn",
       "name": "register_connector_table_factories",
@@ -1192,7 +1202,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/connector_table.rs#L50",
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L71",
       "id": "crates/krishiv-sql/src/connector_table.rs::fn::shared_connector_registry::pub fn shared_connector_registry() -> Arc<ConnectorRegistry>",
       "kind": "fn",
       "name": "shared_connector_registry",
@@ -1202,7 +1212,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/connector_table.rs#L192",
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L266",
+      "id": "crates/krishiv-sql/src/connector_table.rs::fn::sink_only::pub fn sink_only(connector_kind: &'static str, registry: Arc<ConnectorRegistry>) -> Self",
+      "kind": "fn",
+      "name": "sink_only",
+      "replacement": null,
+      "signature": "pub fn sink_only(connector_kind: &'static str, registry: Arc<ConnectorRegistry>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L275",
       "id": "crates/krishiv-sql/src/connector_table.rs::fn::streaming::pub fn streaming(streaming_sources: Arc<RwLock<HashSet<String>>>) -> Self",
       "kind": "fn",
       "name": "streaming",
@@ -1212,7 +1232,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/connector_table.rs#L170",
+      "documentation": "crates/krishiv-sql/src/connector_table.rs#L238",
       "id": "crates/krishiv-sql/src/connector_table.rs::struct::ConnectorTableFactory::pub struct ConnectorTableFactory",
       "kind": "struct",
       "name": "ConnectorTableFactory",
@@ -1222,7 +1242,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/coop_amplifiers.rs#L37",
+      "documentation": "crates/krishiv-sql/src/coop_amplifiers.rs#L38",
       "id": "crates/krishiv-sql/src/coop_amplifiers.rs::fn::new::pub fn new() -> Self",
       "kind": "fn",
       "name": "new",
@@ -1232,7 +1252,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/coop_amplifiers.rs#L33",
+      "documentation": "crates/krishiv-sql/src/coop_amplifiers.rs#L34",
       "id": "crates/krishiv-sql/src/coop_amplifiers.rs::struct::CooperativeAmplifiers::#[derive(Debug, Default)] pub struct CooperativeAmplifiers",
       "kind": "struct",
       "name": "CooperativeAmplifiers",
@@ -1252,7 +1272,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/coverage.rs#L462",
+      "documentation": "crates/krishiv-sql/src/coverage.rs#L491",
       "id": "crates/krishiv-sql/src/coverage.rs::fn::batch_coverage_pct::pub fn batch_coverage_pct(&self) -> f64",
       "kind": "fn",
       "name": "batch_coverage_pct",
@@ -1262,7 +1282,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/coverage.rs#L471",
+      "documentation": "crates/krishiv-sql/src/coverage.rs#L500",
       "id": "crates/krishiv-sql/src/coverage.rs::fn::coverage_report::pub fn coverage_report() -> CoverageReport",
       "kind": "fn",
       "name": "coverage_report",
@@ -1282,7 +1302,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/coverage.rs#L446",
+      "documentation": "crates/krishiv-sql/src/coverage.rs#L475",
       "id": "crates/krishiv-sql/src/coverage.rs::struct::CoverageReport::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct CoverageReport",
       "kind": "struct",
       "name": "CoverageReport",
@@ -1292,7 +1312,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L71",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L75",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::is_create_function_returns_table::pub fn is_create_function_returns_table(sql: &str) -> bool",
       "kind": "fn",
       "name": "is_create_function_returns_table",
@@ -1302,7 +1322,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L81",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L85",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::parse_create_function::pub fn parse_create_function(sql: &str) -> Result<CreateFunctionDdl, String>",
       "kind": "fn",
       "name": "parse_create_function",
@@ -1312,7 +1332,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L210",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L220",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::try_new::pub fn try_new(",
       "kind": "fn",
       "name": "try_new",
@@ -1322,7 +1342,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L323",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L339",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::fn::try_new::pub fn try_new(#2",
       "kind": "fn",
       "name": "try_new",
@@ -1332,7 +1352,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L192",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L202",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::ClosureTableUdf::#[derive(Clone)] pub struct ClosureTableUdf",
       "kind": "struct",
       "name": "ClosureTableUdf",
@@ -1372,7 +1392,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L304",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L320",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::struct::SqlBodyTableUdf::#[derive(Clone)] pub struct SqlBodyTableUdf",
       "kind": "struct",
       "name": "SqlBodyTableUdf",
@@ -1382,7 +1402,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L189",
+      "documentation": "crates/krishiv-sql/src/create_function_ddl.rs#L199",
       "id": "crates/krishiv-sql/src/create_function_ddl.rs::type::UdtfBodyFn::pub type UdtfBodyFn = Arc<dyn Fn(&[ScalarValue]) -> Result<RecordBatch, UdfError> + Send + Sync>",
       "kind": "type",
       "name": "UdtfBodyFn",
@@ -1392,7 +1412,37 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L800",
+      "documentation": "crates/krishiv-sql/src/cte_materialize.rs#L169",
+      "id": "crates/krishiv-sql/src/cte_materialize.rs::fn::cte_materialize_enabled::pub fn cte_materialize_enabled() -> bool",
+      "kind": "fn",
+      "name": "cte_materialize_enabled",
+      "replacement": null,
+      "signature": "pub fn cte_materialize_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cte_materialize.rs#L185",
+      "id": "crates/krishiv-sql/src/cte_materialize.rs::fn::materialize_repeated_ctes::pub async fn materialize_repeated_ctes(",
+      "kind": "fn",
+      "name": "materialize_repeated_ctes",
+      "replacement": null,
+      "signature": "pub async fn materialize_repeated_ctes(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/cte_materialize.rs#L200",
+      "id": "crates/krishiv-sql/src/cte_materialize.rs::fn::materialize_repeated_ctes_forced::pub async fn materialize_repeated_ctes_forced(",
+      "kind": "fn",
+      "name": "materialize_repeated_ctes_forced",
+      "replacement": null,
+      "signature": "pub async fn materialize_repeated_ctes_forced(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2295",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::build_distributed_stages::pub fn build_distributed_stages(",
       "kind": "fn",
       "name": "build_distributed_stages",
@@ -1402,7 +1452,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L480",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2303",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::build_distributed_stages_with_udf_directives::pub fn build_distributed_stages_with_udf_directives(",
+      "kind": "fn",
+      "name": "build_distributed_stages_with_udf_directives",
+      "replacement": null,
+      "signature": "pub fn build_distributed_stages_with_udf_directives(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1184",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::build_stages_for_parquet_query::pub async fn build_stages_for_parquet_query(",
       "kind": "fn",
       "name": "build_stages_for_parquet_query",
@@ -1412,7 +1472,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L686",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1201",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::build_stages_for_parquet_tables::pub async fn build_stages_for_parquet_tables(",
+      "kind": "fn",
+      "name": "build_stages_for_parquet_tables",
+      "replacement": null,
+      "signature": "pub async fn build_stages_for_parquet_tables(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2069",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::coordinator::pub fn coordinator() -> Self",
       "kind": "fn",
       "name": "coordinator",
@@ -1422,7 +1492,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L290",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L680",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::decode_dfplan_task::pub fn decode_dfplan_task(",
       "kind": "fn",
       "name": "decode_dfplan_task",
@@ -1432,7 +1502,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L446",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L151",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::derive_stage_target_partitions::#[must_use] pub fn derive_stage_target_partitions(",
+      "kind": "fn",
+      "name": "derive_stage_target_partitions",
+      "replacement": null,
+      "signature": "#[must_use] pub fn derive_stage_target_partitions(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L887",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::dfplan_body_is_split_safe::pub fn dfplan_body_is_split_safe(body: &str) -> bool",
       "kind": "fn",
       "name": "dfplan_body_is_split_safe",
@@ -1442,7 +1522,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L268",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L509",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::dfplan_body_partition_spec::pub fn dfplan_body_partition_spec(body: &str) -> SqlResult<DfplanTaskSpec>",
       "kind": "fn",
       "name": "dfplan_body_partition_spec",
@@ -1452,7 +1532,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L193",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L401",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::dfplan_body_with_spec::pub fn dfplan_body_with_spec(body: &str, spec: &DfplanTaskSpec) -> SqlResult<String>",
       "kind": "fn",
       "name": "dfplan_body_with_spec",
@@ -1462,7 +1542,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L181",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L389",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::dfplan_task_body::pub fn dfplan_task_body(plan_bytes_b64: &str, partition: usize) -> String",
       "kind": "fn",
       "name": "dfplan_task_body",
@@ -1472,7 +1552,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L186",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L394",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::dfplan_task_body_for_spec::pub fn dfplan_task_body_for_spec(plan_bytes_b64: &str, spec: &DfplanTaskSpec) -> String",
       "kind": "fn",
       "name": "dfplan_task_body_for_spec",
@@ -1482,7 +1562,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L121",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L329",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::encode_dfplan_bytes::pub fn encode_dfplan_bytes(",
       "kind": "fn",
       "name": "encode_dfplan_bytes",
@@ -1492,7 +1572,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L356",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1775",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::estimate_of::pub fn estimate_of(plan: &Arc<dyn ExecutionPlan>) -> (Option<usize>, Option<usize>)",
+      "kind": "fn",
+      "name": "estimate_of",
+      "replacement": null,
+      "signature": "pub fn estimate_of(plan: &Arc<dyn ExecutionPlan>) -> (Option<usize>, Option<usize>)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L793",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::execute_dfplan_body::pub fn execute_dfplan_body(",
       "kind": "fn",
       "name": "execute_dfplan_body",
@@ -1502,7 +1592,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L689",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2072",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::executor::pub fn executor(reader: Arc<dyn ShufflePartitionReader>) -> Self",
       "kind": "fn",
       "name": "executor",
@@ -1512,7 +1602,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L344",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L668",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::fragment_decode_session_context::#[must_use] pub fn fragment_decode_session_context() -> SessionContext",
+      "kind": "fn",
+      "name": "fragment_decode_session_context",
+      "replacement": null,
+      "signature": "#[must_use] pub fn fragment_decode_session_context() -> SessionContext",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L738",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::is_dfplan_body::pub fn is_dfplan_body(body: &str) -> bool",
       "kind": "fn",
       "name": "is_dfplan_body",
@@ -1522,7 +1622,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L545",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1726",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::new::pub fn new(",
       "kind": "fn",
       "name": "new",
@@ -1532,7 +1632,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L570",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L994",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::new::pub fn new(name: impl Into<String>, path: impl Into<String>) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(name: impl Into<String>, path: impl Into<String>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1806",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::num_map_tasks::pub fn num_map_tasks(&self) -> usize",
       "kind": "fn",
       "name": "num_map_tasks",
@@ -1542,7 +1652,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L274",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L515",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::parse_dfplan_body::pub fn parse_dfplan_body(body: &str) -> SqlResult<(DfplanTaskSpec, Vec<u8>)>",
       "kind": "fn",
       "name": "parse_dfplan_body",
@@ -1552,7 +1662,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L574",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1810",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::partition_count::pub fn partition_count(&self) -> usize",
       "kind": "fn",
       "name": "partition_count",
@@ -1562,7 +1672,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L98",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L188",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::planning_session_context::pub fn planning_session_context(target_partitions: usize) -> SessionContext",
       "kind": "fn",
       "name": "planning_session_context",
@@ -1572,7 +1682,67 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L114",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L200",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::planning_session_context_with_join_threshold::pub fn planning_session_context_with_join_threshold(",
+      "kind": "fn",
+      "name": "planning_session_context_with_join_threshold",
+      "replacement": null,
+      "signature": "pub fn planning_session_context_with_join_threshold(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L220",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::planning_session_context_with_options::pub fn planning_session_context_with_options(",
+      "kind": "fn",
+      "name": "planning_session_context_with_options",
+      "replacement": null,
+      "signature": "pub fn planning_session_context_with_options(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L3294",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::redistribute_unsplittable_broadcast_joins::pub fn redistribute_unsplittable_broadcast_joins(",
+      "kind": "fn",
+      "name": "redistribute_unsplittable_broadcast_joins",
+      "replacement": null,
+      "signature": "pub fn redistribute_unsplittable_broadcast_joins(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1094",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::register_parquet_table::pub async fn register_parquet_table(",
+      "kind": "fn",
+      "name": "register_parquet_table",
+      "replacement": null,
+      "signature": "pub async fn register_parquet_table(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1458",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::register_python_udf_signatures_and_strip::pub fn register_python_udf_signatures_and_strip(",
+      "kind": "fn",
+      "name": "register_python_udf_signatures_and_strip",
+      "replacement": null,
+      "signature": "pub fn register_python_udf_signatures_and_strip(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L135",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::resolve_stage_target_partitions::#[must_use] pub fn resolve_stage_target_partitions(cluster: Option<ClusterCapacity>) -> usize",
+      "kind": "fn",
+      "name": "resolve_stage_target_partitions",
+      "replacement": null,
+      "signature": "#[must_use] pub fn resolve_stage_target_partitions(cluster: Option<ClusterCapacity>) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L322",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::shuffle_stage_key::pub fn shuffle_stage_key(stage_index: usize, map_task_index: usize) -> String",
       "kind": "fn",
       "name": "shuffle_stage_key",
@@ -1582,7 +1752,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L155",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L363",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::single::pub fn single(partition: usize) -> Self",
       "kind": "fn",
       "name": "single",
@@ -1592,7 +1762,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L80",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L3763",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::stage_reuse_enabled::pub fn stage_reuse_enabled() -> bool",
+      "kind": "fn",
+      "name": "stage_reuse_enabled",
+      "replacement": null,
+      "signature": "pub fn stage_reuse_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L170",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::stage_split_enabled::pub fn stage_split_enabled() -> bool",
       "kind": "fn",
       "name": "stage_split_enabled",
@@ -1602,17 +1782,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L71",
-      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::stage_target_partitions_from_env::pub fn stage_target_partitions_from_env() -> usize",
-      "kind": "fn",
-      "name": "stage_target_partitions_from_env",
-      "replacement": null,
-      "signature": "pub fn stage_target_partitions_from_env() -> usize",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L775",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2224",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::task_count::pub fn task_count(&self) -> usize",
       "kind": "fn",
       "name": "task_count",
@@ -1622,7 +1792,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L566",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1759",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::upstream_estimate::pub fn upstream_estimate(&self) -> (Option<usize>, Option<usize>)",
+      "kind": "fn",
+      "name": "upstream_estimate",
+      "replacement": null,
+      "signature": "pub fn upstream_estimate(&self) -> (Option<usize>, Option<usize>)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1783",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::upstream_stage_index::pub fn upstream_stage_index(&self) -> usize",
       "kind": "fn",
       "name": "upstream_stage_index",
@@ -1632,7 +1812,37 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L134",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1004",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::with_primary_key::pub fn with_primary_key<I, S>(mut self, columns: I) -> Self",
+      "kind": "fn",
+      "name": "with_primary_key",
+      "replacement": null,
+      "signature": "pub fn with_primary_key<I, S>(mut self, columns: I) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1752",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::fn::with_upstream_estimate::pub fn with_upstream_estimate(mut self, rows: Option<usize>, bytes: Option<usize>) -> Self",
+      "kind": "fn",
+      "name": "with_upstream_estimate",
+      "replacement": null,
+      "signature": "pub fn with_upstream_estimate(mut self, rows: Option<usize>, bytes: Option<usize>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L113",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::ClusterCapacity::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct ClusterCapacity",
+      "kind": "struct",
+      "name": "ClusterCapacity",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub struct ClusterCapacity",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L342",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::DfplanMapRange::#[derive(Debug, Clone, PartialEq, Eq)] pub struct DfplanMapRange",
       "kind": "struct",
       "name": "DfplanMapRange",
@@ -1642,7 +1852,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L145",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L353",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::DfplanTaskSpec::#[derive(Debug, Clone, PartialEq, Eq)] pub struct DfplanTaskSpec",
       "kind": "struct",
       "name": "DfplanTaskSpec",
@@ -1652,7 +1862,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L763",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2212",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::DistributedStage::#[derive(Debug, Clone)] pub struct DistributedStage",
       "kind": "struct",
       "name": "DistributedStage",
@@ -1662,7 +1872,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L781",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2230",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::DistributedStagePlan::#[derive(Debug, Clone)] pub struct DistributedStagePlan",
       "kind": "struct",
       "name": "DistributedStagePlan",
@@ -1672,7 +1882,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L680",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2063",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::KrishivPhysicalCodec::#[derive(Debug, Default)] pub struct KrishivPhysicalCodec",
       "kind": "struct",
       "name": "KrishivPhysicalCodec",
@@ -1682,7 +1892,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L535",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L982",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::ParquetTableSpec::#[derive(Debug, Clone)] pub struct ParquetTableSpec",
+      "kind": "struct",
+      "name": "ParquetTableSpec",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct ParquetTableSpec",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1699",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::ShuffleReadExec::#[derive(Debug)] pub struct ShuffleReadExec",
       "kind": "struct",
       "name": "ShuffleReadExec",
@@ -1692,7 +1912,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L754",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L2203",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::struct::StageShuffleOutput::#[derive(Debug, Clone)] pub struct StageShuffleOutput",
       "kind": "struct",
       "name": "StageShuffleOutput",
@@ -1702,12 +1922,92 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L515",
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1519",
       "id": "crates/krishiv-sql/src/distributed_plan.rs::trait::ShufflePartitionReader::pub trait ShufflePartitionReader: fmt::Debug + Send + Sync",
       "kind": "trait",
       "name": "ShufflePartitionReader",
       "replacement": null,
       "signature": "pub trait ShufflePartitionReader: fmt::Debug + Send + Sync",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/distributed_plan.rs#L1548",
+      "id": "crates/krishiv-sql/src/distributed_plan.rs::type::ShuffleFragmentStream::pub type ShuffleFragmentStream =",
+      "kind": "type",
+      "name": "ShuffleFragmentStream",
+      "replacement": null,
+      "signature": "pub type ShuffleFragmentStream =",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L136",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::fn::bucket_count::#[must_use] pub fn bucket_count(build_bytes: u64, budget: u64) -> usize",
+      "kind": "fn",
+      "name": "bucket_count",
+      "replacement": null,
+      "signature": "#[must_use] pub fn bucket_count(build_bytes: u64, budget: u64) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L221",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::fn::buckets::pub fn buckets(&self) -> usize",
+      "kind": "fn",
+      "name": "buckets",
+      "replacement": null,
+      "signature": "pub fn buckets(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L227",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::fn::build_budget::pub fn build_budget(&self) -> usize",
+      "kind": "fn",
+      "name": "build_budget",
+      "replacement": null,
+      "signature": "pub fn build_budget(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L123",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::fn::enabled::#[must_use] pub fn enabled() -> bool",
+      "kind": "fn",
+      "name": "enabled",
+      "replacement": null,
+      "signature": "#[must_use] pub fn enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L215",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::fn::template::pub fn template(&self) -> &Arc<HashJoinExec>",
+      "kind": "fn",
+      "name": "template",
+      "replacement": null,
+      "signature": "pub fn template(&self) -> &Arc<HashJoinExec>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L187",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::fn::try_new::pub fn try_new(",
+      "kind": "fn",
+      "name": "try_new",
+      "replacement": null,
+      "signature": "pub fn try_new(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/grace_hash_join.rs#L154",
+      "id": "crates/krishiv-sql/src/grace_hash_join.rs::struct::GraceHashJoinExec::#[derive(Debug)] pub struct GraceHashJoinExec",
+      "kind": "struct",
+      "name": "GraceHashJoinExec",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct GraceHashJoinExec",
       "stability": "preview"
     },
     {
@@ -1862,7 +2162,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L103",
+      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L111",
       "id": "crates/krishiv-sql/src/higher_order_functions.rs::fn::new::pub fn new() -> Self",
       "kind": "fn",
       "name": "new",
@@ -1872,7 +2172,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L58",
+      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L321",
+      "id": "crates/krishiv-sql/src/higher_order_functions.rs::fn::new::pub fn new() -> Self#2",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L66",
       "id": "crates/krishiv-sql/src/higher_order_functions.rs::fn::register_higher_order_spark_functions::pub fn register_higher_order_spark_functions(ctx: &SessionContext) -> DFResult<()>",
       "kind": "fn",
       "name": "register_higher_order_spark_functions",
@@ -1882,7 +2192,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L90",
+      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L308",
       "id": "crates/krishiv-sql/src/higher_order_functions.rs::struct::ArrayAllMatch::#[derive(Debug, PartialEq, Eq, Hash)] pub struct ArrayAllMatch",
       "kind": "struct",
       "name": "ArrayAllMatch",
@@ -1892,17 +2202,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L275",
-      "id": "crates/krishiv-sql/src/incremental_view.rs::enum::IncrementalViewResult::pub enum IncrementalViewResult",
-      "kind": "enum",
-      "name": "IncrementalViewResult",
+      "documentation": "crates/krishiv-sql/src/higher_order_functions.rs#L98",
+      "id": "crates/krishiv-sql/src/higher_order_functions.rs::struct::ArrayReduce::#[derive(Debug, PartialEq, Eq, Hash)] pub struct ArrayReduce",
+      "kind": "struct",
+      "name": "ArrayReduce",
       "replacement": null,
-      "signature": "pub enum IncrementalViewResult",
+      "signature": "#[derive(Debug, PartialEq, Eq, Hash)] pub struct ArrayReduce",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L46",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L312",
+      "id": "crates/krishiv-sql/src/incremental_view.rs::enum::IncrementalViewResult::#[derive(Debug, Clone, PartialEq, Eq)] pub enum IncrementalViewResult",
+      "kind": "enum",
+      "name": "IncrementalViewResult",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub enum IncrementalViewResult",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L75",
       "id": "crates/krishiv-sql/src/incremental_view.rs::enum::IncrementalViewStatement::#[derive(Debug, Clone, PartialEq, Eq)] pub enum IncrementalViewStatement",
       "kind": "enum",
       "name": "IncrementalViewStatement",
@@ -1912,7 +2232,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L113",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L148",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::contains::pub fn contains(&self, name: &str) -> bool",
       "kind": "fn",
       "name": "contains",
@@ -1922,7 +2242,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L285",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L331",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::execute_incremental_view_ddl::pub fn execute_incremental_view_ddl(",
       "kind": "fn",
       "name": "execute_incremental_view_ddl",
@@ -1932,7 +2252,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L106",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L141",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::get::pub fn get(&self, name: &str) -> SqlResult<Option<IncrementalViewEntry>>",
       "kind": "fn",
       "name": "get",
@@ -1942,7 +2262,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L88",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L123",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::new::pub fn new() -> Self",
       "kind": "fn",
       "name": "new",
@@ -1952,7 +2272,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L134",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L162",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::parse_incremental_view_statement::pub fn parse_incremental_view_statement(sql: &str) -> SqlResult<Option<IncrementalViewStatement>>",
       "kind": "fn",
       "name": "parse_incremental_view_statement",
@@ -1962,7 +2282,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L91",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L126",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::register::pub fn register(&self, name: impl Into<String>, entry: IncrementalViewEntry) -> SqlResult<()>",
       "kind": "fn",
       "name": "register",
@@ -1972,7 +2292,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L99",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L134",
       "id": "crates/krishiv-sql/src/incremental_view.rs::fn::remove::pub fn remove(&self, name: &str) -> SqlResult<bool>",
       "kind": "fn",
       "name": "remove",
@@ -1982,17 +2302,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L120",
-      "id": "crates/krishiv-sql/src/incremental_view.rs::fn::view_names::pub fn view_names(&self) -> SqlResult<Vec<String>>",
-      "kind": "fn",
-      "name": "view_names",
-      "replacement": null,
-      "signature": "pub fn view_names(&self) -> SqlResult<Vec<String>>",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L69",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L104",
       "id": "crates/krishiv-sql/src/incremental_view.rs::struct::IncrementalViewEntry::#[derive(Debug, Clone)] pub struct IncrementalViewEntry",
       "kind": "struct",
       "name": "IncrementalViewEntry",
@@ -2002,7 +2312,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L82",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L117",
       "id": "crates/krishiv-sql/src/incremental_view.rs::struct::IncrementalViewRegistry::#[derive(Debug, Default)] pub struct IncrementalViewRegistry",
       "kind": "struct",
       "name": "IncrementalViewRegistry",
@@ -2012,7 +2322,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L37",
+      "documentation": "crates/krishiv-sql/src/incremental_view.rs#L66",
       "id": "crates/krishiv-sql/src/incremental_view.rs::struct::LatenessAnnotation::#[derive(Debug, Clone, PartialEq, Eq)] pub struct LatenessAnnotation",
       "kind": "struct",
       "name": "LatenessAnnotation",
@@ -2042,7 +2352,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L116",
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L141",
+      "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::describe_schema::pub fn describe_schema(schema: &Schema) -> SqlResult<RecordBatch>",
+      "kind": "fn",
+      "name": "describe_schema",
+      "replacement": null,
+      "signature": "pub fn describe_schema(schema: &Schema) -> SqlResult<RecordBatch>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L127",
       "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::describe_table::pub async fn describe_table(context: &SessionContext, table: &str) -> SqlResult<RecordBatch>",
       "kind": "fn",
       "name": "describe_table",
@@ -2052,7 +2372,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L158",
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L176",
       "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::explain_query::pub fn explain_query(query: &str, mode: ExplainSqlMode) -> SqlResult<String>",
       "kind": "fn",
       "name": "explain_query",
@@ -2062,7 +2382,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L176",
+      "documentation": "crates/krishiv-sql/src/introspection_sql.rs#L194",
       "id": "crates/krishiv-sql/src/introspection_sql.rs::fn::explain_result_batch::pub fn explain_result_batch(text: &str) -> SqlResult<RecordBatch>",
       "kind": "fn",
       "name": "explain_result_batch",
@@ -2082,6 +2402,56 @@
     },
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/join_reorder.rs#L175",
+      "id": "crates/krishiv-sql/src/join_reorder.rs::fn::forced::pub fn forced(row_counts: TableRowCounts) -> Self",
+      "kind": "fn",
+      "name": "forced",
+      "replacement": null,
+      "signature": "pub fn forced(row_counts: TableRowCounts) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/join_reorder.rs#L142",
+      "id": "crates/krishiv-sql/src/join_reorder.rs::fn::join_reorder_enabled::pub fn join_reorder_enabled() -> bool",
+      "kind": "fn",
+      "name": "join_reorder_enabled",
+      "replacement": null,
+      "signature": "pub fn join_reorder_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/join_reorder.rs#L166",
+      "id": "crates/krishiv-sql/src/join_reorder.rs::fn::new::pub fn new(row_counts: TableRowCounts) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(row_counts: TableRowCounts) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/join_reorder.rs#L154",
+      "id": "crates/krishiv-sql/src/join_reorder.rs::struct::JoinReorder::#[derive(Debug)] pub struct JoinReorder",
+      "kind": "struct",
+      "name": "JoinReorder",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct JoinReorder",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/join_reorder.rs#L83",
+      "id": "crates/krishiv-sql/src/join_reorder.rs::type::TableRowCounts::pub type TableRowCounts = Arc<std::sync::RwLock<HashMap<String, u64>>>",
+      "kind": "type",
+      "name": "TableRowCounts",
+      "replacement": null,
+      "signature": "pub type TableRowCounts = Arc<std::sync::RwLock<HashMap<String, u64>>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-sql/src/json_functions.rs#L25",
       "id": "crates/krishiv-sql/src/json_functions.rs::fn::register_json_functions::pub fn register_json_functions(ctx: &SessionContext) -> Result<(), DataFusionError>",
       "kind": "fn",
@@ -2092,7 +2462,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/kafka_table.rs#L154",
+      "documentation": "crates/krishiv-sql/src/kafka_table.rs#L260",
       "id": "crates/krishiv-sql/src/kafka_table.rs::fn::create_kafka_streaming_table::pub fn create_kafka_streaming_table(",
       "kind": "fn",
       "name": "create_kafka_streaming_table",
@@ -2102,7 +2472,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/kafka_table.rs#L39",
+      "documentation": "crates/krishiv-sql/src/kafka_table.rs#L48",
       "id": "crates/krishiv-sql/src/kafka_table.rs::fn::new::pub fn new(schema: SchemaRef, source: KafkaSource) -> Self",
       "kind": "fn",
       "name": "new",
@@ -2112,7 +2482,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/as_of.rs#L18",
+      "documentation": "crates/krishiv-sql/src/lakehouse/as_of.rs#L54",
       "id": "crates/krishiv-sql/src/lakehouse/as_of.rs::fn::preprocess_as_of_sql::pub fn preprocess_as_of_sql(sql: &str) -> Result<(String, Vec<AsOfTableRef>), String>",
       "kind": "fn",
       "name": "preprocess_as_of_sql",
@@ -2122,7 +2492,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/as_of.rs#L11",
+      "documentation": "crates/krishiv-sql/src/lakehouse/as_of.rs#L18",
       "id": "crates/krishiv-sql/src/lakehouse/as_of.rs::struct::AsOfTableRef::#[derive(Debug, Clone, PartialEq, Eq)] pub struct AsOfTableRef",
       "kind": "struct",
       "name": "AsOfTableRef",
@@ -2132,7 +2502,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L47",
+      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L57",
       "id": "crates/krishiv-sql/src/lakehouse/merge.rs::fn::execute_merge_sql::pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec<RecordBatch>>",
       "kind": "fn",
       "name": "execute_merge_sql",
@@ -2142,7 +2512,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L32",
+      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L42",
       "id": "crates/krishiv-sql/src/lakehouse/merge.rs::struct::MergeResult::#[derive(Debug, Clone, Default, PartialEq, Eq)] pub struct MergeResult",
       "kind": "struct",
       "name": "MergeResult",
@@ -2152,7 +2522,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L40",
+      "documentation": "crates/krishiv-sql/src/lakehouse/merge.rs#L50",
       "id": "crates/krishiv-sql/src/lakehouse/merge.rs::struct::MergeTargetUnsupportedError::#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] #[error(\"MERGE INTO is only supported for delta: and iceberg: targets (got {target})\")] pub struct MergeTargetUnsupportedError",
       "kind": "struct",
       "name": "MergeTargetUnsupportedError",
@@ -2162,7 +2532,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L176",
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L313",
       "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::apply_as_of_refs::pub async fn apply_as_of_refs(",
       "kind": "fn",
       "name": "apply_as_of_refs",
@@ -2192,7 +2562,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L154",
+      "documentation": "crates/krishiv-sql/src/lakehouse/providers.rs#L270",
       "id": "crates/krishiv-sql/src/lakehouse/providers.rs::fn::register_scan_batches::pub async fn register_scan_batches(",
       "kind": "fn",
       "name": "register_scan_batches",
@@ -2202,7 +2572,47 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3030",
+      "documentation": "crates/krishiv-sql/src/late_materialize.rs#L217",
+      "id": "crates/krishiv-sql/src/late_materialize.rs::fn::forced::pub fn forced() -> Self",
+      "kind": "fn",
+      "name": "forced",
+      "replacement": null,
+      "signature": "pub fn forced() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/late_materialize.rs#L185",
+      "id": "crates/krishiv-sql/src/late_materialize.rs::fn::late_materialization_enabled::pub fn late_materialization_enabled() -> bool",
+      "kind": "fn",
+      "name": "late_materialization_enabled",
+      "replacement": null,
+      "signature": "pub fn late_materialization_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/late_materialize.rs#L203",
+      "id": "crates/krishiv-sql/src/late_materialize.rs::struct::LateMaterializeTopKAggregate::#[derive(Debug, Default)] pub struct LateMaterializeTopKAggregate",
+      "kind": "struct",
+      "name": "LateMaterializeTopKAggregate",
+      "replacement": null,
+      "signature": "#[derive(Debug, Default)] pub struct LateMaterializeTopKAggregate",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L625",
+      "id": "crates/krishiv-sql/src/lib.rs::enum::EngineMemory::#[derive(Clone)] pub enum EngineMemory",
+      "kind": "enum",
+      "name": "EngineMemory",
+      "replacement": null,
+      "signature": "#[derive(Clone)] pub enum EngineMemory",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4536",
       "id": "crates/krishiv-sql/src/lib.rs::enum::GroupingMode::pub enum GroupingMode<'a>",
       "kind": "enum",
       "name": "GroupingMode",
@@ -2212,7 +2622,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L241",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L312",
       "id": "crates/krishiv-sql/src/lib.rs::enum::SqlError::#[non_exhaustive] #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] pub enum SqlError",
       "kind": "enum",
       "name": "SqlError",
@@ -2222,7 +2632,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3499",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5029",
       "id": "crates/krishiv-sql/src/lib.rs::fn::arrow_schema::pub fn arrow_schema(&self) -> arrow::datatypes::SchemaRef",
       "kind": "fn",
       "name": "arrow_schema",
@@ -2232,7 +2642,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L409",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L762",
       "id": "crates/krishiv-sql/src/lib.rs::fn::batch_size_from_env::pub fn batch_size_from_env() -> usize",
       "kind": "fn",
       "name": "batch_size_from_env",
@@ -2242,7 +2652,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2962",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4452",
       "id": "crates/krishiv-sql/src/lib.rs::fn::cancel::pub fn cancel(&self, operation_id: u64)",
       "kind": "fn",
       "name": "cancel",
@@ -2252,7 +2662,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3002",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4492",
       "id": "crates/krishiv-sql/src/lib.rs::fn::cancelled_ids::pub fn cancelled_ids(&self) -> Vec<u64>",
       "kind": "fn",
       "name": "cancelled_ids",
@@ -2262,7 +2672,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1550",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2336",
       "id": "crates/krishiv-sql/src/lib.rs::fn::clear_plan_cache::pub fn clear_plan_cache(&self)",
       "kind": "fn",
       "name": "clear_plan_cache",
@@ -2272,7 +2682,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3580",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5134",
       "id": "crates/krishiv-sql/src/lib.rs::fn::collect::pub fn collect(",
       "kind": "fn",
       "name": "collect",
@@ -2282,7 +2692,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3617",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5196",
       "id": "crates/krishiv-sql/src/lib.rs::fn::collect_with_stats::pub fn collect_with_stats(",
       "kind": "fn",
       "name": "collect_with_stats",
@@ -2292,7 +2702,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L420",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L773",
       "id": "crates/krishiv-sql/src/lib.rs::fn::default_parallelism_from_env::pub fn default_parallelism_from_env() -> NonZeroUsize",
       "kind": "fn",
       "name": "default_parallelism_from_env",
@@ -2302,7 +2712,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1267",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2004",
       "id": "crates/krishiv-sql/src/lib.rs::fn::deregister_streaming_source::pub fn deregister_streaming_source(&self, name: &str) -> SqlResult<()>",
       "kind": "fn",
       "name": "deregister_streaming_source",
@@ -2312,7 +2722,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1316",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2063",
       "id": "crates/krishiv-sql/src/lib.rs::fn::deregister_table::pub fn deregister_table(&self, name: &str) -> SqlResult<()>",
       "kind": "fn",
       "name": "deregister_table",
@@ -2322,7 +2732,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3592",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5146",
       "id": "crates/krishiv-sql/src/lib.rs::fn::execute_stream::pub fn execute_stream(",
       "kind": "fn",
       "name": "execute_stream",
@@ -2332,7 +2742,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3674",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5171",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::execute_stream_with_schema::pub fn execute_stream_with_schema(",
+      "kind": "fn",
+      "name": "execute_stream_with_schema",
+      "replacement": null,
+      "signature": "pub fn execute_stream_with_schema(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5247",
       "id": "crates/krishiv-sql/src/lib.rs::fn::execute_stream_with_stats::pub fn execute_stream_with_stats(",
       "kind": "fn",
       "name": "execute_stream_with_stats",
@@ -2342,7 +2762,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2444",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3649",
       "id": "crates/krishiv-sql/src/lib.rs::fn::execute_with_operation_id::pub async fn execute_with_operation_id(",
       "kind": "fn",
       "name": "execute_with_operation_id",
@@ -2352,7 +2772,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2427",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L3632",
       "id": "crates/krishiv-sql/src/lib.rs::fn::execute_with_timeout::pub async fn execute_with_timeout(",
       "kind": "fn",
       "name": "execute_with_timeout",
@@ -2362,7 +2782,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3566",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5096",
       "id": "crates/krishiv-sql/src/lib.rs::fn::explain::pub async fn explain(&self) -> SqlResult<String>",
       "kind": "fn",
       "name": "explain",
@@ -2372,7 +2792,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3561",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5120",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::explain_analyze::pub async fn explain_analyze(&self) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "explain_analyze",
+      "replacement": null,
+      "signature": "pub async fn explain_analyze(&self) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5091",
       "id": "crates/krishiv-sql/src/lib.rs::fn::explain_logical::pub fn explain_logical(&self) -> String",
       "kind": "fn",
       "name": "explain_logical",
@@ -2382,7 +2812,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L5112",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L6754",
       "id": "crates/krishiv-sql/src/lib.rs::fn::explain_sql::pub fn explain_sql(query: impl Into<String>) -> SqlResult<String>",
       "kind": "fn",
       "name": "explain_sql",
@@ -2392,7 +2822,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L5121",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L6763",
       "id": "crates/krishiv-sql/src/lib.rs::fn::explain_sql_optimized::pub fn explain_sql_optimized(query: impl Into<String>, optimizer: &Optimizer) -> SqlResult<String>",
       "kind": "fn",
       "name": "explain_sql_optimized",
@@ -2402,7 +2832,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L5132",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L6774",
       "id": "crates/krishiv-sql/src/lib.rs::fn::explain_sql_with_cost::pub fn explain_sql_with_cost(",
       "kind": "fn",
       "name": "explain_sql_with_cost",
@@ -2412,7 +2842,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1299",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L675",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::for_this_process::pub fn for_this_process() -> Self",
+      "kind": "fn",
+      "name": "for_this_process",
+      "replacement": null,
+      "signature": "pub fn for_this_process() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L649",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::from_limit::pub fn from_limit(bytes: Option<usize>) -> Self",
+      "kind": "fn",
+      "name": "from_limit",
+      "replacement": null,
+      "signature": "pub fn from_limit(bytes: Option<usize>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2031",
       "id": "crates/krishiv-sql/src/lib.rs::fn::incremental_view_registry::pub fn incremental_view_registry(&self) -> &Arc<incremental_view::IncrementalViewRegistry>",
       "kind": "fn",
       "name": "incremental_view_registry",
@@ -2422,7 +2872,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2969",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4459",
       "id": "crates/krishiv-sql/src/lib.rs::fn::is_cancelled::pub fn is_cancelled(&self, operation_id: u64) -> bool",
       "kind": "fn",
       "name": "is_cancelled",
@@ -2432,7 +2882,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1378",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2142",
       "id": "crates/krishiv-sql/src/lib.rs::fn::is_streaming_query::pub fn is_streaming_query(&self, sql: &str) -> SqlResult<bool>",
       "kind": "fn",
       "name": "is_streaming_query",
@@ -2442,7 +2892,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1233",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1970",
       "id": "crates/krishiv-sql/src/lib.rs::fn::is_streaming_source::pub fn is_streaming_source(&self, table_name: &str) -> bool",
       "kind": "fn",
       "name": "is_streaming_source",
@@ -2452,7 +2902,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1416",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2180",
       "id": "crates/krishiv-sql/src/lib.rs::fn::krishiv_catalog::pub fn krishiv_catalog(&self) -> Option<&Arc<RwLock<InMemoryCatalog>>>",
       "kind": "fn",
       "name": "krishiv_catalog",
@@ -2462,7 +2912,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3527",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5057",
       "id": "crates/krishiv-sql/src/lib.rs::fn::krishiv_logical_plan::pub fn krishiv_logical_plan(&self) -> LogicalPlan",
       "kind": "fn",
       "name": "krishiv_logical_plan",
@@ -2472,17 +2922,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1294",
-      "id": "crates/krishiv-sql/src/lib.rs::fn::live_table_registry::pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry>",
-      "kind": "fn",
-      "name": "live_table_registry",
-      "replacement": null,
-      "signature": "pub fn live_table_registry(&self) -> &Arc<live_table::LiveTableRegistry>",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L295",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L366",
       "id": "crates/krishiv-sql/src/lib.rs::fn::logical_plan::pub fn logical_plan(&self) -> &LogicalPlan",
       "kind": "fn",
       "name": "logical_plan",
@@ -2492,7 +2932,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L726",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1419",
       "id": "crates/krishiv-sql/src/lib.rs::fn::memory_limit_bytes::pub fn memory_limit_bytes(&self) -> Option<usize>",
       "kind": "fn",
       "name": "memory_limit_bytes",
@@ -2502,7 +2942,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L605",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1280",
       "id": "crates/krishiv-sql/src/lib.rs::fn::new::pub fn new() -> Self",
       "kind": "fn",
       "name": "new",
@@ -2512,7 +2952,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2955",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4445",
       "id": "crates/krishiv-sql/src/lib.rs::fn::new::pub fn new() -> Self#2",
       "kind": "fn",
       "name": "new",
@@ -2522,7 +2962,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L620",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1308",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::new_with_engine_memory::pub fn new_with_engine_memory(engine_memory: EngineMemory) -> Self",
+      "kind": "fn",
+      "name": "new_with_engine_memory",
+      "replacement": null,
+      "signature": "pub fn new_with_engine_memory(engine_memory: EngineMemory) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1295",
       "id": "crates/krishiv-sql/src/lib.rs::fn::new_with_memory_limit::pub fn new_with_memory_limit(memory_limit_bytes: Option<usize>) -> Self",
       "kind": "fn",
       "name": "new_with_memory_limit",
@@ -2532,7 +2982,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1309",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2041",
       "id": "crates/krishiv-sql/src/lib.rs::fn::operation_registry::pub fn operation_registry(&self) -> &Arc<OperationRegistry>",
       "kind": "fn",
       "name": "operation_registry",
@@ -2542,7 +2992,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3839",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5410",
       "id": "crates/krishiv-sql/src/lib.rs::fn::parse_public_expression::pub fn parse_public_expression(sql: &str) -> SqlResult<krishiv_plan::expression::Expr>",
       "kind": "fn",
       "name": "parse_public_expression",
@@ -2552,7 +3002,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1304",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2036",
       "id": "crates/krishiv-sql/src/lib.rs::fn::pipeline_registry::pub fn pipeline_registry(&self) -> &Arc<pipeline_ddl::PipelineRegistry>",
       "kind": "fn",
       "name": "pipeline_registry",
@@ -2562,7 +3012,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L5082",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L6724",
       "id": "crates/krishiv-sql/src/lib.rs::fn::plan_sql::pub fn plan_sql(query: impl Into<String>) -> SqlResult<SqlPlan>",
       "kind": "fn",
       "name": "plan_sql",
@@ -2572,7 +3022,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L5170",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L6812",
       "id": "crates/krishiv-sql/src/lib.rs::fn::pretty_batches::pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String>",
       "kind": "fn",
       "name": "pretty_batches",
@@ -2582,7 +3032,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2994",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L562",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::process_query_pool::pub fn process_query_pool() -> Option<&'static Arc<dyn MemoryPool>>",
+      "kind": "fn",
+      "name": "process_query_pool",
+      "replacement": null,
+      "signature": "pub fn process_query_pool() -> Option<&'static Arc<dyn MemoryPool>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4484",
       "id": "crates/krishiv-sql/src/lib.rs::fn::progress::pub fn progress(&self, operation_id: u64) -> Option<(u64, u64)>",
       "kind": "fn",
       "name": "progress",
@@ -2592,7 +3052,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L290",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L361",
       "id": "crates/krishiv-sql/src/lib.rs::fn::query::pub fn query(&self) -> &str",
       "kind": "fn",
       "name": "query",
@@ -2602,7 +3062,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3490",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5020",
       "id": "crates/krishiv-sql/src/lib.rs::fn::query::pub fn query(&self) -> Option<&str>",
       "kind": "fn",
       "name": "query",
@@ -2612,7 +3072,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L359",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L435",
       "id": "crates/krishiv-sql/src/lib.rs::fn::query_memory_limit_from_env::pub fn query_memory_limit_from_env() -> Option<usize>",
       "kind": "fn",
       "name": "query_memory_limit_from_env",
@@ -2622,7 +3082,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1801",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2794",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_csv::pub async fn read_csv(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
       "kind": "fn",
       "name": "read_csv",
@@ -2632,7 +3092,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1807",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2800",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_csv_with_options::pub async fn read_csv_with_options(",
       "kind": "fn",
       "name": "read_csv_with_options",
@@ -2642,7 +3102,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1835",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2828",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_delta::pub async fn read_delta(",
       "kind": "fn",
       "name": "read_delta",
@@ -2652,7 +3112,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1851",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2844",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_hudi::pub async fn read_hudi(",
       "kind": "fn",
       "name": "read_hudi",
@@ -2662,7 +3122,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1825",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2818",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_json::pub async fn read_json(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
       "kind": "fn",
       "name": "read_json",
@@ -2672,7 +3132,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1716",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2707",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_parquet::pub async fn read_parquet(&self, path: impl AsRef<Path>) -> SqlResult<SqlDataFrame>",
       "kind": "fn",
       "name": "read_parquet",
@@ -2682,7 +3142,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1781",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2774",
       "id": "crates/krishiv-sql/src/lib.rs::fn::read_parquet_with_options::pub async fn read_parquet_with_options(",
       "kind": "fn",
       "name": "read_parquet_with_options",
@@ -2692,7 +3152,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L5151",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L6793",
       "id": "crates/krishiv-sql/src/lib.rs::fn::referenced_table_names::pub fn referenced_table_names(query: impl AsRef<str>) -> SqlResult<Vec<String>>",
       "kind": "fn",
       "name": "referenced_table_names",
@@ -2702,7 +3162,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1446",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2210",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_iceberg_catalog::pub fn register_iceberg_catalog(",
       "kind": "fn",
       "name": "register_iceberg_catalog",
@@ -2712,7 +3172,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1476",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2240",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_iceberg_rest_catalog_from_env::pub async fn register_iceberg_rest_catalog_from_env(&self) -> Result<bool, String>",
       "kind": "fn",
       "name": "register_iceberg_rest_catalog_from_env",
@@ -2722,7 +3182,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1097",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1829",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_kafka_source::pub fn register_kafka_source(",
       "kind": "fn",
       "name": "register_kafka_source",
@@ -2732,7 +3192,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1673",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2628",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_parquet::pub async fn register_parquet(",
       "kind": "fn",
       "name": "register_parquet",
@@ -2742,7 +3202,47 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1730",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2654",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_parquet_with_primary_key::pub async fn register_parquet_with_primary_key<S: AsRef<str>>(",
+      "kind": "fn",
+      "name": "register_parquet_with_primary_key",
+      "replacement": null,
+      "signature": "pub async fn register_parquet_with_primary_key<S: AsRef<str>>(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2471",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_python_udaf::pub async fn register_python_udaf(",
+      "kind": "fn",
+      "name": "register_python_udaf",
+      "replacement": null,
+      "signature": "pub async fn register_python_udaf(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2425",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_python_udf::pub async fn register_python_udf(",
+      "kind": "fn",
+      "name": "register_python_udf",
+      "replacement": null,
+      "signature": "pub async fn register_python_udf(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2348",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::register_python_udfs_from_sql::pub async fn register_python_udfs_from_sql(&self, sql: &str) -> SqlResult<String>",
+      "kind": "fn",
+      "name": "register_python_udfs_from_sql",
+      "replacement": null,
+      "signature": "pub async fn register_python_udfs_from_sql(&self, sql: &str) -> SqlResult<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2721",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_record_batches::pub async fn register_record_batches(",
       "kind": "fn",
       "name": "register_record_batches",
@@ -2752,7 +3252,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1248",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1985",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_streaming_source_name::pub fn register_streaming_source_name(&self, table_name: impl Into<String>) -> SqlResult<()>",
       "kind": "fn",
       "name": "register_streaming_source_name",
@@ -2762,7 +3262,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L972",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1704",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_streaming_table::pub fn register_streaming_table(",
       "kind": "fn",
       "name": "register_streaming_table",
@@ -2772,7 +3272,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L998",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1730",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_streaming_table_with_capacity::pub fn register_streaming_table_with_capacity(",
       "kind": "fn",
       "name": "register_streaming_table_with_capacity",
@@ -2782,7 +3282,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1351",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2113",
       "id": "crates/krishiv-sql/src/lib.rs::fn::register_table_udf_fn::pub fn register_table_udf_fn(",
       "kind": "fn",
       "name": "register_table_udf_fn",
@@ -2792,7 +3292,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L761",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1454",
       "id": "crates/krishiv-sql/src/lib.rs::fn::registered_table_names::pub fn registered_table_names(&self) -> Vec<String>",
       "kind": "fn",
       "name": "registered_table_names",
@@ -2802,7 +3302,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2977",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4467",
       "id": "crates/krishiv-sql/src/lib.rs::fn::remove::pub fn remove(&self, operation_id: u64)",
       "kind": "fn",
       "name": "remove",
@@ -2812,7 +3312,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L344",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L405",
       "id": "crates/krishiv-sql/src/lib.rs::fn::resolve_query_memory_limit_bytes::pub fn resolve_query_memory_limit_bytes(raw: Option<&str>) -> Option<usize>",
       "kind": "fn",
       "name": "resolve_query_memory_limit_bytes",
@@ -2822,7 +3322,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L325",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L456",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::resolve_query_spill_dir::pub fn resolve_query_spill_dir(raw: Option<&str>) -> Option<std::path::PathBuf>",
+      "kind": "fn",
+      "name": "resolve_query_spill_dir",
+      "replacement": null,
+      "signature": "pub fn resolve_query_spill_dir(raw: Option<&str>) -> Option<std::path::PathBuf>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L476",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::resolve_query_spill_disk_limit_bytes::#[must_use] pub fn resolve_query_spill_disk_limit_bytes(raw: Option<&str>, free_bytes: Option<u64>) -> u64",
+      "kind": "fn",
+      "name": "resolve_query_spill_disk_limit_bytes",
+      "replacement": null,
+      "signature": "#[must_use] pub fn resolve_query_spill_disk_limit_bytes(raw: Option<&str>, free_bytes: Option<u64>) -> u64",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L386",
       "id": "crates/krishiv-sql/src/lib.rs::fn::resolve_streaming_match_recognize_limit::pub fn resolve_streaming_match_recognize_limit(raw: Option<&str>) -> usize",
       "kind": "fn",
       "name": "resolve_streaming_match_recognize_limit",
@@ -2832,7 +3352,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L390",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L743",
       "id": "crates/krishiv-sql/src/lib.rs::fn::runtime_filters_enabled_from_env::pub fn runtime_filters_enabled_from_env() -> bool",
       "kind": "fn",
       "name": "runtime_filters_enabled_from_env",
@@ -2842,7 +3362,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L735",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1428",
       "id": "crates/krishiv-sql/src/lib.rs::fn::session_context::pub fn session_context(&self) -> &SessionContext",
       "kind": "fn",
       "name": "session_context",
@@ -2852,7 +3372,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L381",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L734",
       "id": "crates/krishiv-sql/src/lib.rs::fn::set_runtime_filters_for_tests::#[doc(hidden)] pub fn set_runtime_filters_for_tests(enabled: bool)",
       "kind": "fn",
       "name": "set_runtime_filters_for_tests",
@@ -2862,7 +3382,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L740",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L659",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::shared_pool::pub fn shared_pool(bytes: usize) -> Arc<dyn MemoryPool>",
+      "kind": "fn",
+      "name": "shared_pool",
+      "replacement": null,
+      "signature": "pub fn shared_pool(bytes: usize) -> Arc<dyn MemoryPool>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1433",
       "id": "crates/krishiv-sql/src/lib.rs::fn::shuffle_partitions::pub fn shuffle_partitions(&self) -> Option<u32>",
       "kind": "fn",
       "name": "shuffle_partitions",
@@ -2872,7 +3402,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1873",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L688",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::sizing_bytes::pub fn sizing_bytes(&self) -> Option<usize>",
+      "kind": "fn",
+      "name": "sizing_bytes",
+      "replacement": null,
+      "signature": "pub fn sizing_bytes(&self) -> Option<usize>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2866",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sql::pub fn sql<'a>(",
       "kind": "fn",
       "name": "sql",
@@ -2882,7 +3422,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1171",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1907",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sql_to_kafka::pub async fn sql_to_kafka(",
       "kind": "fn",
       "name": "sql_to_kafka",
@@ -2892,7 +3432,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3717",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5288",
       "id": "crates/krishiv-sql/src/lib.rs::fn::stats::pub fn stats(&self) -> SqlExecutionStats",
       "kind": "fn",
       "name": "stats",
@@ -2902,7 +3442,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L333",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L394",
       "id": "crates/krishiv-sql/src/lib.rs::fn::streaming_match_recognize_limit_from_env::pub fn streaming_match_recognize_limit_from_env() -> usize",
       "kind": "fn",
       "name": "streaming_match_recognize_limit_from_env",
@@ -2912,7 +3452,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1619",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2574",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_aggregate_udfs::pub async fn sync_aggregate_udfs(&self) -> SqlResult<()>",
       "kind": "fn",
       "name": "sync_aggregate_udfs",
@@ -2922,7 +3462,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1645",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2600",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_all_udfs::pub async fn sync_all_udfs(&self) -> SqlResult<()>",
       "kind": "fn",
       "name": "sync_all_udfs",
@@ -2932,7 +3472,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1556",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2510",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs::pub async fn sync_scalar_udfs(&self) -> SqlResult<()>",
       "kind": "fn",
       "name": "sync_scalar_udfs",
@@ -2942,7 +3482,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1575",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2530",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs_with_limits::pub async fn sync_scalar_udfs_with_limits(",
       "kind": "fn",
       "name": "sync_scalar_udfs_with_limits",
@@ -2952,7 +3492,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1600",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2555",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs_with_limits_for_policy::pub async fn sync_scalar_udfs_with_limits_for_policy(",
       "kind": "fn",
       "name": "sync_scalar_udfs_with_limits_for_policy",
@@ -2962,7 +3502,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1587",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2542",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_scalar_udfs_with_limits_for_profile::pub async fn sync_scalar_udfs_with_limits_for_profile(",
       "kind": "fn",
       "name": "sync_scalar_udfs_with_limits_for_profile",
@@ -2972,7 +3512,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1632",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2587",
       "id": "crates/krishiv-sql/src/lib.rs::fn::sync_table_udfs::pub async fn sync_table_udfs(&self) -> SqlResult<()>",
       "kind": "fn",
       "name": "sync_table_udfs",
@@ -2982,7 +3522,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L752",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1445",
       "id": "crates/krishiv-sql/src/lib.rs::fn::table_row_counts::pub fn table_row_counts(&self) -> Arc<std::sync::RwLock<HashMap<String, u64>>>",
       "kind": "fn",
       "name": "table_row_counts",
@@ -2992,7 +3532,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L721",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1414",
       "id": "crates/krishiv-sql/src/lib.rs::fn::target_parallelism::pub fn target_parallelism(&self) -> NonZeroUsize",
       "kind": "fn",
       "name": "target_parallelism",
@@ -3002,7 +3542,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L658",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1351",
       "id": "crates/krishiv-sql/src/lib.rs::fn::try_new::pub fn try_new() -> SqlResult<Self>",
       "kind": "fn",
       "name": "try_new",
@@ -3012,7 +3552,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2987",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4477",
       "id": "crates/krishiv-sql/src/lib.rs::fn::update_progress::pub fn update_progress(&self, operation_id: u64, rows_scanned: u64, rows_emitted: u64)",
       "kind": "fn",
       "name": "update_progress",
@@ -3022,7 +3562,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1430",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2194",
       "id": "crates/krishiv-sql/src/lib.rs::fn::with_iceberg_catalog::pub fn with_iceberg_catalog(",
       "kind": "fn",
       "name": "with_iceberg_catalog",
@@ -3032,7 +3572,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L668",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1361",
       "id": "crates/krishiv-sql/src/lib.rs::fn::with_in_memory_catalog::pub fn with_in_memory_catalog(catalog: Arc<RwLock<InMemoryCatalog>>) -> SqlResult<Self>",
       "kind": "fn",
       "name": "with_in_memory_catalog",
@@ -3042,7 +3582,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L801",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L820",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_krishiv_optimizer_rules::#[must_use] pub fn with_krishiv_optimizer_rules(",
+      "kind": "fn",
+      "name": "with_krishiv_optimizer_rules",
+      "replacement": null,
+      "signature": "#[must_use] pub fn with_krishiv_optimizer_rules(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L843",
+      "id": "crates/krishiv-sql/src/lib.rs::fn::with_krishiv_optimizer_rules_with_join_threshold::#[must_use] pub fn with_krishiv_optimizer_rules_with_join_threshold(",
+      "kind": "fn",
+      "name": "with_krishiv_optimizer_rules_with_join_threshold",
+      "replacement": null,
+      "signature": "#[must_use] pub fn with_krishiv_optimizer_rules_with_join_threshold(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1494",
       "id": "crates/krishiv-sql/src/lib.rs::fn::with_shuffle_partitions::pub fn with_shuffle_partitions(self, n: Option<u32>) -> Self",
       "kind": "fn",
       "name": "with_shuffle_partitions",
@@ -3052,7 +3612,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L698",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1391",
       "id": "crates/krishiv-sql/src/lib.rs::fn::with_target_parallelism::pub fn with_target_parallelism(mut self, n: NonZeroUsize) -> Self",
       "kind": "fn",
       "name": "with_target_parallelism",
@@ -3062,7 +3622,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1227",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1964",
       "id": "crates/krishiv-sql/src/lib.rs::fn::with_udf_limits::pub fn with_udf_limits(mut self, limits: krishiv_plan::udf::ResourceLimits) -> Self",
       "kind": "fn",
       "name": "with_udf_limits",
@@ -3072,7 +3632,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L1521",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L2291",
       "id": "crates/krishiv-sql/src/lib.rs::fn::with_udf_registry::pub fn with_udf_registry(",
       "kind": "fn",
       "name": "with_udf_registry",
@@ -3082,7 +3642,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L214",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L285",
       "id": "crates/krishiv-sql/src/lib.rs::struct::CsvReaderOptions::#[derive(Debug, Clone, Default)] pub struct CsvReaderOptions",
       "kind": "struct",
       "name": "CsvReaderOptions",
@@ -3092,7 +3652,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L232",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L303",
       "id": "crates/krishiv-sql/src/lib.rs::struct::CsvWriterOptions::#[derive(Debug, Clone, Default)] pub struct CsvWriterOptions",
       "kind": "struct",
       "name": "CsvWriterOptions",
@@ -3102,7 +3662,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2947",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4437",
       "id": "crates/krishiv-sql/src/lib.rs::struct::OperationRegistry::#[derive(Clone, Default)] pub struct OperationRegistry",
       "kind": "struct",
       "name": "OperationRegistry",
@@ -3112,7 +3672,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L207",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L278",
       "id": "crates/krishiv-sql/src/lib.rs::struct::ParquetReaderOptions::#[derive(Debug, Clone, Default)] pub struct ParquetReaderOptions",
       "kind": "struct",
       "name": "ParquetReaderOptions",
@@ -3122,7 +3682,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L223",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L294",
       "id": "crates/krishiv-sql/src/lib.rs::struct::ParquetWriterOptions::#[derive(Debug, Clone, Default)] pub struct ParquetWriterOptions",
       "kind": "struct",
       "name": "ParquetWriterOptions",
@@ -3132,7 +3692,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3421",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4951",
       "id": "crates/krishiv-sql/src/lib.rs::struct::SqlDataFrame::#[derive(Clone)] pub struct SqlDataFrame",
       "kind": "struct",
       "name": "SqlDataFrame",
@@ -3142,7 +3702,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L517",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L1182",
       "id": "crates/krishiv-sql/src/lib.rs::struct::SqlEngine::#[derive(Clone)] pub struct SqlEngine",
       "kind": "struct",
       "name": "SqlEngine",
@@ -3152,7 +3712,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3764",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5335",
       "id": "crates/krishiv-sql/src/lib.rs::struct::SqlExecutionStats::#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)] pub struct SqlExecutionStats",
       "kind": "struct",
       "name": "SqlExecutionStats",
@@ -3162,7 +3722,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L282",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L353",
       "id": "crates/krishiv-sql/src/lib.rs::struct::SqlPlan::#[derive(Debug, Clone, PartialEq, Eq)] pub struct SqlPlan",
       "kind": "struct",
       "name": "SqlPlan",
@@ -3172,7 +3732,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3708",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L5279",
       "id": "crates/krishiv-sql/src/lib.rs::struct::SqlStatsHandle::pub struct SqlStatsHandle",
       "kind": "struct",
       "name": "SqlStatsHandle",
@@ -3182,7 +3742,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L2935",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4425",
       "id": "crates/krishiv-sql/src/lib.rs::struct::TaggedQueryResult::pub struct TaggedQueryResult",
       "kind": "struct",
       "name": "TaggedQueryResult",
@@ -3192,7 +3752,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L3036",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L4542",
       "id": "crates/krishiv-sql/src/lib.rs::trait::KrishivDataFrameOps::#[async_trait::async_trait] pub trait KrishivDataFrameOps: Send + Sync",
       "kind": "trait",
       "name": "KrishivDataFrameOps",
@@ -3202,7 +3762,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L108",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L166",
       "id": "crates/krishiv-sql/src/lib.rs::type::SqlResult::pub type SqlResult<T> = Result<T, SqlError>",
       "kind": "type",
       "name": "SqlResult",
@@ -3212,7 +3772,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/lib.rs#L115",
+      "documentation": "crates/krishiv-sql/src/lib.rs#L173",
       "id": "crates/krishiv-sql/src/lib.rs::type::SqlStream::pub type SqlStream =",
       "kind": "type",
       "name": "SqlStream",
@@ -3222,7 +3782,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L11",
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L27",
       "id": "crates/krishiv-sql/src/live_table.rs::enum::LiveTableStatement::#[derive(Debug, Clone, PartialEq, Eq)] pub enum LiveTableStatement",
       "kind": "enum",
       "name": "LiveTableStatement",
@@ -3232,37 +3792,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L67",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::contains::pub fn contains(&self, name: &str) -> SqlResult<bool>",
-      "kind": "fn",
-      "name": "contains",
-      "replacement": null,
-      "signature": "pub fn contains(&self, name: &str) -> SqlResult<bool>",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L198",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::execute_live_table_ddl::pub fn execute_live_table_ddl(",
-      "kind": "fn",
-      "name": "execute_live_table_ddl",
-      "replacement": null,
-      "signature": "pub fn execute_live_table_ddl(",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L33",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::new::pub fn new() -> Self",
-      "kind": "fn",
-      "name": "new",
-      "replacement": null,
-      "signature": "pub fn new() -> Self",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L84",
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L35",
       "id": "crates/krishiv-sql/src/live_table.rs::fn::parse_live_table_statement::pub fn parse_live_table_statement(sql: &str) -> SqlResult<Option<LiveTableStatement>>",
       "kind": "fn",
       "name": "parse_live_table_statement",
@@ -3272,62 +3802,32 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L147",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::plan_live_table::pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan",
+      "documentation": "crates/krishiv-sql/src/live_table.rs#L117",
+      "id": "crates/krishiv-sql/src/live_table.rs::fn::reject_live_table_ddl::pub fn reject_live_table_ddl(sql: &str) -> SqlResult<()>",
       "kind": "fn",
-      "name": "plan_live_table",
+      "name": "reject_live_table_ddl",
       "replacement": null,
-      "signature": "pub fn plan_live_table(stmt: LiveTableStatement) -> LogicalPlan",
+      "signature": "pub fn reject_live_table_ddl(sql: &str) -> SqlResult<()>",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L74",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::query::pub fn query(&self, name: &str) -> SqlResult<Option<String>>",
+      "documentation": "crates/krishiv-sql/src/object_store_registry.rs#L40",
+      "id": "crates/krishiv-sql/src/object_store_registry.rs::fn::new::pub fn new() -> Self",
       "kind": "fn",
-      "name": "query",
+      "name": "new",
       "replacement": null,
-      "signature": "pub fn query(&self, name: &str) -> SqlResult<Option<String>>",
+      "signature": "pub fn new() -> Self",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L52",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::register::pub fn register(",
-      "kind": "fn",
-      "name": "register",
-      "replacement": null,
-      "signature": "pub fn register(",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L60",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::remove_table::pub fn remove_table(&self, name: &str) -> SqlResult<bool>",
-      "kind": "fn",
-      "name": "remove_table",
-      "replacement": null,
-      "signature": "pub fn remove_table(&self, name: &str) -> SqlResult<bool>",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L39",
-      "id": "crates/krishiv-sql/src/live_table.rs::fn::try_register::pub fn try_register(",
-      "kind": "fn",
-      "name": "try_register",
-      "replacement": null,
-      "signature": "pub fn try_register(",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/live_table.rs#L27",
-      "id": "crates/krishiv-sql/src/live_table.rs::struct::LiveTableRegistry::#[derive(Debug, Default)] pub struct LiveTableRegistry",
+      "documentation": "crates/krishiv-sql/src/object_store_registry.rs#L34",
+      "id": "crates/krishiv-sql/src/object_store_registry.rs::struct::LazyCloudObjectStoreRegistry::#[derive(Debug, Default)] pub struct LazyCloudObjectStoreRegistry",
       "kind": "struct",
-      "name": "LiveTableRegistry",
+      "name": "LazyCloudObjectStoreRegistry",
       "replacement": null,
-      "signature": "#[derive(Debug, Default)] pub struct LiveTableRegistry",
+      "signature": "#[derive(Debug, Default)] pub struct LazyCloudObjectStoreRegistry",
       "stability": "preview"
     },
     {
@@ -3342,7 +3842,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pipe_syntax.rs#L154",
+      "documentation": "crates/krishiv-sql/src/pipe_syntax.rs#L219",
       "id": "crates/krishiv-sql/src/pipe_syntax.rs::fn::has_pipe_syntax::pub fn has_pipe_syntax(sql: &str) -> bool",
       "kind": "fn",
       "name": "has_pipe_syntax",
@@ -3572,7 +4072,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L194",
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L205",
       "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::parse_unpivot::pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>>",
       "kind": "fn",
       "name": "parse_unpivot",
@@ -3582,7 +4082,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L155",
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L166",
       "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::rewrite_pivot::pub fn rewrite_pivot(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_pivot",
@@ -3592,7 +4092,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L293",
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L304",
       "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::rewrite_pivot_unpivot::pub fn rewrite_pivot_unpivot(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_pivot_unpivot",
@@ -3602,7 +4102,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L266",
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L277",
       "id": "crates/krishiv-sql/src/pivot_sql.rs::fn::rewrite_unpivot::pub fn rewrite_unpivot(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_unpivot",
@@ -3622,7 +4122,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L179",
+      "documentation": "crates/krishiv-sql/src/pivot_sql.rs#L190",
       "id": "crates/krishiv-sql/src/pivot_sql.rs::struct::UnpivotClause::#[derive(Debug, Clone)] pub struct UnpivotClause",
       "kind": "struct",
       "name": "UnpivotClause",
@@ -3632,52 +4132,282 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L135",
-      "id": "crates/krishiv-sql/src/recursive_cte.rs::fn::build_recursive_cte_op::pub fn build_recursive_cte_op(stmt: &RecursiveCteStatement) -> NodeOp",
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L38",
+      "id": "crates/krishiv-sql/src/python_udf.rs::fn::global_pool::pub fn global_pool() -> Result<Arc<PythonWorkerPool>, UdfError>",
       "kind": "fn",
-      "name": "build_recursive_cte_op",
+      "name": "global_pool",
       "replacement": null,
-      "signature": "pub fn build_recursive_cte_op(stmt: &RecursiveCteStatement) -> NodeOp",
+      "signature": "pub fn global_pool() -> Result<Arc<PythonWorkerPool>, UdfError>",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L165",
-      "id": "crates/krishiv-sql/src/recursive_cte.rs::fn::execute_recursive_cte::pub fn execute_recursive_cte<E, R>(",
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L240",
+      "id": "crates/krishiv-sql/src/python_udf.rs::fn::new::pub fn new(",
       "kind": "fn",
-      "name": "execute_recursive_cte",
+      "name": "new",
       "replacement": null,
-      "signature": "pub fn execute_recursive_cte<E, R>(",
+      "signature": "pub fn new(",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L57",
-      "id": "crates/krishiv-sql/src/recursive_cte.rs::fn::parse_recursive_cte::pub fn parse_recursive_cte(sql: &str) -> SqlResult<Option<RecursiveCteStatement>>",
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L310",
+      "id": "crates/krishiv-sql/src/python_udf.rs::fn::new::pub fn new(#2",
       "kind": "fn",
-      "name": "parse_recursive_cte",
+      "name": "new",
       "replacement": null,
-      "signature": "pub fn parse_recursive_cte(sql: &str) -> SqlResult<Option<RecursiveCteStatement>>",
+      "signature": "pub fn new(",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L147",
-      "id": "crates/krishiv-sql/src/recursive_cte.rs::struct::RecursiveCteResult::#[derive(Debug)] pub struct RecursiveCteResult",
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L80",
+      "id": "crates/krishiv-sql/src/python_udf.rs::fn::spawn::pub fn spawn() -> Result<Arc<Self>, UdfError>",
+      "kind": "fn",
+      "name": "spawn",
+      "replacement": null,
+      "signature": "pub fn spawn() -> Result<Arc<Self>, UdfError>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L292",
+      "id": "crates/krishiv-sql/src/python_udf.rs::struct::PythonWorkerAggregateUdf::pub struct PythonWorkerAggregateUdf",
       "kind": "struct",
-      "name": "RecursiveCteResult",
+      "name": "PythonWorkerAggregateUdf",
       "replacement": null,
-      "signature": "#[derive(Debug)] pub struct RecursiveCteResult",
+      "signature": "pub struct PythonWorkerAggregateUdf",
       "stability": "preview"
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/recursive_cte.rs#L40",
-      "id": "crates/krishiv-sql/src/recursive_cte.rs::struct::RecursiveCteStatement::#[derive(Debug, Clone)] pub struct RecursiveCteStatement",
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L60",
+      "id": "crates/krishiv-sql/src/python_udf.rs::struct::PythonWorkerPool::pub struct PythonWorkerPool",
       "kind": "struct",
-      "name": "RecursiveCteStatement",
+      "name": "PythonWorkerPool",
       "replacement": null,
-      "signature": "#[derive(Debug, Clone)] pub struct RecursiveCteStatement",
+      "signature": "pub struct PythonWorkerPool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/python_udf.rs#L222",
+      "id": "crates/krishiv-sql/src/python_udf.rs::struct::PythonWorkerUdf::pub struct PythonWorkerUdf",
+      "kind": "struct",
+      "name": "PythonWorkerUdf",
+      "replacement": null,
+      "signature": "pub struct PythonWorkerUdf",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/rollup_rewrite.rs#L98",
+      "id": "crates/krishiv-sql/src/rollup_rewrite.rs::fn::rewrite_grouping_sets::pub fn rewrite_grouping_sets(plan: &LogicalPlan) -> SqlResult<Option<LogicalPlan>>",
+      "kind": "fn",
+      "name": "rewrite_grouping_sets",
+      "replacement": null,
+      "signature": "pub fn rewrite_grouping_sets(plan: &LogicalPlan) -> SqlResult<Option<LogicalPlan>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L98",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::enabled::#[must_use] pub fn enabled() -> bool",
+      "kind": "fn",
+      "name": "enabled",
+      "replacement": null,
+      "signature": "#[must_use] pub fn enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L196",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::filter_bytes::pub fn filter_bytes(&self) -> usize",
+      "kind": "fn",
+      "name": "filter_bytes",
+      "replacement": null,
+      "signature": "pub fn filter_bytes(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L113",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::filter_schema::#[must_use] pub fn filter_schema() -> SchemaRef",
+      "kind": "fn",
+      "name": "filter_schema",
+      "replacement": null,
+      "signature": "#[must_use] pub fn filter_schema() -> SchemaRef",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L192",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::key_index::pub fn key_index(&self) -> usize",
+      "kind": "fn",
+      "name": "key_index",
+      "replacement": null,
+      "signature": "pub fn key_index(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L351",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::key_index::pub fn key_index(&self) -> usize#2",
+      "kind": "fn",
+      "name": "key_index",
+      "replacement": null,
+      "signature": "pub fn key_index(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L155",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::try_new::pub fn try_new(",
+      "kind": "fn",
+      "name": "try_new",
+      "replacement": null,
+      "signature": "pub fn try_new(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L305",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::fn::try_new::pub fn try_new(#2",
+      "kind": "fn",
+      "name": "try_new",
+      "replacement": null,
+      "signature": "pub fn try_new(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L133",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::struct::RuntimeFilterBuildExec::#[derive(Debug)] pub struct RuntimeFilterBuildExec",
+      "kind": "struct",
+      "name": "RuntimeFilterBuildExec",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct RuntimeFilterBuildExec",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/runtime_filter_exec.rs#L295",
+      "id": "crates/krishiv-sql/src/runtime_filter_exec.rs::struct::RuntimeFilterProbeExec::#[derive(Debug)] pub struct RuntimeFilterProbeExec",
+      "kind": "struct",
+      "name": "RuntimeFilterProbeExec",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct RuntimeFilterProbeExec",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/scalar_udf.rs#L89",
+      "id": "crates/krishiv-sql/src/scalar_udf.rs::fn::expand_scalar_sql_functions::pub fn expand_scalar_sql_functions(",
+      "kind": "fn",
+      "name": "expand_scalar_sql_functions",
+      "replacement": null,
+      "signature": "pub fn expand_scalar_sql_functions(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/scalar_udf.rs#L37",
+      "id": "crates/krishiv-sql/src/scalar_udf.rs::fn::new::pub fn new(name: &str, params: &[String], body_sql: &str) -> Result<Self, String>",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(name: &str, params: &[String], body_sql: &str) -> Result<Self, String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/scalar_udf.rs#L27",
+      "id": "crates/krishiv-sql/src/scalar_udf.rs::struct::ScalarSqlFunction::#[derive(Clone, Debug)] pub struct ScalarSqlFunction",
+      "kind": "struct",
+      "name": "ScalarSqlFunction",
+      "replacement": null,
+      "signature": "#[derive(Clone, Debug)] pub struct ScalarSqlFunction",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L296",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::fn::forced::pub fn forced() -> Self",
+      "kind": "fn",
+      "name": "forced",
+      "replacement": null,
+      "signature": "pub fn forced() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L702",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::fn::forced::pub fn forced() -> Self#2",
+      "kind": "fn",
+      "name": "forced",
+      "replacement": null,
+      "signature": "pub fn forced() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L169",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::fn::semi_join_dimension_reduction_enabled::pub fn semi_join_dimension_reduction_enabled() -> bool",
+      "kind": "fn",
+      "name": "semi_join_dimension_reduction_enabled",
+      "replacement": null,
+      "signature": "pub fn semi_join_dimension_reduction_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L196",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::fn::semi_join_pushdown_enabled::pub fn semi_join_pushdown_enabled() -> bool",
+      "kind": "fn",
+      "name": "semi_join_pushdown_enabled",
+      "replacement": null,
+      "signature": "pub fn semi_join_pushdown_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L188",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::fn::semi_join_reduction_enabled::pub fn semi_join_reduction_enabled() -> bool",
+      "kind": "fn",
+      "name": "semi_join_reduction_enabled",
+      "replacement": null,
+      "signature": "pub fn semi_join_reduction_enabled() -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L282",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::struct::SemiJoinPushdownThroughInnerJoin::#[derive(Debug, Default)] pub struct SemiJoinPushdownThroughInnerJoin",
+      "kind": "struct",
+      "name": "SemiJoinPushdownThroughInnerJoin",
+      "replacement": null,
+      "signature": "#[derive(Debug, Default)] pub struct SemiJoinPushdownThroughInnerJoin",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L693",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::struct::SemiJoinReductionFromSelectiveDimension::#[derive(Debug, Default)] pub struct SemiJoinReductionFromSelectiveDimension",
+      "kind": "struct",
+      "name": "SemiJoinReductionFromSelectiveDimension",
+      "replacement": null,
+      "signature": "#[derive(Debug, Default)] pub struct SemiJoinReductionFromSelectiveDimension",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/semi_join_reduction.rs#L813",
+      "id": "crates/krishiv-sql/src/semi_join_reduction.rs::struct::SemiJoinReductionThroughAggregate::#[derive(Debug, Default)] pub struct SemiJoinReductionThroughAggregate",
+      "kind": "struct",
+      "name": "SemiJoinReductionThroughAggregate",
+      "replacement": null,
+      "signature": "#[derive(Debug, Default)] pub struct SemiJoinReductionThroughAggregate",
       "stability": "preview"
     },
     {
@@ -3692,7 +4422,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L260",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L343",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::contains_describe_extended::pub fn contains_describe_extended(sql: &str) -> bool",
       "kind": "fn",
       "name": "contains_describe_extended",
@@ -3702,7 +4432,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L18",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L41",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::contains_lateral_view::pub fn contains_lateral_view(sql: &str) -> bool",
       "kind": "fn",
       "name": "contains_lateral_view",
@@ -3712,7 +4442,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L285",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L368",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::contains_show_tblproperties::pub fn contains_show_tblproperties(sql: &str) -> bool",
       "kind": "fn",
       "name": "contains_show_tblproperties",
@@ -3722,7 +4452,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L192",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L249",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::contains_tablesample::pub fn contains_tablesample(sql: &str) -> bool",
       "kind": "fn",
       "name": "contains_tablesample",
@@ -3732,7 +4462,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L244",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L301",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::contains_transform::pub fn contains_transform(sql: &str) -> bool",
       "kind": "fn",
       "name": "contains_transform",
@@ -3742,7 +4472,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L358",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L447",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::preprocess_spark_sql::pub fn preprocess_spark_sql(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "preprocess_spark_sql",
@@ -3752,7 +4482,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L272",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L355",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::rewrite_describe_extended::pub fn rewrite_describe_extended(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_describe_extended",
@@ -3762,7 +4492,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L43",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L66",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::rewrite_lateral_view::pub fn rewrite_lateral_view(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_lateral_view",
@@ -3772,7 +4502,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L290",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L373",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::rewrite_show_tblproperties::pub fn rewrite_show_tblproperties(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_show_tblproperties",
@@ -3782,7 +4512,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L208",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L265",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::rewrite_tablesample::pub fn rewrite_tablesample(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_tablesample",
@@ -3792,7 +4522,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L252",
+      "documentation": "crates/krishiv-sql/src/spark_sql_ext.rs#L325",
       "id": "crates/krishiv-sql/src/spark_sql_ext.rs::fn::rewrite_transform::pub fn rewrite_transform(sql: &str) -> SqlResult<String>",
       "kind": "fn",
       "name": "rewrite_transform",
@@ -3802,7 +4532,87 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L71",
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L121",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::build_sizing_bytes::#[must_use] pub fn build_sizing_bytes(",
+      "kind": "fn",
+      "name": "build_sizing_bytes",
+      "replacement": null,
+      "signature": "#[must_use] pub fn build_sizing_bytes(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L682",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::for_local_execution::pub fn for_local_execution() -> Self",
+      "kind": "fn",
+      "name": "for_local_execution",
+      "replacement": null,
+      "signature": "pub fn for_local_execution() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L622",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::from_capacity::pub fn from_capacity() -> Self",
+      "kind": "fn",
+      "name": "from_capacity",
+      "replacement": null,
+      "signature": "pub fn from_capacity() -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L710",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::with_grace_where_plans_are_never_encoded::pub fn with_grace_where_plans_are_never_encoded(self) -> Self",
+      "kind": "fn",
+      "name": "with_grace_where_plans_are_never_encoded",
+      "replacement": null,
+      "signature": "pub fn with_grace_where_plans_are_never_encoded(self) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L858",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::with_threshold::pub fn with_threshold(threshold_bytes: Option<u64>) -> Self",
+      "kind": "fn",
+      "name": "with_threshold",
+      "replacement": null,
+      "signature": "pub fn with_threshold(threshold_bytes: Option<u64>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L872",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::with_threshold_and_grace::pub fn with_threshold_and_grace(threshold_bytes: Option<u64>, grace: bool) -> Self",
+      "kind": "fn",
+      "name": "with_threshold_and_grace",
+      "replacement": null,
+      "signature": "pub fn with_threshold_and_grace(threshold_bytes: Option<u64>, grace: bool) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L669",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::fn::without_broadcast_rescue::pub fn without_broadcast_rescue(self) -> Self",
+      "kind": "fn",
+      "name": "without_broadcast_rescue",
+      "replacement": null,
+      "signature": "pub fn without_broadcast_rescue(self) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/spillable_join.rs#L595",
+      "id": "crates/krishiv-sql/src/spillable_join.rs::struct::SpillableJoinSelection::#[derive(Debug)] pub struct SpillableJoinSelection",
+      "kind": "struct",
+      "name": "SpillableJoinSelection",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct SpillableJoinSelection",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L136",
       "id": "crates/krishiv-sql/src/sqlstate.rs::fn::from_sql_error::pub fn from_sql_error(error: &SqlError) -> Self",
       "kind": "fn",
       "name": "from_sql_error",
@@ -3822,7 +4632,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L61",
+      "documentation": "crates/krishiv-sql/src/sqlstate.rs#L126",
       "id": "crates/krishiv-sql/src/sqlstate.rs::struct::SqlStateError::#[derive(Debug, Clone, PartialEq, Eq)] pub struct SqlStateError",
       "kind": "struct",
       "name": "SqlStateError",
@@ -3832,7 +4642,57 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L99",
+      "documentation": "crates/krishiv-sql/src/stateless_exec.rs#L98",
+      "id": "crates/krishiv-sql/src/stateless_exec.rs::fn::new::pub fn new(query: impl Into<String>, table_name: impl Into<String>) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(query: impl Into<String>, table_name: impl Into<String>) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/stateless_exec.rs#L136",
+      "id": "crates/krishiv-sql/src/stateless_exec.rs::fn::on_batch::pub async fn on_batch(",
+      "kind": "fn",
+      "name": "on_batch",
+      "replacement": null,
+      "signature": "pub async fn on_batch(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/stateless_exec.rs#L115",
+      "id": "crates/krishiv-sql/src/stateless_exec.rs::fn::register_side_table::pub fn register_side_table(",
+      "kind": "fn",
+      "name": "register_side_table",
+      "replacement": null,
+      "signature": "pub fn register_side_table(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/stateless_exec.rs#L89",
+      "id": "crates/krishiv-sql/src/stateless_exec.rs::struct::StatelessBatchExecutor::pub struct StatelessBatchExecutor",
+      "kind": "struct",
+      "name": "StatelessBatchExecutor",
+      "replacement": null,
+      "signature": "pub struct StatelessBatchExecutor",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L319",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::enum::CacheStatement::#[derive(Debug, Clone, PartialEq, Eq)] pub enum CacheStatement",
+      "kind": "enum",
+      "name": "CacheStatement",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub enum CacheStatement",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L121",
       "id": "crates/krishiv-sql/src/statement_completion.rs::fn::apply_use::pub fn apply_use(ctx: &SessionContext, query: &str) -> Option<Result<(), String>>",
       "kind": "fn",
       "name": "apply_use",
@@ -3842,7 +4702,57 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L48",
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L334",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::parse_cache::pub fn parse_cache(query: &str) -> Option<Result<CacheStatement, String>>",
+      "kind": "fn",
+      "name": "parse_cache",
+      "replacement": null,
+      "signature": "pub fn parse_cache(query: &str) -> Option<Result<CacheStatement, String>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L221",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::parse_create_vector_index::pub fn parse_create_vector_index(query: &str) -> Option<Result<CreateVectorIndex, String>>",
+      "kind": "fn",
+      "name": "parse_create_vector_index",
+      "replacement": null,
+      "signature": "pub fn parse_create_vector_index(query: &str) -> Option<Result<CreateVectorIndex, String>>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L423",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::parse_describe_query::pub fn parse_describe_query(query: &str) -> Option<String>",
+      "kind": "fn",
+      "name": "parse_describe_query",
+      "replacement": null,
+      "signature": "pub fn parse_describe_query(query: &str) -> Option<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L439",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::parse_show_partitions::pub fn parse_show_partitions(query: &str) -> Option<String>",
+      "kind": "fn",
+      "name": "parse_show_partitions",
+      "replacement": null,
+      "signature": "pub fn parse_show_partitions(query: &str) -> Option<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L184",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::parse_truncate::pub fn parse_truncate(query: &str) -> Option<String>",
+      "kind": "fn",
+      "name": "parse_truncate",
+      "replacement": null,
+      "signature": "pub fn parse_truncate(query: &str) -> Option<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L66",
       "id": "crates/krishiv-sql/src/statement_completion.rs::fn::parse_use::pub fn parse_use(query: &str) -> Option<UseTarget>",
       "kind": "fn",
       "name": "parse_use",
@@ -3852,7 +4762,27 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L116",
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L399",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::rewrite_describe_database::pub fn rewrite_describe_database(query: &str) -> Option<String>",
+      "kind": "fn",
+      "name": "rewrite_describe_database",
+      "replacement": null,
+      "signature": "pub fn rewrite_describe_database(query: &str) -> Option<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L374",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::fn::rewrite_describe_function::pub fn rewrite_describe_function(query: &str) -> Option<String>",
+      "kind": "fn",
+      "name": "rewrite_describe_function",
+      "replacement": null,
+      "signature": "pub fn rewrite_describe_function(query: &str) -> Option<String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L138",
       "id": "crates/krishiv-sql/src/statement_completion.rs::fn::rewrite_show_databases::pub fn rewrite_show_databases(query: &str) -> Option<String>",
       "kind": "fn",
       "name": "rewrite_show_databases",
@@ -3862,7 +4792,17 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L23",
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L202",
+      "id": "crates/krishiv-sql/src/statement_completion.rs::struct::CreateVectorIndex::#[derive(Debug, Clone, PartialEq, Eq)] pub struct CreateVectorIndex",
+      "kind": "struct",
+      "name": "CreateVectorIndex",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct CreateVectorIndex",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/statement_completion.rs#L33",
       "id": "crates/krishiv-sql/src/statement_completion.rs::struct::UseTarget::#[derive(Debug, Clone, PartialEq, Eq)] pub struct UseTarget",
       "kind": "struct",
       "name": "UseTarget",
@@ -3872,7 +4812,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L26",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L27",
       "id": "crates/krishiv-sql/src/streaming.rs::enum::ContinuousInputError::#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)] pub enum ContinuousInputError",
       "kind": "enum",
       "name": "ContinuousInputError",
@@ -3882,7 +4822,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L158",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L201",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::cancel::pub fn cancel(&self)",
       "kind": "fn",
       "name": "cancel",
@@ -3892,7 +4832,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L147",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L182",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::close::pub fn close(&self) -> Result<bool, ContinuousInputError>",
       "kind": "fn",
       "name": "close",
@@ -3902,7 +4842,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L200",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L240",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::create_continuous_table::pub fn create_continuous_table(",
       "kind": "fn",
       "name": "create_continuous_table",
@@ -3912,7 +4852,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L209",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L249",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::create_continuous_table_with_capacity::pub fn create_continuous_table_with_capacity(",
       "kind": "fn",
       "name": "create_continuous_table_with_capacity",
@@ -3922,7 +4862,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L169",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L209",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::is_closed::pub fn is_closed(&self) -> Result<bool, ContinuousInputError>",
       "kind": "fn",
       "name": "is_closed",
@@ -3932,17 +4872,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L57",
-      "id": "crates/krishiv-sql/src/streaming.rs::fn::new::pub fn new(schema: SchemaRef, receiver: mpsc::Receiver<RecordBatch>) -> Self",
-      "kind": "fn",
-      "name": "new",
-      "replacement": null,
-      "signature": "pub fn new(schema: SchemaRef, receiver: mpsc::Receiver<RecordBatch>) -> Self",
-      "stability": "preview"
-    },
-    {
-      "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L120",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L155",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::schema::pub fn schema(&self) -> &SchemaRef",
       "kind": "fn",
       "name": "schema",
@@ -3952,7 +4882,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L135",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L170",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::send::pub async fn send(&self, batch: RecordBatch) -> Result<(), ContinuousInputError>",
       "kind": "fn",
       "name": "send",
@@ -3962,7 +4892,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L125",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L160",
       "id": "crates/krishiv-sql/src/streaming.rs::fn::try_send::pub fn try_send(&self, batch: RecordBatch) -> Result<(), ContinuousInputError>",
       "kind": "fn",
       "name": "try_send",
@@ -3972,7 +4902,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L43",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L44",
       "id": "crates/krishiv-sql/src/streaming.rs::struct::ChannelPartitionStream::pub struct ChannelPartitionStream",
       "kind": "struct",
       "name": "ChannelPartitionStream",
@@ -3982,12 +4912,72 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming.rs#L97",
+      "documentation": "crates/krishiv-sql/src/streaming.rs#L121",
       "id": "crates/krishiv-sql/src/streaming.rs::struct::ContinuousTableInput::pub struct ContinuousTableInput",
       "kind": "struct",
       "name": "ContinuousTableInput",
       "replacement": null,
       "signature": "pub struct ContinuousTableInput",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming_join_plan.rs#L115",
+      "id": "crates/krishiv-sql/src/streaming_join_plan.rs::fn::compile_streaming_join_sql::pub fn compile_streaming_join_sql(sql: &str) -> SqlResult<StreamingJoinPlan>",
+      "kind": "fn",
+      "name": "compile_streaming_join_sql",
+      "replacement": null,
+      "signature": "pub fn compile_streaming_join_sql(sql: &str) -> SqlResult<StreamingJoinPlan>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming_join_plan.rs#L48",
+      "id": "crates/krishiv-sql/src/streaming_join_plan.rs::fn::looks_like_streaming_join::#[must_use] pub fn looks_like_streaming_join(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "looks_like_streaming_join",
+      "replacement": null,
+      "signature": "#[must_use] pub fn looks_like_streaming_join(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming_join_plan.rs#L36",
+      "id": "crates/krishiv-sql/src/streaming_join_plan.rs::struct::StreamingJoinPlan::#[derive(Debug, Clone, PartialEq, Eq)] pub struct StreamingJoinPlan",
+      "kind": "struct",
+      "name": "StreamingJoinPlan",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct StreamingJoinPlan",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming_pipeline_plan.rs#L70",
+      "id": "crates/krishiv-sql/src/streaming_pipeline_plan.rs::fn::compile_streaming_pipeline_sql::pub fn compile_streaming_pipeline_sql(sql: &str) -> SqlResult<StreamingPipelinePlan>",
+      "kind": "fn",
+      "name": "compile_streaming_pipeline_sql",
+      "replacement": null,
+      "signature": "pub fn compile_streaming_pipeline_sql(sql: &str) -> SqlResult<StreamingPipelinePlan>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming_pipeline_plan.rs#L47",
+      "id": "crates/krishiv-sql/src/streaming_pipeline_plan.rs::fn::looks_like_streaming_pipeline::#[must_use] pub fn looks_like_streaming_pipeline(sql: &str) -> bool",
+      "kind": "fn",
+      "name": "looks_like_streaming_pipeline",
+      "replacement": null,
+      "signature": "#[must_use] pub fn looks_like_streaming_pipeline(sql: &str) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/streaming_pipeline_plan.rs#L38",
+      "id": "crates/krishiv-sql/src/streaming_pipeline_plan.rs::struct::StreamingPipelinePlan::#[derive(Debug, Clone)] pub struct StreamingPipelinePlan",
+      "kind": "struct",
+      "name": "StreamingPipelinePlan",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct StreamingPipelinePlan",
       "stability": "preview"
     },
     {
@@ -4022,7 +5012,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming_tvf.rs#L203",
+      "documentation": "crates/krishiv-sql/src/streaming_tvf.rs#L215",
       "id": "crates/krishiv-sql/src/streaming_tvf.rs::fn::find_window_tvf::pub fn find_window_tvf(sql: &str) -> Option<(usize, WindowTvf<'_>, usize)>",
       "kind": "fn",
       "name": "find_window_tvf",
@@ -4032,7 +5022,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming_tvf.rs#L335",
+      "documentation": "crates/krishiv-sql/src/streaming_tvf.rs#L359",
       "id": "crates/krishiv-sql/src/streaming_tvf.rs::fn::rewrite_window_tvfs::pub fn rewrite_window_tvfs(sql: &str) -> String",
       "kind": "fn",
       "name": "rewrite_window_tvfs",
@@ -4042,7 +5032,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming_window_plan.rs#L93",
+      "documentation": "crates/krishiv-sql/src/streaming_window_plan.rs#L94",
       "id": "crates/krishiv-sql/src/streaming_window_plan.rs::fn::compile_streaming_window_sql::pub fn compile_streaming_window_sql(sql: &str) -> SqlResult<StreamingWindowPlan>",
       "kind": "fn",
       "name": "compile_streaming_window_sql",
@@ -4052,7 +5042,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming_window_plan.rs#L79",
+      "documentation": "crates/krishiv-sql/src/streaming_window_plan.rs#L80",
       "id": "crates/krishiv-sql/src/streaming_window_plan.rs::fn::is_windowed_streaming_sql::pub fn is_windowed_streaming_sql(sql: &str) -> bool",
       "kind": "fn",
       "name": "is_windowed_streaming_sql",
@@ -4062,7 +5052,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/streaming_window_plan.rs#L56",
+      "documentation": "crates/krishiv-sql/src/streaming_window_plan.rs#L57",
       "id": "crates/krishiv-sql/src/streaming_window_plan.rs::struct::StreamingWindowPlan::#[derive(Debug, Clone, PartialEq, Eq)] pub struct StreamingWindowPlan",
       "kind": "struct",
       "name": "StreamingWindowPlan",
@@ -4072,7 +5062,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/subquery.rs#L26",
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L22",
       "id": "crates/krishiv-sql/src/subquery.rs::enum::SubqueryKind::#[derive(Debug, Clone, PartialEq, Eq)] pub enum SubqueryKind",
       "kind": "enum",
       "name": "SubqueryKind",
@@ -4082,7 +5072,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/subquery.rs#L55",
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L51",
       "id": "crates/krishiv-sql/src/subquery.rs::fn::detect_subqueries::pub fn detect_subqueries(sql: &str) -> SqlResult<Vec<DetectedSubquery>>",
       "kind": "fn",
       "name": "detect_subqueries",
@@ -4092,7 +5082,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/subquery.rs#L250",
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L182",
       "id": "crates/krishiv-sql/src/subquery.rs::fn::explain_subqueries::pub fn explain_subqueries(sql: &str) -> Option<String>",
       "kind": "fn",
       "name": "explain_subqueries",
@@ -4102,7 +5092,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/subquery.rs#L192",
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L124",
       "id": "crates/krishiv-sql/src/subquery.rs::fn::validate_no_streaming_subqueries::pub fn validate_no_streaming_subqueries(",
       "kind": "fn",
       "name": "validate_no_streaming_subqueries",
@@ -4112,7 +5102,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/subquery.rs#L42",
+      "documentation": "crates/krishiv-sql/src/subquery.rs#L38",
       "id": "crates/krishiv-sql/src/subquery.rs::struct::DetectedSubquery::#[derive(Debug, Clone)] pub struct DetectedSubquery",
       "kind": "struct",
       "name": "DetectedSubquery",
@@ -4122,7 +5112,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/udf.rs#L275",
+      "documentation": "crates/krishiv-sql/src/udf.rs#L318",
       "id": "crates/krishiv-sql/src/udf.rs::fn::register_single_table_udf::pub fn register_single_table_udf(",
       "kind": "fn",
       "name": "register_single_table_udf",
@@ -4132,7 +5122,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/udf.rs#L122",
+      "documentation": "crates/krishiv-sql/src/udf.rs#L146",
       "id": "crates/krishiv-sql/src/udf.rs::fn::sync_aggregate_udfs::pub fn sync_aggregate_udfs(",
       "kind": "fn",
       "name": "sync_aggregate_udfs",
@@ -4162,7 +5152,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/udf.rs#L292",
+      "documentation": "crates/krishiv-sql/src/udf.rs#L356",
       "id": "crates/krishiv-sql/src/udf.rs::fn::sync_table_udfs::pub fn sync_table_udfs(",
       "kind": "fn",
       "name": "sync_table_udfs",
@@ -4172,7 +5162,7 @@
     },
     {
       "deprecated": false,
-      "documentation": "crates/krishiv-sql/src/unnest_sql.rs#L86",
+      "documentation": "crates/krishiv-sql/src/unnest_sql.rs#L96",
       "id": "crates/krishiv-sql/src/unnest_sql.rs::fn::build_unnest_op::pub fn build_unnest_op(",
       "kind": "fn",
       "name": "build_unnest_op",
@@ -4212,6 +5202,366 @@
     },
     {
       "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unspillable_headroom.rs#L72",
+      "id": "crates/krishiv-sql/src/unspillable_headroom.rs::fn::headroom_bytes::#[must_use] pub fn headroom_bytes(pool_size: usize) -> usize",
+      "kind": "fn",
+      "name": "headroom_bytes",
+      "replacement": null,
+      "signature": "#[must_use] pub fn headroom_bytes(pool_size: usize) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unspillable_headroom.rs#L107",
+      "id": "crates/krishiv-sql/src/unspillable_headroom.rs::fn::new::pub fn new(inner: Arc<dyn MemoryPool>, pool_size: usize, headroom: usize) -> Self",
+      "kind": "fn",
+      "name": "new",
+      "replacement": null,
+      "signature": "pub fn new(inner: Arc<dyn MemoryPool>, pool_size: usize, headroom: usize) -> Self",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unspillable_headroom.rs#L123",
+      "id": "crates/krishiv-sql/src/unspillable_headroom.rs::fn::spillable_ceiling::pub fn spillable_ceiling(&self) -> usize",
+      "kind": "fn",
+      "name": "spillable_ceiling",
+      "replacement": null,
+      "signature": "pub fn spillable_ceiling(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/unspillable_headroom.rs#L88",
+      "id": "crates/krishiv-sql/src/unspillable_headroom.rs::struct::UnspillableHeadroomPool::#[derive(Debug)] pub struct UnspillableHeadroomPool",
+      "kind": "struct",
+      "name": "UnspillableHeadroomPool",
+      "replacement": null,
+      "signature": "#[derive(Debug)] pub struct UnspillableHeadroomPool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_footer.rs#L106",
+      "id": "crates/krishiv-sql/src/vector_footer.rs::fn::read_vector_index_footer::pub fn read_vector_index_footer(path: &Path, embedding_col: &str) -> Option<IvfIndex>",
+      "kind": "fn",
+      "name": "read_vector_index_footer",
+      "replacement": null,
+      "signature": "pub fn read_vector_index_footer(path: &Path, embedding_col: &str) -> Option<IvfIndex>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_footer.rs#L39",
+      "id": "crates/krishiv-sql/src/vector_footer.rs::fn::vector_index_meta_key::pub fn vector_index_meta_key(embedding_col: &str) -> String",
+      "kind": "fn",
+      "name": "vector_index_meta_key",
+      "replacement": null,
+      "signature": "pub fn vector_index_meta_key(embedding_col: &str) -> String",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_footer.rs#L49",
+      "id": "crates/krishiv-sql/src/vector_footer.rs::fn::write_parquet_with_vector_index::pub fn write_parquet_with_vector_index(",
+      "kind": "fn",
+      "name": "write_parquet_with_vector_index",
+      "replacement": null,
+      "signature": "pub fn write_parquet_with_vector_index(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_functions.rs#L29",
+      "id": "crates/krishiv-sql/src/vector_functions.rs::fn::register_vector_functions::pub fn register_vector_functions(ctx: &SessionContext)",
+      "kind": "fn",
+      "name": "register_vector_functions",
+      "replacement": null,
+      "signature": "pub fn register_vector_functions(ctx: &SessionContext)",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L77",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::build::pub fn build(",
+      "kind": "fn",
+      "name": "build",
+      "replacement": null,
+      "signature": "pub fn build(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L56",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::cells::pub fn cells(&self) -> &[Vec<u32>]",
+      "kind": "fn",
+      "name": "cells",
+      "replacement": null,
+      "signature": "pub fn cells(&self) -> &[Vec<u32>]",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L50",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::centroids::pub fn centroids(&self) -> &[f32]",
+      "kind": "fn",
+      "name": "centroids",
+      "replacement": null,
+      "signature": "pub fn centroids(&self) -> &[f32]",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L259",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::from_bytes::pub fn from_bytes(bytes: &[u8]) -> Option<Self>",
+      "kind": "fn",
+      "name": "from_bytes",
+      "replacement": null,
+      "signature": "pub fn from_bytes(bytes: &[u8]) -> Option<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L64",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::is_empty::pub fn is_empty(&self) -> bool",
+      "kind": "fn",
+      "name": "is_empty",
+      "replacement": null,
+      "signature": "pub fn is_empty(&self) -> bool",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L61",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::len::pub fn len(&self) -> usize",
+      "kind": "fn",
+      "name": "len",
+      "replacement": null,
+      "signature": "pub fn len(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L44",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::nlist::pub fn nlist(&self) -> usize",
+      "kind": "fn",
+      "name": "nlist",
+      "replacement": null,
+      "signature": "pub fn nlist(&self) -> usize",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L184",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::probe::pub fn probe(&self, query: &[f32], nprobe: usize) -> Result<Vec<u32>, String>",
+      "kind": "fn",
+      "name": "probe",
+      "replacement": null,
+      "signature": "pub fn probe(&self, query: &[f32], nprobe: usize) -> Result<Vec<u32>, String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L214",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::search::pub fn search(",
+      "kind": "fn",
+      "name": "search",
+      "replacement": null,
+      "signature": "pub fn search(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L238",
+      "id": "crates/krishiv-sql/src/vector_index.rs::fn::to_bytes::pub fn to_bytes(&self) -> Vec<u8>",
+      "kind": "fn",
+      "name": "to_bytes",
+      "replacement": null,
+      "signature": "pub fn to_bytes(&self) -> Vec<u8>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_index.rs#L27",
+      "id": "crates/krishiv-sql/src/vector_index.rs::struct::IvfIndex::#[derive(Debug, Clone, PartialEq)] pub struct IvfIndex",
+      "kind": "struct",
+      "name": "IvfIndex",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq)] pub struct IvfIndex",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_metric.rs#L8",
+      "id": "crates/krishiv-sql/src/vector_metric.rs::enum::VectorMetric::#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum VectorMetric",
+      "kind": "enum",
+      "name": "VectorMetric",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum VectorMetric",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_metric.rs#L23",
+      "id": "crates/krishiv-sql/src/vector_metric.rs::fn::distance::pub fn distance(self, a: &[f32], b: &[f32]) -> f32",
+      "kind": "fn",
+      "name": "distance",
+      "replacement": null,
+      "signature": "pub fn distance(self, a: &[f32], b: &[f32]) -> f32",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_metric.rs#L60",
+      "id": "crates/krishiv-sql/src/vector_metric.rs::fn::from_tag::pub fn from_tag(tag: u8) -> Option<Self>",
+      "kind": "fn",
+      "name": "from_tag",
+      "replacement": null,
+      "signature": "pub fn from_tag(tag: u8) -> Option<Self>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_metric.rs#L51",
+      "id": "crates/krishiv-sql/src/vector_metric.rs::fn::tag::pub fn tag(self) -> u8",
+      "kind": "fn",
+      "name": "tag",
+      "replacement": null,
+      "signature": "pub fn tag(self) -> u8",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L82",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::fn::bits::pub fn bits(&self) -> u8",
+      "kind": "fn",
+      "name": "bits",
+      "replacement": null,
+      "signature": "pub fn bits(&self) -> u8",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L108",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::fn::decode::pub fn decode(&self, codes: &[u16]) -> Vec<f32>",
+      "kind": "fn",
+      "name": "decode",
+      "replacement": null,
+      "signature": "pub fn decode(&self, codes: &[u16]) -> Vec<f32>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L88",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::fn::encode::pub fn encode(&self, v: &[f32]) -> Vec<u16>",
+      "kind": "fn",
+      "name": "encode",
+      "replacement": null,
+      "signature": "pub fn encode(&self, v: &[f32]) -> Vec<u16>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L121",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::fn::estimate_inner_product::pub fn estimate_inner_product(&self, query: &[f32], codes: &[u16]) -> f32",
+      "kind": "fn",
+      "name": "estimate_inner_product",
+      "replacement": null,
+      "signature": "pub fn estimate_inner_product(&self, query: &[f32], codes: &[u16]) -> f32",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L46",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::fn::fit::pub fn fit(rows: &[f32], dim: usize, bits: u8) -> Result<Self, String>",
+      "kind": "fn",
+      "name": "fit",
+      "replacement": null,
+      "signature": "pub fn fit(rows: &[f32], dim: usize, bits: u8) -> Result<Self, String>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L138",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::fn::pack_column::pub fn pack_column(&self, rows: &[f32]) -> Vec<u8>",
+      "kind": "fn",
+      "name": "pack_column",
+      "replacement": null,
+      "signature": "pub fn pack_column(&self, rows: &[f32]) -> Vec<u8>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_quantize.rs#L30",
+      "id": "crates/krishiv-sql/src/vector_quantize.rs::struct::ScalarQuantizer::#[derive(Debug, Clone, PartialEq)] pub struct ScalarQuantizer",
+      "kind": "struct",
+      "name": "ScalarQuantizer",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq)] pub struct ScalarQuantizer",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_search.rs#L501",
+      "id": "crates/krishiv-sql/src/vector_search.rs::fn::ann_search::pub async fn ann_search(",
+      "kind": "fn",
+      "name": "ann_search",
+      "replacement": null,
+      "signature": "pub async fn ann_search(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_search.rs#L623",
+      "id": "crates/krishiv-sql/src/vector_search.rs::fn::build_vector_index::pub async fn build_vector_index(",
+      "kind": "fn",
+      "name": "build_vector_index",
+      "replacement": null,
+      "signature": "pub async fn build_vector_index(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_search.rs#L670",
+      "id": "crates/krishiv-sql/src/vector_search.rs::fn::register_parquet_with_vector_index::pub async fn register_parquet_with_vector_index(",
+      "kind": "fn",
+      "name": "register_parquet_with_vector_index",
+      "replacement": null,
+      "signature": "pub async fn register_parquet_with_vector_index(",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_search.rs#L32",
+      "id": "crates/krishiv-sql/src/vector_search.rs::struct::AnnHit::#[derive(Debug, Clone, PartialEq)] pub struct AnnHit",
+      "kind": "struct",
+      "name": "AnnHit",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq)] pub struct AnnHit",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_search.rs#L41",
+      "id": "crates/krishiv-sql/src/vector_search.rs::struct::AnnSearchParams::#[derive(Debug, Clone)] pub struct AnnSearchParams<'a>",
+      "kind": "struct",
+      "name": "AnnSearchParams",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone)] pub struct AnnSearchParams<'a>",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
+      "documentation": "crates/krishiv-sql/src/vector_search.rs#L467",
+      "id": "crates/krishiv-sql/src/vector_search.rs::struct::VectorIndexStats::#[derive(Debug, Clone, PartialEq, Eq)] pub struct VectorIndexStats",
+      "kind": "struct",
+      "name": "VectorIndexStats",
+      "replacement": null,
+      "signature": "#[derive(Debug, Clone, PartialEq, Eq)] pub struct VectorIndexStats",
+      "stability": "preview"
+    },
+    {
+      "deprecated": false,
       "documentation": "crates/krishiv-sql/src/window_functions.rs#L26",
       "id": "crates/krishiv-sql/src/window_functions.rs::fn::register_window_functions::pub fn register_window_functions(ctx: &SessionContext) -> Result<(), DataFusionError>",
       "kind": "fn",
@@ -4223,6 +5573,7 @@
   ],
   "modules": [
     "analyze",
+    "ann_rewrite",
     "catalog/glue_catalog",
     "catalog/iceberg_catalog_bridge",
     "catalog/iceberg_rest",
@@ -4239,35 +5590,56 @@
     "coop_amplifiers",
     "coverage",
     "create_function_ddl",
+    "cte_materialize",
     "distributed_plan",
+    "grace_hash_join",
     "grammar",
     "higher_order_functions",
     "incremental_view",
     "introspection_sql",
+    "join_estimates",
+    "join_reorder",
     "json_functions",
     "kafka_table",
     "lakehouse/as_of",
     "lakehouse/merge",
     "lakehouse/mod",
     "lakehouse/providers",
+    "late_materialize",
     "lib",
     "live_table",
+    "object_store_registry",
     "pipe_syntax",
     "pipeline_ddl",
     "pivot_sql",
-    "recursive_cte",
+    "python_udf",
+    "rollup_rewrite",
+    "runtime_filter_exec",
+    "scalar_udf",
+    "semi_join_reduction",
     "spark_functions",
     "spark_sql_ext",
+    "spillable_join",
     "sql_tests",
     "sqlstate",
+    "stateless_exec",
     "statement_completion",
     "streaming",
+    "streaming_join_plan",
+    "streaming_pipeline_plan",
     "streaming_table_ddl",
     "streaming_tvf",
     "streaming_window_plan",
     "subquery",
     "udf",
     "unnest_sql",
+    "unspillable_headroom",
+    "vector_footer",
+    "vector_functions",
+    "vector_index",
+    "vector_metric",
+    "vector_quantize",
+    "vector_search",
     "window_functions"
   ]
 }
