@@ -8576,3 +8576,22 @@ field nothing read.
 - **Next**: read that log; then decide `tpcds_q12` budget tightening once a
   week of real-q12 history exists (`benchmarks/budgets.json` note).
 
+
+## 2026-09-06 — v0.1.2 tagged
+
+- **Completed**: `f733096` "chore: release v0.1.2", annotated tag `v0.1.2`
+  pushed. Versions bumped everywhere (workspace, 23 intra-workspace pins,
+  conformance, Helm chart, examples, four Python packages); CHANGELOG has
+  the `[0.1.2] - 2026-09-06` section with migration notes for all 15
+  approved pre-1.0 API changes.
+- **Validation**: check_release/parity/migration gates, fmt, `cargo check
+  --workspace --all-targets`, `just project-check`, `just check` (five
+  modes), `just test` (5535 passed, 0 failed).
+- **Blocker**: the GitHub Release itself is not created — `release.yml`
+  triggers on `release: published` and there is no `gh`/token on this
+  machine. Create it from the tag (pre-release checked) with the drafted
+  notes; then watch the macOS wheel job, which is the one known likely
+  failure.
+- **Next**: `gh release create v0.1.2 --prerelease -F <notes>`; after the
+  workflow runs, smoke-test the binary archive and images (`RELEASE.md`
+  step 9).
