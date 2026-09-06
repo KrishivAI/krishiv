@@ -21,12 +21,12 @@ async-trait = { workspace = true }
 datafusion = { workspace = true }
 futures = { workspace = true }
 tracing = { workspace = true }
-krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
-krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
-krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
-krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
-krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
-krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.2" }
+krishiv-delta = { path = "../krishiv-delta", version = "0.1.2" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.2" }
+krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.2" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.2" }
 tokio = { workspace = true }
 
 [dev-dependencies]

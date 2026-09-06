@@ -19,25 +19,25 @@ tracing = { workspace = true }
 dashmap = { workspace = true }
 tokio = { workspace = true }
 futures = { workspace = true }
-krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
-krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
-krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.0" }
-krishiv-state = { path = "../krishiv-state", version = "0.1.0" }
-krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.0" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.2" }
+krishiv-runtime = { path = "../krishiv-runtime", version = "0.1.2" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.2" }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.2" }
 # `hudi` was pinned here as well, but it gates no module: `mod hudi` inside
 # `lakehouse` is unconditional, so the flag only ever selected a certification
 # arm. Pinning it advertised a dependency edge that does not exist.
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.0", features = ["lakehouse"] }
-krishiv-sql = { path = "../krishiv-sql", version = "0.1.0" }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.2", features = ["lakehouse"] }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.2" }
 # A-4: needed to re-export `LiveJobView` for `Session::list_jobs_remote` /
 # `Session::get_job_remote`. The runtime already depends on it transitively,
 # but `krishiv-api` cannot reach the symbol through the runtime's
 # re-export boundary, so we depend on the type crate directly.
-krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.0" }
-krishiv-delta = { path = "../krishiv-delta", version = "0.1.0" }
-krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.0" }
-krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.0" }
-krishiv-engines = { path = "../krishiv-engines", version = "0.1.0" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.2" }
+krishiv-delta = { path = "../krishiv-delta", version = "0.1.2" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.2" }
+krishiv-engine-core = { path = "../krishiv-engine-core", version = "0.1.2" }
+krishiv-engines = { path = "../krishiv-engines", version = "0.1.2" }
 datafusion = { workspace = true }
 parquet = { workspace = true }
 twox-hash = { workspace = true }
@@ -63,9 +63,9 @@ iceberg-catalog = [
 [dev-dependencies]
 # dev-only cycle (flight-sql depends on api); Cargo permits dev-dep cycles.
 # Gives the remote-execution Flight test a live server to hit.
-krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.0" }
-krishiv-common = { path = "../krishiv-common", version = "0.1.0" }
-krishiv-plan = { path = "../krishiv-plan", version = "0.1.0" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.2" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.2" }
 tempfile = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }

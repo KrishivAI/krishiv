@@ -8,6 +8,133 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.1.2] - 2026-09-06
+
+Highlights since 0.1.0: the TPC-DS SF1 suite runs 21.4 s → 13.5 s (2.03× DuckDB,
+99/99 results identical) through join reordering, CTE materialisation and
+grouping-set rewriting; the read-every-file audit closed the four largest
+crates with ~65 revert-proven fixes (`docs/engineering-log/crate-audit-register.md`);
+the documentation is a 19-document architecture reference; and CI on `main` is
+green again after two weeks in which the test tier had not run at all
+(register §98). 0.1.1 was never tagged; this release supersedes it.
+
+### Added
+
+- **Architecture documentation set** (2026-09-05): `docs/architecture/00`–`18`
+  cover every crate and feature (execution modes, SQL engine, planning,
+  scheduler, executor, shuffle, state/checkpoints, streaming, IVM,
+  connectors, interfaces, security, observability, deployment, configuration,
+  performance, testing, compatibility). Superseded phase plans and design
+  notes were removed; the audit registers and dated evidence live in
+  `docs/engineering-log/`.
+- **Join reordering** (`JoinReorder`, `KRISHIV_JOIN_REORDER`, default on):
+  inner-join chains are reordered smallest-connected-first from the
+  row-count registry (populated from Parquet footers at registration and by
+  `ANALYZE TABLE`), firing only when the written `FROM` order is inverted.
+  TPC-DS q72 2655 → 280 ms.
+- **CTE materialisation** (`KRISHIV_CTE_MATERIALIZE`, default on, one-shot
+  CLI process only): a `WITH` body referenced more than once — including
+  from subqueries — is computed once into a partitioned `MemTable`, with
+  consumer filters traced into the body where they reduce it.
+- **ROLLUP / CUBE / GROUPING SETS** are evaluated as one finest-grain
+  aggregate plus re-aggregation instead of one aggregate per set.
+- **IVM: a delta whose columns differ from its source's is refused at
+  `feed`** with a message naming the source and both column lists, and the
+  state's append path refuses it too. Previously it was retained and every
+  subsequent tick failed inside DataFusion ("Mismatch between schema and
+  batches"), poisoning the source.
+- Nightly workflow is a **dry run** unless the repository variable
+  `NIGHTLY_PUBLISH` is `"true"`: crates `cargo publish --dry-run`, images
+  built and not pushed, PyPI/Docker Hub/manifest/tag skipped.
+
+### Changed
+
+- DataFusion session defaults: `repartition_file_min_size` 10 MiB → 1 MiB
+  (dimension scans split across partitions),
+  `hash_join_single_partition_threshold` 1 MiB → 8 MiB / 1 M rows (a
+  filtered dimension can be a `CollectLeft` build). Both measured on all 99
+  queries, paired and hashed; `parquet.pushdown_filters` stays off (oracle
+  ceiling 5.6 %, not structurally decidable — register §95).
+- The CLI honours `KRISHIV_TARGET_PARALLELISM`.
+- The website moved to its own repository (`KrishivAI/Krishiv-web`); the
+  `web/` directory, its deploy workflow and `just web-*` recipes are gone.
+- `krishiv.ai` (Python) now stands in honestly when the native `vector-sinks`
+  feature is not built: attribute access explains how to build it instead of
+  a circular-import `ImportError` at import time.
+- `krishiv-conformance` is Apache-2.0 (was BUSL-1.1 in an Apache-2.0
+  workspace; failed the license gate).
+- The `tpcds_q12` smoke benchmark is the real TPC-DS query 12 (the previous
+  constant was a hand-written three-fact-table fan-out running 130–180 s).
+
+### Fixed
+
+- CI (register §98): `protoc` missing from the lint and test jobs (the lint
+  failure had skipped the entire test tier since before 2026-08-26);
+  `rust:1.92-slim` Dockerfile pins below the 1.94.1 MSRV; BSD `sed -i` in
+  the macOS wheel stamp; `scripts/external-test-services.sh` committed
+  non-executable; `RUSTC_WRAPPER=sccache` leaking into the docker-based
+  cargo-deny action; `rustsec/audit-check` not honouring `deny.toml`'s
+  accepted advisories (replaced by `cargo audit` with the same list).
+- Dependencies: `h2` 0.4.15 → 0.4.19 (RUSTSEC-2026-0258), yanked
+  `chacha20` 0.10.1 → 0.10.2.
+- The public-API inventories under `api/` were regenerated; they had been
+  stale since the live-table removal.
+
+### Removed — migration notes (preview APIs, pre-1.0)
+
+Every removal or signature change below is listed in
+`api/approved-breaking.toml` with its reason; this is the migration guide.
+
+- Replacement strings, verbatim, as recorded in `api/approved-breaking.toml`
+  (the migration-notes gate matches these exactly):
+  - `DataFrame::write_stream().refresh(..).to_table(session, name) — the same three-arm routing, and previously the caller of this method`
+  - `BlockingSession::register_record_batches (Batch) or BlockingSession::sql("CREATE MATERIALIZED VIEW ..") (Incremental); both remain runtime-free`
+  - `ViewHealth::is_reported() for the previous check (unchanged meaning), ViewHealth::is_complete() for the new one; match ViewHealth::Reported { .. } where the variant is matched directly`
+
+- **Sync `Session`/`DataFrameReader` methods now require `Send` query and
+  path arguments.** `krishiv_common::async_util::block_on`'s fallback used
+  to call `block_on` on a second runtime from a thread that had already
+  entered one, which Tokio's per-thread nesting guard still rejects; it now
+  hops to a fresh OS thread, so the driven future must be `Send`. Callers
+  passing `&str`/`String`/`PathBuf` are unaffected; only a non-`Send`
+  `impl AsRef<str>` needs changing. New signatures:
+  `Session::sql(&self, query: impl AsRef<str> + Send)`,
+  `Session::sql_as(&self, api_key: &str, query: impl AsRef<str> + Send)`,
+  `Session::sql_with_timeout(&self, query: impl AsRef<str> + Send, timeout_ms: u64)`,
+  `Session::batch(&self, query: impl AsRef<str> + Send)`,
+  `Session::execute_local(&self, query: impl AsRef<str> + Send)`,
+  `Session::execute_remote(&self, query: impl AsRef<str> + Send)`,
+  `DataFrameReader::load(self, path: impl AsRef<Path> + Send)`.
+- **`Session::create_live_table` removed.** A "live table" was never a
+  distinct object — the method was a three-arm router (Batch collected the
+  query once, Incremental issued `CREATE MATERIALIZED VIEW`, Continuous
+  errored) over a stack with no handlers, now deleted. Use
+  `DataFrame::write_stream().refresh(..).to_table(session, name)` — the same
+  three-arm routing, and previously the caller of this method.
+- **`BlockingSession::create_live_table` removed** (the sync facade of the
+  above). Use `BlockingSession::register_record_batches` (Batch) or
+  `BlockingSession::sql("CREATE MATERIALIZED VIEW ..")` (Incremental); both
+  remain runtime-free.
+- **`ViewHealth::Reported` is a struct variant** carrying
+  `degraded_omitted` / `errored_omitted`, because the resident IVM tick wire
+  caps each health vector at 256 entries and a Rust caller could read a
+  truncated list as complete. Use `ViewHealth::is_reported()` for the
+  previous check (unchanged meaning), `ViewHealth::is_complete()` for the
+  new one; match `ViewHealth::Reported { .. }` where the variant is matched
+  directly.
+- Inventory-only changes, no code change needed: `DataFrameWriter::option(mut self, key, value)`
+  (parameter renamed, body enabled); `StreamingDataFrame` (`#[derive(Clone)]`
+  retained); `SqlDataFrame` (struct retained, derive set updated);
+  Python `Session.sql_async` (same name, updated signature);
+  `Stream.tumbling_window` (public stable API unchanged; an underscore
+  helper was renamed).
+
+### Added
+
 - **Adaptive query execution + statistics** (Phase 54, 2026-07-12). The
   coordinator now re-optimizes real distributed stages at stage
   boundaries from measured shuffle output: small reduce partitions are

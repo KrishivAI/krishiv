@@ -4744,7 +4744,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "axum",
@@ -4778,7 +4778,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-api"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4811,7 +4811,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-bench"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "arrow",
@@ -4836,7 +4836,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-chaos"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "krishiv-common",
@@ -4853,7 +4853,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-common"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "hex",
@@ -4867,7 +4867,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-conformance"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4882,7 +4882,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-connectors"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "apache-avro 0.22.0",
  "arrow",
@@ -4929,7 +4929,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-dataflow"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "arrow",
@@ -4951,7 +4951,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-delta"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "arrow",
@@ -4965,7 +4965,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-engine-core"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -4982,7 +4982,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-engines"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5001,7 +5001,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-executor"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "axum",
@@ -5041,7 +5041,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-flight-sql"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -5068,7 +5068,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-ivm"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "arrow",
@@ -5089,7 +5089,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-mcp"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "axum",
@@ -5107,7 +5107,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-metrics"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "dashmap",
  "http 1.5.0",
@@ -5129,7 +5129,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-operator"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "axum",
@@ -5152,7 +5152,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-plan"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "chrono",
@@ -5169,7 +5169,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-proto"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -5188,7 +5188,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-python"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "constant_time_eq 0.6.0",
@@ -5214,7 +5214,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-runtime"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -5251,7 +5251,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-scheduler"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5293,7 +5293,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-shuffle"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "ahash",
  "arrow",
@@ -5325,7 +5325,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-sql"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "async-trait",
@@ -5363,7 +5363,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-sql-gateway"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "krishiv-api",
  "krishiv-sql",
@@ -5371,7 +5371,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-state"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -5393,7 +5393,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-ui"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow",
  "axum",
