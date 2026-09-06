@@ -9118,10 +9118,24 @@ feed check reverted (the error moves to the tick and the test's
 `expect_err` at feed panics). The Python test now asserts the new contract
 and that the view is still maintainable afterwards.
 
-### Not fixed — watching
+### The two "flakes" were not flakes
 
-- CI's `Supply-chain (cargo-deny)` failed on `a14ce6f` at the same minute
-  the identical action passed in `security.yml` on the same commit, and
-  `cargo deny check` is clean locally. One data point; judged on the next
-  push.
-- `just test-etcd` on `a14ce6f`: not reproducible locally (above).
+Both failed identically on `93e2f21`, `a14ce6f` and `a2f8ef1` while
+everything around them went green, which rules out chance.
+
+- **`just test-etcd`** — `etcd-client 0.19`'s build script runs
+  `tonic_prost_build::compile_protos` and needs a system `protoc`; the
+  `Tests` job's `rust-setup` did not install one (only the `check` and
+  feature-guard jobs did), so the etcd feature failed to *compile* there
+  while `just test` (no etcd) passed in the same job. Same class as #1.
+  `protobuf-compiler` is now part of `rust-setup`'s baseline for every job
+  and the per-job `extra-apt` copies are gone. (My earlier "645/645 locally,
+  plain and nextest" was half right: cargo-nextest is not installed here,
+  so the justfile fell back to `cargo test` both times — the runner was
+  never the variable.)
+- **CI `Supply-chain (cargo-deny)`** — `cargo-deny-action` is a docker
+  action and inherits the workflow env; `ci.yml` sets `RUSTC_WRAPPER=sccache`
+  at workflow level and the action's container has no sccache, so cargo's
+  rustc probe fails before any check runs. `security.yml` sets no such env,
+  which is why the identical action passed there on the same commits. The
+  deny job now clears `RUSTC_WRAPPER`.

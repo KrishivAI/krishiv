@@ -35,12 +35,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           components: rustfmt,clippy
-          # `just lint` runs krishiv-connectors/krishiv-python with --all-features,
-          # which enables `pulsar-source`; pulsar's build script calls
-          # prost_build::compile_protos and needs a system protoc (no vendored
-          # binary). Without this the job failed on every push and, because
-          # every test job `needs` it, skipped the whole test tier.
-          extra-apt: protobuf-compiler
       - uses: taiki-e/install-action@just
       - run: just fmt
       - run: just lint
@@ -54,6 +48,13 @@ jobs:
   deny:
     name: Supply-chain (cargo-deny)
     runs-on: ubuntu-latest
+    env:
+      # cargo-deny-action is a docker action and inherits the workflow env,
+      # where RUSTC_WRAPPER=sccache names a binary that does not exist in its
+      # container; cargo's rustc probe then fails before any check runs. The
+      # identical action in security.yml (no such env) passes on the same
+      # commits. Clear it here.
+      RUSTC_WRAPPER: ""
     steps:
       - uses: actions/checkout@v4
       - uses: EmbarkStudios/cargo-deny-action@v2
@@ -102,7 +103,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: check-${{ matrix.mode }}
-          extra-apt: protobuf-compiler
       - uses: taiki-e/install-action@just
       - run: just check-${{ matrix.mode }}
 
@@ -116,7 +116,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: feature-guard
-          extra-apt: protobuf-compiler
       - uses: taiki-e/install-action@cargo-hack
       - uses: taiki-e/install-action@just
       - run: just lint-features

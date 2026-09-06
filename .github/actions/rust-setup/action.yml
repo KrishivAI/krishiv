@@ -29,5 +29,10 @@ runs:
       shell: bash
       run: |
         sudo apt-get update -qq
+        # protobuf-compiler is baseline, not per-job: any job that compiles the
+        # `etcd` feature (etcd-client) or the connectors' `pulsar-source`
+        # (pulsar) runs a prost-build script that needs a system protoc. Two
+        # jobs had it, three that needed it did not, and each missing one
+        # failed on every push (register §98).
         sudo apt-get install -y --no-install-recommends \
-          libssl-dev pkg-config cmake mold clang libclang-dev sccache ${{ inputs.extra-apt }}
+          libssl-dev pkg-config cmake mold clang libclang-dev sccache protobuf-compiler ${{ inputs.extra-apt }}

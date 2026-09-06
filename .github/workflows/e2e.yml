@@ -36,7 +36,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: kind-e2e
-          extra-apt: protobuf-compiler
       - name: Install kind
         run: |
           curl -sSLo ./kind https://kind.sigs.k8s.io/dl/v0.23.0/kind-linux-amd64
@@ -81,7 +80,6 @@ jobs:
       - uses: ./.github/actions/rust-setup
         with:
           cache-key: bare-metal-e2e
-          extra-apt: protobuf-compiler
       - name: Build cluster binaries
         run: |
           cargo build -p krishiv-scheduler --bin krishiv-clusterd --features etcd
