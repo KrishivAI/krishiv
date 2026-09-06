@@ -8556,3 +8556,23 @@ field nothing read.
   reviewed commit.
 - **Next**: `python3 scripts/check_api_surface.py --write` in a dedicated
   commit after reviewing the diff; then `just project-check` goes green.
+
+## 2026-09-06 — CI green on main; nightly is a dry run
+
+- **Completed**: eleven distinct CI defects fixed across `93e2f21`…`5477d24`
+  (register §98): protoc missing from the lint and test jobs (the lint one
+  had skipped the whole test tier since before 08-26), cargo-deny license /
+  h2 / chacha20, audit-check vs deny.toml, `rust:1.92` Dockerfile pins vs
+  MSRV 1.94.1, BSD `sed -i`, the fake `tpcds_q12`, the non-executable
+  external-services script, the `krishiv.ai` self-import, a wrong-columns
+  delta poisoning an IVM source (two red-proven guards), `RUSTC_WRAPPER`
+  leaking into the docker-based deny action. Nightly publishes only when
+  the repo variable `NIGHTLY_PUBLISH` is `"true"`.
+- **Validation**: `ci.yml` success on `5477d24` (all jobs); Security and
+  publish-main-image success; local `cargo test -p krishiv-delta -p
+  krishiv-ivm` (24 suites), pytest 741/42 on 3.14 and in a 3.12 container.
+- **Blocker**: macOS nightly wheels fail inside `maturin-action` — never
+  reached before; needs the job log (no mac, no token here).
+- **Next**: read that log; then decide `tpcds_q12` budget tightening once a
+  week of real-q12 history exists (`benchmarks/budgets.json` note).
+

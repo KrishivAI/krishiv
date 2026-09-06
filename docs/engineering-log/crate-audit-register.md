@@ -9139,3 +9139,18 @@ everything around them went green, which rules out chance.
   rustc probe fails before any check runs. `security.yml` sets no such env,
   which is why the identical action passed there on the same commits. The
   deny job now clears `RUSTC_WRAPPER`.
+
+### Outcome (2026-09-06)
+
+- `ci.yml` on `5477d24`: **success** — every job, including the full test
+  tier — the first green `main` since before 2026-08-26. `security.yml`,
+  `publish-main-image.yml`: success.
+- First dry-run Nightly (`5477d24`, 01:40 UTC): all six Docker builds pass
+  on `rust:1.94-slim` and nothing is published (manifest, Docker Hub, PyPI
+  skipped as designed; no tag). Linux wheels build.
+- **Open — macOS wheels** (`macos-14`, both targets): the stamp step now
+  passes and the job fails inside `PyO3/maturin-action`. That step had never
+  executed before (the stamp failed first every night since the job was
+  written), so whatever it hits is untested mac-specific breakage; there is
+  no mac here and no log access without a GitHub token. Needs the job log.
+
