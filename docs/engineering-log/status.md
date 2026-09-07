@@ -8577,12 +8577,12 @@ field nothing read.
   week of real-q12 history exists (`benchmarks/budgets.json` note).
 
 
-## 2026-09-06 — v0.1.2 tagged
+## 2026-09-07 — v0.1.1 tagged (retargeted from v0.1.2 before any release was created)
 
-- **Completed**: `f733096` "chore: release v0.1.2", annotated tag `v0.1.2`
-  pushed. Versions bumped everywhere (workspace, 23 intra-workspace pins,
+- **Completed**: "chore: release v0.1.1", annotated tag `v0.1.1` pushed; the `v0.1.2`
+  tag (never released) was deleted from origin. Versions bumped everywhere (workspace, 23 intra-workspace pins,
   conformance, Helm chart, examples, four Python packages); CHANGELOG has
-  the `[0.1.2] - 2026-09-06` section with migration notes for all 15
+  the `[0.1.1] - 2026-09-07` section with migration notes for all 15
   approved pre-1.0 API changes.
 - **Validation**: check_release/parity/migration gates, fmt, `cargo check
   --workspace --all-targets`, `just project-check`, `just check` (five
@@ -8592,6 +8592,6 @@ field nothing read.
   machine. Create it from the tag (pre-release checked) with the drafted
   notes; then watch the macOS wheel job, which is the one known likely
   failure.
-- **Next**: `gh release create v0.1.2 --prerelease -F <notes>`; after the
+- **Next**: `gh release create v0.1.1 --prerelease -F <notes>`; after the
   workflow runs, smoke-test the binary archive and images (`RELEASE.md`
   step 9).

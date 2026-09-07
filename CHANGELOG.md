@@ -12,7 +12,7 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
-## [0.1.2] - 2026-09-06
+## [0.1.1] - 2026-09-07
 
 Highlights since 0.1.0: the TPC-DS SF1 suite runs 21.4 s → 13.5 s (2.03× DuckDB,
 99/99 results identical) through join reordering, CTE materialisation and
@@ -20,7 +20,7 @@ grouping-set rewriting; the read-every-file audit closed the four largest
 crates with ~65 revert-proven fixes (`docs/engineering-log/crate-audit-register.md`);
 the documentation is a 19-document architecture reference; and CI on `main` is
 green again after two weeks in which the test tier had not run at all
-(register §98). 0.1.1 was never tagged; this release supersedes it.
+(register §98).
 
 ### Added
 

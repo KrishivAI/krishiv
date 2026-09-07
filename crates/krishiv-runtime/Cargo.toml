@@ -12,17 +12,17 @@ readme = "README.md"
 
 [dependencies]
 thiserror = { workspace = true }
-krishiv-plan = { path = "../krishiv-plan", version = "0.1.2" }
-krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.2" }
-krishiv-executor = { path = "../krishiv-executor", version = "0.1.2" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.1" }
+krishiv-dataflow = { path = "../krishiv-dataflow", version = "0.1.1" }
+krishiv-executor = { path = "../krishiv-executor", version = "0.1.1" }
 # In-memory shuffle store for Phase 52 staged (partition-parallel) batch jobs
 # on the in-process cluster.
-krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.2" }
-krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.2" }
-krishiv-proto = { path = "../krishiv-proto", version = "0.1.2", features = ["serde"] }
-krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
-krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.2" }
-krishiv-sql = { path = "../krishiv-sql", version = "0.1.2" }
+krishiv-shuffle = { path = "../krishiv-shuffle", version = "0.1.1" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.1" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.1", features = ["serde"] }
+krishiv-common = { path = "../krishiv-common", version = "0.1.1" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.1" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.1" }
 dashmap = { workspace = true }
 reqwest = { workspace = true }
 urlencoding = { workspace = true }
@@ -37,7 +37,7 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 parquet = { workspace = true }
 webpki-root-certs = { workspace = true }
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.2", features = ["vector-sinks"], optional = true }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.1", features = ["vector-sinks"], optional = true }
 object_store = { workspace = true, features = ["aws"], optional = true }
 bytes = { workspace = true, optional = true }
 
@@ -59,7 +59,7 @@ tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 # dev-only cycle (flight-sql depends on runtime); Cargo permits dev-dep cycles.
 # Gives the distributed Flight integration tests a live server to hit.
-krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.2" }
+krishiv-flight-sql = { path = "../krishiv-flight-sql", version = "0.1.1" }
 
 [lib]
 path = "src/lib.rs"

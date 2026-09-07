@@ -14,8 +14,8 @@ readme = "README.md"
 path = "src/lib.rs"
 
 [dependencies]
-krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
-krishiv-delta = { path = "../krishiv-delta", version = "0.1.2" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.1" }
+krishiv-delta = { path = "../krishiv-delta", version = "0.1.1" }
 arrow = { workspace = true }
 datafusion = { workspace = true }
 sqlparser = { workspace = true }

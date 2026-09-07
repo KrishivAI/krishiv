@@ -13,11 +13,11 @@ constant_time_eq = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 arrow = { workspace = true }
-krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
-krishiv-proto = { path = "../krishiv-proto", version = "0.1.2" }
-krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.2" }
-krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.2" }
-krishiv-sql = { path = "../krishiv-sql", version = "0.1.2" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.1" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.1" }
+krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.1" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.1" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.1" }
 rust-embed = { workspace = true }
 mime_guess = { workspace = true }
 serde = { workspace = true }

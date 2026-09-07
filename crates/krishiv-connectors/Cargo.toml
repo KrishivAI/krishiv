@@ -89,16 +89,16 @@ parquet = { workspace = true, features = ["object_store", "async"] }
 bytes = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
-krishiv-common = { path = "../krishiv-common", version = "0.1.2" }
-krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.2" }
-krishiv-proto = { path = "../krishiv-proto", version = "0.1.2" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.1" }
+krishiv-metrics = { path = "../krishiv-metrics", version = "0.1.1" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.1" }
 chrono = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 iceberg = { workspace = true, optional = true }
 datafusion = { workspace = true, optional = true }
 uuid = { workspace = true, optional = true }
-krishiv-state = { path = "../krishiv-state", version = "0.1.2", optional = true }
+krishiv-state = { path = "../krishiv-state", version = "0.1.1", optional = true }
 object_store = { workspace = true }
 rdkafka = { version = "0.39", optional = true, default-features = false, features = ["tokio"] }
 regex = { workspace = true }

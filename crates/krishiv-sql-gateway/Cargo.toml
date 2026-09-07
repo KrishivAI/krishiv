@@ -10,8 +10,8 @@ documentation.workspace = true
 description = "Separately versioned SQL gateway facade for JDBC/ODBC-compatible clients"
 
 [dependencies]
-krishiv-api = { path = "../krishiv-api", version = "0.1.2" }
-krishiv-sql = { path = "../krishiv-sql", version = "0.1.2" }
+krishiv-api = { path = "../krishiv-api", version = "0.1.1" }
+krishiv-sql = { path = "../krishiv-sql", version = "0.1.1" }
 
 [lints]
 workspace = true

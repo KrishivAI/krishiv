@@ -2,8 +2,8 @@ apiVersion: v2
 name: krishiv
 description: Krishiv hybrid compute framework — coordinator, executor, and operator.
 type: application
-version: 0.1.2
-appVersion: "0.1.2"
+version: 0.1.1
+appVersion: "0.1.1"
 keywords:
   - krishiv
   - data

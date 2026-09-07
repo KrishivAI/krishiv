@@ -9,14 +9,14 @@ description = "Cross-crate chaos and fault-injection integration tests"
 
 [dependencies]
 arrow = { workspace = true }
-krishiv-common = { path = "../krishiv-common", version = "0.1.2", features = ["chaos"] }
-krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.2" }
-krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.2" }
-krishiv-operator = { path = "../krishiv-operator", version = "0.1.2" }
-krishiv-plan = { path = "../krishiv-plan", version = "0.1.2" }
-krishiv-proto = { path = "../krishiv-proto", version = "0.1.2" }
-krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.2" }
-krishiv-state = { path = "../krishiv-state", version = "0.1.2" }
+krishiv-common = { path = "../krishiv-common", version = "0.1.1", features = ["chaos"] }
+krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.1" }
+krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.1" }
+krishiv-operator = { path = "../krishiv-operator", version = "0.1.1" }
+krishiv-plan = { path = "../krishiv-plan", version = "0.1.1" }
+krishiv-proto = { path = "../krishiv-proto", version = "0.1.1" }
+krishiv-scheduler = { path = "../krishiv-scheduler", version = "0.1.1" }
+krishiv-state = { path = "../krishiv-state", version = "0.1.1" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
 [dev-dependencies]
