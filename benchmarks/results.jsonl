@@ -727,3 +727,14 @@
 {"path": "nexmark_q2_auction_filter_100k_p50", "value_ms": 1.93242368202765, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
 {"path": "nexmark_q5_auction_category_100k_p50", "value_ms": 2.1184787131647775, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
 {"path": "nexmark_q8_person_region_100k_p50", "value_ms": 0.8726226134778012, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpch_distributed_q1_sf1_p50", "value_ms": 110.8975755511111, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpch_distributed_q3_sf1_p50", "value_ms": 98.87335916666667, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpch_distributed_q5_sf1_p50", "value_ms": 1061.0724368333333, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpch_distributed_q6_sf1_p50", "value_ms": 77.10971805952381, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpch_distributed_q10_sf1_p50", "value_ms": 139.738383171875, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpch_distributed_q18_sf1_p50", "value_ms": 196.72442205555558, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpcds_q1_sf1_p50", "value_ms": 2.9428703770053475, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpcds_q3_sf1_p50", "value_ms": 19.417222379012347, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpcds_q6_sf1_p50", "value_ms": 42.18136022052154, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpcds_q12_sf1_p50", "value_ms": 28.459245781954888, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
+{"path": "tpcds_q27_sf1_p50", "value_ms": 58.312632558333334, "commit": "daa43fab975f1c890e096ed7b3e5c002263f270e", "date": "2026-09-17", "env": "ci-shared"}
