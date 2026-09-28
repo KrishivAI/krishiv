@@ -67,10 +67,14 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
   - fixed 2026-09-28: outer→inner merge ignores a Failed for the epoch the inner copy is committing; `a_stale_timeout_failure_does_not_overwrite_a_commit_in_progress`
 - [x] M12 `krishiv-sql/src/semi_join_reduction.rs:816` SemiJoinReductionThroughAggregate ignores `null_equality`
   - fixed 2026-09-28: with H4
-- [ ] M13 `krishiv-sql/src/rollup_rewrite.rs:398` count re-aggregated as `sum` → NULL instead of 0 on empty input
-- [ ] M14 `krishiv-sql/src/spark_sql_ext.rs:343` DESCRIBE EXTENDED substring detection rewrites literals
-- [ ] M15 `krishiv-sql/src/spark_sql_ext.rs:270,378` TABLESAMPLE / SHOW TBLPROPERTIES Unicode-offset slice panic
-- [ ] M16 `krishiv-sql/src/pivot_sql.rs:120,184,300` PIVOT drops trailing WHERE/ORDER BY; slice panic; literal match
+- [x] M13 `krishiv-sql/src/rollup_rewrite.rs:398` count re-aggregated as `sum` → NULL instead of 0 on empty input
+  - fixed 2026-09-28: count re-aggregated as `coalesce(sum(p), 0)`; `an_empty_rollup_counts_zero_not_null`
+- [x] M14 `krishiv-sql/src/spark_sql_ext.rs:343` DESCRIBE EXTENDED substring detection rewrites literals
+  - fixed 2026-09-28: literal-aware `sql_words` scanner; DESCRIBE EXTENDED only when the statement is DESC[RIBE] [TABLE] EXTENDED
+- [x] M15 `krishiv-sql/src/spark_sql_ext.rs:270,378` TABLESAMPLE / SHOW TBLPROPERTIES Unicode-offset slice panic
+  - fixed 2026-09-28: TABLESAMPLE / SHOW TBLPROPERTIES use byte-exact word offsets (no Unicode panic, no literal matches)
+- [x] M16 `krishiv-sql/src/pivot_sql.rs:120,184,300` PIVOT drops trailing WHERE/ORDER BY; slice panic; literal match
+  - fixed 2026-09-28: PIVOT/UNPIVOT found as words, FOR/IN parsed by word after the aggregate, trailing clauses refused
 - [ ] M17 `krishiv-connectors/src/registry/drivers/pulsar.rs:34` registry Pulsar source never acks; ignores `start_position`
 - [ ] M18 `krishiv-connectors/src/kinesis.rs:243` idle shard returns empty batch (spin); iterator taken before fallible call
 - [ ] M19 `krishiv-connectors/src/two_phase.rs:303` local Parquet 2PC: no fsync of tmp or dir

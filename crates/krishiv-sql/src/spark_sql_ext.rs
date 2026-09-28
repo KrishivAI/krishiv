@@ -247,7 +247,75 @@ fn find_keyword_boundary(sql: &str, keyword: &str) -> Option<usize> {
 
 /// Detects `TABLESAMPLE` in SQL.
 pub fn contains_tablesample(sql: &str) -> bool {
-    sql.to_uppercase().contains("TABLESAMPLE")
+    sql_words(sql).iter().any(|w| w.upper == "TABLESAMPLE")
+}
+
+/// A bare word of SQL text — outside string literals, quoted identifiers and
+/// comments — with its byte range in the original text.
+pub(crate) struct SqlWord {
+    pub(crate) start: usize,
+    pub(crate) end: usize,
+    pub(crate) upper: String,
+}
+
+/// Split `sql` into bare words, skipping '…', "…", `…`, -- and /* */.
+///
+/// The text rewriters here used to search `sql.to_uppercase()` and slice the
+/// original with the offsets it gave: that matched keywords inside string
+/// literals (rewriting data), and panicked once a character changed byte
+/// length when upper-cased. Offsets from this scan index `sql` itself.
+pub(crate) fn sql_words(sql: &str) -> Vec<SqlWord> {
+    let bytes = sql.as_bytes();
+    let at = |i: usize| bytes.get(i).copied();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while let Some(b) = at(i) {
+        match b {
+            quote @ (b'\'' | b'"' | b'`') => {
+                i += 1;
+                while let Some(c) = at(i) {
+                    if c == quote {
+                        // A doubled quote is an escaped quote inside the literal.
+                        if at(i + 1) == Some(quote) {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'-' if at(i + 1) == Some(b'-') => {
+                while at(i).is_some_and(|c| c != b'\n') {
+                    i += 1;
+                }
+            }
+            b'/' if at(i + 1) == Some(b'*') => {
+                i += 2;
+                while at(i).is_some() && !(at(i) == Some(b'*') && at(i + 1) == Some(b'/')) {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b if b.is_ascii_alphabetic() || b == b'_' => {
+                let start = i;
+                while at(i).is_some_and(|c| c.is_ascii_alphanumeric() || c == b'_') {
+                    i += 1;
+                }
+                // Word bytes are ASCII, so these are char boundaries.
+                if let Some(word) = sql.get(start..i) {
+                    words.push(SqlWord {
+                        start,
+                        end: i,
+                        upper: word.to_ascii_uppercase(),
+                    });
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    words
 }
 
 /// Rewrites Spark `TABLESAMPLE(n PERCENT)` to DataFusion-compatible form.
@@ -267,11 +335,12 @@ pub fn rewrite_tablesample(sql: &str) -> SqlResult<String> {
         return Ok(sql.to_string());
     }
 
-    let upper = sql.to_uppercase();
-
     // Validate TABLESAMPLE syntax: TABLESAMPLE (n PERCENT) or TABLESAMPLE (n ROWS)
-    if let Some(pos) = upper.find("TABLESAMPLE") {
-        let after = sql[pos + "TABLESAMPLE".len()..].trim_start();
+    if let Some(word) = sql_words(sql)
+        .into_iter()
+        .find(|w| w.upper == "TABLESAMPLE")
+    {
+        let after = sql[word.end..].trim_start();
         if !after.starts_with('(') {
             return Err(SqlError::DataFusion {
                 message: "TABLESAMPLE requires parentheses: TABLESAMPLE (n PERCENT)".into(),
@@ -341,10 +410,23 @@ pub fn rewrite_transform(sql: &str) -> SqlResult<String> {
 
 /// Detects `DESCRIBE TABLE EXTENDED` in SQL.
 pub fn contains_describe_extended(sql: &str) -> bool {
-    let upper = sql.to_uppercase();
-    (upper.contains("DESCRIBE") || upper.contains("DESC"))
-        && upper.contains("TABLE")
-        && upper.contains("EXTENDED")
+    describe_extended_word(sql).is_some()
+}
+
+/// The `EXTENDED` of a statement that *is* `DESC[RIBE] [TABLE] EXTENDED …`.
+fn describe_extended_word(sql: &str) -> Option<SqlWord> {
+    let mut words = sql_words(sql).into_iter();
+    let first = words.next()?;
+    if first.upper != "DESC" && first.upper != "DESCRIBE" {
+        return None;
+    }
+    let second = words.next()?;
+    let candidate = if second.upper == "TABLE" {
+        words.next()?
+    } else {
+        second
+    };
+    (candidate.upper == "EXTENDED").then_some(candidate)
 }
 
 /// Rewrites `DESCRIBE TABLE EXTENDED <table>` to standard `DESCRIBE TABLE <table>`.
@@ -357,16 +439,27 @@ pub fn rewrite_describe_extended(sql: &str) -> SqlResult<String> {
         return Ok(sql.to_string());
     }
 
-    // Remove EXTENDED keyword
-    let result = regex_replace(sql, r"(?i)\bEXTENDED\b\s*", "")?;
-    Ok(result.trim().to_string())
+    let Some(word) = describe_extended_word(sql) else {
+        return Ok(sql.to_string());
+    };
+    let rest = sql[word.end..].trim_start();
+    Ok(format!("{}{rest}", &sql[..word.start]).trim().to_string())
 }
 
 // ── SHOW TABLE PROPERTIES ────────────────────────────────────────────────────
 
 /// Detects `SHOW TBLPROPERTIES` in SQL.
 pub fn contains_show_tblproperties(sql: &str) -> bool {
-    sql.to_uppercase().contains("SHOW TBLPROPERTIES")
+    show_tblproperties_end(sql).is_some()
+}
+
+/// Byte offset just past `SHOW TBLPROPERTIES` as bare words.
+fn show_tblproperties_end(sql: &str) -> Option<usize> {
+    let words = sql_words(sql);
+    words.windows(2).find_map(|pair| match pair {
+        [show, tbl] if show.upper == "SHOW" && tbl.upper == "TBLPROPERTIES" => Some(tbl.end),
+        _ => None,
+    })
 }
 
 /// Rewrites `SHOW TBLPROPERTIES <table>` to a query against the catalog.
@@ -375,10 +468,9 @@ pub fn rewrite_show_tblproperties(sql: &str) -> SqlResult<String> {
         return Ok(sql.to_string());
     }
 
-    let upper = sql.to_uppercase();
     // Extract table name after SHOW TBLPROPERTIES
-    if let Some(pos) = upper.find("SHOW TBLPROPERTIES") {
-        let after = sql[pos + "SHOW TBLPROPERTIES".len()..].trim_start();
+    if let Some(end) = show_tblproperties_end(sql) {
+        let after = sql[end..].trim_start();
         // Remove trailing semicolon
         let table_name = after.trim_end_matches(';').trim();
         if table_name.is_empty() {
@@ -402,45 +494,6 @@ pub fn rewrite_show_tblproperties(sql: &str) -> SqlResult<String> {
 
 // ── Utility ──────────────────────────────────────────────────────────────────
 
-/// Simple regex-like replacement for single patterns.
-fn regex_replace(input: &str, pattern: &str, replacement: &str) -> SqlResult<String> {
-    // Simple case-insensitive replacement (no regex crate needed)
-    let _ = replacement;
-
-    // For simple patterns without wildcards, just do string replacement
-    if pattern == r"(?i)\bEXTENDED\b\s*" {
-        // Remove EXTENDED and surrounding whitespace
-        let mut result = input.to_string();
-        // ASCII folding: `pos` indexes `result`.
-        while let Some(pos) = result.to_ascii_uppercase().find("EXTENDED") {
-            // Check word boundaries
-            let bytes = result.as_bytes();
-            let before_ok =
-                pos == 0 || bytes.get(pos - 1).is_some_and(|&b| b == b' ' || b == b'\t');
-            let after_pos = pos + "EXTENDED".len();
-            let after_ok = after_pos >= result.len()
-                || bytes
-                    .get(after_pos)
-                    .is_some_and(|&b| b == b' ' || b == b'\t' || b == b'\n');
-
-            if before_ok && after_ok {
-                // Remove EXTENDED plus trailing space
-                let end = if bytes.get(after_pos).is_some_and(|&b| b == b' ') {
-                    after_pos + 1
-                } else {
-                    after_pos
-                };
-                result = format!("{}{}", &result[..pos], &result[end..]);
-            } else {
-                break;
-            }
-        }
-        return Ok(result);
-    }
-
-    Ok(input.to_string())
-}
-
 // ── Unified Pre-Processor ────────────────────────────────────────────────────
 
 /// Apply all Spark SQL pre-processing rewrites to a SQL string.
@@ -460,6 +513,37 @@ pub fn preprocess_spark_sql(sql: &str) -> SqlResult<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M14: "extended" in a string literal is data, not a DESCRIBE keyword.
+    #[test]
+    fn describe_extended_rewrite_ignores_literals() {
+        let sql = "SELECT id FROM timetable WHERE note = 'hours extended today' ORDER BY id DESC";
+        assert!(!contains_describe_extended(sql));
+        assert_eq!(rewrite_describe_extended(sql).unwrap(), sql);
+        assert_eq!(
+            rewrite_describe_extended("DESCRIBE TABLE EXTENDED orders").unwrap(),
+            "DESCRIBE TABLE orders"
+        );
+        assert_eq!(
+            rewrite_describe_extended("desc extended orders").unwrap(),
+            "desc orders"
+        );
+    }
+
+    /// M15: keyword offsets from `to_uppercase()` do not index the original
+    /// text once a character changes length when upper-cased ('ŉ' → "ʼN"),
+    /// and keywords inside literals are data.
+    #[test]
+    fn tablesample_and_tblproperties_are_unicode_and_literal_safe() {
+        let sql = "SELECT 'ŉŉŉŉŉŉŉŉŉŉŉŉ' AS s FROM t TABLESAMPLE (1 ROWS)";
+        assert_eq!(rewrite_tablesample(sql).unwrap(), sql);
+        let sql = "SELECT msg FROM t WHERE msg LIKE '%tablesample%'";
+        assert!(!contains_tablesample(sql));
+        assert_eq!(rewrite_tablesample(sql).unwrap(), sql);
+        let sql = "SELECT 'show tblproperties x' AS s";
+        assert!(!contains_show_tblproperties(sql));
+        assert!(rewrite_show_tblproperties("SELECT 'ŉŉŉŉ' AS s; SHOW TBLPROPERTIES t").is_err());
+    }
 
     // ── LATERAL VIEW tests ────────────────────────────────────────────────
 

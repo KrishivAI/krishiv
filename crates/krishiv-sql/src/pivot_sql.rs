@@ -39,13 +39,75 @@ use crate::{SqlError, SqlResult};
 
 /// Returns `true` if `sql` contains a `PIVOT` clause (case-insensitive).
 pub fn contains_pivot(sql: &str) -> bool {
-    sql.to_ascii_uppercase().contains(" PIVOT (") || sql.to_ascii_uppercase().contains(" PIVOT(")
+    find_clause(sql, "PIVOT").is_some()
+}
+
+/// Byte offset of `keyword` used as a clause: a bare word (not inside a
+/// literal, quoted identifier or comment) followed by `(`.
+fn find_clause(sql: &str, keyword: &str) -> Option<usize> {
+    crate::spark_sql_ext::sql_words(sql)
+        .into_iter()
+        .find(|w| w.upper == keyword && sql[w.end..].trim_start().starts_with('('))
+        .map(|w| w.start)
+}
+
+/// Split a `<value-expr> FOR <column> IN (<list>)` body. `FOR` and `IN` are
+/// found as words, `IN` only after `FOR`, so an `IN (…)` inside the aggregate
+/// is not mistaken for the clause's list.
+fn split_for_in<'a>(body: &'a str, clause: &str) -> SqlResult<(&'a str, &'a str, &'a str)> {
+    let words = crate::spark_sql_ext::sql_words(body);
+    let for_word =
+        words
+            .iter()
+            .find(|w| w.upper == "FOR")
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: format!("{clause}: missing FOR keyword"),
+            })?;
+    let in_word = words
+        .iter()
+        .find(|w| {
+            w.start > for_word.end && w.upper == "IN" && body[w.end..].trim_start().starts_with('(')
+        })
+        .ok_or_else(|| SqlError::Unsupported {
+            feature: format!("{clause}: missing IN keyword"),
+        })?;
+    let list_open = in_word.end
+        + body[in_word.end..]
+            .find('(')
+            .ok_or_else(|| SqlError::Unsupported {
+                feature: format!("{clause}: missing IN list"),
+            })?
+        + 1;
+    let list_close =
+        find_closing_paren(&body[list_open..]).ok_or_else(|| SqlError::Unsupported {
+            feature: format!("{clause}: IN list is not closed"),
+        })? + list_open;
+    Ok((
+        body[..for_word.start].trim(),
+        body[for_word.end..in_word.start].trim(),
+        &body[list_open..list_close],
+    ))
+}
+
+/// The rewrite replaces the whole statement, so anything after the clause's
+/// closing paren would be silently dropped: refuse it instead.
+fn reject_trailing_text(sql: &str, body_end: usize, clause: &str) -> SqlResult<()> {
+    let tail = sql[body_end + 1..].trim().trim_end_matches(';').trim();
+    if tail.is_empty() {
+        Ok(())
+    } else {
+        Err(SqlError::Unsupported {
+            feature: format!(
+                "{clause}: clauses after {clause} (...) are not supported (found '{tail}'); \
+                 wrap the {clause} in a subquery"
+            ),
+        })
+    }
 }
 
 /// Returns `true` if `sql` contains an `UNPIVOT` clause (case-insensitive).
 pub fn contains_unpivot(sql: &str) -> bool {
-    sql.to_ascii_uppercase().contains(" UNPIVOT (")
-        || sql.to_ascii_uppercase().contains(" UNPIVOT(")
+    find_clause(sql, "UNPIVOT").is_some()
 }
 
 // ── PIVOT rewrite ─────────────────────────────────────────────────────────────
@@ -69,17 +131,8 @@ pub struct PivotClause {
 ///
 /// Returns `Ok(None)` when the SQL does not contain a PIVOT clause.
 pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
-    let upper = sql.to_ascii_uppercase();
-    let pivot_kw = " PIVOT (";
-    let pivot_pos = match upper.find(pivot_kw) {
-        Some(p) => p,
-        None => {
-            // Try without space before paren.
-            match upper.find(" PIVOT(") {
-                Some(p) => p,
-                None => return Ok(None),
-            }
-        }
+    let Some(pivot_pos) = find_clause(sql, "PIVOT") else {
+        return Ok(None);
     };
 
     let source = sql[..pivot_pos].trim().to_owned();
@@ -101,23 +154,12 @@ pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
         feature: "PIVOT: unmatched parenthesis".into(),
     })? + body_start;
 
+    reject_trailing_text(sql, body_end, "PIVOT")?;
     let body = sql[body_start..body_end].trim();
-    let body_upper = body.to_ascii_uppercase();
 
     // Parse: AGG(col) FOR dim IN (v1, v2, ...)
-    let for_pos = body_upper
-        .find(" FOR ")
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "PIVOT: missing FOR keyword".into(),
-        })?;
-    let in_pos = body_upper
-        .find(" IN (")
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "PIVOT: missing IN keyword".into(),
-        })?;
-
-    let agg_expr = body[..for_pos].trim();
-    let for_column = body[for_pos + 5..in_pos].trim().to_owned();
+    let (agg_expr, for_column, in_list) = split_for_in(body, "PIVOT")?;
+    let for_column = for_column.to_owned();
 
     // Parse AGG(col)
     let lp = agg_expr.find('(').ok_or_else(|| SqlError::Unsupported {
@@ -128,16 +170,6 @@ pub fn parse_pivot(sql: &str) -> SqlResult<Option<PivotClause>> {
     })?;
     let agg_fn = agg_expr[..lp].trim().to_owned();
     let agg_column = agg_expr[lp + 1..rp].trim().to_owned();
-
-    // Parse IN (v1, v2, ...)
-    let in_list_start = in_pos + 5;
-    let in_list_end = body[in_list_start..]
-        .find(')')
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "PIVOT: IN list is not closed".into(),
-        })?
-        + in_list_start;
-    let in_list = &body[in_list_start..in_list_end];
 
     let in_values: Vec<String> = in_list
         .split(',')
@@ -203,15 +235,8 @@ pub struct UnpivotClause {
 ///
 /// Returns `Ok(None)` when the SQL does not contain an UNPIVOT clause.
 pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>> {
-    let upper = sql.to_ascii_uppercase();
-    let kw = " UNPIVOT (";
-    let kw_short = " UNPIVOT(";
-    let unpivot_pos = match upper.find(kw) {
-        Some(p) => p,
-        None => match upper.find(kw_short) {
-            Some(p) => p,
-            None => return Ok(None),
-        },
+    let Some(unpivot_pos) = find_clause(sql, "UNPIVOT") else {
+        return Ok(None);
     };
 
     let source = sql[..unpivot_pos].trim().to_owned();
@@ -225,31 +250,12 @@ pub fn parse_unpivot(sql: &str) -> SqlResult<Option<UnpivotClause>> {
     let body_end = find_closing_paren(&sql[body_start..]).ok_or_else(|| SqlError::Unsupported {
         feature: "UNPIVOT: unmatched parenthesis".into(),
     })? + body_start;
+    reject_trailing_text(sql, body_end, "UNPIVOT")?;
     let body = sql[body_start..body_end].trim();
-    let body_upper = body.to_ascii_uppercase();
 
-    let for_pos = body_upper
-        .find(" FOR ")
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "UNPIVOT: missing FOR keyword".into(),
-        })?;
-    let in_pos = body_upper
-        .find(" IN (")
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "UNPIVOT: missing IN keyword".into(),
-        })?;
-
-    let value_column = body[..for_pos].trim().to_owned();
-    let name_column = body[for_pos + 5..in_pos].trim().to_owned();
-
-    let in_list_start = in_pos + 5;
-    let in_list_end = body[in_list_start..]
-        .find(')')
-        .ok_or_else(|| SqlError::Unsupported {
-            feature: "UNPIVOT: IN list is not closed".into(),
-        })?
-        + in_list_start;
-    let in_list = &body[in_list_start..in_list_end];
+    let (value_column, name_column, in_list) = split_for_in(body, "UNPIVOT")?;
+    let value_column = value_column.to_owned();
+    let name_column = name_column.to_owned();
 
     let in_columns: Vec<String> = in_list
         .split(',')
@@ -384,6 +390,36 @@ fn top_level_from(s: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M16: text after the PIVOT body was silently dropped; `IN (` inside
+    /// the aggregate made the slice start past its end; a quoted "pivot (" in
+    /// a literal was treated as the clause.
+    #[test]
+    fn pivot_rewrite_refuses_what_it_would_drop_and_ignores_literals() {
+        let trailing = "SELECT * FROM sales PIVOT (SUM(amount) FOR food IN ('a', 'b')) \
+                        WHERE \"a\" > 100 ORDER BY 1";
+        assert!(
+            rewrite_pivot_unpivot(trailing).is_err(),
+            "WHERE/ORDER BY must not vanish"
+        );
+
+        let nested = "SELECT * FROM t PIVOT (SUM(CASE WHEN r IN ('x') THEN a END) FOR c IN ('a'))";
+        let _ = rewrite_pivot_unpivot(nested); // must not panic
+
+        let literal = "SELECT * FROM notes WHERE note = 'see pivot (x)'";
+        assert!(!contains_pivot(literal));
+        assert_eq!(rewrite_pivot_unpivot(literal).unwrap(), literal);
+
+        let unpivot_trailing = "SELECT * FROM wide UNPIVOT (v FOR k IN (a, b)) WHERE v > 1";
+        assert!(rewrite_pivot_unpivot(unpivot_trailing).is_err());
+
+        let plain = "SELECT * FROM sales PIVOT (SUM(amount) FOR food IN ('a', 'b'))";
+        assert!(
+            rewrite_pivot_unpivot(plain)
+                .unwrap()
+                .contains("CASE WHEN food = 'a'")
+        );
+    }
 
     // ── PIVOT ──────────────────────────────────────────────────────────────────
 

@@ -361,6 +361,15 @@ impl Reagg {
 fn sum_of(expr: Expr) -> Expr {
     datafusion::functions_aggregate::expr_fn::sum(expr)
 }
+/// Re-aggregate partial counts. A count over no rows is 0, but the `sum` of
+/// no partials is NULL — which is what the grand-total row of a rollup over
+/// empty input would otherwise report.
+fn count_of_partials(expr: Expr) -> Expr {
+    datafusion::functions::expr_fn::coalesce(vec![
+        sum_of(expr),
+        datafusion::logical_expr::lit(0_i64),
+    ])
+}
 fn min_of(expr: Expr) -> Expr {
     datafusion::functions_aggregate::expr_fn::min(expr)
 }
@@ -399,6 +408,7 @@ fn decompose(
             let reagg: fn(Expr) -> Expr = match name {
                 "min" => min_of,
                 "max" => max_of,
+                "count" => count_of_partials,
                 _ => sum_of,
             };
             Some(Reagg::Simple { partial, reagg })
@@ -540,6 +550,21 @@ mod tests {
         assert_eq!(
             rows(&ctx, ROLLUP, true).await,
             rows(&context(), ROLLUP, false).await
+        );
+    }
+
+    /// M13: over empty input a rollup's grand-total row still exists, and its
+    /// count is 0. Re-aggregating count as `sum` made it NULL.
+    #[tokio::test]
+    async fn an_empty_rollup_counts_zero_not_null() {
+        const EMPTY: &str = "SELECT cat, count(*) c, count(q) cq FROM t WHERE q < 0 \
+                             GROUP BY ROLLUP(cat)";
+        let ctx = context();
+        let plan = plan(&ctx, EMPTY).await;
+        assert!(!plan.contains("ROLLUP"), "the ROLLUP must be gone:\n{plan}");
+        assert_eq!(
+            rows(&ctx, EMPTY, true).await,
+            rows(&context(), EMPTY, false).await
         );
     }
 
