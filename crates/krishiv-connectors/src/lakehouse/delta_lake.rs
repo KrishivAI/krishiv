@@ -17,6 +17,18 @@ pub enum DeltaWriteMode {
 }
 
 /// Handle to a local Delta table directory.
+/// A requested Delta version as the log's `u64`. A negative version used to
+/// wrap to a huge number, which then read the latest snapshot.
+fn delta_version(version: Option<i64>) -> LakehouseResult<Option<u64>> {
+    version
+        .map(|v| {
+            u64::try_from(v).map_err(|_| LakehouseError::NotFound {
+                table: format!("Delta version {v} (versions start at 0)"),
+            })
+        })
+        .transpose()
+}
+
 #[derive(Clone, Debug)]
 pub struct DeltaTableHandle {
     path: String,
@@ -30,7 +42,7 @@ impl DeltaTableHandle {
         // reading the actual data here materialized the whole table on every
         // open (Phase 52 #194) while surfacing the same missing/corrupt-log
         // errors.
-        let _ = local_delta::list_table_data_files(&path, version.map(|v| v as u64))?;
+        let _ = local_delta::list_table_data_files(&path, delta_version(version)?)?;
         Ok(Self { path, version })
     }
 
@@ -43,11 +55,11 @@ impl DeltaTableHandle {
     }
 
     pub async fn schema(&self) -> LakehouseResult<SchemaRef> {
-        local_delta::table_schema(&self.path, self.version.map(|v| v as u64))
+        local_delta::table_schema(&self.path, delta_version(self.version)?)
     }
 
     pub async fn scan_batches(&self) -> LakehouseResult<Vec<RecordBatch>> {
-        local_delta::read_table(&self.path, self.version.map(|v| v as u64))
+        local_delta::read_table(&self.path, delta_version(self.version)?)
     }
 
     pub async fn with_version(self, version: i64) -> LakehouseResult<Self> {
@@ -107,6 +119,13 @@ pub async fn merge_delta(
     };
     let target = concat_batches(&target_batches)?;
     let source = concat_batches(&source_batches)?;
+    // Merged rows are concatenated with the kept target rows by position, so
+    // the source must be in the target's column order.
+    let source = if target.num_columns() == 0 {
+        source
+    } else {
+        align_to_schema(&source, &target.schema())?
+    };
     let key = merge_key.to_string();
 
     let source_col = source
@@ -120,6 +139,17 @@ pub async fn merge_delta(
     // target row as matched or unmatched.  Keys are type-prefixed to prevent
     // cross-type false matches (e.g. Int64(1) must not match String("1")).
     let source_keys: HashSet<String> = keys_set(source_col.as_ref())?;
+    // One source row per key: with two, the merge would insert or update the
+    // same target key twice and the table would carry duplicate keys.
+    let non_null_source_keys = source_col.len() - source_col.null_count();
+    if source_keys.len() != non_null_source_keys {
+        return Err(LakehouseError::SchemaConflict {
+            message: format!(
+                "MERGE source has duplicate values of key '{key}'; each target row may be \
+                 matched by at most one source row"
+            ),
+        });
+    }
 
     // Keep target rows whose key does NOT appear in source. When matched
     // rows are not being updated (insert-only merge), matched target rows
@@ -329,6 +359,50 @@ impl DeltaObjectStoreReader {
 
 use arrow::array::Array;
 use arrow::util::display::{ArrayFormatter, FormatOptions};
+
+/// Reorder `batch`'s columns to `schema`'s order, by name.
+fn align_to_schema(
+    batch: &RecordBatch,
+    schema: &arrow::datatypes::SchemaRef,
+) -> LakehouseResult<RecordBatch> {
+    if batch.schema().fields().len() != schema.fields().len() {
+        return Err(LakehouseError::SchemaConflict {
+            message: format!(
+                "MERGE source has {} columns, target has {}",
+                batch.num_columns(),
+                schema.fields().len()
+            ),
+        });
+    }
+    let columns = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            let column = batch.column_by_name(field.name()).ok_or_else(|| {
+                LakehouseError::SchemaConflict {
+                    message: format!("MERGE source is missing target column '{}'", field.name()),
+                }
+            })?;
+            if column.data_type() == field.data_type() {
+                return Ok(Arc::clone(column));
+            }
+            // e.g. a DataFusion source's Utf8View against a stored Utf8.
+            arrow::compute::cast(column, field.data_type()).map_err(|e| {
+                LakehouseError::SchemaConflict {
+                    message: format!(
+                        "MERGE source column '{}' is {}, target is {}: {e}",
+                        field.name(),
+                        column.data_type(),
+                        field.data_type()
+                    ),
+                }
+            })
+        })
+        .collect::<LakehouseResult<Vec<_>>>()?;
+    RecordBatch::try_new(Arc::clone(schema), columns).map_err(|e| LakehouseError::SchemaConflict {
+        message: format!("MERGE source does not fit the target schema: {e}"),
+    })
+}
 
 fn concat_batches(batches: &[RecordBatch]) -> LakehouseResult<RecordBatch> {
     if batches.is_empty() {
@@ -700,6 +774,90 @@ mod tests {
                 (3, "c".to_string()),
             ]
         );
+    }
+
+    /// M34: columns are matched by name, not position, and a source that
+    /// carries the same key twice is refused instead of producing duplicate
+    /// target rows.
+    #[tokio::test]
+    async fn merge_delta_matches_columns_by_name_and_refuses_duplicate_keys() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let two_ints = |a: &str, b: &str, rows: &[(i64, i64)]| {
+            let schema = Arc::new(arrow::datatypes::Schema::new(vec![
+                arrow::datatypes::Field::new(a, arrow::datatypes::DataType::Int64, false),
+                arrow::datatypes::Field::new(b, arrow::datatypes::DataType::Int64, false),
+            ]));
+            RecordBatch::try_new(
+                schema,
+                vec![
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+                    )),
+                    Arc::new(Int64Array::from(
+                        rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
+            .unwrap()
+        };
+        write_delta(
+            &path,
+            vec![two_ints("id", "qty", &[(1, 10), (2, 20)])],
+            DeltaWriteMode::Overwrite,
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Same columns, other order: (qty, id).
+        merge_delta(
+            &path,
+            vec![two_ints("qty", "id", &[(99, 1)])],
+            "id",
+            true,
+            true,
+        )
+        .await
+        .unwrap();
+        let merged = concat_batches(
+            &DeltaTableHandle::open(&path, None)
+                .await
+                .unwrap()
+                .scan_batches()
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let col = |name: &str| {
+            merged
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone()
+        };
+        let (ids, qtys) = (col("id"), col("qty"));
+        let mut rows: Vec<(i64, i64)> = (0..merged.num_rows())
+            .map(|i| (ids.value(i), qtys.value(i)))
+            .collect();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![(1, 99), (2, 20)],
+            "values landed in the wrong columns"
+        );
+
+        let duplicate = merge_delta(
+            &path,
+            vec![two_ints("id", "qty", &[(2, 1), (2, 2)])],
+            "id",
+            true,
+            true,
+        )
+        .await;
+        assert!(duplicate.is_err(), "duplicate source keys must be refused");
     }
 
     /// `write_delta` with Merge mode must refuse instead of silently

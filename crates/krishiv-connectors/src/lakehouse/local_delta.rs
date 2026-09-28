@@ -234,6 +234,19 @@ fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseRes
     }
     versions.sort_unstable();
     check_log_listing(names.iter().map(String::as_str), &versions)?;
+    // Time travel to a version the log does not have is an error, not a read
+    // of the latest snapshot.
+    if let Some(requested) = max_version
+        && versions.last().is_none_or(|latest| requested > *latest)
+    {
+        return Err(LakehouseError::NotFound {
+            table: format!(
+                "{} at version {requested} (latest is {:?})",
+                root.display(),
+                versions.last()
+            ),
+        });
+    }
     let limit = max_version.unwrap_or_else(|| versions.last().copied().unwrap_or(0));
     for v in versions.into_iter().filter(|ver| *ver <= limit) {
         let path = dir.join(format!("{v:020}.json"));
@@ -362,8 +375,14 @@ pub fn version_at_timestamp(root: &Path, timestamp_ms: i64) -> LakehouseResult<O
 /// Read the table as it was at `timestamp_ms` (Unix milliseconds).
 pub fn read_table_at_timestamp(path: &str, timestamp_ms: i64) -> LakehouseResult<Vec<RecordBatch>> {
     let root = Path::new(path);
-    let version = version_at_timestamp(root, timestamp_ms)?;
-    read_table(path, version)
+    // No version at or before the timestamp means the table did not exist
+    // then; reading the latest snapshot instead would answer a different
+    // question.
+    let version =
+        version_at_timestamp(root, timestamp_ms)?.ok_or_else(|| LakehouseError::NotFound {
+            table: format!("{path} at timestamp {timestamp_ms} (before the first commit)"),
+        })?;
+    read_table(path, Some(version))
 }
 
 /// Compute per-column min/max string values and row count for a set of batches.
@@ -1075,6 +1094,23 @@ mod tests {
             .map(|b| b.num_rows())
             .sum();
         assert_eq!(rows, 3);
+    }
+
+    /// M31: time travel to a version or time the table does not have must
+    /// fail, not quietly return the present.
+    #[test]
+    fn time_travel_outside_the_log_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_table(&path, vec![batch(&[1])], false).unwrap();
+        write_table(&path, vec![batch(&[2])], false).unwrap();
+
+        assert_eq!(read_table(&path, Some(1)).unwrap().len(), 2);
+        assert!(read_table(&path, Some(99)).is_err(), "version past the log");
+        assert!(
+            read_table_at_timestamp(&path, 0).is_err(),
+            "a time before the table existed"
+        );
     }
 
     #[test]

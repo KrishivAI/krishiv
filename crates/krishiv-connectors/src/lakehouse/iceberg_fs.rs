@@ -7,9 +7,10 @@
 //! ## Concurrent commits (G2/G3 gap register)
 //!
 //! Commits are optimistic-concurrency, Iceberg-style: `append` reads the
-//! highest existing `metadata-v{N}.json`, then atomically creates
-//! `metadata-v{N+1}.json` via `create_new` (`O_EXCL` on Unix) — the OS
-//! guarantees only one writer can win that create. A losing writer (file
+//! highest existing `metadata-v{N}.json`, writes and fsyncs the new document
+//! under a private temp name, then publishes it as `metadata-v{N+1}.json` with
+//! `hard_link` — which fails if the name exists, so only one writer can win,
+//! and the version file never appears partially written. A losing writer (file
 //! already exists) re-reads the fresh latest version and retries. This has
 //! no unconditional-overwrite step anywhere, so two concurrent committers —
 //! whether two tasks in one process or two separate `krishiv` processes
@@ -162,25 +163,42 @@ impl IcebergFsTable {
         let bytes =
             serde_json::to_vec_pretty(&meta).map_err(|e| LakehouseError::Io(e.to_string()))?;
         let path = Self::metadata_version_path(root, next_version);
-        // `create_new` opens with O_EXCL on Unix (and CREATE_NEW on
-        // Windows): the OS guarantees this fails with `AlreadyExists` if
-        // another writer's create won the race, and that at most one of any
-        // number of concurrent callers can succeed. This is the whole fix —
-        // no unconditional overwrite exists anywhere in the commit path.
-        let mut file = match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        // Write the full document under a private name, fsync it, then
+        // publish it with `hard_link`, which fails with `AlreadyExists` if a
+        // concurrent writer already claimed this version — the same
+        // put-if-absent the old `create_new` gave, except the version file
+        // now appears only complete. Creating it first and filling it after
+        // left an empty newest version on a crash in between (the table could
+        // no longer be scanned or appended to) and let concurrent readers
+        // parse a half-written file.
+        let tmp = path.with_extension(format!(
+            "json.tmp.{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
         {
-            Ok(f) => f,
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .map_err(|e| LakehouseError::Io(e.to_string()))?;
+            let written = file.write_all(&bytes).and_then(|()| file.sync_all());
+            if let Err(e) = written {
+                let _ = fs::remove_file(&tmp);
+                return Err(LakehouseError::Io(e.to_string()));
+            }
+        }
+        let claimed = fs::hard_link(&tmp, &path);
+        let _ = fs::remove_file(&tmp);
+        match claimed {
+            Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
             Err(e) => return Err(LakehouseError::Io(e.to_string())),
-        };
-        use std::io::Write;
-        file.write_all(&bytes)
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
-        file.sync_all()
-            .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        }
         // Sync the parent directory so the new file's directory entry is
         // durable. Best-effort on platforms without this concept.
         #[cfg(unix)]

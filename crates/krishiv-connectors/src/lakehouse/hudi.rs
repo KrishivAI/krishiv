@@ -393,6 +393,40 @@ impl HudiCowWriter {
         }
         fs::create_dir_all(self.table_path.join(".hoodie/timeline"))
             .map_err(|e| LakehouseError::Io(e.to_string()))?;
+        // The check above is check-then-act: two writers that read the same
+        // base both pass it before either publishes. Claiming "the commit
+        // after <base>" with a put-if-absent file makes exactly one of them
+        // the successor; the other gets the conflict the check promised.
+        let claim = claim_successor(&self.table_path, base_instant.as_deref(), instant)?;
+        let result = self.publish_commit(
+            instant,
+            action,
+            key_column,
+            base_batch,
+            change_batch,
+            rows_inserted,
+            rows_updated,
+            snapshot_rows,
+        );
+        if result.is_err() {
+            // A failed publish must not leave the base claimed forever.
+            let _ = fs::remove_file(&claim);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn publish_commit(
+        &self,
+        instant: &str,
+        action: &str,
+        key_column: Option<&str>,
+        base_batch: Option<&RecordBatch>,
+        change_batch: &RecordBatch,
+        rows_inserted: u64,
+        rows_updated: u64,
+        snapshot_rows: u64,
+    ) -> LakehouseResult<HudiWriteResult> {
         let timeline_marker = self
             .table_path
             .join(".hoodie/timeline")
@@ -1137,6 +1171,65 @@ fn write_parquet_i64_string(path: &Path, rows: &[(i64, &str)]) -> LakehouseResul
     Ok(())
 }
 
+/// A successor claim older than this with no commit marker is treated as
+/// left by a writer that crashed mid-commit, and may be taken over.
+const STALE_SUCCESSOR_CLAIM: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Claim the right to publish the commit that follows `base` (`None`: the
+/// first commit). Returns the claim file's path.
+fn claim_successor(
+    table_path: &std::path::Path,
+    base: Option<&str>,
+    instant: &str,
+) -> LakehouseResult<std::path::PathBuf> {
+    use std::io::Write;
+    let claim = table_path
+        .join(".hoodie/timeline")
+        .join(format!("{}.successor", base.unwrap_or("genesis")));
+    for _ in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&claim)
+        {
+            Ok(mut file) => {
+                file.write_all(instant.as_bytes())
+                    .and_then(|()| file.sync_all())
+                    .map_err(|e| LakehouseError::Io(e.to_string()))?;
+                return Ok(claim);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let holder = fs::read_to_string(&claim).unwrap_or_default();
+                let holder_committed = table_path
+                    .join(".hoodie/timeline")
+                    .join(format!("{}.commit", holder.trim()))
+                    .exists();
+                let stale = !holder_committed
+                    && fs::metadata(&claim)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > STALE_SUCCESSOR_CLAIM);
+                if stale {
+                    let _ = fs::remove_file(&claim);
+                    continue;
+                }
+                return Err(LakehouseError::Concurrency {
+                    message: format!(
+                        "another writer ({}) is committing on top of Hudi instant {base:?}; \
+                         retry against the new snapshot",
+                        holder.trim()
+                    ),
+                });
+            }
+            Err(e) => return Err(LakehouseError::Io(e.to_string())),
+        }
+    }
+    Err(LakehouseError::Concurrency {
+        message: format!("could not claim the commit after Hudi instant {base:?}"),
+    })
+}
+
 fn write_parquet_batch(path: &Path, batch: &RecordBatch) -> LakehouseResult<()> {
     use parquet::arrow::ArrowWriter;
 
@@ -1326,6 +1419,22 @@ fn process_unique_suffix() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M33: two writers that read the same base both pass the latest-instant
+    /// check; only one may become its successor.
+    #[test]
+    fn only_one_writer_claims_the_commit_after_a_base() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".hoodie/timeline")).unwrap();
+        let first = claim_successor(dir.path(), Some("001"), "002").unwrap();
+        assert!(first.exists());
+        assert!(matches!(
+            claim_successor(dir.path(), Some("001"), "003"),
+            Err(LakehouseError::Concurrency { .. })
+        ));
+        // A different base is independent.
+        claim_successor(dir.path(), Some("002"), "003").unwrap();
+    }
     use arrow::array::{Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use std::fs;

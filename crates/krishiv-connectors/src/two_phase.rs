@@ -235,6 +235,14 @@ impl LocalParquetTwoPhaseCommitSink {
     }
 }
 
+/// Best-effort fsync of a directory so a created or renamed entry in it
+/// survives a crash (a no-op where directories cannot be opened, e.g. Windows).
+fn sync_dir(dir: &std::path::Path) {
+    if let Ok(handle) = std::fs::File::open(dir) {
+        let _ = handle.sync_all();
+    }
+}
+
 impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
     type Handle = ParquetCommitHandle;
 
@@ -308,9 +316,16 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         writer.write(batch).map_err(|e| {
             ConnectorError::Parquet(format!("parquet 2pc prepare: write error: {e}"))
         })?;
-        writer.close().map_err(|e| {
+        // Prepared data must survive a crash: the checkpoint that acks this
+        // epoch is what later tells recovery to publish it, so an unsynced
+        // staging file lost to power failure makes that restore fail forever.
+        let file = writer.into_inner().map_err(|e| {
             ConnectorError::Parquet(format!("parquet 2pc prepare: close error: {e}"))
         })?;
+        file.sync_all().map_err(|e| {
+            ConnectorError::Parquet(format!("parquet 2pc prepare: fsync error: {e}"))
+        })?;
+        sync_dir(&self.output_dir);
 
         Ok(ParquetCommitHandle {
             epoch,
@@ -325,7 +340,13 @@ impl TwoPhaseCommitSink for LocalParquetTwoPhaseCommitSink {
         // already exists, the commit was completed by a prior attempt (idempotent).
         use std::io::ErrorKind;
         match std::fs::rename(&handle.staging_path, &handle.final_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The rename is the publish; make the new directory entry durable.
+                if let Some(dir) = handle.final_path.parent() {
+                    sync_dir(dir);
+                }
+                Ok(())
+            }
             Err(e) if e.kind() == ErrorKind::NotFound => {
                 // Staging file is gone — either already committed (final exists)
                 // or an unexpected race.  Accept if the final target exists.

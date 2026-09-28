@@ -75,9 +75,12 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
   - fixed 2026-09-28: TABLESAMPLE / SHOW TBLPROPERTIES use byte-exact word offsets (no Unicode panic, no literal matches)
 - [x] M16 `krishiv-sql/src/pivot_sql.rs:120,184,300` PIVOT drops trailing WHERE/ORDER BY; slice panic; literal match
   - fixed 2026-09-28: PIVOT/UNPIVOT found as words, FOR/IN parsed by word after the aggregate, trailing clauses refused
-- [ ] M17 `krishiv-connectors/src/registry/drivers/pulsar.rs:34` registry Pulsar source never acks; ignores `start_position`
-- [ ] M18 `krishiv-connectors/src/kinesis.rs:243` idle shard returns empty batch (spin); iterator taken before fallible call
-- [ ] M19 `krishiv-connectors/src/two_phase.rs:303` local Parquet 2PC: no fsync of tmp or dir
+- [x] M17 `krishiv-connectors/src/registry/drivers/pulsar.rs:34` registry Pulsar source never acks; ignores `start_position`
+  - fixed 2026-09-28: registry driver sets `ack_on_next_read` (acks the previous batch when the next is read) and parses `start_position`; `registry_pulsar_config_acks_and_honours_start_position`. A checkpoint-driven ack hook on DynSource remains the full fix.
+- [x] M18 `krishiv-connectors/src/kinesis.rs:243` idle shard returns empty batch (spin); iterator taken before fallible call
+  - fixed 2026-09-28: iterator/restore target consumed only after a successful AWS call; idle shard returns `Ok(None)`; `a_failed_read_keeps_the_shard_position`
+- [x] M19 `krishiv-connectors/src/two_phase.rs:303` local Parquet 2PC: no fsync of tmp or dir
+  - fixed 2026-09-28: prepare fsyncs the staging file and dir, commit fsyncs the dir after rename (no crash test possible)
 - [ ] M20 `krishiv-shuffle/src/disk_store.rs:524` dropped writer future commits truncated partition with valid sidecar
 - [ ] M21 `krishiv-executor/src/runner/result_spool.rs:196` partial spool leaked on error/cancel
 - [ ] M22 `krishiv-executor/src/fragment/shuffle_write_buffer.rs:642` failed/cancelled spill file leaked
@@ -89,10 +92,14 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
 - [ ] M28 `krishiv-runtime/src/flight_client.rs:655` `do_action` retries non-idempotent push/drain after server applied
 - [ ] M29 `krishiv-state/src/checkpoint/io.rs:364` sync manifest validation builds a Tokio runtime per entry on S3
 - [ ] M30 `krishiv-delta/src/snapshot_index.rs:269` Raw arm propagates SchemaMismatch → view stops advancing (error discarded at `krishiv-ivm/src/flow.rs:1324`)
-- [ ] M31 `krishiv-connectors/src/lakehouse/local_delta.rs:157` time travel past latest / negative / pre-creation returns latest
-- [ ] M32 `krishiv-connectors/src/lakehouse/iceberg_fs.rs:170` metadata-vN.json created then filled (not atomic)
-- [ ] M33 `krishiv-connectors/src/lakehouse/hudi.rs:385` lost-update check is check-then-act
-- [ ] M34 `krishiv-connectors/src/lakehouse/delta_lake.rs:317` merge_delta positional columns; duplicate source keys
+- [x] M31 `krishiv-connectors/src/lakehouse/local_delta.rs:157` time travel past latest / negative / pre-creation returns latest
+  - fixed 2026-09-28: versions past the log, negative versions and pre-creation timestamps are NotFound; `time_travel_outside_the_log_is_an_error`
+- [x] M32 `krishiv-connectors/src/lakehouse/iceberg_fs.rs:170` metadata-vN.json created then filled (not atomic)
+  - fixed 2026-09-28: metadata published via fsynced temp file + `hard_link` (never visible partially written)
+- [x] M33 `krishiv-connectors/src/lakehouse/hudi.rs:385` lost-update check is check-then-act
+  - fixed 2026-09-28: put-if-absent successor claim per base instant (stale claims reclaimable after 10 min); `only_one_writer_claims_the_commit_after_a_base`
+- [x] M34 `krishiv-connectors/src/lakehouse/delta_lake.rs:317` merge_delta positional columns; duplicate source keys
+  - fixed 2026-09-28: source aligned to the target schema by name (cast when compatible), duplicate source keys refused; `merge_delta_matches_columns_by_name_and_refuses_duplicate_keys`
 
 ## Medium — broken as shipped
 - [ ] M35 `krishiv-scheduler/src/coordinator_daemon.rs:2180` JCP daemon calls unserved `/federation/*`; `deploy/k8s/operator/jcp-pod-template.yaml` bad flags → wire or delete

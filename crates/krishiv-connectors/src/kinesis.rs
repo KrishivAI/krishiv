@@ -238,18 +238,23 @@ impl KinesisSource {
 
     /// Fetch the next batch of records from the shard.
     ///
-    /// Returns `Ok(None)` when the stream is exhausted (end of shard or no
-    /// more data and `MillisBehindLatest == 0` with no iterator).
+    /// Returns `Ok(None)` when there is nothing to read right now: the shard
+    /// is idle, or closed (no next iterator). Callers poll again later.
     pub async fn next_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
         // A pending checkpoint restore applies here (not only via
         // `Source::read_batch`) so direct callers of the public API resume
         // from the restored position too.
-        if let Some(seq) = self.restore_to_sequence.take() {
+        //
+        // The restore target and the iterator are consumed only once the AWS
+        // call that replaces them succeeds: a throttle or an expired iterator
+        // is retryable, and dropping the position on it read as "exhausted"
+        // (or restarted a failed restore from the configured start).
+        if let Some(seq) = self.restore_to_sequence.clone() {
             self.shard_iterator = self.get_shard_iterator_after(&seq).await?;
+            self.restore_to_sequence = None;
         }
-        let iterator = match self.shard_iterator.take() {
-            Some(it) => it,
-            None => return Ok(None),
+        let Some(iterator) = self.shard_iterator.clone() else {
+            return Ok(None);
         };
 
         let resp = self
@@ -264,9 +269,12 @@ impl KinesisSource {
         // Advance the iterator for the next call.
         self.shard_iterator = resp.next_shard_iterator().map(str::to_owned);
 
+        // An idle shard is "nothing now", like the Kafka and Pulsar sources:
+        // an empty batch here kept `while let Some(batch)` loops calling
+        // GetRecords with no pause until the shard throttled.
         let records = resp.records();
         if records.is_empty() {
-            return Ok(Some(RecordBatch::new_empty(self.schema.clone())));
+            return Ok(None);
         }
 
         if let Some(last) = records.last() {
@@ -401,6 +409,25 @@ pub fn records_to_batch(schema: &SchemaRef, records: &[Record]) -> ConnectorResu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M18: a failed AWS call must not consume the shard position. The
+    /// iterator and a pending restore target used to be `take()`n before the
+    /// call, so one throttle or expired iterator read as "exhausted" and a
+    /// failed restore fell back to the configured start.
+    #[tokio::test]
+    async fn a_failed_read_keeps_the_shard_position() {
+        let mut source = KinesisSource::offline_for_tests();
+        source.shard_iterator = Some("iterator-1".into());
+        assert!(
+            source.next_batch().await.is_err(),
+            "offline client cannot reach AWS"
+        );
+        assert_eq!(source.shard_iterator.as_deref(), Some("iterator-1"));
+
+        source.restore_to_sequence = Some("seq-9".into());
+        assert!(source.next_batch().await.is_err());
+        assert_eq!(source.restore_to_sequence.as_deref(), Some("seq-9"));
+    }
     use aws_sdk_kinesis::primitives::Blob;
 
     fn make_record(seq: &str, key: &str, payload: &[u8]) -> Record {

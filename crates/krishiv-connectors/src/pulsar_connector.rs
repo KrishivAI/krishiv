@@ -93,6 +93,13 @@ pub struct PulsarConfig {
     /// available message, `false` = only messages published after the
     /// subscription is created (the Pulsar default).
     pub start_at_earliest: bool,
+    /// Acknowledge the previous batch when the next one is requested through
+    /// [`Source::read_batch`]. For generic engine callers (the connector
+    /// registry) that have no checkpoint-driven ack hook: without it nothing
+    /// ever acked, every restart replayed the whole subscription, and the
+    /// pending-id buffer grew for the life of the job. At-least-once: a batch
+    /// is acked only after the engine consumed it and asked for more.
+    pub ack_on_next_read: bool,
 }
 
 impl PulsarConfig {
@@ -106,6 +113,7 @@ impl PulsarConfig {
             batch_size: 500,
             poll_timeout: std::time::Duration::from_secs(1),
             start_at_earliest: false,
+            ack_on_next_read: false,
         }
     }
 
@@ -137,6 +145,12 @@ impl PulsarConfig {
         self.start_at_earliest = earliest;
         self
     }
+
+    /// See [`PulsarConfig::ack_on_next_read`].
+    pub fn with_ack_on_next_read(mut self, ack: bool) -> Self {
+        self.ack_on_next_read = ack;
+        self
+    }
 }
 
 // ── Source ────────────────────────────────────────────────────────────────────
@@ -161,6 +175,7 @@ pub struct PulsarSource {
     /// state until `ack_all_pending()` is called, providing at-least-once
     /// delivery semantics.
     pending_messages: VecDeque<(String, MessageData)>,
+    ack_on_next_read: bool,
 }
 
 impl PulsarSource {
@@ -195,6 +210,7 @@ impl PulsarSource {
             batch_size: config.batch_size,
             poll_timeout: config.poll_timeout,
             pending_messages: VecDeque::new(),
+            ack_on_next_read: config.ack_on_next_read,
         })
     }
 
@@ -324,6 +340,9 @@ impl Source for PulsarSource {
     }
 
     async fn read_batch(&mut self) -> ConnectorResult<Option<RecordBatch>> {
+        if self.ack_on_next_read {
+            self.ack_all_pending().await?;
+        }
         self.next_batch(self.batch_size).await
     }
 
