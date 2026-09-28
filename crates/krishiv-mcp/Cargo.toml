@@ -22,6 +22,7 @@ krishiv-api = { path = "../krishiv-api", version = "0.1.1" }
 krishiv-connectors = { path = "../krishiv-connectors", version = "0.1.1", features = ["lakehouse"] }
 krishiv-ivm = { path = "../krishiv-ivm", version = "0.1.1" }
 serde_json = { workspace = true }
+sqlparser = { workspace = true }
 tokio = { workspace = true, features = ["io-std"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }

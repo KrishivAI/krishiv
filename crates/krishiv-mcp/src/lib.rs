@@ -1011,7 +1011,7 @@ impl KrishivMcpServer {
         let query = required_string(arguments, "query")?;
         let read_only =
             optional_bool(arguments, "read_only")?.unwrap_or(!self.config.allow_write_sql);
-        if read_only && !looks_read_only_sql(query) {
+        if read_only && !is_read_only_sql(query) {
             return Err(ToolError::Unsupported(
                 "execute_sql rejected non-read-only SQL; use explicit job/pipeline tools or set read_only=false with KRISHIV_MCP_ALLOW_WRITE_SQL=1".into(),
             ));
@@ -1038,6 +1038,13 @@ impl KrishivMcpServer {
     async fn tool_explain_sql(&self, arguments: &Map<String, Value>) -> ToolResult<Value> {
         let query = required_string(arguments, "query")?;
         let mode = optional_string(arguments, "mode")?.unwrap_or_else(|| "physical".into());
+        // Planning runs DDL eagerly and `analyze` executes the query, so the
+        // same write gate as execute_sql applies here.
+        if !self.config.allow_write_sql && !is_read_only_sql(query) {
+            return Err(ToolError::Unsupported(
+                "explain_sql rejected non-read-only SQL; set KRISHIV_MCP_ALLOW_WRITE_SQL=1 to explain writes".into(),
+            ));
+        }
         let dataframe = self.session.sql_async(query).await?;
         let explain = match mode.trim().to_ascii_lowercase().as_str() {
             "logical" => dataframe.explain_logical(),
@@ -1989,17 +1996,64 @@ fn decode_checkpoint_base64(raw: &str) -> ToolResult<Vec<u8>> {
     })
 }
 
-fn looks_read_only_sql(query: &str) -> bool {
-    let trimmed = query.trim_start();
-    let first = trimmed
-        .split(|c: char| c.is_whitespace() || c == '(')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    matches!(
-        first.as_str(),
-        "select" | "with" | "show" | "describe" | "explain"
-    )
+/// True only for a single statement that cannot change state.
+///
+/// The engine runs multi-statement scripts, so the whole text is parsed and
+/// must be exactly one statement of a read-only kind. Anything the parser
+/// cannot read (engine-specific DDL such as `CREATE EXTERNAL TABLE` or `COPY`
+/// included) is treated as a write: this gate fails closed.
+fn is_read_only_sql(query: &str) -> bool {
+    use sqlparser::ast::Statement;
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, query) else {
+        return false;
+    };
+    let [statement] = statements.as_slice() else {
+        return false;
+    };
+    match statement {
+        Statement::Query(query) => is_read_only_query(query),
+        Statement::Explain { statement, .. } => {
+            matches!(statement.as_ref(), Statement::Query(query) if is_read_only_query(query))
+        }
+        Statement::ExplainTable { .. }
+        | Statement::ShowTables { .. }
+        | Statement::ShowColumns { .. }
+        | Statement::ShowCreate { .. }
+        | Statement::ShowFunctions { .. }
+        | Statement::ShowVariable { .. }
+        | Statement::ShowVariables { .. }
+        | Statement::ShowSchemas { .. }
+        | Statement::ShowDatabases { .. }
+        | Statement::ShowViews { .. } => true,
+        _ => false,
+    }
+}
+
+/// A query is read-only unless a CTE or set-operation branch is a DML body or
+/// a `SELECT … INTO`.
+fn is_read_only_query(query: &sqlparser::ast::Query) -> bool {
+    let ctes_read_only = query.with.as_ref().is_none_or(|with| {
+        with.cte_tables
+            .iter()
+            .all(|cte| is_read_only_query(&cte.query))
+    });
+    ctes_read_only && is_read_only_set_expr(&query.body)
+}
+
+fn is_read_only_set_expr(body: &sqlparser::ast::SetExpr) -> bool {
+    use sqlparser::ast::SetExpr;
+    match body {
+        SetExpr::Select(select) => select.into.is_none(),
+        SetExpr::Query(query) => is_read_only_query(query),
+        SetExpr::SetOperation { left, right, .. } => {
+            is_read_only_set_expr(left) && is_read_only_set_expr(right)
+        }
+        SetExpr::Values(_) | SetExpr::Table(_) => true,
+        _ => false,
+    }
 }
 
 fn limited_query_for_sql(query: &str, limit: usize) -> String {
@@ -2569,6 +2623,120 @@ mod tests {
             .ok_or_else(|| format!("execute_sql missing returned_rows: {response}"))?;
         assert_eq!(returned_rows, 1);
         Ok(())
+    }
+
+    async fn call_tool(server: &KrishivMcpServer, name: &str, arguments: Value) -> Value {
+        server
+            .handle_json_rpc(json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": arguments }
+            }))
+            .await
+            .expect("tools/call response")
+    }
+
+    async fn session_with_table() -> Session {
+        let session = Session::builder().build().expect("session");
+        session
+            .sql("CREATE TABLE orders AS VALUES (1)")
+            .expect("create")
+            .collect_async()
+            .await
+            .expect("collect");
+        session
+    }
+
+    async fn table_still_exists(session: &Session) -> bool {
+        match session.sql("SELECT * FROM orders") {
+            Ok(df) => df.collect_async().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// The engine runs multi-statement scripts, so a read-only check that
+    /// only looks at the first keyword lets `EXPLAIN …; DROP …` through.
+    #[tokio::test]
+    async fn execute_sql_rejects_write_hidden_behind_read_only_prefix() {
+        let session = session_with_table().await;
+        let server = KrishivMcpServer::new(session.clone(), McpConfig::default());
+        for query in [
+            "EXPLAIN SELECT 1; DROP TABLE orders; SELECT 1",
+            "SELECT 1; DROP TABLE orders",
+            "WITH x AS (SELECT 1) SELECT * FROM x; DROP TABLE orders",
+        ] {
+            let response = call_tool(&server, "execute_sql", json!({ "query": query })).await;
+            assert_eq!(
+                response.pointer("/result/isError"),
+                Some(&json!(true)),
+                "{query} must be rejected: {response}"
+            );
+            assert!(
+                table_still_exists(&session).await,
+                "{query} dropped the table"
+            );
+        }
+    }
+
+    /// `explain_sql` plans through the session, which executes DDL eagerly.
+    #[tokio::test]
+    async fn explain_sql_rejects_write_sql_by_default() {
+        let session = session_with_table().await;
+        let server = KrishivMcpServer::new(session.clone(), McpConfig::default());
+        for mode in ["logical", "physical", "analyze"] {
+            let response = call_tool(
+                &server,
+                "explain_sql",
+                json!({ "query": "DROP TABLE orders", "mode": mode }),
+            )
+            .await;
+            assert_eq!(
+                response.pointer("/result/isError"),
+                Some(&json!(true)),
+                "explain_sql {mode} must reject DROP: {response}"
+            );
+            assert!(
+                table_still_exists(&session).await,
+                "explain_sql {mode} dropped the table"
+            );
+        }
+        let response = call_tool(&server, "explain_sql", json!({ "query": "SELECT 1" })).await;
+        assert_eq!(
+            response.pointer("/result/isError"),
+            Some(&json!(false)),
+            "explain_sql of a SELECT must still work: {response}"
+        );
+    }
+
+    #[test]
+    fn read_only_classifier() {
+        for ok in [
+            "SELECT 1",
+            "  select * from t where a = 'x; drop table t'",
+            "WITH a AS (SELECT 1) SELECT * FROM a",
+            "SELECT 1 UNION ALL SELECT 2",
+            "EXPLAIN SELECT 1",
+            "SHOW TABLES",
+            "DESCRIBE orders",
+            "SELECT 1;",
+        ] {
+            assert!(super::is_read_only_sql(ok), "{ok} should be read-only");
+        }
+        for bad in [
+            "DROP TABLE t",
+            "SELECT 1; DROP TABLE t",
+            "EXPLAIN SELECT 1; DROP TABLE t",
+            "EXPLAIN DROP TABLE t",
+            "INSERT INTO t VALUES (1)",
+            "CREATE EXTERNAL TABLE x STORED AS CSV LOCATION '/etc/passwd'",
+            "COPY (SELECT 1) TO '/tmp/x.csv'",
+            "WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d",
+            "not sql at all",
+            "",
+        ] {
+            assert!(!super::is_read_only_sql(bad), "{bad} must not be read-only");
+        }
     }
 
     #[tokio::test]

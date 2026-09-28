@@ -1691,6 +1691,8 @@ impl KrishivFlightSqlService {
                 encode_batches_ipc(&result)
             }
             A::Explain(body) => {
+                self.check_table_access(&body.sql)
+                    .map_err(KrishivActionError::Status)?;
                 let text = self
                     .host
                     .explain_sql_query(&body.sql)
@@ -1704,6 +1706,8 @@ impl KrishivFlightSqlService {
                 // For both backends, route ExecutePlan through execute_sql (handles
                 // streaming plans by registering them as continuous jobs).
                 let sql = krishiv_runtime::flight_client::plan_to_sql(&plan);
+                self.check_table_access(&sql)
+                    .map_err(KrishivActionError::Status)?;
                 if plan.kind() == krishiv_plan::ExecutionKind::Streaming {
                     let spec = krishiv_runtime::streaming_spec_from_plan(&plan)
                         .map_err(|e| KrishivActionError::Other(e.to_string()))?;
@@ -1725,6 +1729,8 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::BatchSql(body) => {
+                self.check_table_access(&body.query)
+                    .map_err(KrishivActionError::Status)?;
                 // Split the wire tables into inline-IPC tables and path tables.
                 //
                 // The distributed client inlines a parquet table's Arrow IPC so
@@ -1762,6 +1768,8 @@ impl KrishivFlightSqlService {
             A::BatchSqlSink(body) => {
                 // Phase 2.3 distributed write: the result is committed through
                 // the staged sink contract instead of being returned inline.
+                self.check_table_access(&body.query)
+                    .map_err(KrishivActionError::Status)?;
                 use krishiv_scheduler::BatchSqlInlineTable;
                 let inline_tables: Vec<BatchSqlInlineTable> = body
                     .tables
@@ -2534,5 +2542,103 @@ mod declared_default_guard {
             Some(super::DEFAULT_FLIGHT_MAX_RESULT_BYTES as u64),
             "KRISHIV_FLIGHT_MAX_RESULT_BYTES: docs and code disagree"
         );
+    }
+}
+
+/// Every DoAction that carries SQL must honour the table-access policy the
+/// statement paths enforce; otherwise a denied table is one action away.
+#[cfg(test)]
+mod action_policy_tests {
+    use super::*;
+    use krishiv_plan::governance::PolicyHook;
+    use krishiv_runtime::KrishivFlightAction as A;
+    use krishiv_runtime::flight_action::{
+        BatchSqlBody, BatchSqlSinkBody, ExecutePlanBody, ExplainBody,
+    };
+
+    struct DenySecret;
+
+    impl PolicyHook for DenySecret {
+        fn check_table_access(&self, table_name: &str) -> bool {
+            table_name != "secret"
+        }
+    }
+
+    async fn denied_service() -> KrishivFlightSqlService {
+        let host = FlightExecutionHost::embedded().expect("embedded host");
+        host.execute_sql("CREATE TABLE secret AS VALUES (1)")
+            .await
+            .expect("create secret");
+        KrishivFlightSqlService::with_host(host).with_policy(Arc::new(DenySecret))
+    }
+
+    async fn assert_denied(service: &KrishivFlightSqlService, action: A, what: &str) {
+        match service.handle_krishiv_action(action).await {
+            Err(KrishivActionError::Status(status)) => assert_eq!(
+                status.code(),
+                tonic::Code::PermissionDenied,
+                "{what}: expected PermissionDenied, got {status}"
+            ),
+            Err(KrishivActionError::Other(other)) => {
+                panic!("{what}: expected PermissionDenied, got {other}")
+            }
+            Ok(_) => panic!("{what}: a denied table must not be reachable"),
+        }
+    }
+
+    #[tokio::test]
+    async fn explain_action_enforces_table_policy() {
+        let service = denied_service().await;
+        let action = A::Explain(ExplainBody {
+            sql: "SELECT * FROM secret".into(),
+        });
+        assert_denied(&service, action, "Explain").await;
+    }
+
+    #[tokio::test]
+    async fn batch_sql_action_enforces_table_policy() {
+        let service = denied_service().await;
+        let action = A::BatchSql(BatchSqlBody {
+            query: "SELECT * FROM secret".into(),
+            tables: Vec::new(),
+            is_streaming: false,
+        });
+        assert_denied(&service, action, "BatchSql").await;
+    }
+
+    #[tokio::test]
+    async fn batch_sql_sink_action_enforces_table_policy() {
+        let service = denied_service().await;
+        let action = A::BatchSqlSink(BatchSqlSinkBody {
+            query: "SELECT * FROM secret".into(),
+            tables: Vec::new(),
+            sink_contract: String::new(),
+        });
+        assert_denied(&service, action, "BatchSqlSink").await;
+    }
+
+    #[tokio::test]
+    async fn execute_plan_action_enforces_table_policy() {
+        let service = denied_service().await;
+        let plan = krishiv_plan::PhysicalPlan::new(
+            "SELECT * FROM secret",
+            krishiv_plan::ExecutionKind::Batch,
+        );
+        let action = A::ExecutePlan(ExecutePlanBody::from_plan(&plan).expect("plan body"));
+        assert_denied(&service, action, "ExecutePlan").await;
+    }
+
+    #[tokio::test]
+    async fn allowed_tables_still_work_through_actions() {
+        let service = denied_service().await;
+        let action = A::BatchSql(BatchSqlBody {
+            query: "SELECT 1 AS x".into(),
+            tables: Vec::new(),
+            is_streaming: false,
+        });
+        service
+            .handle_krishiv_action(action)
+            .await
+            .unwrap_or_else(|_| panic!("a query touching no denied table must run"));
     }
 }
