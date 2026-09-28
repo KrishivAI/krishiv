@@ -338,6 +338,24 @@ impl CheckpointInner {
         self.barrier_sent
             .retain(|(jid, _)| src.coordinators.contains_key(jid));
         for (job_id, src_coord) in &src.coordinators {
+            // The outer copy never sees acks, so its ack timeout fires for an
+            // epoch this (inner) copy has already taken to Committing. A real
+            // commit failure is decided here, by the commit itself, so a
+            // Failed arriving from outside for the epoch being committed is
+            // that stale timeout and must not abort the commit mid-write.
+            let stale_timeout = matches!(
+                (
+                    self.coordinators.get(job_id).map(|c| &c.state),
+                    &src_coord.state,
+                ),
+                (
+                    Some(CheckpointCoordinatorState::Committing { epoch: committing }),
+                    CheckpointCoordinatorState::Failed { epoch: failed, .. },
+                ) if committing == failed
+            );
+            if stale_timeout {
+                continue;
+            }
             merge_checkpoint_coordinator(&mut self.coordinators, job_id, src_coord.clone());
         }
         self.checkpoint_complete_sent
@@ -704,6 +722,39 @@ mod checkpoint_inner_tests {
         assert!(inner.checkpoint_complete_sent.is_empty());
         assert!(inner.notify_sent.is_empty());
         assert!(inner.barrier_sent.is_empty());
+    }
+
+    /// M11: the outer copy never sees the inner copy's acks, so it times out
+    /// and aborts an epoch the inner copy already took to Committing. That
+    /// stale Failed must not overwrite a commit that is still writing.
+    #[test]
+    fn a_stale_timeout_failure_does_not_overwrite_a_commit_in_progress() {
+        let j = job("ci-timeout");
+        let mut inner = CheckpointInner::new();
+        inner.coordinators.insert(
+            j.clone(),
+            coord(&j, 5, CheckpointCoordinatorState::Committing { epoch: 5 }),
+        );
+        let mut outer = CheckpointInner::new();
+        outer.coordinators.insert(j.clone(), {
+            let mut failed = coord(&j, 5, CheckpointCoordinatorState::Committing { epoch: 5 });
+            failed.state = CheckpointCoordinatorState::Failed {
+                epoch: 5,
+                reason: "ack timeout".into(),
+            };
+            failed
+        });
+
+        inner.apply_monotonic_from(&outer);
+
+        assert!(
+            matches!(
+                inner.coordinators[&j].coordinator_state(),
+                CheckpointCoordinatorState::Committing { epoch: 5 }
+            ),
+            "a merged-in timeout overwrote the commit: {:?}",
+            inner.coordinators[&j].coordinator_state()
+        );
     }
 
     #[test]

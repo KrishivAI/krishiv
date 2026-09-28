@@ -59,9 +59,12 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
   - fixed 2026-09-28: dot-only ids rejected by `validate_safe_id` and `is_safe_identifier`
 
 ## Medium — correctness
-- [ ] M9 `krishiv-scheduler/src/coordinator/mod.rs:843,970` stall/speculation CancelTask RPCs unbounded, awaited in heartbeat loop
-- [ ] M10 `krishiv-scheduler/src/coordinator/job_lifecycle.rs:368` `cancel_job` has no terminal-state guard (Succeeded/Failed/Committing → Cancelled)
-- [ ] M11 `krishiv-scheduler/src/coordinator_sharded.rs:386` outer ack-timeout overwrites inner `Committing{N}` with `Failed{N}`
+- [x] M9 `krishiv-scheduler/src/coordinator/mod.rs:843,970` stall/speculation CancelTask RPCs unbounded, awaited in heartbeat loop
+  - fixed 2026-09-28: both fan-outs route through `dispatch_cancel_targets` (CANCEL_RPC_TIMEOUT per RPC); no dedicated test — covered by `dispatch_cancel_targets_bounds_a_hung_peer`
+- [x] M10 `krishiv-scheduler/src/coordinator/job_lifecycle.rs:368` `cancel_job` has no terminal-state guard (Succeeded/Failed/Committing → Cancelled)
+  - fixed 2026-09-28: terminal jobs: cancel is a no-op; Committing: refused with InvalidJob; `cancel_leaves_finished_and_committing_jobs_alone`
+- [x] M11 `krishiv-scheduler/src/coordinator_sharded.rs:386` outer ack-timeout overwrites inner `Committing{N}` with `Failed{N}`
+  - fixed 2026-09-28: outer→inner merge ignores a Failed for the epoch the inner copy is committing; `a_stale_timeout_failure_does_not_overwrite_a_commit_in_progress`
 - [x] M12 `krishiv-sql/src/semi_join_reduction.rs:816` SemiJoinReductionThroughAggregate ignores `null_equality`
   - fixed 2026-09-28: with H4
 - [ ] M13 `krishiv-sql/src/rollup_rewrite.rs:398` count re-aggregated as `sum` → NULL instead of 0 on empty input

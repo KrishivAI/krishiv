@@ -785,9 +785,6 @@ impl SharedCoordinator {
     /// gRPC round-trips, and the zombie executor receives a cancel signal before
     /// the coordinator re-queues the task for another executor.
     pub async fn detect_and_cancel_stalled_tasks(&self) {
-        use crate::coordinator::task_assignment::inject_executor_task_request_context;
-        use crate::in_process::is_in_process_task_endpoint;
-
         let work: Vec<StallCancelWork> = {
             let coord = self.inner.read().await;
             coord.collect_stall_cancel_work()
@@ -801,19 +798,17 @@ impl SharedCoordinator {
             let coord = self.inner.read().await;
             coord.executor_channels.clone()
         };
-        let mut cancel_futures = futures::stream::FuturesUnordered::new();
+        // Each RPC is bounded by CANCEL_RPC_TIMEOUT inside
+        // `dispatch_cancel_targets`: this runs on the heartbeat loop, and an
+        // executor that answers keepalives but never the cancel must not stop
+        // it ticking (no eviction, no checkpoint timers) — Phase 58 #180.
+        let mut targets = Vec::new();
         for item in &work {
             let Some(ref endpoint) = item.executor_endpoint else {
                 continue;
             };
-            if is_in_process_task_endpoint(endpoint) {
+            let Ok(attempt_id) = AttemptId::try_new(item.attempt) else {
                 continue;
-            }
-            let endpoint = endpoint.clone();
-            let channels = channels.clone();
-            let attempt_id = match AttemptId::try_new(item.attempt) {
-                Ok(id) => id,
-                Err(_) => continue,
             };
             let req = TaskCancellationRequest::new(TaskAttemptRef::new(
                 item.job_id.clone(),
@@ -822,33 +817,9 @@ impl SharedCoordinator {
                 attempt_id,
             ))
             .with_reason("task stalled: no progress for >30 min");
-            cancel_futures.push(async move {
-                let channel =
-                    match Coordinator::get_or_connect_channel_on_map(&channels, &endpoint).await {
-                        Ok(c) => c,
-                        Err(err) => {
-                            tracing::warn!(endpoint = %endpoint, error = %err, "stall-cancel: connect failed");
-                            return;
-                        }
-                    };
-                let max = krishiv_proto::max_grpc_message_bytes();
-                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
-                    channel,
-                    inject_executor_task_request_context
-                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-                )
-                .max_decoding_message_size(max)
-                .max_encoding_message_size(max);
-                if let Err(err) = client
-                    .cancel_task(wire::task_cancellation_request_to_wire(req))
-                    .await
-                {
-                    tracing::warn!(endpoint = %endpoint, error = %err, "stall-cancel: cancel_task rpc failed");
-                }
-            });
+            targets.push((endpoint.clone(), req));
         }
-        use futures::stream::StreamExt as _;
-        while cancel_futures.next().await.is_some() {}
+        Coordinator::dispatch_cancel_targets(channels, targets).await;
 
         // Apply resets under write lock after RPCs complete.
         let mut coord = self.inner.write().await;
@@ -899,9 +870,6 @@ impl SharedCoordinator {
     /// No-op when `speculative_execution_enabled` is `false`.  Called alongside
     /// `detect_and_cancel_stalled_tasks` in the daemon heartbeat loop.
     pub async fn run_speculative_execution(&self) {
-        use crate::coordinator::task_assignment::inject_executor_task_request_context;
-        use crate::in_process::is_in_process_task_endpoint;
-
         let work: Vec<SpeculativeWork> = {
             let coord = self.inner.read().await;
             coord.collect_speculation_work()
@@ -928,19 +896,17 @@ impl SharedCoordinator {
             let coord = self.inner.read().await;
             coord.executor_channels.clone()
         };
-        let mut cancel_futures = futures::stream::FuturesUnordered::new();
+        // Each RPC is bounded by CANCEL_RPC_TIMEOUT inside
+        // `dispatch_cancel_targets`: this runs on the heartbeat loop, and an
+        // executor that answers keepalives but never the cancel must not stop
+        // it ticking (no eviction, no checkpoint timers) — Phase 58 #180.
+        let mut targets = Vec::new();
         for item in &work {
             let Some(ref endpoint) = item.executor_endpoint else {
                 continue;
             };
-            if is_in_process_task_endpoint(endpoint) {
+            let Ok(attempt_id) = AttemptId::try_new(item.attempt) else {
                 continue;
-            }
-            let endpoint = endpoint.clone();
-            let channels = channels.clone();
-            let attempt_id = match AttemptId::try_new(item.attempt) {
-                Ok(id) => id,
-                Err(_) => continue,
             };
             let req = TaskCancellationRequest::new(TaskAttemptRef::new(
                 item.job_id.clone(),
@@ -949,33 +915,9 @@ impl SharedCoordinator {
                 attempt_id,
             ))
             .with_reason("speculative preemption: straggler re-queued to another executor");
-            cancel_futures.push(async move {
-                let channel =
-                    match Coordinator::get_or_connect_channel_on_map(&channels, &endpoint).await {
-                        Ok(c) => c,
-                        Err(err) => {
-                            tracing::warn!(endpoint = %endpoint, error = %err, "speculation-cancel: connect failed");
-                            return;
-                        }
-                    };
-                let max = krishiv_proto::max_grpc_message_bytes();
-                let mut client = wire::v1::executor_task_client::ExecutorTaskClient::with_interceptor(
-                    channel,
-                    inject_executor_task_request_context
-                        as fn(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status>,
-                )
-                .max_decoding_message_size(max)
-                .max_encoding_message_size(max);
-                if let Err(err) = client
-                    .cancel_task(wire::task_cancellation_request_to_wire(req))
-                    .await
-                {
-                    tracing::warn!(endpoint = %endpoint, error = %err, "speculation-cancel: cancel_task rpc failed");
-                }
-            });
+            targets.push((endpoint.clone(), req));
         }
-        use futures::stream::StreamExt as _;
-        while cancel_futures.next().await.is_some() {}
+        Coordinator::dispatch_cancel_targets(channels, targets).await;
 
         // Apply preempt-resets under write lock after the cancels: the reset
         // re-checks Running-at-attempt, so an original that completed while

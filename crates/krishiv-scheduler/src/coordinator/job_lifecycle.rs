@@ -379,6 +379,20 @@ impl Coordinator {
         };
         {
             let mut job = self.find_job_mut(job_id)?;
+            // A finished job keeps its outcome: cancelling it again is a no-op,
+            // not a rewrite of Succeeded/Failed into Cancelled.
+            if job.state.is_terminal() {
+                return Ok(());
+            }
+            // A committing job is publishing its output; the publish completes
+            // regardless, so reporting it cancelled would be false.
+            if job.state == JobState::Committing {
+                return Err(SchedulerError::InvalidJob {
+                    message: format!(
+                        "job {job_id} is committing its output and can no longer be cancelled"
+                    ),
+                });
+            }
             job.cancel();
         }
 
@@ -1478,6 +1492,43 @@ mod terminal_id_reuse_tests {
                 "sql: select 1",
             )),
         )
+    }
+
+    /// M10: cancelling a job that already finished must not rewrite its
+    /// outcome, and a job publishing its output must not be reported as
+    /// cancelled while the publish completes.
+    #[test]
+    fn cancel_leaves_finished_and_committing_jobs_alone() {
+        let mut coordinator = Coordinator::new_active(None)
+            .unwrap()
+            .with_store(InMemoryMetadataStore::default());
+        for (name, state) in [
+            ("job-succeeded", JobState::Succeeded),
+            ("job-failed", JobState::Failed),
+        ] {
+            let job_id = JobId::try_new(name).unwrap();
+            coordinator
+                .submit_job(single_task_job(&job_id, "t0"))
+                .unwrap();
+            coordinator.find_job_mut(&job_id).unwrap().state = state;
+            coordinator.cancel_job(&job_id).unwrap();
+            assert_eq!(
+                coordinator.find_job(&job_id).unwrap().state,
+                state,
+                "{name}: cancel rewrote a finished job"
+            );
+        }
+
+        let job_id = JobId::try_new("job-committing").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0"))
+            .unwrap();
+        coordinator.find_job_mut(&job_id).unwrap().state = JobState::Committing;
+        assert!(coordinator.cancel_job(&job_id).is_err());
+        assert_eq!(
+            coordinator.find_job(&job_id).unwrap().state,
+            JobState::Committing
+        );
     }
 
     /// Resubmitting under an id whose in-memory `JobCoordinator` was evicted
