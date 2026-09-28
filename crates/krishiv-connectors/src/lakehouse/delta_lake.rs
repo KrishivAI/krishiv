@@ -97,7 +97,14 @@ pub async fn merge_delta(
     if source_batches.is_empty() {
         return Ok(MergeDeltaResult::default());
     }
-    let target_batches = local_delta::read_table(target_path, None)?;
+    // Read at a pinned version and commit on top of exactly that version, so
+    // a writer that commits in between surfaces as a conflict instead of
+    // having its rows removed by this overwrite.
+    let read_version = local_delta::latest_version(std::path::Path::new(target_path))?;
+    let target_batches = match read_version {
+        Some(version) => local_delta::read_table(target_path, Some(version))?,
+        None => Vec::new(),
+    };
     let target = concat_batches(&target_batches)?;
     let source = concat_batches(&source_batches)?;
     let key = merge_key.to_string();
@@ -153,7 +160,12 @@ pub async fn merge_delta(
     };
 
     let merged = concat_batches(&merged_batches)?;
-    write_delta(target_path, vec![merged], DeltaWriteMode::Overwrite, false).await?;
+    let path = target_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        local_delta::write_table_based_on(&path, vec![merged], read_version)
+    })
+    .await
+    .map_err(|e| LakehouseError::Io(e.to_string()))??;
     Ok(MergeDeltaResult {
         rows_inserted,
         rows_updated,
@@ -195,6 +207,7 @@ impl DeltaObjectStoreReader {
         let log_prefix = object_store::path::Path::from(format!("{}/_delta_log", self.prefix));
         let mut stream = self.store.list(Some(&log_prefix));
         let mut versions = Vec::new();
+        let mut names = Vec::new();
         while let Some(meta) = stream.next().await {
             let meta = meta.map_err(|e| LakehouseError::Io(e.to_string()))?;
             let name = meta.location.filename().unwrap_or("").to_string();
@@ -203,8 +216,10 @@ impl DeltaObjectStoreReader {
             {
                 versions.push(v);
             }
+            names.push(name);
         }
         versions.sort_unstable();
+        local_delta::check_log_listing(names.iter().map(String::as_str), &versions)?;
         Ok(versions)
     }
 
@@ -241,6 +256,7 @@ impl DeltaObjectStoreReader {
             }
             let v: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            local_delta::check_log_action(&v)?;
             // Delta add action: {"add": {"path": "part-xxx.parquet", ...}}
             if let Some(path) = v
                 .get("add")

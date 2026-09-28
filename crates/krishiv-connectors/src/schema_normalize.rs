@@ -10,6 +10,68 @@ use arrow::record_batch::RecordBatch;
 
 use crate::error::{ConnectorError, ConnectorResult};
 
+/// Cast every column of `batch` to the type a sink's value converter handles.
+///
+/// `target` names the type to cast a column to (return the column's own type
+/// to keep it), or `None` when the sink has no mapping for it — which fails
+/// the write. Sink converters used to fall through to NULL for unmapped
+/// types, which silently blanked every `Utf8View` string a DataFusion Parquet
+/// scan produces.
+pub fn cast_columns_for_sink(
+    batch: &RecordBatch,
+    sink: &str,
+    target: impl Fn(&DataType) -> Option<DataType>,
+) -> ConnectorResult<RecordBatch> {
+    let schema = batch.schema();
+    if schema
+        .fields()
+        .iter()
+        .all(|f| target(f.data_type()).as_ref() == Some(f.data_type()))
+    {
+        return Ok(batch.clone());
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len());
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+    for (field, column) in schema.fields().iter().zip(batch.columns()) {
+        let Some(to) = target(field.data_type()) else {
+            return Err(ConnectorError::Unsupported {
+                message: format!(
+                    "{sink} sink cannot write column '{}' of type {}",
+                    field.name(),
+                    field.data_type()
+                ),
+            });
+        };
+        let cast_column = if &to == field.data_type() {
+            Arc::clone(column)
+        } else {
+            cast(column, &to).map_err(|e| ConnectorError::Schema {
+                message: format!(
+                    "{sink} sink: casting column '{}' from {} to {to}: {e}",
+                    field.name(),
+                    field.data_type()
+                ),
+            })?
+        };
+        fields.push(field.as_ref().clone().with_data_type(to));
+        columns.push(cast_column);
+    }
+    let schema = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    RecordBatch::try_new(schema, columns).map_err(|e| ConnectorError::Schema {
+        message: format!("{sink} sink: rebuilding batch: {e}"),
+    })
+}
+
+/// The string and binary encodings every sink treats alike: views and large
+/// offsets collapse onto `Utf8` / `Binary`.
+pub fn plain_string_or_binary(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Utf8View | DataType::LargeUtf8 => Some(DataType::Utf8),
+        DataType::BinaryView | DataType::LargeBinary => Some(DataType::Binary),
+        _ => None,
+    }
+}
+
 /// Maps target column names to source column names for rename evolution.
 #[derive(Debug, Clone, Default)]
 pub struct ColumnRenameMap {

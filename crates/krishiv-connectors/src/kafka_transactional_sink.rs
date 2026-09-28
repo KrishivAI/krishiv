@@ -22,6 +22,42 @@ static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
 /// Timeout for Kafka transaction operations (init, begin, commit, abort).
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Default `transaction.timeout.ms` for [`RdkafkaTransactionalSink::new`].
+///
+/// A transaction stays open from its first prepare until the checkpoint that
+/// covers it completes, and the broker aborts it once this passes — after the
+/// source offsets for that epoch may already be committed. 15 minutes is the
+/// broker's default `transaction.max.timeout.ms`, the largest value it accepts
+/// without configuration.
+const DEFAULT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// How long one commit or abort call may block. Separate from the
+/// transaction timeout, which bounds the whole open transaction and is far
+/// too long to wait on a single broker round trip.
+const FINALIZE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Producer settings for one transactional sink.
+fn producer_config(
+    bootstrap_servers: &str,
+    transactional_id: &str,
+    transaction_timeout: Duration,
+) -> ConnectorResult<ClientConfig> {
+    let timeout_ms: u32 =
+        transaction_timeout
+            .as_millis()
+            .try_into()
+            .map_err(|_| ConnectorError::Config {
+                message: format!("transaction timeout {transaction_timeout:?} exceeds u32::MAX ms"),
+            })?;
+    let mut cfg = ClientConfig::new();
+    cfg.set("bootstrap.servers", bootstrap_servers)
+        .set("transactional.id", transactional_id)
+        .set("enable.idempotence", "true")
+        .set("message.timeout.ms", timeout_ms.to_string())
+        .set("transaction.timeout.ms", timeout_ms.to_string());
+    Ok(cfg)
+}
+
 /// An rdkafka-backed exactly-once Kafka sink.
 ///
 /// Uses Kafka transactions (EOS) to implement [`TwoPhaseCommitSink`].
@@ -59,9 +95,6 @@ pub struct RdkafkaTransactionalSink {
     /// commit so `prepare` can reject duplicate or stale (non-monotonic)
     /// epoch retries.
     last_finalized_epoch: Option<u64>,
-    /// Transaction timeout in milliseconds. Must be ≤ broker
-    /// `transaction.max.timeout.ms` (default 15 min).
-    transaction_timeout_ms: u32,
 }
 
 impl RdkafkaTransactionalSink {
@@ -74,7 +107,7 @@ impl RdkafkaTransactionalSink {
     /// (e.g. `"{job_id}/{task_slot}"`) — this ensures Kafka's zombie fencing
     /// works correctly. Per-epoch IDs would break fencing.
     ///
-    /// `transaction_timeout_ms` defaults to 30 seconds. Must be ≤ the broker's
+    /// The transaction timeout defaults to 15 minutes. Must be ≤ the broker's
     /// `transaction.max.timeout.ms` setting.
     pub fn new(
         bootstrap_servers: impl AsRef<str>,
@@ -85,7 +118,7 @@ impl RdkafkaTransactionalSink {
             bootstrap_servers,
             topic,
             transactional_id,
-            Duration::from_secs(30),
+            DEFAULT_TRANSACTION_TIMEOUT,
         )
     }
 
@@ -96,22 +129,11 @@ impl RdkafkaTransactionalSink {
         transactional_id: impl AsRef<str>,
         transaction_timeout: Duration,
     ) -> ConnectorResult<Self> {
-        let timeout_ms: u32 =
-            transaction_timeout
-                .as_millis()
-                .try_into()
-                .map_err(|_| ConnectorError::Config {
-                    message: format!(
-                        "transaction timeout {transaction_timeout:?} exceeds u32::MAX ms"
-                    ),
-                })?;
-
-        let mut cfg = ClientConfig::new();
-        cfg.set("bootstrap.servers", bootstrap_servers.as_ref())
-            .set("transactional.id", transactional_id.as_ref())
-            .set("enable.idempotence", "true")
-            .set("message.timeout.ms", timeout_ms.to_string())
-            .set("transaction.timeout.ms", timeout_ms.to_string());
+        let cfg = producer_config(
+            bootstrap_servers.as_ref(),
+            transactional_id.as_ref(),
+            transaction_timeout,
+        )?;
 
         let producer: ThreadedProducer<rdkafka::producer::DefaultProducerContext> =
             cfg.create().map_err(|e| ConnectorError::Kafka {
@@ -133,7 +155,6 @@ impl RdkafkaTransactionalSink {
             current_epoch: None,
             open_handles: Vec::new(),
             last_finalized_epoch: None,
-            transaction_timeout_ms: timeout_ms,
         })
     }
 
@@ -223,7 +244,7 @@ impl RdkafkaTransactionalSink {
     /// leaves the sink "open" with no handle that could ever close it.
     fn discard_open_transaction(&mut self) {
         if self.transaction_open {
-            let timeout = Duration::from_millis(self.transaction_timeout_ms as u64);
+            let timeout = FINALIZE_TIMEOUT;
             if let Err(error) = self.producer.abort_transaction(timeout) {
                 tracing::warn!(
                     error = %error,
@@ -325,7 +346,7 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
             // Already committed — idempotent.
             return Ok(());
         }
-        let timeout = Duration::from_millis(self.transaction_timeout_ms as u64);
+        let timeout = FINALIZE_TIMEOUT;
         self.producer
             .commit_transaction(timeout)
             .map_err(|e| ConnectorError::Kafka {
@@ -345,7 +366,7 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
             // Nothing staged — idempotent.
             return Ok(());
         }
-        let timeout = Duration::from_millis(self.transaction_timeout_ms as u64);
+        let timeout = FINALIZE_TIMEOUT;
         self.producer
             .abort_transaction(timeout)
             .map_err(|e| ConnectorError::Kafka {
@@ -364,6 +385,21 @@ impl TwoPhaseCommitSink for RdkafkaTransactionalSink {
 #[cfg(test)]
 mod tests {
     use super::RdkafkaTransactionalSink as Sink;
+
+    /// The broker aborts an open transaction once `transaction.timeout.ms`
+    /// passes. A transaction stays open from the first prepare until the
+    /// checkpoint that covers it completes, so a 30 s timeout aborted any
+    /// epoch whose checkpoint took longer — after its source offsets had
+    /// already been committed. Default to the broker's own ceiling.
+    #[test]
+    fn default_transaction_timeout_is_the_broker_ceiling() {
+        let cfg =
+            super::producer_config("b:9092", "job/0", super::DEFAULT_TRANSACTION_TIMEOUT).unwrap();
+        assert_eq!(cfg.get("transaction.timeout.ms"), Some("900000"));
+        assert_eq!(cfg.get("message.timeout.ms"), Some("900000"));
+        assert_eq!(cfg.get("transactional.id"), Some("job/0"));
+        assert_eq!(cfg.get("enable.idempotence"), Some("true"));
+    }
 
     /// A prepare for an epoch at or below the last committed epoch is a
     /// duplicate/stale retry and must be rejected — even though no

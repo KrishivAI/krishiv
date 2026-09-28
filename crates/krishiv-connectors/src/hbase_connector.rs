@@ -173,6 +173,23 @@ pub fn build_row_mutations(
     batch: &RecordBatch,
     config: &HBaseConfig,
 ) -> ConnectorResult<Vec<BatchMutation>> {
+    // HBase cells are bytes; the converter stores each value's string form.
+    // Anything it has no arm for is rendered as a string first instead of
+    // being dropped from the row.
+    let batch = &crate::schema_normalize::cast_columns_for_sink(batch, "HBase", |dt| match dt {
+        DataType::Boolean
+        | DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8
+        | DataType::Binary => Some(dt.clone()),
+        other => crate::schema_normalize::plain_string_or_binary(other).or_else(|| {
+            arrow::compute::can_cast_types(other, &DataType::Utf8).then_some(DataType::Utf8)
+        }),
+    })?;
     let schema = batch.schema();
     let n = batch.num_rows();
 
@@ -394,5 +411,30 @@ mod tests {
         assert_eq!(cfg.table, "tbl");
         assert_eq!(cfg.column_family, "d");
         assert_eq!(cfg.row_key_column.as_deref(), Some("pk"));
+    }
+
+    /// A `Utf8View` column (every DataFusion Parquet scan) must be written,
+    /// not dropped, and must work as the row key.
+    #[test]
+    fn utf8_view_cells_are_written() {
+        use arrow::array::StringViewArray;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("row_id", DataType::Utf8View, false),
+            Field::new("name", DataType::Utf8View, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringViewArray::from(vec!["r1"])),
+                Arc::new(StringViewArray::from(vec!["alice"])),
+            ],
+        )
+        .unwrap();
+        let config = HBaseConfig::new("localhost:9090", "t1", "cf").with_row_key_column("row_id");
+        let mutations = build_row_mutations(&batch, &config).unwrap();
+        assert_eq!(mutations[0].row.as_deref(), Some(b"r1".as_ref()));
+        let cells = mutations[0].mutations.as_ref().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].value.as_deref(), Some(b"alice".as_ref()));
     }
 }

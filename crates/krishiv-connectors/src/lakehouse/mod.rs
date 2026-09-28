@@ -86,6 +86,9 @@ pub enum LakehouseError {
     #[doc = "**Beta API**: may change between minor releases."]
     #[error("Concurrency conflict: {message}")]
     Concurrency { message: String },
+    #[doc = "**Beta API**: may change between minor releases."]
+    #[error("Unsupported table feature: {message}")]
+    Unsupported { message: String },
 }
 
 /// Convenience result alias for lakehouse operations.

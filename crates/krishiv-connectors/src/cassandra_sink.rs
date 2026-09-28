@@ -154,23 +154,10 @@ impl CassandraSink {
         let insert_cql = build_insert_cql(&self.config.keyspace, &self.config.table, &column_names);
 
         let mut cql_batch = Batch::new(BatchType::Unlogged);
-        let mut all_values: Vec<Vec<Option<CqlValue>>> = Vec::with_capacity(batch.num_rows());
-
-        for row in 0..batch.num_rows() {
+        for _ in 0..batch.num_rows() {
             cql_batch.append_statement(insert_cql.as_str());
-            let row_values: Vec<Option<CqlValue>> = schema
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(col_idx, field)| {
-                    let col = batch.column(col_idx);
-                    arrow_scalar_to_cql(col.as_ref(), row, field.data_type())
-                })
-                .collect();
-            all_values.push(row_values);
         }
-
-        let serialized_values: Vec<Vec<Option<CqlValue>>> = all_values;
+        let serialized_values = batch_to_cql_rows(batch)?;
 
         self.session
             .batch(&cql_batch, serialized_values)
@@ -217,6 +204,39 @@ fn build_insert_cql(keyspace: &str, table: &str, column_names: &[&str]) -> Strin
 /// Convert a single Arrow array cell to an `Option<CqlValue>`.
 ///
 /// Returns `None` for null cells.
+/// Convert every row of `batch` to bound CQL values, in schema order.
+///
+/// Errors on a column with no CQL mapping: an unbound value is written as
+/// NULL, which would overwrite what the row already holds.
+pub fn batch_to_cql_rows(batch: &RecordBatch) -> ConnectorResult<Vec<Vec<Option<CqlValue>>>> {
+    let batch =
+        &crate::schema_normalize::cast_columns_for_sink(batch, "Cassandra", |dt| match dt {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Utf8
+            | DataType::Binary => Some(dt.clone()),
+            other => crate::schema_normalize::plain_string_or_binary(other),
+        })?;
+    let schema = batch.schema();
+    Ok((0..batch.num_rows())
+        .map(|row| {
+            schema
+                .fields()
+                .iter()
+                .enumerate()
+                .map(|(col_idx, field)| {
+                    arrow_scalar_to_cql(batch.column(col_idx).as_ref(), row, field.data_type())
+                })
+                .collect()
+        })
+        .collect())
+}
+
 pub fn arrow_scalar_to_cql(col: &dyn Array, row: usize, dt: &DataType) -> Option<CqlValue> {
     if col.is_null(row) {
         return None;
@@ -384,5 +404,38 @@ mod tests {
         assert_eq!(cfg.node, "127.0.0.1:9042");
         assert_eq!(cfg.keyspace, "ks");
         assert_eq!(cfg.table, "tbl");
+    }
+
+    /// Unbound values are written as NULL, which overwrites the stored value;
+    /// a `Utf8View` string must bind as text.
+    #[test]
+    fn utf8_view_binds_as_text() {
+        use arrow::array::StringViewArray;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Utf8View,
+            false,
+        )]));
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringViewArray::from(vec!["hello"]))])
+                .unwrap();
+        let rows = batch_to_cql_rows(&batch).unwrap();
+        assert_eq!(rows[0][0], Some(CqlValue::Text("hello".into())));
+    }
+
+    /// A type with no CQL mapping must fail the write, not bind NULL.
+    #[test]
+    fn unmappable_type_is_an_error() {
+        use arrow::array::Decimal128Array;
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "amount",
+            DataType::Decimal128(10, 2),
+            false,
+        )]));
+        let col = Decimal128Array::from(vec![1234i128])
+            .with_precision_and_scale(10, 2)
+            .unwrap();
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(col)]).unwrap();
+        assert!(batch_to_cql_rows(&batch).is_err());
     }
 }

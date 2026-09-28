@@ -246,7 +246,10 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
     ),
     entry("kafka", "sink", "preview", Yes, Yes, Yes, Yes).with_note(
         "distributed reach is the checkpoint-aligned two-phase-commit KafkaSink \
-         (Phase 55): exactly-once for read_committed consumers",
+         (Phase 55): exactly-once for read_committed consumers while the executor \
+         survives; a crash after a checkpoint completes but before its Kafka \
+         transaction commits aborts that epoch's output (no prepared-transaction \
+         recovery yet)",
     ),
     entry("iceberg", "sink", "preview", Yes, Yes, Yes, Yes)
         .with_note("distributed reach is the checkpoint-aligned two-phase-commit IcebergSink (G7)"),

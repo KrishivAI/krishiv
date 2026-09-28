@@ -137,6 +137,83 @@ fn next_version(root: &Path) -> LakehouseResult<u64> {
     Ok(max.map_or(0, |m| m + 1))
 }
 
+/// Refuse a log this reader would misread.
+///
+/// The reader replays JSON commits from version 0 and reads each `add`ed file
+/// as-is. A table that relies on anything else — a checkpoint standing in for
+/// cleaned-up commits, deletion vectors, partition values carried in the log,
+/// column mapping, or any reader feature — would come back with missing,
+/// resurrected or wrongly-shaped rows, so it is an error instead.
+pub(crate) fn check_log_listing<'a>(
+    file_names: impl IntoIterator<Item = &'a str>,
+    sorted_versions: &[u64],
+) -> LakehouseResult<()> {
+    let unsupported = |message: String| Err(LakehouseError::Unsupported { message });
+    for name in file_names {
+        if name == "_last_checkpoint" || name.contains(".checkpoint.") {
+            return unsupported(format!(
+                "Delta checkpoints are not supported (found _delta_log/{name})"
+            ));
+        }
+    }
+    if let Some((index, version)) = sorted_versions
+        .iter()
+        .enumerate()
+        .find(|(index, version)| **version != *index as u64)
+    {
+        return unsupported(format!(
+            "Delta log is not contiguous from version 0 (expected version {index}, found \
+             {version}); commits cleaned up behind a checkpoint are not supported"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a log action that changes how files must be read. See
+/// [`check_log_listing`].
+pub(crate) fn check_log_action(action: &serde_json::Value) -> LakehouseResult<()> {
+    let unsupported = |message: &str| {
+        Err(LakehouseError::Unsupported {
+            message: message.to_string(),
+        })
+    };
+    if let Some(protocol) = action.get("protocol")
+        && protocol
+            .get("minReaderVersion")
+            .and_then(serde_json::Value::as_u64)
+            .is_some_and(|v| v > 1)
+    {
+        return unsupported(&format!(
+            "Delta reader protocol {protocol} is not supported (reader version 1 only)"
+        ));
+    }
+    if action
+        .get("add")
+        .and_then(|add| add.get("deletionVector"))
+        .is_some_and(|dv| !dv.is_null())
+    {
+        return unsupported("Delta deletion vectors are not supported");
+    }
+    if let Some(meta) = action.get("metaData") {
+        if meta
+            .get("partitionColumns")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|cols| !cols.is_empty())
+        {
+            return unsupported("partitioned Delta tables are not supported");
+        }
+        if meta
+            .get("configuration")
+            .and_then(|c| c.get("delta.columnMapping.mode"))
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|mode| mode != "none")
+        {
+            return unsupported("Delta column mapping is not supported");
+        }
+    }
+    Ok(())
+}
+
 fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseResult<Vec<String>> {
     let dir = delta_log_dir(root);
     if !dir.exists() {
@@ -144,6 +221,7 @@ fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseRes
     }
     let mut active = BTreeSet::new();
     let mut versions: Vec<u64> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
     for entry in fs::read_dir(&dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
         let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
         let name = entry.file_name().to_string_lossy().to_string();
@@ -152,8 +230,10 @@ fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseRes
         {
             versions.push(v);
         }
+        names.push(name);
     }
     versions.sort_unstable();
+    check_log_listing(names.iter().map(String::as_str), &versions)?;
     let limit = max_version.unwrap_or_else(|| versions.last().copied().unwrap_or(0));
     for v in versions.into_iter().filter(|ver| *ver <= limit) {
         let path = dir.join(format!("{v:020}.json"));
@@ -164,6 +244,7 @@ fn active_data_file_paths(root: &Path, max_version: Option<u64>) -> LakehouseRes
             }
             let value: serde_json::Value =
                 serde_json::from_str(line).map_err(|e| LakehouseError::Io(e.to_string()))?;
+            check_log_action(&value)?;
             if let Some(add) = value.get("add").and_then(|a| a.get("path"))
                 && let Some(rel) = add.as_str()
             {
@@ -554,7 +635,51 @@ pub fn read_table(path: &str, version: Option<u64>) -> LakehouseResult<Vec<Recor
     Ok(out)
 }
 
+/// The newest committed log version, or `None` for a table with no commits.
+pub fn latest_version(root: &Path) -> LakehouseResult<Option<u64>> {
+    let dir = delta_log_dir(root);
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let mut max = None;
+    for entry in fs::read_dir(&dir).map_err(|e| LakehouseError::Io(e.to_string()))? {
+        let entry = entry.map_err(|e| LakehouseError::Io(e.to_string()))?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if let Some(stem) = name.strip_suffix(".json")
+            && let Ok(v) = stem.parse::<u64>()
+        {
+            max = Some(max.map_or(v, |m: u64| m.max(v)));
+        }
+    }
+    Ok(max)
+}
+
 pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> LakehouseResult<()> {
+    write_table_inner(path, batches, overwrite, None)
+}
+
+/// Overwrite the table with the result of a read-modify-write that read
+/// `read_version` (`None`: the table had no commits).
+///
+/// The commit must land directly on top of that version. If another writer
+/// committed in between, this fails with [`LakehouseError::Concurrency`]
+/// instead of retrying at a later version: the new contents were computed from
+/// a snapshot that no longer exists, and committing them would delete the
+/// other writer's rows.
+pub fn write_table_based_on(
+    path: &str,
+    batches: Vec<RecordBatch>,
+    read_version: Option<u64>,
+) -> LakehouseResult<()> {
+    write_table_inner(path, batches, true, Some(read_version))
+}
+
+fn write_table_inner(
+    path: &str,
+    batches: Vec<RecordBatch>,
+    overwrite: bool,
+    based_on: Option<Option<u64>>,
+) -> LakehouseResult<()> {
     let root = Path::new(path);
     fs::create_dir_all(root).map_err(|e| LakehouseError::Io(e.to_string()))?;
 
@@ -579,7 +704,22 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
     // Write the data file once under a writer-unique name so a concurrent
     // writer racing for the same version can never truncate it.
     let suffix = commit_attempt_suffix();
-    let mut version = next_version(root)?;
+    let conflict = |read: Option<u64>| LakehouseError::Concurrency {
+        message: format!(
+            "Delta table changed after it was read at version {read:?}; the merge must be \
+             retried against the new version"
+        ),
+    };
+    let mut version = match based_on {
+        Some(read) => {
+            let expected = read.map_or(0, |v| v + 1);
+            if next_version(root)? != expected {
+                return Err(conflict(read));
+            }
+            expected
+        }
+        None => next_version(root)?,
+    };
     let mut file_name = format!("part-{version:05}-{suffix}.parquet");
     let file_path = root.join(&file_name);
     let f = File::create(&file_path).map_err(|e| LakehouseError::Io(e.to_string()))?;
@@ -634,6 +774,10 @@ pub fn write_table(path: &str, batches: Vec<RecordBatch>, overwrite: bool) -> La
             String::from_utf8(contents).map_err(|e| LakehouseError::Io(e.to_string()))?;
         if claim_commit_log(root, version, &contents)? {
             return Ok(());
+        }
+        if let Some(read) = based_on {
+            let _ = fs::remove_file(root.join(&file_name));
+            return Err(conflict(read));
         }
         // Lost the race: move the data file to the next version's name and retry.
         version = next_version(root)?;
@@ -818,6 +962,119 @@ mod tests {
     fn batch(values: &[i64]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    /// A table this reader cannot interpret faithfully must be refused, not
+    /// read into wrong rows: checkpoints (older commits are gone), deletion
+    /// vectors (deleted rows would come back), partition columns (values live
+    /// in the log, not the files), and reader protocol versions above 1.
+    #[test]
+    fn foreign_delta_features_are_refused_not_misread() {
+        fn table_with(extra: impl Fn(&Path)) -> String {
+            let dir = tempfile::tempdir().unwrap().keep();
+            let path = dir.to_string_lossy().to_string();
+            write_table(&path, vec![batch(&[1, 2])], false).unwrap();
+            extra(&dir);
+            path
+        }
+        let append_log = |root: &Path, version: u64, line: &str| {
+            let file = delta_log_dir(root).join(format!("{version:020}.json"));
+            fs::write(file, format!("{line}\n")).unwrap();
+        };
+        let cases: Vec<(&str, String)> = vec![
+            (
+                "checkpoint",
+                table_with(|root| {
+                    fs::write(
+                        delta_log_dir(root).join("_last_checkpoint"),
+                        r#"{"version":0,"size":1}"#,
+                    )
+                    .unwrap();
+                }),
+            ),
+            (
+                "deletion vector",
+                table_with(|root| {
+                    append_log(
+                        root,
+                        1,
+                        r#"{"add":{"path":"x.parquet","size":1,"dataChange":true,"deletionVector":{"storageType":"u","pathOrInlineDv":"ab","offset":1,"sizeInBytes":1,"cardinality":1}}}"#,
+                    )
+                }),
+            ),
+            (
+                "partition",
+                table_with(|root| {
+                    append_log(
+                        root,
+                        1,
+                        r#"{"metaData":{"id":"m","format":{"provider":"parquet","options":{}},"schemaString":"{}","partitionColumns":["region"],"configuration":{}}}"#,
+                    )
+                }),
+            ),
+            (
+                "reader version",
+                table_with(|root| {
+                    append_log(
+                        root,
+                        1,
+                        r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["deletionVectors"],"writerFeatures":["deletionVectors"]}}"#,
+                    )
+                }),
+            ),
+            (
+                "missing commit",
+                table_with(|root| {
+                    append_log(root, 1, r#"{"commitInfo":{"operation":"WRITE"}}"#);
+                    fs::remove_file(delta_log_dir(root).join(format!("{:020}.json", 0))).unwrap();
+                }),
+            ),
+        ];
+        for (what, path) in cases {
+            let result = read_table(&path, None);
+            assert!(
+                matches!(result, Err(LakehouseError::Unsupported { .. })),
+                "{what}: expected Unsupported, got {:?}",
+                result.map(|b| b.iter().map(RecordBatch::num_rows).sum::<usize>())
+            );
+        }
+    }
+
+    /// A read-modify-write must commit on top of exactly the version it read.
+    /// Recomputing the removes from whatever is newest at commit time silently
+    /// deleted rows a concurrent writer appended in between.
+    #[test]
+    fn overwrite_based_on_a_stale_read_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_table(&path, vec![batch(&[1])], false).unwrap();
+        let read_version = latest_version(dir.path()).unwrap();
+        assert_eq!(read_version, Some(0));
+
+        // A concurrent writer appends after our read.
+        write_table(&path, vec![batch(&[2])], false).unwrap();
+
+        let result = write_table_based_on(&path, vec![batch(&[1, 10])], read_version);
+        assert!(
+            matches!(result, Err(LakehouseError::Concurrency { .. })),
+            "expected a conflict, got {result:?}"
+        );
+        let rows: usize = read_table(&path, None)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 2, "the concurrent append must survive");
+
+        // Based on the current version, the same overwrite goes through.
+        let current = latest_version(dir.path()).unwrap();
+        write_table_based_on(&path, vec![batch(&[1, 2, 10])], current).unwrap();
+        let rows: usize = read_table(&path, None)
+            .unwrap()
+            .iter()
+            .map(|b| b.num_rows())
+            .sum();
+        assert_eq!(rows, 3);
     }
 
     #[test]

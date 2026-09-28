@@ -135,7 +135,7 @@ impl ElasticsearchSink {
             return Ok(());
         }
 
-        let docs = batch_to_json_docs(batch);
+        let docs = batch_to_json_docs(batch)?;
         let mut ops = BulkOperations::new();
 
         // A configured id_column that is missing from the batch is an ERROR,
@@ -219,8 +219,40 @@ impl ElasticsearchSink {
 
 // ── Arrow → JSON row conversion ───────────────────────────────────────────────
 
+/// The type each column is indexed as: JSON numbers and booleans where the
+/// converter maps them, a string rendering (ISO dates, exact decimals) for
+/// anything else Arrow can print.
+fn elasticsearch_column_type(data_type: &DataType) -> Option<DataType> {
+    use arrow::compute::can_cast_types;
+    match data_type {
+        DataType::Boolean
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Utf8 => Some(data_type.clone()),
+        DataType::Int8
+        | DataType::Int16
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32 => Some(DataType::Int64),
+        DataType::Float16 => Some(DataType::Float32),
+        other => crate::schema_normalize::plain_string_or_binary(other)
+            .filter(|t| *t == DataType::Utf8)
+            .or_else(|| can_cast_types(other, &DataType::Utf8).then_some(DataType::Utf8)),
+    }
+}
+
 /// Convert every row in `batch` to a `serde_json::Map`.
-pub fn batch_to_json_docs(batch: &RecordBatch) -> Vec<Map<String, JsonValue>> {
+///
+/// Errors on a column type that has no JSON rendering rather than indexing it
+/// as null.
+pub fn batch_to_json_docs(batch: &RecordBatch) -> ConnectorResult<Vec<Map<String, JsonValue>>> {
+    let batch = crate::schema_normalize::cast_columns_for_sink(
+        batch,
+        "Elasticsearch",
+        elasticsearch_column_type,
+    )?;
     let schema = batch.schema();
     let n = batch.num_rows();
     let mut rows: Vec<Map<String, JsonValue>> = (0..n).map(|_| Map::new()).collect();
@@ -233,7 +265,7 @@ pub fn batch_to_json_docs(batch: &RecordBatch) -> Vec<Map<String, JsonValue>> {
             map.insert(name.clone(), val);
         }
     }
-    rows
+    Ok(rows)
 }
 
 fn arrow_scalar_to_json(col: &dyn Array, row: usize) -> JsonValue {
@@ -380,7 +412,7 @@ mod tests {
     #[test]
     fn batch_converts_to_json_docs() {
         let batch = make_batch();
-        let docs = batch_to_json_docs(&batch);
+        let docs = batch_to_json_docs(&batch).unwrap();
         assert_eq!(docs.len(), 3);
 
         let doc = &docs[0];
@@ -391,7 +423,7 @@ mod tests {
     #[test]
     fn json_docs_have_all_columns() {
         let batch = make_batch();
-        let docs = batch_to_json_docs(&batch);
+        let docs = batch_to_json_docs(&batch).unwrap();
         assert!(docs[0].contains_key("id"));
         assert!(docs[0].contains_key("age"));
         assert!(docs[0].contains_key("score"));
@@ -402,7 +434,7 @@ mod tests {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, true)]));
         let arr: Arc<dyn Array> = Arc::new(StringArray::from(vec![Some("hi"), None]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
-        let docs = batch_to_json_docs(&batch);
+        let docs = batch_to_json_docs(&batch).unwrap();
         assert_eq!(docs[0]["x"], JsonValue::String("hi".to_owned()));
         assert_eq!(docs[1]["x"], JsonValue::Null);
     }
@@ -411,7 +443,7 @@ mod tests {
     fn empty_batch_produces_no_docs() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         let batch = RecordBatch::new_empty(schema);
-        let docs = batch_to_json_docs(&batch);
+        let docs = batch_to_json_docs(&batch).unwrap();
         assert!(docs.is_empty());
     }
 
@@ -481,8 +513,41 @@ mod tests {
             ],
         )
         .unwrap();
-        let docs = batch_to_json_docs(&batch);
+        let docs = batch_to_json_docs(&batch).unwrap();
         assert_eq!(docs[0]["active"], JsonValue::Bool(true));
         assert_eq!(docs[1]["active"], JsonValue::Bool(false));
+    }
+
+    /// DataFusion's Parquet scans produce `Utf8View`; timestamps, small ints
+    /// and decimals are ordinary too. None of them may be indexed as null.
+    #[test]
+    fn non_primitive_columns_are_not_written_as_null() {
+        use arrow::array::{Int16Array, StringViewArray, TimestampMillisecondArray};
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8View, false),
+            Field::new("small", DataType::Int16, false),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
+                false,
+            ),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringViewArray::from(vec!["hello"])),
+                Arc::new(Int16Array::from(vec![7i16])),
+                Arc::new(TimestampMillisecondArray::from(vec![1_700_000_000_000i64])),
+            ],
+        )
+        .unwrap();
+        let docs = batch_to_json_docs(&batch).unwrap();
+        assert_eq!(docs[0]["name"], JsonValue::String("hello".into()));
+        assert_eq!(docs[0]["small"], JsonValue::Number(7.into()));
+        assert!(
+            docs[0]["ts"].is_string(),
+            "timestamp became {:?}",
+            docs[0]["ts"]
+        );
     }
 }
