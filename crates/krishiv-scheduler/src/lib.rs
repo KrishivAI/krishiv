@@ -95,7 +95,7 @@ pub use error::{
     FailureClass, SchedulerError, SchedulerResult, StaleTaskReason, TaskUpdateOutcome,
 };
 #[cfg(feature = "etcd")]
-pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaseElection};
+pub use etcd_lease::{DEFAULT_CCP_LEADER_KEY, EtcdLeaderFence, EtcdLeaseElection};
 #[cfg(feature = "etcd")]
 pub use etcd_metadata::EtcdMetadataStore;
 pub use ivm::{IvmJob, IvmJobRegistry, SharedIvmJobRegistry};

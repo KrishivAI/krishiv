@@ -247,6 +247,16 @@ pub fn build_shared_coordinator_sync(
             coord
                 .recover_from_store(&mut store)
                 .map_err(|e| format!("coordinator recovery failed: {e}"))?;
+            // Under etcd leader election, every metadata write is conditional
+            // on still holding the leader key: a deposed coordinator's queued
+            // writes must not land over the new leader's records.
+            let store = if config.leader_backend == "etcd" {
+                store.with_leader_fence(crate::etcd_lease::EtcdLeaderFence::for_key(
+                    &config.etcd_lease_key,
+                ))
+            } else {
+                store
+            };
             SharedCoordinator::new(attach_metadata_store(coord, store, config))
         }
         #[cfg(not(feature = "etcd"))]

@@ -1,7 +1,9 @@
 //! etcd v3 lease election for bare-metal cluster control plane HA.
 
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use async_trait::async_trait;
@@ -11,6 +13,64 @@ use crate::LeaderElection;
 
 /// Default leader key for the cluster control plane.
 pub const DEFAULT_CCP_LEADER_KEY: &str = "/krishiv/ccp/leader";
+
+/// This process's hold on one etcd leader key, shared between the election
+/// that acquires it and the metadata store whose writes it fences.
+///
+/// The store guards each write with "the leader key is still attached to my
+/// lease". A coordinator that stalled past its lease (GC pause, VM freeze) and
+/// was replaced therefore cannot overwrite the new leader's records on
+/// resuming: its lease is gone from the key, so the compare fails in etcd
+/// itself, whatever the local process still believes.
+#[derive(Clone, Debug)]
+pub struct EtcdLeaderFence {
+    lease_key: Arc<str>,
+    /// The lease currently attached to `lease_key` by this process; 0 when
+    /// this process does not hold it.
+    lease_id: Arc<AtomicI64>,
+}
+
+impl EtcdLeaderFence {
+    /// The process-wide fence for `lease_key`. The election and the metadata
+    /// store are built separately from the same daemon config, so they meet
+    /// here rather than through a constructor argument.
+    pub fn for_key(lease_key: &str) -> Self {
+        static FENCES: OnceLock<Mutex<HashMap<String, EtcdLeaderFence>>> = OnceLock::new();
+        let mut fences = FENCES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        fences
+            .entry(lease_key.to_string())
+            .or_insert_with(|| Self::detached(lease_key))
+            .clone()
+    }
+
+    /// A fence not shared through [`for_key`](Self::for_key).
+    pub fn detached(lease_key: &str) -> Self {
+        Self {
+            lease_key: Arc::from(lease_key),
+            lease_id: Arc::new(AtomicI64::new(0)),
+        }
+    }
+
+    pub fn lease_key(&self) -> &str {
+        &self.lease_key
+    }
+
+    /// The lease this process holds the key with, or `None` when it does not
+    /// hold the key.
+    pub fn current_lease(&self) -> Option<i64> {
+        match self.lease_id.load(Ordering::Acquire) {
+            0 => None,
+            lease => Some(lease),
+        }
+    }
+
+    pub fn set_lease(&self, lease: Option<i64>) {
+        self.lease_id.store(lease.unwrap_or(0), Ordering::Release);
+    }
+}
 
 #[derive(Debug)]
 struct EtcdLeaseState {
@@ -35,6 +95,9 @@ pub struct EtcdLeaseElection {
     lease_duration_s: u64,
     client: Option<tokio::sync::Mutex<Client>>,
     state: Mutex<EtcdLeaseState>,
+    /// Published only by a live (etcd-backed) election; simulation mode never
+    /// holds a real lease, so it leaves the fence alone.
+    fence: Option<EtcdLeaderFence>,
 }
 
 impl fmt::Debug for EtcdLeaseElection {
@@ -71,6 +134,7 @@ impl EtcdLeaseElection {
                 lease_id: 0,
                 last_renewed_at: None,
             }),
+            fence: None,
         }
     }
 
@@ -91,10 +155,13 @@ impl EtcdLeaseElection {
         let client = Client::connect(&endpoints, None)
             .await
             .map_err(|e| format!("etcd connect failed: {e}"))?;
+        let lease_key: String = lease_key.into();
+        let fence = Some(EtcdLeaderFence::for_key(&lease_key));
         Ok(Self {
-            lease_key: lease_key.into(),
+            lease_key,
             holder_identity: holder_identity.into(),
             lease_duration_s: lease_duration_s.max(1),
+            fence,
             client: Some(tokio::sync::Mutex::new(client)),
             state: Mutex::new(EtcdLeaseState {
                 is_leader: false,
@@ -141,12 +208,18 @@ impl EtcdLeaseElection {
         s.is_leader = true;
         s.lease_id = lease_id;
         s.last_renewed_at = Some(Instant::now());
+        if let Some(fence) = &self.fence {
+            fence.set_lease(Some(lease_id));
+        }
     }
 
     fn clear_leader(&self) {
         let mut s = self.state.lock().unwrap_or_else(|p| p.into_inner());
         s.is_leader = false;
         s.lease_id = 0;
+        if let Some(fence) = &self.fence {
+            fence.set_lease(None);
+        }
     }
 
     async fn etcd_try_acquire(&self, client: &mut Client) -> bool {

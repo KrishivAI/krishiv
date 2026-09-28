@@ -42,7 +42,10 @@
 //! scheduling runtime, which would deadlock the coordinator under load (see
 //! [`ETCD_RUNTIME`]).
 
-use etcd_client::{Client, DeleteOptions, GetOptions, KeyValue, KvClient, SortOrder, SortTarget};
+use etcd_client::{
+    Client, Compare, CompareOp, DeleteOptions, GetOptions, KeyValue, KvClient, SortOrder,
+    SortTarget, Txn, TxnOp,
+};
 
 use crate::store::{
     ContinuousSnapshot, EventLogEvent, JobHistoryRecord, MAX_JOB_HISTORY, MetadataStore,
@@ -208,9 +211,67 @@ pub struct EtcdMetadataStore {
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
     ivm_snapshots: std::collections::HashMap<String, Vec<u8>>,
     history: Vec<JobHistoryRecord>,
+    /// When set, every write is conditional on this process still holding the
+    /// leader key (see [`EtcdLeaderFence`]). Unset for a single-coordinator
+    /// deployment, which has no leader key to check.
+    leader_fence: Option<crate::etcd_lease::EtcdLeaderFence>,
 }
 
 impl EtcdMetadataStore {
+    /// Make every write conditional on holding the leader key behind `fence`.
+    ///
+    /// Without it a coordinator that lost leadership while writes were queued
+    /// (a GC pause longer than the lease) overwrites the new leader's job
+    /// records when it resumes, and a job the new leader finished comes back
+    /// as running on the next failover.
+    pub fn with_leader_fence(mut self, fence: crate::etcd_lease::EtcdLeaderFence) -> Self {
+        self.leader_fence = Some(fence);
+        self
+    }
+
+    /// Wrap `op` in a transaction that applies only while this process's
+    /// lease is still attached to the leader key.
+    fn fenced_txn(fence: &crate::etcd_lease::EtcdLeaderFence, op: TxnOp) -> SchedulerResult<Txn> {
+        let lease = fence.current_lease().ok_or_else(|| SchedulerError::Store {
+            message: format!(
+                "etcd metadata write refused: this coordinator does not hold leader key {}",
+                fence.lease_key()
+            ),
+        })?;
+        Ok(Txn::new()
+            .when([Compare::lease(fence.lease_key(), CompareOp::Equal, lease)])
+            .and_then([op]))
+    }
+
+    /// Apply one write, fenced on leadership when a fence is configured.
+    fn write(&self, op: TxnOp, what: &'static str) -> SchedulerResult<()> {
+        let mut client = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let txn = match &self.leader_fence {
+            Some(fence) => Self::fenced_txn(fence, op)?,
+            None => Txn::new().and_then([op]),
+        };
+        let response = etcd_block_on(async move { client.txn(txn).await })?.map_err(|e| {
+            SchedulerError::Transport {
+                message: format!("etcd {what} failed: {e}"),
+            }
+        })?;
+        if !response.succeeded() {
+            if let Some(fence) = &self.leader_fence {
+                fence.set_lease(None);
+            }
+            return Err(SchedulerError::Store {
+                message: format!(
+                    "etcd {what} refused: leadership was lost (the leader key is no longer \
+                     held by this coordinator's lease)"
+                ),
+            });
+        }
+        Ok(())
+    }
     /// Connect to etcd and load all job and executor records from their
     /// individual keys.
     ///
@@ -285,55 +346,26 @@ impl EtcdMetadataStore {
             continuous_snapshots,
             ivm_snapshots,
             history: truncate_history(sort_history(history)),
+            leader_fence: None,
         })
     }
 
     /// Write a single key to etcd.
     fn put_key(&self, key: String, value: Vec<u8>) -> SchedulerResult<()> {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        etcd_block_on(async move { client.put(key, value, None).await })?.map_err(|e| {
-            SchedulerError::Transport {
-                message: format!("etcd put failed: {e}"),
-            }
-        })?;
-        Ok(())
+        self.write(TxnOp::put(key, value, None), "put")
     }
 
     /// Delete a single key from etcd.
     fn delete_key(&self, key: String) -> SchedulerResult<()> {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
-        etcd_block_on(async move { client.delete(key, None).await })?.map_err(|e| {
-            SchedulerError::Transport {
-                message: format!("etcd delete failed: {e}"),
-            }
-        })?;
-        Ok(())
+        self.write(TxnOp::delete(key, None), "delete")
     }
 
     /// Delete every key in the half-open range `[start, end)` from etcd. Used
     /// to sweep IVM snapshot chunk keys (`/krishiv/ivm/<job>#…`) — both when a
     /// snapshot shrinks (surplus higher-index chunks) and when it is removed.
     fn delete_range(&self, start: Vec<u8>, end: Vec<u8>) -> SchedulerResult<()> {
-        let mut client = self
-            .client
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
         let opts = DeleteOptions::new().with_range(end);
-        etcd_block_on(async move { client.delete(start, Some(opts)).await })?.map_err(|e| {
-            SchedulerError::Transport {
-                message: format!("etcd delete range failed: {e}"),
-            }
-        })?;
-        Ok(())
+        self.write(TxnOp::delete(start, Some(opts)), "delete range")
     }
 }
 
@@ -1390,5 +1422,104 @@ mod tests {
             name.starts_with("krishiv-etcd"),
             "etcd future must run on the dedicated runtime, ran on {name:?}"
         );
+    }
+
+    /// H10, against a live etcd (`KRISHIV_ETCD_TEST_ENDPOINT=http://host:port`).
+    ///
+    /// Coordinator A leads and then stalls past its lease; B takes the key.
+    /// When A resumes, a write it had queued must be refused by etcd — not
+    /// land over B's record.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a live etcd: set KRISHIV_ETCD_TEST_ENDPOINT"]
+    async fn a_deposed_leader_cannot_overwrite_the_new_leaders_records() {
+        use crate::LeaderElection as _;
+        use crate::etcd_lease::{EtcdLeaderFence, EtcdLeaseElection};
+
+        let endpoint = std::env::var("KRISHIV_ETCD_TEST_ENDPOINT").expect("endpoint");
+        let unique = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let leader_key = format!("/krishiv-test/{unique}/leader");
+        let record_key = format!("/krishiv-test/{unique}/job");
+
+        // A: leader, with a store fenced on A's hold of the key. B is another
+        // process, played here by a raw client.
+        let a = EtcdLeaseElection::connect(vec![endpoint.clone()], leader_key.clone(), "a", 2)
+            .await
+            .unwrap();
+        assert!(a.try_acquire().await, "A must win the empty key");
+        let store_a = EtcdMetadataStore::connect(vec![endpoint.clone()])
+            .await
+            .unwrap()
+            .with_leader_fence(EtcdLeaderFence::for_key(&leader_key));
+        let store_a = std::sync::Arc::new(store_a);
+        {
+            let (store, key) = (store_a.clone(), record_key.clone());
+            tokio::task::spawn_blocking(move || store.put_key(key, b"running".to_vec()))
+                .await
+                .unwrap()
+                .expect("the leader's write lands");
+        }
+
+        // A stalls: its lease expires in etcd without A noticing, and B wins.
+        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        let mut other = Client::connect([endpoint.as_str()], None).await.unwrap();
+        let grant = other.lease_grant(30, None).await.unwrap();
+        let won = other
+            .txn(
+                Txn::new()
+                    .when([Compare::create_revision(
+                        leader_key.as_str(),
+                        CompareOp::Equal,
+                        0,
+                    )])
+                    .and_then([TxnOp::put(
+                        leader_key.as_str(),
+                        "b",
+                        Some(etcd_client::PutOptions::new().with_lease(grant.id())),
+                    )]),
+            )
+            .await
+            .unwrap();
+        assert!(won.succeeded(), "B must win once A's lease has expired");
+        other
+            .put(record_key.as_str(), "succeeded", None)
+            .await
+            .unwrap();
+
+        // A resumes and its queued write goes out.
+        let late = {
+            let (store, key) = (store_a.clone(), record_key.clone());
+            tokio::task::spawn_blocking(move || store.put_key(key, b"running".to_vec()))
+                .await
+                .unwrap()
+        };
+        assert!(late.is_err(), "a deposed leader's write must be refused");
+        let current = other.get(record_key.as_str(), None).await.unwrap();
+        assert_eq!(
+            current.kvs().first().map(|kv| kv.value()),
+            Some(b"succeeded".as_ref()),
+            "the new leader's record must survive"
+        );
+        assert_eq!(
+            EtcdLeaderFence::for_key(&leader_key).current_lease(),
+            None,
+            "a refused write must mark this process as no longer holding the key"
+        );
+    }
+
+    /// Without a lease, a fenced store must not even send the write.
+    #[test]
+    fn a_fence_without_a_lease_refuses_to_build_the_write() {
+        let fence = crate::etcd_lease::EtcdLeaderFence::detached("/k");
+        let result = EtcdMetadataStore::fenced_txn(&fence, TxnOp::put("x", "y", None));
+        assert!(result.is_err());
+        fence.set_lease(Some(7));
+        assert!(EtcdMetadataStore::fenced_txn(&fence, TxnOp::put("x", "y", None)).is_ok());
     }
 }
