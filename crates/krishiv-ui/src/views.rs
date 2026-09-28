@@ -300,6 +300,8 @@ pub struct SqlQueryResponse {
     pub error: Option<String>,
     pub row_count: usize,
     pub elapsed_ms: u64,
+    /// True when the result was cut off at the console's row cap.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Deserialize)]

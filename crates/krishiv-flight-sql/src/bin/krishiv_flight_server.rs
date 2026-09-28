@@ -12,6 +12,12 @@ use std::process;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() {
+    if let Err(error) = krishiv_common::validate_durability_profile_env() {
+        eprintln!(
+            "fatal: KRISHIV_DURABILITY_PROFILE: {error} (expected dev-local, single-node-durable or distributed-durable)"
+        );
+        process::exit(2);
+    }
     // Flight SQL server is I/O-bound: Arrow IPC serialisation + gRPC network.
     // Cap at 8 workers; CPU saturation is never the bottleneck here.
     let concurrency = std::thread::available_parallelism()

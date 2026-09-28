@@ -35,6 +35,13 @@ fn main() {
         eprintln!("warn: failed to load .env: {e}");
     }
 
+    if let Err(error) = krishiv_common::validate_durability_profile_env() {
+        eprintln!(
+            "fatal: KRISHIV_DURABILITY_PROFILE: {error} (expected dev-local, single-node-durable or distributed-durable)"
+        );
+        std::process::exit(2);
+    }
+
     // Initialise telemetry — opt-in via OTEL_EXPORTER_OTLP_ENDPOINT.
     let otlp_endpoint = env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
     let _metrics = krishiv_metrics::init(krishiv_metrics::MetricsConfig {

@@ -41,14 +41,22 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
   - fixed 2026-09-28: per-object patches use the object's namespace; `per_object_patches_target_the_objects_namespace`
 
 ## Medium — security
-- [ ] M1 No SQL entry point restricts file DDL / `COPY TO` / path directives (`flight-sql host.rs:160`, `flight_protocol.rs:456`) → shared `SQLOptions` + single-statement guard
-- [ ] M2 `krishiv-flight-sql` prepared-statement create runs `sql_query_schema` before policy (`service.rs:664`, `host.rs:663`)
-- [ ] M3 `krishiv-ui/src/handlers.rs:191` `/api/v1/sql` no row/byte cap or timeout, allows DDL
-- [ ] M4 `krishiv-mcp/src/lib.rs:1830` HTTP transport: no auth, no Origin/Host check (DNS rebinding)
-- [ ] M5 `krishiv-common/src/production.rs:34` malformed `KRISHIV_DURABILITY_PROFILE` → DevLocal (auth off); also `krishiv/src/cli.rs:1313`, `kafka_table.rs:19`
-- [ ] M6 `krishiv/src/remote_client.rs:69` CLI remote client plaintext only; bearer token in cleartext
-- [ ] M7 `krishiv-scheduler/src/continuous_stream_http.rs:2029` `parallelism` uncapped → coordinator OOM
-- [ ] M8 `krishiv-common/src/validate.rs:31` `validate_safe_id`/`is_safe_identifier` accept `"."`; `is_safe_path` accepts absolute → shuffle GC `remove_dir_all(<root>/.)`
+- [x] M1 No SQL entry point restricts file DDL / `COPY TO` / path directives (`flight-sql host.rs:160`, `flight_protocol.rs:456`) → shared `SQLOptions` + single-statement guard
+  - fixed 2026-09-28: `krishiv_sql::sql_accesses_server_files`; Flight refuses file SQL/path directives/RegisterParquet in durable profiles unless `KRISHIV_FLIGHT_ALLOW_FILE_SQL=1`; `file_sql_is_refused_when_not_allowed`
+- [x] M2 `krishiv-flight-sql` prepared-statement create runs `sql_query_schema` before policy (`service.rs:664`, `host.rs:663`)
+  - fixed 2026-09-28: prepared-statement create checks policy before planning; `prepared_statement_create_checks_policy_before_planning`
+- [x] M3 `krishiv-ui/src/handlers.rs:191` `/api/v1/sql` no row/byte cap or timeout, allows DDL
+  - fixed 2026-09-28: console refuses server-file SQL, streams with a 10k-row cap (`truncated` flag) and a 30 s timeout; `sql_console_tests`
+- [x] M4 `krishiv-mcp/src/lib.rs:1830` HTTP transport: no auth, no Origin/Host check (DNS rebinding)
+  - fixed 2026-09-28: Origin/Host validation, `KRISHIV_MCP_BEARER_TOKEN` (constant-time), non-loopback bind requires a token
+- [x] M5 `krishiv-common/src/production.rs:34` malformed `KRISHIV_DURABILITY_PROFILE` → DevLocal (auth off); also `krishiv/src/cli.rs:1313`, `kafka_table.rs:19`
+  - fixed 2026-09-28: server entry points (krishiv, executor, flight server) refuse an unparsable profile at startup; resolver unchanged
+- [x] M6 `krishiv/src/remote_client.rs:69` CLI remote client plaintext only; bearer token in cleartext
+  - fixed 2026-09-28: https:// configures TLS from `KRISHIV_CA_CERT`; bearer token never sent over plaintext to a non-loopback host
+- [x] M7 `krishiv-scheduler/src/continuous_stream_http.rs:2029` `parallelism` uncapped → coordinator OOM
+  - fixed 2026-09-28: `MAX_CONTINUOUS_PARALLELISM = 1024`, refused before any spec is built; `registration_parallelism_is_capped`
+- [x] M8 `krishiv-common/src/validate.rs:31` `validate_safe_id`/`is_safe_identifier` accept `"."`; `is_safe_path` accepts absolute → shuffle GC `remove_dir_all(<root>/.)`
+  - fixed 2026-09-28: dot-only ids rejected by `validate_safe_id` and `is_safe_identifier`
 
 ## Medium — correctness
 - [ ] M9 `krishiv-scheduler/src/coordinator/mod.rs:843,970` stall/speculation CancelTask RPCs unbounded, awaited in heartbeat loop

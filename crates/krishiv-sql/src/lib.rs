@@ -6808,6 +6808,78 @@ pub fn referenced_table_names(query: impl AsRef<str>) -> SqlResult<Vec<String>> 
     Ok(names.into_iter().collect())
 }
 
+/// True when `sql` would read or write files on the server: `CREATE EXTERNAL
+/// TABLE … LOCATION`, `COPY … TO`, Postgres `COPY`, or a
+/// `krishiv-register-parquet` path directive — in any statement of a script,
+/// including under `EXPLAIN`.
+///
+/// Network-facing SQL surfaces use this to keep clients from reaching the
+/// server's filesystem (`/etc/passwd` as a CSV table, a `COPY` over a config
+/// file) unless the deployment allows it. Text the parser cannot read is
+/// judged by keyword, so an unparsable variant is not a way around the check.
+pub fn sql_accesses_server_files(sql: &str) -> bool {
+    use datafusion::sql::parser::{DFParser, Statement as DfStatement};
+
+    fn touches(statement: &DfStatement) -> bool {
+        match statement {
+            DfStatement::CreateExternalTable(_) | DfStatement::CopyTo(_) => true,
+            DfStatement::Explain(explain) => touches(&explain.statement),
+            DfStatement::Statement(inner) => matches!(
+                inner.as_ref(),
+                datafusion::sql::sqlparser::ast::Statement::Copy { .. }
+            ),
+            _ => false,
+        }
+    }
+
+    // The path form only; the `-ipc` form carries its data inline.
+    if sql.contains("krishiv-register-parquet:") {
+        return true;
+    }
+    match DFParser::parse_sql(sql) {
+        Ok(statements) => statements.iter().any(touches),
+        Err(_) => {
+            let upper = sql.to_ascii_uppercase();
+            let words: Vec<&str> = upper
+                .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .filter(|w| !w.is_empty())
+                .collect();
+            words.contains(&"COPY") || words.windows(2).any(|pair| pair == ["EXTERNAL", "TABLE"])
+        }
+    }
+}
+
+#[cfg(test)]
+mod server_file_access_tests {
+    use super::sql_accesses_server_files as touches;
+
+    #[test]
+    fn file_ddl_and_directives_are_detected() {
+        for sql in [
+            "CREATE EXTERNAL TABLE p STORED AS CSV LOCATION '/etc/passwd'",
+            "COPY (SELECT 1) TO '/tmp/out.csv'",
+            "SELECT 1; COPY (SELECT 1) TO '/tmp/out.parquet'",
+            "EXPLAIN COPY (SELECT 1) TO '/tmp/out.csv'",
+            "/* krishiv-register-parquet:x:/data/secret.parquet */ SELECT * FROM x",
+            "CREATE EXTERNAL TABLE broken(",
+        ] {
+            assert!(touches(sql), "{sql}");
+        }
+    }
+
+    #[test]
+    fn ordinary_sql_is_not_flagged() {
+        for sql in [
+            "SELECT * FROM orders WHERE note = 'copy that'",
+            "WITH external_table AS (SELECT 1) SELECT * FROM external_table",
+            "/* krishiv-register-parquet-ipc:x:QUJD */ SELECT * FROM x",
+            "CREATE TABLE t AS VALUES (1)",
+        ] {
+            assert!(!touches(sql), "{sql}");
+        }
+    }
+}
+
 /// Format Arrow batches for CLI and tests.
 pub fn pretty_batches(batches: &[RecordBatch]) -> SqlResult<String> {
     Ok(pretty_format_batches(batches)

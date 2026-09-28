@@ -34,7 +34,14 @@ pub fn validate_safe_id(id: &str, label: &str) -> Result<(), ValidationError> {
             message: format!("{label} cannot be empty"),
         });
     }
-    if id.contains('/') || id.contains('\\') || id.contains('\0') || id.contains("..") {
+    // An id made only of dots names a directory itself (`.`) once joined
+    // onto a root, so deleting "that job's" directory deletes the root.
+    if id.contains('/')
+        || id.contains('\\')
+        || id.contains('\0')
+        || id.contains("..")
+        || id.chars().all(|c| c == '.')
+    {
         return Err(ValidationError {
             message: format!("{label} contains invalid characters: {id}"),
         });
@@ -58,6 +65,7 @@ pub fn validate_safe_id(id: &str, label: &str) -> Result<(), ValidationError> {
 pub fn is_safe_identifier(s: &str) -> bool {
     !s.is_empty()
         && !s.contains("..")
+        && !s.chars().all(|c| c == '.')
         && s.chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
@@ -137,6 +145,18 @@ pub fn validate_sql_identifier(name: &str) -> Result<(), ValidationError> {
 
 #[cfg(test)]
 mod tests {
+    /// M8: `"."` names the parent directory itself. As a job id it made
+    /// shuffle GC run `remove_dir_all(<shuffle_root>/.)` — every job's data.
+    #[test]
+    fn dot_only_ids_are_not_path_safe() {
+        for id in [".", "..", "..."] {
+            assert!(super::validate_safe_id(id, "job_id").is_err(), "{id:?}");
+            assert!(!super::is_safe_identifier(id), "{id:?}");
+        }
+        assert!(super::validate_safe_id("job.v1", "job_id").is_ok());
+        assert!(super::is_safe_identifier("job.v1"));
+    }
+
     use super::*;
 
     // ── validate_safe_id ──────────────────────────────────────────────

@@ -66,10 +66,10 @@ impl RemoteCoordinatorClient {
 
     fn client(&mut self) -> Result<&mut CoordinatorManagementClient<Channel>, RemoteClientError> {
         if self.client.is_none() {
-            let endpoint = self
-                .url
-                .parse::<tonic::transport::Endpoint>()
-                .map_err(|e| RemoteClientError(e.to_string()))?;
+            let endpoint = endpoint_for(
+                &self.url,
+                krishiv_executor::grpc_client::client_tls_config_from_env(),
+            )?;
             let channel = endpoint.connect_lazy();
             self.client = Some(CoordinatorManagementClient::new(channel));
         }
@@ -81,6 +81,7 @@ impl RemoteCoordinatorClient {
     fn request<T>(&self, message: T) -> Result<tonic::Request<T>, RemoteClientError> {
         let mut request = tonic::Request::new(message);
         if let Some(token) = configured_coordinator_bearer_token() {
+            check_token_transport(&self.url, true)?;
             inject_coordinator_bearer_token(&mut request, &token)?;
         }
         Ok(request)
@@ -191,6 +192,60 @@ impl RemoteCoordinatorClient {
     }
 }
 
+/// Build the channel endpoint for `url`, with TLS for `https://`.
+///
+/// `url.parse::<Endpoint>()` never configures TLS, so every `https://`
+/// coordinator failed and only plaintext ones worked. The trust root comes
+/// from `KRISHIV_CA_CERT`, as for executors.
+fn endpoint_for(
+    url: &str,
+    tls: Option<tonic::transport::ClientTlsConfig>,
+) -> Result<tonic::transport::Endpoint, RemoteClientError> {
+    let endpoint = tonic::transport::Endpoint::from_shared(url.to_owned())
+        .map_err(|e| RemoteClientError(e.to_string()))?;
+    if !url
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("https://")
+    {
+        return Ok(endpoint);
+    }
+    let tls = tls.ok_or_else(|| {
+        RemoteClientError(format!(
+            "{url} uses TLS: set KRISHIV_CA_CERT to the PEM bundle that signs the \
+             coordinator's certificate"
+        ))
+    })?;
+    endpoint
+        .tls_config(tls)
+        .map_err(|e| RemoteClientError(format!("TLS configuration for {url}: {e}")))
+}
+
+/// Refuse to put the bearer token on a plaintext connection that leaves this
+/// machine.
+fn check_token_transport(url: &str, has_token: bool) -> Result<(), RemoteClientError> {
+    let lower = url.trim().to_ascii_lowercase();
+    let Some(rest) = lower.strip_prefix("http://") else {
+        return Ok(());
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let host = if let Some(v6) = authority.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        authority
+            .rsplit_once(':')
+            .map_or(authority, |(host, _port)| host)
+    };
+    let loopback = matches!(host, "localhost" | "127.0.0.1" | "::1");
+    if has_token && !loopback {
+        return Err(RemoteClientError(format!(
+            "refusing to send {COORDINATOR_BEARER_TOKEN_ENV} in cleartext to {url}; use an \
+             https:// URL (with KRISHIV_CA_CERT)"
+        )));
+    }
+    Ok(())
+}
+
 fn configured_coordinator_bearer_token() -> Option<String> {
     std::env::var(COORDINATOR_BEARER_TOKEN_ENV)
         .ok()
@@ -215,6 +270,23 @@ fn inject_coordinator_bearer_token<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M6: `https://` must configure TLS (it used to fail with tonic's
+    /// "HttpsUriWithoutTlsSupport"), and the bearer token must never be sent
+    /// in cleartext to a coordinator on another host.
+    #[test]
+    fn https_needs_a_trust_root_and_tokens_never_go_out_in_cleartext() {
+        // No KRISHIV_CA_CERT in the test environment: https is refused with a
+        // message naming what to set, instead of an opaque transport error.
+        let err = endpoint_for("https://coordinator:7070", None).unwrap_err();
+        assert!(err.to_string().contains("KRISHIV_CA_CERT"), "{err}");
+
+        assert!(check_token_transport("http://coordinator:7070", true).is_err());
+        assert!(check_token_transport("http://127.0.0.1:7070", true).is_ok());
+        assert!(check_token_transport("http://localhost:7070", true).is_ok());
+        assert!(check_token_transport("https://coordinator:7070", true).is_ok());
+        assert!(check_token_transport("http://coordinator:7070", false).is_ok());
+    }
 
     #[test]
     fn remote_client_new_stores_url() {

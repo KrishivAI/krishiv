@@ -24,6 +24,28 @@ pub fn resolve_durability_profile() -> DurabilityProfile {
     resolve_durability_profile_from(std::env::var(DURABILITY_PROFILE_ENV).ok())
 }
 
+/// Refuse to start on a `KRISHIV_DURABILITY_PROFILE` value that does not
+/// parse. Unset is fine (DevLocal).
+///
+/// [`resolve_durability_profile`] falls back to DevLocal on a bad value, and
+/// every auth gate, the native-UDF ban and the `memory://` checkpoint ban are
+/// keyed on the profile — so a typo such as `distributed_durable` turned all
+/// of them off with only a warning. Server entry points call this first, the
+/// way the coordinator already rejects the value.
+pub fn validate_durability_profile_env()
+-> Result<(), crate::durability::DurabilityProfileParseError> {
+    validate_durability_profile_value(std::env::var(DURABILITY_PROFILE_ENV).ok().as_deref())
+}
+
+fn validate_durability_profile_value(
+    value: Option<&str>,
+) -> Result<(), crate::durability::DurabilityProfileParseError> {
+    match value {
+        None => Ok(()),
+        Some(value) => value.parse::<DurabilityProfile>().map(|_| ()),
+    }
+}
+
 /// Resolve a durability profile from an already-read env value.
 ///
 /// Factored out of `resolve_durability_profile` so the parse-failure fallback
@@ -253,6 +275,16 @@ mod tests {
             resolve_durability_profile_from(Some(String::new())),
             DurabilityProfile::DevLocal
         );
+    }
+
+    /// M5: server entry points must refuse a misspelled profile instead of
+    /// running as DevLocal with auth off.
+    #[test]
+    fn startup_validation_rejects_a_misspelled_profile() {
+        assert!(validate_durability_profile_value(Some("distributed_durable")).is_err());
+        assert!(validate_durability_profile_value(Some("")).is_err());
+        assert!(validate_durability_profile_value(Some("distributed-durable")).is_ok());
+        assert!(validate_durability_profile_value(None).is_ok());
     }
 
     #[test]

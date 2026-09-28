@@ -5094,6 +5094,7 @@ dependencies = [
  "arrow",
  "axum",
  "base64 0.23.1",
+ "constant_time_eq 0.6.0",
  "krishiv-api",
  "krishiv-connectors",
  "krishiv-ivm",
@@ -5103,6 +5104,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
  "tracing",
 ]
 
@@ -5401,6 +5403,7 @@ dependencies = [
  "arrow",
  "axum",
  "constant_time_eq 0.6.0",
+ "futures",
  "krishiv-common",
  "krishiv-metrics",
  "krishiv-proto",

@@ -660,10 +660,22 @@ pub static FLAGS: &[FlagSpec] = &[
         "MCP server listen address (http transport).",
     ),
     rt(
+        "KRISHIV_FLIGHT_ALLOW_FILE_SQL",
+        FlagKind::Bool,
+        "false",
+        "Allow Flight SQL clients to run SQL that reads or writes server files (COPY, CREATE EXTERNAL TABLE, parquet path directives, RegisterParquet) in durable profiles. Always allowed in dev-local.",
+    ),
+    rt(
         "KRISHIV_MCP_ALLOW_WRITE_SQL",
         FlagKind::Bool,
         "false",
         "Allow the MCP run_sql tool to execute write statements.",
+    ),
+    rt(
+        "KRISHIV_MCP_BEARER_TOKEN",
+        FlagKind::Text,
+        "(unset)",
+        "Bearer token every MCP HTTP request must present. Required to bind the HTTP transport to a non-loopback address; unset on loopback means Origin/Host checks only.",
     ),
     rt(
         "KRISHIV_MCP_MAX_ROWS",
@@ -1903,6 +1915,9 @@ mod tests {
         "KRISHIV_BLESS_PYSPARK_PARITY",
         "KRISHIV_BLESS_SQL_DOCS",
         "KRISHIV_BLESS_CERT_MATRIX",
+        // Endpoint of a live etcd for the scheduler's `#[ignore]`d fencing
+        // test; read only by that test.
+        "KRISHIV_ETCD_TEST_ENDPOINT",
     ];
 
     #[test]

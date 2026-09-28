@@ -219,7 +219,8 @@ pub fn mcp_help() -> &'static str {
        KRISHIV_MCP_ADDR                   HTTP bind address (default 127.0.0.1:8765)\n\
        KRISHIV_MCP_MAX_ROWS               max rows returned by SQL/sample tools (default 100)\n\
        KRISHIV_MCP_TIMEOUT_MS             default SQL timeout (default 30000)\n\
-       KRISHIV_MCP_ALLOW_WRITE_SQL        allow execute_sql to run non-read-only SQL\n"
+       KRISHIV_MCP_ALLOW_WRITE_SQL        allow execute_sql to run non-read-only SQL\n\
+       KRISHIV_MCP_BEARER_TOKEN           bearer token required on HTTP calls (required off loopback)\n"
 }
 
 /// Mode-aware MCP server over a Krishiv session.
@@ -1834,26 +1835,115 @@ async fn serve_stdio(server: Arc<KrishivMcpServer>) -> McpResult<()> {
     Ok(())
 }
 
-async fn serve_http(server: Arc<KrishivMcpServer>, addr: SocketAddr) -> McpResult<()> {
-    let router = Router::new()
+/// Refuse to expose the tools beyond this machine without a bearer token.
+fn check_http_exposure(addr: SocketAddr, token: Option<&str>) -> McpResult<()> {
+    if !addr.ip().is_loopback() && token.is_none() {
+        return Err(McpServerError::InvalidConfig(format!(
+            "refusing to serve MCP over HTTP on non-loopback address {addr} without \
+             KRISHIV_MCP_BEARER_TOKEN: the tools can read and write data"
+        )));
+    }
+    Ok(())
+}
+
+/// True for `localhost`, `127.0.0.1`, `[::1]` (with or without a port).
+fn is_local_host(host: &str) -> bool {
+    let host = host.trim();
+    let name = if let Some(rest) = host.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        host.rsplit_once(':').map_or(host, |(name, _port)| name)
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+#[derive(Clone)]
+struct HttpState {
+    server: Arc<KrishivMcpServer>,
+    token: Option<Arc<str>>,
+}
+
+/// The MCP streamable-HTTP transport.
+///
+/// A browser page can reach a server on the developer's machine, either by
+/// cross-site POST or by rebinding its own domain to 127.0.0.1. The spec's
+/// defence is to validate `Origin`; `Host` is checked too because a rebound
+/// request carries the attacker's hostname there. A configured bearer token
+/// is required on every call.
+fn http_router(server: Arc<KrishivMcpServer>, token: Option<String>) -> Router {
+    Router::new()
         .route("/healthz", get(http_health))
         .route("/mcp", post(http_mcp))
-        .with_state(server);
+        .with_state(HttpState {
+            server,
+            token: token.map(Arc::from),
+        })
+}
+
+fn check_http_request(
+    state: &HttpState,
+    headers: &axum::http::HeaderMap,
+) -> Result<(), StatusCode> {
+    let header = |name: axum::http::HeaderName| headers.get(name).and_then(|v| v.to_str().ok());
+    if let Some(origin) = header(axum::http::header::ORIGIN) {
+        let host = origin
+            .split_once("://")
+            .map_or(origin, |(_scheme, rest)| rest);
+        if !is_local_host(host) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    if state.token.is_none()
+        && let Some(host) = header(axum::http::header::HOST)
+        && !is_local_host(host)
+    {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(expected) = &state.token {
+        let presented = header(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .unwrap_or("");
+        if !constant_time_eq::constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+    }
+    Ok(())
+}
+
+async fn serve_http(server: Arc<KrishivMcpServer>, addr: SocketAddr) -> McpResult<()> {
+    let token = std::env::var("KRISHIV_MCP_BEARER_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty());
+    check_http_exposure(addr, token.as_deref())?;
+    let router = http_router(server, token);
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, "Krishiv MCP HTTP server listening");
     axum::serve(listener, router).await?;
     Ok(())
 }
 
-async fn http_health(State(server): State<Arc<KrishivMcpServer>>) -> impl IntoResponse {
-    Json(server.health())
+async fn http_health(
+    State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(status) = check_http_request(&state, &headers) {
+        return status.into_response();
+    }
+    Json(state.server.health()).into_response()
 }
 
 async fn http_mcp(
-    State(server): State<Arc<KrishivMcpServer>>,
+    State(state): State<HttpState>,
+    headers: axum::http::HeaderMap,
     Json(message): Json<Value>,
-) -> impl IntoResponse {
-    match server.handle_json_rpc(message).await {
+) -> axum::response::Response {
+    if let Err(status) = check_http_request(&state, &headers) {
+        return status.into_response();
+    }
+    match state.server.handle_json_rpc(message).await {
         Some(response) => Json(response).into_response(),
         None => StatusCode::ACCEPTED.into_response(),
     }
@@ -2737,6 +2827,100 @@ mod tests {
         ] {
             assert!(!super::is_read_only_sql(bad), "{bad} must not be read-only");
         }
+    }
+
+    /// M4: the HTTP transport is reachable from any web page a developer has
+    /// open (DNS rebinding, cross-site POST). It must reject foreign Origin and
+    /// Host headers, and require the bearer token when one is configured.
+    #[tokio::test]
+    async fn http_transport_rejects_cross_site_and_unauthenticated_requests() {
+        use tower::ServiceExt as _;
+
+        let server = Arc::new(KrishivMcpServer::new(
+            Session::builder().build().unwrap(),
+            McpConfig::default(),
+        ));
+        let body = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
+        let call = |router: axum::Router, headers: Vec<(&'static str, &'static str)>| async move {
+            let mut request =
+                axum::http::Request::post("/mcp").header("content-type", "application/json");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            router
+                .oneshot(request.body(axum::body::Body::from(body)).unwrap())
+                .await
+                .unwrap()
+                .status()
+        };
+
+        let open = super::http_router(server.clone(), None);
+        assert_eq!(
+            call(open.clone(), vec![("host", "127.0.0.1:8765")]).await,
+            200
+        );
+        assert_eq!(
+            call(
+                open.clone(),
+                vec![
+                    ("host", "127.0.0.1:8765"),
+                    ("origin", "https://evil.example")
+                ]
+            )
+            .await,
+            403,
+            "a foreign Origin must be refused"
+        );
+        assert_eq!(
+            call(open.clone(), vec![("host", "evil.example:8765")]).await,
+            403,
+            "a rebinding Host must be refused"
+        );
+        assert_eq!(
+            call(
+                open,
+                vec![
+                    ("host", "localhost:8765"),
+                    ("origin", "http://localhost:3000")
+                ]
+            )
+            .await,
+            200
+        );
+
+        let token = super::http_router(server, Some("s3cret".to_string()));
+        assert_eq!(
+            call(token.clone(), vec![("host", "127.0.0.1:8765")]).await,
+            401
+        );
+        assert_eq!(
+            call(
+                token.clone(),
+                vec![("host", "127.0.0.1:8765"), ("authorization", "Bearer nope")]
+            )
+            .await,
+            401
+        );
+        assert_eq!(
+            call(
+                token,
+                vec![
+                    ("host", "127.0.0.1:8765"),
+                    ("authorization", "Bearer s3cret")
+                ]
+            )
+            .await,
+            200
+        );
+    }
+
+    #[test]
+    fn a_non_loopback_bind_requires_a_token() {
+        let exposed: std::net::SocketAddr = "0.0.0.0:8765".parse().unwrap();
+        let local: std::net::SocketAddr = "127.0.0.1:8765".parse().unwrap();
+        assert!(super::check_http_exposure(exposed, None).is_err());
+        assert!(super::check_http_exposure(exposed, Some("t")).is_ok());
+        assert!(super::check_http_exposure(local, None).is_ok());
     }
 
     #[tokio::test]

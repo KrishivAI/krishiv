@@ -57,7 +57,7 @@ pub use production::{
     profile_requires_authenticated_flight, profile_requires_authenticated_shuffle,
     profile_requires_authenticated_ui, profile_requires_durable_window_state,
     profile_requires_fail_closed_metadata, requires_file_backed_state, requires_http_auth,
-    requires_manual_kafka_commit, resolve_durability_profile,
+    requires_manual_kafka_commit, resolve_durability_profile, validate_durability_profile_env,
 };
 pub use stream_quality::{StreamQualityHook, StreamQualityResult};
 pub use unified_memory_manager::{

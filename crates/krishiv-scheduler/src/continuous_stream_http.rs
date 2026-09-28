@@ -2015,6 +2015,9 @@ pub async fn register_continuous_stream_with_options(
 /// cannot express its input discipline there, and refusing names the mode
 /// that works), and pipelines are parallelism-1 (stage re-keying; see the
 /// executor's refusal).
+/// Upper bound on subtasks per continuous job accepted at registration.
+pub const MAX_CONTINUOUS_PARALLELISM: u32 = 1024;
+
 pub async fn register_continuous_task_with_options(
     coordinator: &SharedCoordinator,
     job_id: &str,
@@ -2027,6 +2030,14 @@ pub async fn register_continuous_task_with_options(
     task.validate()
         .map_err(|e| invalid_registration(e.to_string()))?;
     let parallelism = options.parallelism.unwrap_or(1).max(1);
+    // One task spec is built per subtask, each embedding the encoded spec, so
+    // the request's value must be bounded before anything is built.
+    if parallelism > MAX_CONTINUOUS_PARALLELISM {
+        return Err(invalid_registration(format!(
+            "parallelism {parallelism} exceeds the maximum of {MAX_CONTINUOUS_PARALLELISM} \
+             subtasks per continuous job"
+        )));
+    }
     let mode = ContinuousJobMode::parse(options.mode.as_deref(), parallelism)
         .map_err(invalid_registration)?;
 
@@ -5141,6 +5152,38 @@ mod tests {
                  (an UnknownJob here is the unfenced bug)"
             ),
         }
+    }
+
+    /// M7: `parallelism` comes from the request body. The spec builder makes
+    /// one task per subtask, so an unbounded value runs the coordinator out
+    /// of memory before anything else validates it.
+    #[tokio::test]
+    async fn registration_parallelism_is_capped() {
+        use krishiv_plan::stream_join::StreamingJoinSpec;
+        use krishiv_plan::stream_task::StreamingTaskSpec;
+
+        let task = StreamingTaskSpec::Join(Box::new(StreamingJoinSpec {
+            left_source: "bid".into(),
+            right_source: "auction".into(),
+            time_column: "ts".into(),
+            left_key_column: "auction".into(),
+            right_key_column: "id".into(),
+            window_ms: 10_000,
+        }));
+        let coordinator = make_coordinator_with_executor("cap").await;
+        let options = ContinuousRegistrationOptions {
+            mode: Some("run-loop".into()),
+            parallelism: Some(u32::MAX),
+            ..Default::default()
+        };
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            register_continuous_task_with_options(&coordinator, "cap", &task, &options),
+        )
+        .await
+        .expect("an absurd parallelism must be refused up front, not built")
+        .expect_err("an absurd parallelism must be refused");
+        assert!(err.to_string().contains("parallelism"), "{err}");
     }
 
     /// Task #147: a JOIN registered through `stream_spec` builds a

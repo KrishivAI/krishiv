@@ -171,6 +171,10 @@ pub struct KrishivFlightSqlService {
     /// eviction, and session metrics. Complements the *global* `inflight_queries`
     /// semaphore with a *per-subject* dimension.
     session_limits: Arc<crate::session_limits::SessionRegistry>,
+    /// Whether clients may run SQL that reads or writes server files
+    /// (`COPY`, `CREATE EXTERNAL TABLE`, path directives, RegisterParquet).
+    /// Off in durable profiles unless `KRISHIV_FLIGHT_ALLOW_FILE_SQL` is set.
+    allow_file_sql: bool,
     /// Response budget for the `ContinuousDrain` do_action; oversized drains
     /// put their data back and error retryably instead of losing it.
     drain_action_budget: usize,
@@ -185,6 +189,15 @@ fn read_prepared_stmt_capacity() -> std::num::NonZeroUsize {
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(DEFAULT_PREPARED_STMT_CAPACITY);
     std::num::NonZeroUsize::new(n.max(1)).unwrap_or(std::num::NonZeroUsize::MIN)
+}
+
+/// Client file SQL is allowed in dev-local (the embedded/CLI experience) and
+/// refused in durable profiles unless explicitly enabled.
+fn file_sql_allowed_from_env() -> bool {
+    krishiv_common::env_registry::truthy_env("KRISHIV_FLIGHT_ALLOW_FILE_SQL")
+        || !krishiv_common::profile_requires_authenticated_flight(
+            krishiv_common::resolve_durability_profile(),
+        )
 }
 
 fn read_max_concurrent_queries() -> Option<usize> {
@@ -264,6 +277,7 @@ impl KrishivFlightSqlService {
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             max_result_bytes: read_max_result_bytes(),
             session_limits: crate::session_limits::SessionRegistry::from_env(),
+            allow_file_sql: file_sql_allowed_from_env(),
             drain_action_budget: drain_action_response_budget(read_max_result_bytes()),
         })
     }
@@ -281,8 +295,16 @@ impl KrishivFlightSqlService {
             inflight_queries: limit.map(|n| Arc::new(tokio::sync::Semaphore::new(n))),
             max_result_bytes: read_max_result_bytes(),
             session_limits: crate::session_limits::SessionRegistry::from_env(),
+            allow_file_sql: file_sql_allowed_from_env(),
             drain_action_budget: drain_action_response_budget(read_max_result_bytes()),
         }
+    }
+
+    /// Allow or refuse client SQL that touches server files (see
+    /// `allow_file_sql`).
+    pub fn with_file_sql_allowed(mut self, allowed: bool) -> Self {
+        self.allow_file_sql = allowed;
+        self
     }
 
     /// Override the per-session limit registry programmatically (tests / custom
@@ -369,6 +391,24 @@ impl KrishivFlightSqlService {
         auth.authenticate(&token)
             .map(Some)
             .ok_or_else(|| Status::unauthenticated("invalid API key"))
+    }
+
+    /// Refuse SQL that reads or writes server files unless the deployment
+    /// allows it.
+    fn check_file_access(&self, query: &str) -> Result<(), Status> {
+        if !self.allow_file_sql && krishiv_sql::sql_accesses_server_files(query) {
+            return Err(Status::permission_denied(
+                "SQL that reads or writes server files (COPY, CREATE EXTERNAL TABLE, path \
+                 directives) is disabled; set KRISHIV_FLIGHT_ALLOW_FILE_SQL=1 to allow it",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Every check a client SQL text must pass before it is planned or run.
+    fn check_sql_allowed(&self, query: &str) -> Result<(), Status> {
+        self.check_file_access(query)?;
+        self.check_table_access(query)
     }
 
     /// Check table-level access policy if configured.
@@ -567,7 +607,7 @@ impl FlightSqlService for KrishivFlightSqlService {
             .map_err(|e| Status::invalid_argument(format!("invalid query encoding: {e}")))?;
 
         // Check table access if a policy is configured.
-        self.check_table_access(query)?;
+        self.check_sql_allowed(query)?;
 
         // Acquire a concurrent-query slot. Returns immediately if no cap is set;
         // returns resource_exhausted when the semaphore is saturated.
@@ -670,6 +710,9 @@ impl FlightSqlService for KrishivFlightSqlService {
         let subject_key = subject.as_deref().unwrap_or("__anon__").to_owned();
         let handle = Uuid::new_v4().to_string();
         let sql = normalize_question_mark_params(&query.query);
+        // Planning the result schema below runs the SQL through the engine
+        // (a script executes in full), so policy comes first.
+        self.check_sql_allowed(&sql)?;
         let n_params = count_sql_params(&sql);
         let param_schema = build_param_schema(n_params);
         let parameter_schema = schema_to_ipc_bytes(&param_schema)?;
@@ -884,7 +927,7 @@ impl FlightSqlService for KrishivFlightSqlService {
                 .ok_or_else(|| Status::not_found(format!("unknown prepared statement: {handle}")))?
         };
 
-        self.check_table_access(&sql)?;
+        self.check_sql_allowed(&sql)?;
         // `execute_sql` returns an already-classified `Status`; propagate it
         // as-is rather than re-wrapping (audit §11 error taxonomy).
         let batches = self.host.execute_sql(&sql).await?;
@@ -1598,6 +1641,12 @@ impl KrishivFlightSqlService {
 
         match action {
             A::RegisterParquet(body) => {
+                if !self.allow_file_sql {
+                    return Err(KrishivActionError::Status(Status::permission_denied(
+                        "RegisterParquet names a server path and is disabled; set \
+                         KRISHIV_FLIGHT_ALLOW_FILE_SQL=1 to allow it",
+                    )));
+                }
                 // Update the host's client-side catalog.
                 self.host.register_parquet(&body.table, body.path);
                 Ok(Vec::new())
@@ -1691,7 +1740,7 @@ impl KrishivFlightSqlService {
                 encode_batches_ipc(&result)
             }
             A::Explain(body) => {
-                self.check_table_access(&body.sql)
+                self.check_sql_allowed(&body.sql)
                     .map_err(KrishivActionError::Status)?;
                 let text = self
                     .host
@@ -1706,7 +1755,7 @@ impl KrishivFlightSqlService {
                 // For both backends, route ExecutePlan through execute_sql (handles
                 // streaming plans by registering them as continuous jobs).
                 let sql = krishiv_runtime::flight_client::plan_to_sql(&plan);
-                self.check_table_access(&sql)
+                self.check_sql_allowed(&sql)
                     .map_err(KrishivActionError::Status)?;
                 if plan.kind() == krishiv_plan::ExecutionKind::Streaming {
                     let spec = krishiv_runtime::streaming_spec_from_plan(&plan)
@@ -1729,7 +1778,7 @@ impl KrishivFlightSqlService {
                 Ok(Vec::new())
             }
             A::BatchSql(body) => {
-                self.check_table_access(&body.query)
+                self.check_sql_allowed(&body.query)
                     .map_err(KrishivActionError::Status)?;
                 // Split the wire tables into inline-IPC tables and path tables.
                 //
@@ -1768,7 +1817,7 @@ impl KrishivFlightSqlService {
             A::BatchSqlSink(body) => {
                 // Phase 2.3 distributed write: the result is committed through
                 // the staged sink contract instead of being returned inline.
-                self.check_table_access(&body.query)
+                self.check_sql_allowed(&body.query)
                     .map_err(KrishivActionError::Status)?;
                 use krishiv_scheduler::BatchSqlInlineTable;
                 let inline_tables: Vec<BatchSqlInlineTable> = body
@@ -2626,6 +2675,56 @@ mod action_policy_tests {
         );
         let action = A::ExecutePlan(ExecutePlanBody::from_plan(&plan).expect("plan body"));
         assert_denied(&service, action, "ExecutePlan").await;
+    }
+
+    fn file_sql_denied_service(host: FlightExecutionHost) -> KrishivFlightSqlService {
+        KrishivFlightSqlService::with_host(host).with_file_sql_allowed(false)
+    }
+
+    /// M1: with file SQL disallowed, no entry point may reach the server's
+    /// filesystem through `COPY`, `CREATE EXTERNAL TABLE` or a path
+    /// directive — including the RegisterParquet action.
+    #[tokio::test]
+    async fn file_sql_is_refused_when_not_allowed() {
+        let service = file_sql_denied_service(FlightExecutionHost::embedded().expect("host"));
+        let actions = [
+            A::BatchSql(BatchSqlBody {
+                query: "COPY (SELECT 1) TO '/tmp/krishiv-m1.csv'".into(),
+                tables: Vec::new(),
+                is_streaming: false,
+            }),
+            A::Explain(ExplainBody {
+                sql: "CREATE EXTERNAL TABLE p STORED AS CSV LOCATION '/etc/passwd'".into(),
+            }),
+            A::RegisterParquet(krishiv_runtime::flight_action::RegisterParquetBody {
+                table: "p".into(),
+                path: "/etc/passwd".into(),
+            }),
+        ];
+        for action in actions {
+            let what = format!("{action:?}");
+            assert_denied(&service, action, &what).await;
+        }
+    }
+
+    /// M2: creating a prepared statement plans (and for a script, runs) the
+    /// SQL to report its schema, so the policy must be checked first.
+    #[tokio::test]
+    async fn prepared_statement_create_checks_policy_before_planning() {
+        use arrow_flight::sql::ActionCreatePreparedStatementRequest;
+        let service = denied_service().await;
+        let request = ActionCreatePreparedStatementRequest {
+            query: "SELECT * FROM secret".into(),
+            transaction_id: None,
+        };
+        let status = service
+            .do_action_create_prepared_statement(
+                request,
+                tonic::Request::new(arrow_flight::Action::default()),
+            )
+            .await
+            .expect_err("a denied table must not be prepared");
+        assert_eq!(status.code(), tonic::Code::PermissionDenied, "{status}");
     }
 
     #[tokio::test]

@@ -95,7 +95,9 @@ Regenerate with:
 | `KRISHIV_MAX_CONCURRENT_ASSIGNMENT_RPCS` | uint | `128` | Coordinator-side concurrency cap for task assignment RPC fan-out. |
 | `KRISHIV_MAX_SHUFFLE_REGEN` | uint | `8` | Maximum times a lost shuffle partition may be regenerated before the job fails terminally (consumer-driven FetchFailed recovery bound). |
 | `KRISHIV_MCP_ADDR` | host:port | `127.0.0.1:8811` | MCP server listen address (http transport). |
+| `KRISHIV_FLIGHT_ALLOW_FILE_SQL` | bool | `false` | Allow Flight SQL clients to run SQL that reads or writes server files (COPY, CREATE EXTERNAL TABLE, parquet path directives, RegisterParquet) in durable profiles. Always allowed in dev-local. |
 | `KRISHIV_MCP_ALLOW_WRITE_SQL` | bool | `false` | Allow the MCP run_sql tool to execute write statements. |
+| `KRISHIV_MCP_BEARER_TOKEN` | text | `(unset)` | Bearer token every MCP HTTP request must present. Required to bind the HTTP transport to a non-loopback address; unset on loopback means Origin/Host checks only. |
 | `KRISHIV_MCP_MAX_ROWS` | uint | `100` | Row cap on MCP query results. |
 | `KRISHIV_MCP_TIMEOUT_MS` | uint | `30000` | MCP tool execution timeout. |
 | `KRISHIV_MCP_TRANSPORT` | stdio \| http | `stdio` | MCP server transport. |

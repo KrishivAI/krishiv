@@ -16,10 +16,7 @@ use krishiv_connectors::kafka::{KafkaConfig, KafkaSource};
 const STREAMING_AUTO_COMMIT_MS: u64 = 1_000;
 
 pub(crate) fn kafka_auto_commit_interval_ms() -> Option<u64> {
-    let profile = std::env::var("KRISHIV_DURABILITY_PROFILE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(krishiv_common::DurabilityProfile::DevLocal);
+    let profile = krishiv_common::resolve_durability_profile();
     auto_commit_interval_for(profile)
 }
 

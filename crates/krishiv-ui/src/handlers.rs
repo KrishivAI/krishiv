@@ -168,6 +168,12 @@ pub(crate) async fn api_queues(
     }))
 }
 
+/// Most rows the SQL console returns for one query.
+pub(crate) const UI_SQL_MAX_ROWS: usize = 10_000;
+
+/// Longest a console query may run.
+const UI_SQL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 pub(crate) async fn api_sql_execute(
     State(state): State<UiState>,
     Json(req): Json<SqlQueryRequest>,
@@ -183,40 +189,79 @@ pub(crate) async fn api_sql_execute(
                 ),
                 row_count: 0,
                 elapsed_ms: 0,
+                truncated: false,
             });
         }
     };
 
     let start = std::time::Instant::now();
-    match engine.sql(&req.query).await {
-        Ok(df) => match df.collect().await {
-            Ok(batches) => {
-                let (columns, rows) = extract_columns_and_rows(&batches);
-                let elapsed = start.elapsed().as_millis() as u64;
-                let row_count = rows.len();
-                Json(SqlQueryResponse {
-                    columns,
-                    rows,
-                    error: None,
-                    row_count,
-                    elapsed_ms: elapsed,
-                })
-            }
-            Err(e) => Json(SqlQueryResponse {
-                columns: vec![],
-                rows: vec![],
-                error: Some(format!("execution error: {e}")),
-                row_count: 0,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            }),
-        },
-        Err(e) => Json(SqlQueryResponse {
+    let failed = |message: String| {
+        Json(SqlQueryResponse {
             columns: vec![],
             rows: vec![],
-            error: Some(format!("sql error: {e}")),
+            error: Some(message),
             row_count: 0,
             elapsed_ms: start.elapsed().as_millis() as u64,
-        }),
+            truncated: false,
+        })
+    };
+    // The console runs in the coordinator process: it must not read or write
+    // the host's files, and one query must not be able to exhaust memory.
+    if krishiv_sql::sql_accesses_server_files(&req.query) {
+        return failed(
+            "sql error: statements that read or write server files (COPY, CREATE \
+             EXTERNAL TABLE, path directives) are not available in the console"
+                .to_string(),
+        );
+    }
+    let run = async {
+        use futures::StreamExt as _;
+        let df = engine
+            .sql(&req.query)
+            .await
+            .map_err(|e| format!("sql error: {e}"))?;
+        let mut stream = df
+            .execute_stream()
+            .await
+            .map_err(|e| format!("execution error: {e}"))?;
+        let mut batches = Vec::new();
+        let mut rows = 0usize;
+        let mut truncated = false;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(|e| format!("execution error: {e}"))?;
+            let room = UI_SQL_MAX_ROWS - rows;
+            if batch.num_rows() > room {
+                batches.push(batch.slice(0, room));
+                truncated = true;
+                break;
+            }
+            rows += batch.num_rows();
+            batches.push(batch);
+            if rows == UI_SQL_MAX_ROWS {
+                truncated = stream.next().await.is_some();
+                break;
+            }
+        }
+        Ok::<_, String>((batches, truncated))
+    };
+    match tokio::time::timeout(UI_SQL_TIMEOUT, run).await {
+        Ok(Ok((batches, truncated))) => {
+            let (columns, rows) = extract_columns_and_rows(&batches);
+            let row_count = rows.len();
+            Json(SqlQueryResponse {
+                columns,
+                rows,
+                error: None,
+                row_count,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+                truncated,
+            })
+        }
+        Ok(Err(message)) => failed(message),
+        Err(_) => failed(format!(
+            "execution error: query exceeded the console's {}s limit",
+            UI_SQL_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -748,5 +793,54 @@ mod scalar_json_tests {
         let rendered = scalar_array_to_json(&d, 0);
         assert_ne!(rendered, serde_json::json!("Date32"));
         assert_eq!(rendered, serde_json::json!(19_000));
+    }
+}
+
+/// M3: the UI SQL console runs inside the coordinator process.
+#[cfg(test)]
+mod sql_console_tests {
+    use super::api_sql_execute;
+    use crate::UiState;
+    use crate::views::SqlQueryRequest;
+    use axum::Json;
+    use axum::extract::State;
+    use krishiv_proto::CoordinatorId;
+    use krishiv_scheduler::Coordinator;
+
+    fn state() -> UiState {
+        UiState::new(Coordinator::active(
+            CoordinatorId::try_new("ui-sql").unwrap(),
+        ))
+        .with_sql_engine(krishiv_sql::SqlEngine::new())
+    }
+
+    async fn run(query: &str) -> crate::views::SqlQueryResponse {
+        let Json(response) = api_sql_execute(
+            State(state()),
+            Json(SqlQueryRequest {
+                query: query.to_string(),
+            }),
+        )
+        .await;
+        response
+    }
+
+    /// The console must not read or write the coordinator host's files.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn server_file_sql_is_refused() {
+        let target = std::env::temp_dir().join(format!("krishiv-ui-m3-{}.csv", std::process::id()));
+        let response = run(&format!("COPY (SELECT 1 AS x) TO '{}'", target.display())).await;
+        assert!(response.error.is_some(), "COPY must be refused");
+        assert!(!target.exists(), "COPY wrote to the coordinator host");
+    }
+
+    /// A result is capped, and the response says so, instead of the whole
+    /// relation being collected into coordinator memory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn results_are_capped_and_flagged() {
+        let response = run("SELECT * FROM range(1000000)").await;
+        assert!(response.error.is_none(), "{:?}", response.error);
+        assert_eq!(response.row_count, super::UI_SQL_MAX_ROWS);
+        assert!(response.truncated);
     }
 }
