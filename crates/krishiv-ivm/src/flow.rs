@@ -414,6 +414,13 @@ struct IncrementalFlowInner {
     /// when a dependency is dirty, and a restore makes nothing dirty
     /// (IVM-AUD-CORE-16).
     rebuild_all_views: bool,
+    /// Views whose incremental operator failed on a committed tick. The tick
+    /// released its inputs (other views consumed them), so the failed view's
+    /// operator state and published output both miss that delta. The next tick
+    /// recomputes these views from SQL and diffs against their last output —
+    /// which republishes the missed rows downstream as an ordinary delta — and
+    /// the tick after rebuilds and re-seeds their operators.
+    recompute_views: HashSet<String>,
     /// Bumped by every operation that replaces state a tick in flight has
     /// already read: `restore`, `restore_full`, `restore_delta`,
     /// `apply_remote_tick`, `invalidate_view_plans`, and
@@ -625,6 +632,7 @@ impl IncrementalFlow {
                 force_diff_based: false,
                 view_deps: AHashMap::new(),
                 rebuild_all_views: false,
+                recompute_views: HashSet::new(),
                 state_epoch: 0,
                 last_step_outputs: AHashMap::new(),
                 view_delta_stats: AHashMap::new(),
@@ -1464,12 +1472,15 @@ impl IncrementalFlow {
         // A restore replaced the sources and cleared every view's derived
         // state, so this tick must rebuild the views even though no input
         // arrived (IVM-AUD-CORE-16).
-        let rebuild_all_views = {
+        let (rebuild_all_views, recompute_views) = {
             let mut inner = self.inner.lock().map_err(lock_err)?;
-            std::mem::take(&mut inner.rebuild_all_views)
+            (
+                std::mem::take(&mut inner.rebuild_all_views),
+                std::mem::take(&mut inner.recompute_views),
+            )
         };
 
-        if inputs.is_empty() && !rebuild_all_views {
+        if inputs.is_empty() && !rebuild_all_views && recompute_views.is_empty() {
             // Nothing to reprocess: release custody before returning.
             custody.commit();
             let mut inner = self.inner.lock().map_err(lock_err)?;
@@ -1654,7 +1665,8 @@ impl IncrementalFlow {
                             || dirty_views.contains(token.as_str())
                     })
                 });
-            if !is_dirty && !rebuild_all_views {
+            let recompute = recompute_views.contains(view_name);
+            if !is_dirty && !rebuild_all_views && !recompute {
                 continue;
             }
             dirty_views.insert(view_name_lower);
@@ -1675,28 +1687,28 @@ impl IncrementalFlow {
             // (`DECLARE RECURSIVE VIEW v AS SELECT k, SUM(x) … GROUP BY k` is
             // legal, if pointless) skipped the fixpoint loop altogether and was
             // maintained as if the RECURSIVE keyword were absent.
-            let plan_is_incremental = if force_diff_based || rebuild_all_views || spec.is_recursive
-            {
-                false
-            } else if views_needing_plans.contains(view_name) {
-                let planned = crate::plan::build_planned_view(
-                    &spec.body_sql,
-                    &spec.output_schema,
-                    &available_schemas,
-                    &spec.lateness,
-                )
-                .await;
-                let is_incr = matches!(planned.plan.kind(), ViewPlanKind::Incremental);
-                new_orders.push((view_name.clone(), planned.order));
-                new_plans.push((view_name.clone(), planned.plan, spec.body_sql.clone()));
-                is_incr
-            } else {
-                view_plan_kinds
-                    .get(view_name)
-                    .copied()
-                    .map(|k| k == ViewPlanKind::Incremental)
-                    .unwrap_or(false)
-            };
+            let plan_is_incremental =
+                if force_diff_based || rebuild_all_views || recompute || spec.is_recursive {
+                    false
+                } else if views_needing_plans.contains(view_name) {
+                    let planned = crate::plan::build_planned_view(
+                        &spec.body_sql,
+                        &spec.output_schema,
+                        &available_schemas,
+                        &spec.lateness,
+                    )
+                    .await;
+                    let is_incr = matches!(planned.plan.kind(), ViewPlanKind::Incremental);
+                    new_orders.push((view_name.clone(), planned.order));
+                    new_plans.push((view_name.clone(), planned.plan, spec.body_sql.clone()));
+                    is_incr
+                } else {
+                    view_plan_kinds
+                        .get(view_name)
+                        .copied()
+                        .map(|k| k == ViewPlanKind::Incremental)
+                        .unwrap_or(false)
+                };
             dirty_order.push(view_name.clone());
             plan_is_incremental_by_view.insert(view_name.clone(), plan_is_incremental);
         }
@@ -2752,6 +2764,24 @@ impl IncrementalFlow {
                         "watermark GC failed for view plan"
                     );
                 }
+            }
+        }
+
+        // A view whose operator failed has missed this tick's delta, and the
+        // inputs are about to be released. Drop its plan and recompute it from
+        // SQL next tick (see `recompute_views`). A recompute that fails again
+        // stays queued until it succeeds; an ordinary SQL-path failure needs
+        // nothing, because that path already recomputes in full on its next
+        // tick.
+        for error in &errored_views {
+            let operator_failed = matches!(
+                error.kind,
+                ViewErrorKind::OperatorApply | ViewErrorKind::Publish
+            );
+            let recompute_failed = recompute_views.contains(&error.view);
+            if operator_failed || recompute_failed {
+                inner.view_plans.remove(&error.view);
+                inner.recompute_views.insert(error.view.clone());
             }
         }
 

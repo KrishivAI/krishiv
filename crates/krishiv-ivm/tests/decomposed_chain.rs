@@ -139,3 +139,75 @@ async fn a_chain_global_sum_returns_to_null_when_fully_retracted() {
         "SUM over a fully-retracted input is NULL"
     );
 }
+
+/// H11: a chain whose last hop is a top-N. The top-N index is not framed into
+/// the checkpoint (it is rebuildable), so restore must report "not fully
+/// restored" and let the flow re-seed. Reporting success left the index
+/// empty, and the next delta published a second "top" row next to the
+/// restored one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chain_ending_in_top_n_matches_the_uninterrupted_flow_after_restore() {
+    const TOP_SQL: &str = "SELECT region, SUM(amount) AS total FROM sales \
+                           GROUP BY region ORDER BY total DESC LIMIT 1";
+    let spec = || IncrementalViewSpec {
+        name: "v".into(),
+        body_sql: TOP_SQL.into(),
+        output_schema: Arc::new(Schema::new(vec![
+            Field::new("region", DataType::Int64, false),
+            Field::new("total", DataType::Int64, true),
+        ])),
+        is_materialized: true,
+        is_recursive: false,
+        lateness: vec![],
+    };
+    let rows = |flow: &IncrementalFlow| {
+        let snap = flow.snapshot("v").unwrap().expect("published");
+        let region = snap
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let total = snap
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut out: Vec<(i64, i64)> = (0..snap.num_rows())
+            .map(|i| (region.value(i), total.value(i)))
+            .collect();
+        out.sort();
+        out
+    };
+
+    let flow = IncrementalFlow::new();
+    flow.register_view(spec()).unwrap();
+    flow.feed(
+        "sales",
+        DeltaBatch::from_inserts(sales(&[(10, 5), (20, 3)])).unwrap(),
+    )
+    .unwrap();
+    flow.step_datafusion().await.unwrap();
+    let (inc, why) = flow
+        .view_plan_classification("v")
+        .unwrap()
+        .expect("registered");
+    assert!(inc && why.contains("chain"), "not a chain: {why}");
+    assert_eq!(rows(&flow), vec![(10, 5)]);
+
+    let blob = flow.checkpoint_full().unwrap();
+    let restored = IncrementalFlow::new();
+    restored.register_view(spec()).unwrap();
+    restored.restore_full(&blob).unwrap();
+
+    // Region 20 overtakes region 10: the old top row must be retracted.
+    for f in [&flow, &restored] {
+        f.feed(
+            "sales",
+            DeltaBatch::from_inserts(sales(&[(20, 4)])).unwrap(),
+        )
+        .unwrap();
+        f.step_datafusion().await.unwrap();
+    }
+    assert_eq!(rows(&flow), vec![(20, 7)]);
+    assert_eq!(rows(&restored), rows(&flow), "restored chain diverged");
+}

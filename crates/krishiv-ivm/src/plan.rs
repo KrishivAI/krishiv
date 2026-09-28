@@ -598,6 +598,15 @@ impl ViewPlan {
         }
     }
 
+    /// True for a plan that holds no state between ticks, so an absent
+    /// checkpoint slot for it loses nothing.
+    fn carries_no_state(&self) -> bool {
+        matches!(
+            self,
+            ViewPlan::Map { .. } | ViewPlan::FlatMap { .. } | ViewPlan::DiffBased
+        )
+    }
+
     /// Restore operator state produced by [`checkpoint_state`]. Returns `false`
     /// when this plan variant does not carry restorable state (caller should
     /// seed instead); `true` when the state was applied.
@@ -623,11 +632,15 @@ impl ViewPlan {
             ViewPlan::Chain { hops, sides, .. } => {
                 let err =
                     |m: &str| krishiv_delta::DeltaError::Operator(format!("chain state: {m}"));
+                /// Each hop's framed state, `None` for an absent slot.
+                type HopSlots<'a> = Vec<Option<&'a [u8]>>;
+                /// Split one framed hop run into each hop's state slice
+                /// (`None` for an absent slot) without touching the hops.
                 fn unframe_hops<'a>(
-                    hops: &mut [ViewPlan],
+                    hop_count: usize,
                     mut rest: &'a [u8],
                     err: &dyn Fn(&str) -> krishiv_delta::DeltaError,
-                ) -> Result<&'a [u8], krishiv_delta::DeltaError> {
+                ) -> Result<(HopSlots<'a>, &'a [u8]), krishiv_delta::DeltaError> {
                     let (count_bytes, tail) = rest
                         .split_at_checked(4)
                         .ok_or_else(|| err("truncated count"))?;
@@ -635,13 +648,13 @@ impl ViewPlan {
                     let count =
                         u32::from_le_bytes(count_bytes.try_into().map_err(|_| err("bad count"))?)
                             as usize;
-                    if count != hops.len() {
+                    if count != hop_count {
                         return Err(err(&format!(
-                            "hop count changed: state has {count}, plan has {}",
-                            hops.len()
+                            "hop count changed: state has {count}, plan has {hop_count}"
                         )));
                     }
-                    for hop in hops.iter_mut() {
+                    let mut slots = Vec::with_capacity(hop_count);
+                    for _ in 0..hop_count {
                         let (flag, tail) = rest
                             .split_at_checked(1)
                             .ok_or_else(|| err("truncated flag"))?;
@@ -657,22 +670,29 @@ impl ViewPlan {
                                 .split_at_checked(len)
                                 .ok_or_else(|| err("truncated hop"))?;
                             rest = tail;
-                            hop.restore_state_bytes(hop_bytes)?;
+                            slots.push(Some(hop_bytes));
+                        } else {
+                            slots.push(None);
                         }
                     }
-                    Ok(rest)
+                    Ok((slots, rest))
                 }
                 let rest = if sides.is_empty() {
                     bytes
                         .strip_prefix(CHAIN_STATE_MAGIC)
                         .ok_or_else(|| err("bad magic"))?
                 } else {
-                    let rest = bytes
+                    bytes
                         .strip_prefix(CHAIN_SIDES_MAGIC)
-                        .ok_or_else(|| err("bad magic (side-bearing chain wants CHN2)"))?;
-                    let (count_bytes, mut rest) = rest
+                        .ok_or_else(|| err("bad magic (side-bearing chain wants CHN2)"))?
+                };
+                let mut side_slots = Vec::with_capacity(sides.len());
+                let mut rest = rest;
+                if !sides.is_empty() {
+                    let (count_bytes, tail) = rest
                         .split_at_checked(4)
                         .ok_or_else(|| err("truncated side count"))?;
+                    rest = tail;
                     let count = u32::from_le_bytes(
                         count_bytes.try_into().map_err(|_| err("bad side count"))?,
                     ) as usize;
@@ -682,13 +702,46 @@ impl ViewPlan {
                             sides.len()
                         )));
                     }
-                    for side in sides.iter_mut() {
-                        rest = unframe_hops(&mut side.hops, rest, &err)?;
+                    for side in sides.iter() {
+                        let (slots, tail) = unframe_hops(side.hops.len(), rest, &err)?;
+                        side_slots.push(slots);
+                        rest = tail;
                     }
-                    rest
+                }
+                let (spine_slots, _) = unframe_hops(hops.len(), rest, &err)?;
+
+                // A hop whose state is not in the checkpoint (a top-N or
+                // session index, a join whose trace failed to serialize) can
+                // only be rebuilt by seeding, and seeding replays the whole
+                // chain. Restore nothing in that case: seeding on top of
+                // partially restored hops would count the restored ones twice.
+                let complete = |hops: &[ViewPlan], slots: &[Option<&[u8]>]| {
+                    hops.iter()
+                        .zip(slots)
+                        .all(|(hop, slot)| slot.is_some() || hop.carries_no_state())
                 };
-                let _ = unframe_hops(hops, rest, &err)?;
-                Ok(true)
+                if !complete(hops, &spine_slots)
+                    || sides
+                        .iter()
+                        .zip(&side_slots)
+                        .any(|(side, slots)| !complete(&side.hops, slots))
+                {
+                    return Ok(false);
+                }
+                let mut all_restored = true;
+                for (side, slots) in sides.iter_mut().zip(side_slots) {
+                    for (hop, slot) in side.hops.iter_mut().zip(slots) {
+                        if let Some(hop_bytes) = slot {
+                            all_restored &= hop.restore_state_bytes(hop_bytes)?;
+                        }
+                    }
+                }
+                for (hop, slot) in hops.iter_mut().zip(spine_slots) {
+                    if let Some(hop_bytes) = slot {
+                        all_restored &= hop.restore_state_bytes(hop_bytes)?;
+                    }
+                }
+                Ok(all_restored)
             }
             ViewPlan::DiffBased => Ok(false),
         }
