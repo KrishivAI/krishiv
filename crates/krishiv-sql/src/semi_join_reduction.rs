@@ -339,6 +339,13 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
         if semi.on.is_empty() {
             return Ok(Transformed::no(plan));
         }
+        // The rebuilt join below uses plain SQL equality. A `NOT IN` anti join
+        // (`null_aware`) and the `INTERSECT`/`EXCEPT ALL` joins
+        // (`NullEqualsNull`) mean something else for NULL keys, so relocating
+        // them would change the answer.
+        if !has_plain_null_semantics(semi) {
+            return Ok(Transformed::no(plan));
+        }
         let (filtered, probe) = if filtered_is_right {
             (semi.right.as_ref(), semi.left.as_ref())
         } else {
@@ -386,6 +393,12 @@ impl OptimizerRule for SemiJoinPushdownThroughInnerJoin {
             None => Ok(Transformed::no(plan)),
         }
     }
+}
+
+/// True when NULL keys never match, which is the only semantics the rewrites
+/// in this module rebuild joins with.
+fn has_plain_null_semantics(join: &Join) -> bool {
+    !join.null_aware && join.null_equality == NullEquality::NullEqualsNothing
 }
 
 /// Rewrite the residual filter's references to *this* level's columns into the
@@ -726,7 +739,13 @@ impl OptimizerRule for SemiJoinReductionFromSelectiveDimension {
         let LogicalPlan::Join(join) = &plan else {
             return Ok(Transformed::no(plan));
         };
-        if join.join_type != JoinType::Inner || join.on.is_empty() {
+        // The reducer is built with plain SQL equality; an inner join that
+        // matches NULL to NULL (`IS NOT DISTINCT FROM`) would lose its NULL-key
+        // rows to it.
+        if join.join_type != JoinType::Inner
+            || join.on.is_empty()
+            || !has_plain_null_semantics(join)
+        {
             return Ok(Transformed::no(plan));
         }
 
@@ -835,7 +854,13 @@ impl OptimizerRule for SemiJoinReductionThroughAggregate {
         let LogicalPlan::Join(join) = &plan else {
             return Ok(Transformed::no(plan));
         };
-        if join.join_type != JoinType::Inner || join.on.is_empty() {
+        // The reducer is built with plain SQL equality; an inner join that
+        // matches NULL to NULL (`IS NOT DISTINCT FROM`) would lose its NULL-key
+        // rows to it.
+        if join.join_type != JoinType::Inner
+            || join.on.is_empty()
+            || !has_plain_null_semantics(join)
+        {
             return Ok(Transformed::no(plan));
         }
 
@@ -1307,6 +1332,89 @@ mod tests {
         }
         out.sort();
         out
+    }
+
+    /// Nullable fixture for the NULL-semantics tests: `a.x` and `s.x` carry
+    /// NULLs, which is what `NOT IN` and `INTERSECT`/`EXCEPT ALL` treat
+    /// specially.
+    fn null_context(with_rule: bool) -> SessionContext {
+        let mut builder = SessionStateBuilder::new().with_default_features();
+        if with_rule {
+            builder = builder
+                .with_optimizer_rule(Arc::new(SemiJoinReductionThroughAggregate))
+                .with_optimizer_rule(Arc::new(SemiJoinPushdownThroughInnerJoin::forced()));
+        }
+        let ctx = SessionContext::new_with_state(builder.build());
+        let a = Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, false),
+            Field::new("x", DataType::Int64, true),
+        ]));
+        let a_batch = RecordBatch::try_new(
+            a.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1i64, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![
+                    Some(10i64),
+                    Some(20),
+                    None,
+                    Some(40),
+                ])),
+            ],
+        )
+        .unwrap();
+        let b = Arc::new(Schema::new(vec![Field::new("k", DataType::Int64, false)]));
+        let b_batch = RecordBatch::try_new(
+            b.clone(),
+            vec![Arc::new(Int64Array::from(vec![1i64, 2, 3, 4]))],
+        )
+        .unwrap();
+        let s = Arc::new(Schema::new(vec![
+            Field::new("x", DataType::Int64, true),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let s_batch = RecordBatch::try_new(
+            s.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(10i64), None, Some(99)])),
+                Arc::new(Int64Array::from(vec![1i64, 1, 0])),
+            ],
+        )
+        .unwrap();
+        for (name, schema, batch) in [("a", a, a_batch), ("b", b, b_batch), ("s", s, s_batch)] {
+            ctx.register_table(
+                name,
+                Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap()),
+            )
+            .unwrap();
+        }
+        ctx
+    }
+
+    /// `NOT IN` against a set containing NULL is never true, so the answer is
+    /// empty. The pushed-down anti join must keep DataFusion's `null_aware`
+    /// semantics or it returns every row whose `x` merely differs.
+    #[tokio::test]
+    async fn not_in_with_null_in_subquery_keeps_null_aware_semantics() {
+        let sql = "SELECT a.k FROM a JOIN b ON a.k = b.k \
+                   WHERE a.x NOT IN (SELECT x FROM s WHERE v > 0)";
+        let expected = rows(&null_context(false), sql).await;
+        assert!(
+            expected.is_empty(),
+            "NOT IN over a NULL must return nothing: {expected:?}"
+        );
+        assert_eq!(rows(&null_context(true), sql).await, expected);
+    }
+
+    /// `INTERSECT ALL` / `EXCEPT ALL` match NULL to NULL.
+    #[tokio::test]
+    async fn set_operations_keep_null_equals_null() {
+        for sql in [
+            "SELECT a.x FROM a JOIN b ON a.k = b.k INTERSECT ALL SELECT x FROM s WHERE v > 0",
+            "SELECT a.x FROM a JOIN b ON a.k = b.k EXCEPT ALL SELECT x FROM s WHERE v > 0",
+        ] {
+            let expected = rows(&null_context(false), sql).await;
+            assert_eq!(rows(&null_context(true), sql).await, expected, "{sql}");
+        }
     }
 
     /// As [`context`], plus the selective-dimension rule (the q7 rule).

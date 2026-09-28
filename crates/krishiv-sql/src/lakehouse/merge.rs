@@ -87,6 +87,11 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
                 .into(),
         });
     }
+    reject_unexecutable_merge(
+        on_clause,
+        caps.get(4).map(|m| m.as_str()),
+        caps.get(5).map(|m| m.as_str()),
+    )?;
 
     let merge_key: String = KEY_COL_RE
         .as_ref()
@@ -180,6 +185,54 @@ pub async fn execute_merge_sql(ctx: &SessionContext, sql: &str) -> SqlResult<Vec
     };
 
     Ok(vec![merge_result_batch(metrics)?])
+}
+
+/// `merge_delta` matches on one key column and replaces or inserts whole rows.
+/// Refuse any statement that asks for more, so it cannot be executed as the
+/// simpler statement and reported as done.
+fn reject_unexecutable_merge(
+    on_clause: &str,
+    matched_arm: Option<&str>,
+    not_matched_arm: Option<&str>,
+) -> SqlResult<()> {
+    let unsupported = |feature: &str| {
+        Err(SqlError::Unsupported {
+            feature: feature.to_string(),
+        })
+    };
+    let single_key = KEY_COL_RE
+        .as_ref()
+        .and_then(|re| re.find(on_clause))
+        .is_some_and(|m| m.start() == 0 && m.end() == on_clause.len());
+    if !single_key {
+        return unsupported(
+            "MERGE ON must be a single column equality (target.col = source.col); \
+             compound or computed conditions are not implemented",
+        );
+    }
+    let words = |arm: &str| {
+        arm.split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase()
+    };
+    if let Some(arm) = matched_arm
+        && words(arm) != "WHEN MATCHED THEN UPDATE SET *"
+    {
+        return unsupported(
+            "MERGE WHEN MATCHED supports only UPDATE SET * (whole-row replace); \
+             column SET lists are not implemented",
+        );
+    }
+    if let Some(arm) = not_matched_arm
+        && words(arm) != "WHEN NOT MATCHED THEN INSERT *"
+    {
+        return unsupported(
+            "MERGE WHEN NOT MATCHED supports only INSERT * (whole-row insert); \
+             column and VALUES lists are not implemented",
+        );
+    }
+    Ok(())
 }
 
 fn merge_result_batch(
@@ -369,5 +422,42 @@ mod tests {
             update_only.get(5).is_none(),
             "an update-only MERGE must not report a WHEN NOT MATCHED arm"
         );
+    }
+
+    /// The merge underneath matches on one key and replaces or inserts whole
+    /// rows. A statement asking for more — a compound ON, a SET list, an
+    /// explicit INSERT column list — must be refused, not quietly executed as
+    /// the simpler statement (which rewrote rows across every region matched
+    /// on `id` alone).
+    #[tokio::test]
+    async fn merge_refuses_what_it_would_not_execute() {
+        let ctx = SessionContext::new();
+        for (sql, expect) in [
+            (
+                "MERGE INTO delta.`/tmp/krishiv-merge-refuse` USING staging \
+                 ON t.id = staging.id AND t.region = staging.region \
+                 WHEN MATCHED THEN UPDATE SET *",
+                "single",
+            ),
+            (
+                "MERGE INTO delta.`/tmp/krishiv-merge-refuse` USING staging \
+                 ON t.id = staging.id WHEN MATCHED THEN UPDATE SET t.qty = staging.qty",
+                "UPDATE SET *",
+            ),
+            (
+                "MERGE INTO delta.`/tmp/krishiv-merge-refuse` USING staging \
+                 ON t.id = staging.id WHEN NOT MATCHED THEN INSERT (id) VALUES (staging.id)",
+                "INSERT *",
+            ),
+        ] {
+            let error = execute_merge_sql(&ctx, sql)
+                .await
+                .expect_err("a MERGE the engine would not execute as written must fail");
+            let message = error.to_string();
+            assert!(
+                matches!(error, SqlError::Unsupported { .. }) && message.contains(expect),
+                "{sql}\n  expected Unsupported mentioning {expect:?}, got: {message}"
+            );
+        }
     }
 }
