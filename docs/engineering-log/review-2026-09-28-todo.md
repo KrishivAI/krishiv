@@ -1,0 +1,121 @@
+# Codebase review 2026-09-28 — todo list
+
+Source: full-tree review (11 units, read-only). Per-finding scenario/evidence/fix is in the
+unit reports; none of these were in `crate-audit-register.md` at review time.
+Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` decided not to fix.
+
+## Gates
+- [x] G1 `cargo deny` fails: rustls 0.23.43 RUSTSEC-2026-0285 → `cargo update -p rustls` (>=0.23.45)
+  - fixed 2026-09-28: rustls 0.23.45; `cargo deny check advisories` ok
+
+## High
+- [x] H1 `krishiv-mcp/src/lib.rs:1992` read-only gate is first-word only; multi-statement `EXPLAIN SELECT 1; DROP …` runs the DROP (register §20 note is wrong)
+  - fixed 2026-09-28: sqlparser single-statement read-only classifier; test `execute_sql_rejects_write_hidden_behind_read_only_prefix`, `read_only_classifier`
+- [x] H2 `krishiv-mcp/src/lib.rs:1038` `explain_sql` has no read-only gate at all (runs DDL; `analyze` runs DML)
+  - fixed 2026-09-28: gate applied; test `explain_sql_rejects_write_sql_by_default`
+- [x] H3 `krishiv-flight-sql/src/service.rs:1727` DoAction `BatchSql`/`BatchSqlSink`/`ExecutePlan` skip `check_table_access`
+  - fixed 2026-09-28: `check_table_access` on Explain/ExecutePlan/BatchSql/BatchSqlSink; `action_policy_tests`
+- [x] H4 `krishiv-sql/src/semi_join_reduction.rs:588` semi-join pushdown drops `null_aware`/`null_equality` → wrong NOT IN / EXCEPT ALL / INTERSECT ALL
+  - fixed 2026-09-28: rules decline `null_aware` / `NullEqualsNull` joins (also covers M12); `not_in_with_null_in_subquery_keeps_null_aware_semantics`, `set_operations_keep_null_equals_null`
+- [x] H5 `krishiv-sql/src/lakehouse/merge.rs:91` MERGE INTO keeps only first ON equality; ignores SET / INSERT lists
+  - fixed 2026-09-28: refuses compound ON / SET lists / INSERT column lists (typed Unsupported); `merge_refuses_what_it_would_not_execute`
+- [x] H6 `krishiv-connectors/src/lakehouse/delta_lake.rs:100` + `local_delta.rs:610` `merge_delta` has no read-version conflict check → concurrent append silently removed
+  - fixed 2026-09-28: merge reads a pinned version and commits exactly on top of it (`write_table_based_on`); `overwrite_based_on_a_stale_read_is_a_conflict` (mutation-checked)
+- [x] H7 `krishiv-connectors/src/lakehouse/local_delta.rs:140` + `delta_lake.rs:193` Delta reader ignores checkpoints / protocol / deletion vectors / partition values → wrong rows on foreign tables
+  - fixed 2026-09-28: reader fails closed on checkpoints / non-contiguous log / DV / partitions / column mapping / reader>1, both local and object-store readers; `foreign_delta_features_are_refused_not_misread`
+- [~] H8 `krishiv-connectors/src/kafka_transactional_sink.rs:236` "exactly-once" sink cannot recover a prepared txn after crash; 30 s txn timeout
+  - PARTIAL — txn timeout 30 s → 15 min, commit/abort bounded at 60 s, reachability note corrected. Prepared-transaction recovery after crash still open: needs a decision (refuse under durable profiles vs. implement producer-id/epoch resume).
+- [x] H9 `krishiv-connectors/src/elasticsearch_sink.rs:299` (+ `cassandra_sink.rs:261`, `hbase_connector.rs:280`) non-primitive types incl. `Utf8View` written as null
+  - fixed 2026-09-28: shared `cast_columns_for_sink`; views/large → base, ES/HBase render the rest as strings, Cassandra errors on unmappable types
+- [x] H10 `krishiv-scheduler/src/etcd_metadata.rs:292` metadata puts not fenced on leadership → deposed leader overwrites new leader's job records
+  - fixed 2026-09-28: `EtcdLeaderFence`: every metadata put/delete is a Txn comparing the leader key's lease; wired when `--leader-backend etcd`; live test `a_deposed_leader_cannot_overwrite_the_new_leaders_records` (mutation-checked against a local etcd)
+- [x] H11 `krishiv-ivm/src/plan.rs:548` Chain checkpoints TopN/KeyedTopN/Sessionize as empty but restore returns `Ok(true)`
+  - fixed 2026-09-28: chain restore is all-or-nothing; a hop without checkpointed state makes restore return false so the flow re-seeds; `a_chain_ending_in_top_n_matches_the_uninterrupted_flow_after_restore`
+- [x] H12 `krishiv-ivm/src/flow.rs:2093` operator-apply error still commits tick inputs → view permanently loses delta
+  - fixed 2026-09-28: failed views drop their plan and recompute via SQL next tick (republishing the missed delta downstream); `a_view_that_fails_one_tick_recovers_the_rows_of_that_tick`
+- [x] H13 `krishiv-state/src/dfs_backend.rs:576` DFS snapshot writes v2, all decoders accept v1 only → unrestorable
+  - fixed 2026-09-28: DFS writes v1, loads v1+v2; three tests
+- [x] H14 `krishiv-engine-core/src/error.rs:47` every Checkpoint error transient + substring match → whole-job retry after sinks flushed duplicates output (`krishiv-engines/src/lib.rs:77`)
+  - fixed 2026-09-28: `run_job` retries only if the attempt never opened a sink; `connect` no longer matches `connector`; `run_job_does_not_retry_after_sink_output`
+- [x] H15 `krishiv-operator/src/dynamic.rs:97` `--all-namespaces` patches via cluster-scoped handle → 404, no job admitted
+  - fixed 2026-09-28: per-object patches use the object's namespace; `per_object_patches_target_the_objects_namespace`
+
+## Medium — security
+- [ ] M1 No SQL entry point restricts file DDL / `COPY TO` / path directives (`flight-sql host.rs:160`, `flight_protocol.rs:456`) → shared `SQLOptions` + single-statement guard
+- [ ] M2 `krishiv-flight-sql` prepared-statement create runs `sql_query_schema` before policy (`service.rs:664`, `host.rs:663`)
+- [ ] M3 `krishiv-ui/src/handlers.rs:191` `/api/v1/sql` no row/byte cap or timeout, allows DDL
+- [ ] M4 `krishiv-mcp/src/lib.rs:1830` HTTP transport: no auth, no Origin/Host check (DNS rebinding)
+- [ ] M5 `krishiv-common/src/production.rs:34` malformed `KRISHIV_DURABILITY_PROFILE` → DevLocal (auth off); also `krishiv/src/cli.rs:1313`, `kafka_table.rs:19`
+- [ ] M6 `krishiv/src/remote_client.rs:69` CLI remote client plaintext only; bearer token in cleartext
+- [ ] M7 `krishiv-scheduler/src/continuous_stream_http.rs:2029` `parallelism` uncapped → coordinator OOM
+- [ ] M8 `krishiv-common/src/validate.rs:31` `validate_safe_id`/`is_safe_identifier` accept `"."`; `is_safe_path` accepts absolute → shuffle GC `remove_dir_all(<root>/.)`
+
+## Medium — correctness
+- [ ] M9 `krishiv-scheduler/src/coordinator/mod.rs:843,970` stall/speculation CancelTask RPCs unbounded, awaited in heartbeat loop
+- [ ] M10 `krishiv-scheduler/src/coordinator/job_lifecycle.rs:368` `cancel_job` has no terminal-state guard (Succeeded/Failed/Committing → Cancelled)
+- [ ] M11 `krishiv-scheduler/src/coordinator_sharded.rs:386` outer ack-timeout overwrites inner `Committing{N}` with `Failed{N}`
+- [x] M12 `krishiv-sql/src/semi_join_reduction.rs:816` SemiJoinReductionThroughAggregate ignores `null_equality`
+  - fixed 2026-09-28: with H4
+- [ ] M13 `krishiv-sql/src/rollup_rewrite.rs:398` count re-aggregated as `sum` → NULL instead of 0 on empty input
+- [ ] M14 `krishiv-sql/src/spark_sql_ext.rs:343` DESCRIBE EXTENDED substring detection rewrites literals
+- [ ] M15 `krishiv-sql/src/spark_sql_ext.rs:270,378` TABLESAMPLE / SHOW TBLPROPERTIES Unicode-offset slice panic
+- [ ] M16 `krishiv-sql/src/pivot_sql.rs:120,184,300` PIVOT drops trailing WHERE/ORDER BY; slice panic; literal match
+- [ ] M17 `krishiv-connectors/src/registry/drivers/pulsar.rs:34` registry Pulsar source never acks; ignores `start_position`
+- [ ] M18 `krishiv-connectors/src/kinesis.rs:243` idle shard returns empty batch (spin); iterator taken before fallible call
+- [ ] M19 `krishiv-connectors/src/two_phase.rs:303` local Parquet 2PC: no fsync of tmp or dir
+- [ ] M20 `krishiv-shuffle/src/disk_store.rs:524` dropped writer future commits truncated partition with valid sidecar
+- [ ] M21 `krishiv-executor/src/runner/result_spool.rs:196` partial spool leaked on error/cancel
+- [ ] M22 `krishiv-executor/src/fragment/shuffle_write_buffer.rs:642` failed/cancelled spill file leaked
+- [ ] M23 `krishiv-dataflow/src/window/session.rs:415` single open session per key mishandles admitted out-of-order events
+- [ ] M24 `krishiv-ivm/src/window_rewrite.rs:365` streaming TopN rewrite case-sensitive column compare → rewrites valid SQL
+- [ ] M25 `krishiv-executor/src/fragment/run_loop_classes.rs:377` rjoin/rpipe/rbatch bypass StreamingLoop gate; RunLoop EOS flush
+- [ ] M26 `krishiv-state/src/dfs_backend.rs:660` DFS restore doesn't delete post-checkpoint records
+- [ ] M27 `krishiv-state/src/dfs_backend.rs:178` DFS write not atomic; torn record decodes OK
+- [ ] M28 `krishiv-runtime/src/flight_client.rs:655` `do_action` retries non-idempotent push/drain after server applied
+- [ ] M29 `krishiv-state/src/checkpoint/io.rs:364` sync manifest validation builds a Tokio runtime per entry on S3
+- [ ] M30 `krishiv-delta/src/snapshot_index.rs:269` Raw arm propagates SchemaMismatch → view stops advancing (error discarded at `krishiv-ivm/src/flow.rs:1324`)
+- [ ] M31 `krishiv-connectors/src/lakehouse/local_delta.rs:157` time travel past latest / negative / pre-creation returns latest
+- [ ] M32 `krishiv-connectors/src/lakehouse/iceberg_fs.rs:170` metadata-vN.json created then filled (not atomic)
+- [ ] M33 `krishiv-connectors/src/lakehouse/hudi.rs:385` lost-update check is check-then-act
+- [ ] M34 `krishiv-connectors/src/lakehouse/delta_lake.rs:317` merge_delta positional columns; duplicate source keys
+
+## Medium — broken as shipped
+- [ ] M35 `krishiv-scheduler/src/coordinator_daemon.rs:2180` JCP daemon calls unserved `/federation/*`; `deploy/k8s/operator/jcp-pod-template.yaml` bad flags → wire or delete
+- [ ] M36 `krishiv/src/cli.rs:855` `savepoint --label` dropped
+- [ ] M37 `krishiv/src/cli.rs:973` `restore -c` hard-codes `./krishiv-checkpoints`; `from_savepoint` always false
+- [ ] M38 `krishiv/src/cluster_cmd.rs:170` `cluster start` boots clusterd rejecting all RPCs; failed executor spawns hidden
+- [ ] M39 `krishiv-operator/src/reconciler.rs:131` standby acts on deletions (strips finalizer, deletes pods)
+- [ ] M40 `krishiv-operator/src/controller.rs:344` executor pod creation one-shot; launch-failure detection unreachable
+- [ ] M41 `krishiv-python/src/session.rs:1361` `Session.close()` never closes
+- [ ] M42 `krishiv-metrics/src/counters.rs:670` `remove_job` has no production caller → unbounded cardinality
+- [ ] M43 `python/krishiv-airflow/krishiv_airflow/operators.py:68` sensor can never complete
+- [ ] M44 `python/krishiv-dbt-adapter/krishiv_dbt_adapter/impl.py:39` silently no-op without flightsql
+- [ ] M45 `krishiv-runtime/src/flight_client.rs:1452-1512` four `#[ignore]` regression tests with stale reason (register note wrong)
+
+## Low
+- [ ] L1 `krishiv-scheduler/src/store.rs:1501` terminal latch checked before store lock (resurrection race)
+- [ ] L2 `krishiv-shuffle/src/push_shuffle.rs:131` ESS push: task_id ignored; merge_read concatenates IPC streams (or delete path)
+- [ ] L3 `krishiv-sql/src/lakehouse/providers.rs:132` Delta scan log replay on async task; dead `exists()` filter
+- [ ] L4 `krishiv-sql/src/unnest_sql.rs` no callers — wire or delete
+- [ ] L5 `krishiv-ivm/src/window_rewrite.rs:39,95` TUMBLE/HOP truncating `%` vs floor for negative ts
+- [ ] L6 `krishiv-runtime/src/execution_runtime.rs:639` health loop aborted by its own clone's Drop
+- [ ] L7 `krishiv-runtime/src/continuous_stream.rs:383` drain size check after commit → double apply
+- [ ] L8 `krishiv-state/src/dfs_backend.rs:128` unescaped `__` namespace filenames
+- [ ] L9 `krishiv-runtime/src/execution_runtime.rs:1060` garbled error message whitespace
+- [ ] L10 `krishiv-delta/src/operators/session_window.rs:147` half-applied on NULL ts
+- [ ] L11 `krishiv-delta` `join.rs:1147`, `distinct.rs:159`, `trace.rs:525` unbounded `with_capacity` from checkpoint count
+- [ ] L12 `krishiv-plan/src/lowering.rs:57` filters joined with AND unparenthesised
+- [ ] L13 `krishiv-plan/src/cep/matcher.rs:32` CEP partial recovery doc false; `CepOperator` unused
+- [ ] L14 `krishiv-engines/src/lib.rs:759` StreamingEngine::run skips `validate()`
+- [ ] L15 `krishiv/src/query_cli.rs:160` `sql --analyze` ignored; `--api-key` "policy-enforced" but AllowAll
+- [ ] L16 `krishiv-chaos/tests/chaos_suite.rs:537-705` six tests cannot fail
+- [ ] L17 `krishiv-python/src/sinks.rs` GIL held across network I/O
+- [ ] L18 `deploy/k8s/operator/rbac.yaml` ClusterRole broader than needed
+- [ ] L19 `krishiv-connectors/src/two_phase_parquet_s3.rs` unused, misnamed, replacing rename
+- [ ] L20 Delta: `LocalDeltaTwoPhaseCommitSink` v0 lacks protocol/metadata; `vacuum_table(0)` races unlogged writes
+
+## Register corrections
+- [ ] R1 §20 MCP first-token note — false since multi-statement support (a273347)
+- [ ] R2 ignored-test note for `flight_client` ResultTooLarge tests — reason is stale
+- [ ] R3 §4 "fencing token prevents split-brain writes" — checkpoints only
+- [ ] R4 §8 DFS v2 "never redistributed" — false

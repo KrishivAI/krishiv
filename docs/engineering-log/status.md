@@ -1,5 +1,36 @@
 # Krishiv Implementation Status
 
+## 2026-09-28 — full-tree review; high-priority fixes (branch `review-fixes-2026-09-28`, uncommitted)
+
+Review of all 27 crates found ~80 issues not in the audit register; the list
+and per-item status is `docs/engineering-log/review-2026-09-28-todo.md`.
+
+Fixed this session, each with a test seen red first (H6/H10 via mutation):
+G1 rustls → 0.23.45 (RUSTSEC-2026-0285); H1/H2 MCP read-only gate (parser,
+single statement) and explain_sql gate; H3 Flight DoAction table policy;
+H4 (+M12) semi-join rules keep NOT IN / NullEqualsNull semantics; H5 MERGE
+refuses what it would not execute; H6 merge_delta commits on its read version;
+H7 Delta readers fail closed on checkpoints/DV/partitions/column mapping/
+reader>1; H9 ES/Cassandra/HBase no longer write nulls for Utf8View etc.;
+H10 etcd metadata writes fenced on the leader lease (`EtcdLeaderFence`);
+H11 chain restore all-or-nothing; H12 failed IVM views recompute via SQL;
+H13 DFS snapshot version; H14 no whole-job retry after sink output;
+H15 operator per-object patches namespaced.
+
+Partial: H8 Kafka txn timeout 15 min + honest reachability note; crash
+recovery of a prepared transaction needs a decision (refuse under durable
+profiles, or implement producer-id/epoch resume).
+
+Validation (all EXIT=0): `cargo fmt --all --check`; workspace clippy
+`-D warnings`; clippy connectors (kafka,elasticsearch,cassandra,hbase,
+lakehouse) and scheduler (etcd); `cargo test` for state, mcp, flight-sql, sql,
+engines, engine-core, operator, connectors (default + features), scheduler
+(+etcd, live test against local etcd 3.5.17), ivm.
+
+Next: decide H8; then medium security items M1–M8 in the todo file. Live etcd
+test: `KRISHIV_ETCD_TEST_ENDPOINT=http://127.0.0.1:2379 cargo test -p
+krishiv-scheduler --lib --features etcd -- --include-ignored deposed_leader`.
+
 ## 2026-08-16 — correction: P15 "Dynamic Partition Pruning" was never reachable; the rule is deleted
 
 The P15 row and its detail paragraph below stay as the historical record. What
