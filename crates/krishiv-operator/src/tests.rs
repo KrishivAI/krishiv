@@ -324,6 +324,77 @@ mod operator_tests {
         );
     }
 
+    /// A kube client that answers every request with `object` and records
+    /// each request path, so a test can see which URL a helper targeted.
+    fn recording_client(
+        object: serde_json::Value,
+    ) -> (kube::Client, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&paths);
+        let body = serde_json::to_vec(&object).unwrap();
+        let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+            seen.lock().unwrap().push(req.uri().path().to_string());
+            let body = body.clone();
+            async move {
+                Ok::<_, std::convert::Infallible>(
+                    http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(body))
+                        .unwrap(),
+                )
+            }
+        });
+        (kube::Client::new(service, "default"), paths)
+    }
+
+    /// `--all-namespaces` hands the helpers a cluster-scoped handle. The CRD is
+    /// namespaced, so a patch by name must still target the object's own
+    /// namespace or the API server answers 404 and no job is ever admitted.
+    #[tokio::test]
+    async fn per_object_patches_target_the_objects_namespace() {
+        let resource = sample_resource();
+        let echo = json!({
+            "apiVersion": "krishiv.io/v1alpha1",
+            "kind": "KrishivJob",
+            "metadata": { "name": "sample-batch", "namespace": "krishiv-system" },
+        });
+        let (client, paths) = recording_client(echo);
+        let all = crate::krishivjob_api(client, None).unwrap();
+
+        crate::dynamic::patch_krishivjob_finalizer(&all, &resource)
+            .await
+            .unwrap();
+        crate::dynamic::remove_krishivjob_finalizer(&all, &resource)
+            .await
+            .unwrap();
+        let status = KrishivJobStatus {
+            phase: KrishivJobPhase::Running,
+            coordinator: None,
+            observed_generation: 1,
+            stages: 0,
+            tasks: TaskStatusCounters {
+                assigned: 0,
+                running: 0,
+                succeeded: 0,
+                failed: 0,
+            },
+            conditions: vec![],
+        };
+        crate::dynamic::patch_krishivjob_status(&all, &resource, &status)
+            .await
+            .unwrap();
+
+        let paths = paths.lock().unwrap().clone();
+        assert_eq!(paths.len(), 3, "{paths:?}");
+        for path in &paths {
+            assert!(
+                path.contains("/namespaces/krishiv-system/krishivjobs/sample-batch"),
+                "patch went to a cluster-scoped URL: {path}"
+            );
+        }
+    }
+
     #[test]
     fn converts_dynamic_object_into_typed_resource() {
         let api_resource = krishivjob_api_resource();

@@ -14,6 +14,7 @@
 //!   non-windowed queries return a typed [`EngineError::Unsupported`].
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
@@ -27,8 +28,8 @@ use krishiv_dataflow::stream_driver::{StopOutcome, StopReason, StreamDriver, Str
 use krishiv_delta::DeltaBatch;
 use krishiv_engine_core::{
     ChangelogBatch, CheckpointPayload, CompiledJob, ComputeEngine, EngineError, EngineKind,
-    EngineResult, EngineRuntime, JobHandle, JobStatus, Placement, RowKind, SinkSpec, SinkWriter,
-    SourceReader,
+    EngineResult, EngineRuntime, JobHandle, JobStatus, Placement, RowKind, SinkProvider, SinkSpec,
+    SinkWriter, SourceReader,
 };
 use krishiv_ivm::{IncrementalFlow, IncrementalViewSpec};
 use krishiv_sql::streaming_window_plan::compile_streaming_window_sql;
@@ -81,13 +82,32 @@ pub async fn run_job(job: CompiledJob, rt: EngineRuntime) -> EngineResult<JobHan
     };
     let mut attempts: u32 = 0;
     loop {
+        // A retry re-runs the whole job, including every sink write. Once an
+        // attempt has opened a sink its output may already be visible, so a
+        // retry would append it again: only attempts that never reached a
+        // sink are retried.
+        let opened = Arc::new(AtomicBool::new(false));
+        let attempt_rt = EngineRuntime {
+            sinks: Arc::new(OpenTrackingSinkProvider {
+                inner: Arc::clone(&rt.sinks),
+                opened: Arc::clone(&opened),
+            }),
+            ..rt.clone()
+        };
         let result = match job.engine {
-            EngineKind::Batch => BatchEngine.run(job.clone(), rt.clone()).await,
-            EngineKind::Incremental => IncrementalEngine.run(job.clone(), rt.clone()).await,
-            EngineKind::Streaming => StreamingEngine.run(job.clone(), rt.clone()).await,
+            EngineKind::Batch => BatchEngine.run(job.clone(), attempt_rt).await,
+            EngineKind::Incremental => IncrementalEngine.run(job.clone(), attempt_rt).await,
+            EngineKind::Streaming => StreamingEngine.run(job.clone(), attempt_rt).await,
         };
         match result {
             Ok(handle) => return Ok(handle),
+            Err(e) if e.is_transient() && opened.load(Ordering::Acquire) => {
+                tracing::warn!(
+                    job = %job.name,
+                    "transient engine error after sink output; not retrying: {e}",
+                );
+                return Err(e);
+            }
             Err(e) if e.is_transient() && attempts < max_retries => {
                 let delay_ms = 100u64 * (1 << attempts);
                 tracing::warn!(
@@ -102,6 +122,23 @@ pub async fn run_job(job: CompiledJob, rt: EngineRuntime) -> EngineResult<JobHan
             }
             Err(e) => return Err(e),
         }
+    }
+}
+
+/// Records whether a job attempt opened any sink, so [`run_job`] can tell a
+/// retry that would duplicate output from one that would not.
+struct OpenTrackingSinkProvider {
+    inner: Arc<dyn SinkProvider>,
+    opened: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl SinkProvider for OpenTrackingSinkProvider {
+    async fn open(&self, spec: &SinkSpec) -> EngineResult<Box<dyn SinkWriter>> {
+        // Set before opening: a sink that fails part-way through `open` may
+        // already have created or truncated its target.
+        self.opened.store(true, Ordering::Release);
+        self.inner.open(spec).await
     }
 }
 
@@ -2743,6 +2780,47 @@ mod tests {
         ) -> EngineResult<Option<CheckpointPayload>> {
             self.inner.restore_latest(job).await
         }
+    }
+
+    /// A whole-job retry re-runs every sink write. Once output has been handed
+    /// to a sink, a later transient error (here: the final checkpoint persist,
+    /// which happens after the sinks flush) must surface instead of appending
+    /// the same output again.
+    #[tokio::test]
+    async fn run_job_does_not_retry_after_sink_output() {
+        let batches = vec![
+            event_batch("a", 1_000, 1),
+            event_batch("a", 15_000, 1), // closes the first window
+        ];
+
+        let reference_sources = InMemorySourceProvider::new();
+        reference_sources.insert("events", batches.clone());
+        let reference_sink = InMemorySinkProvider::new();
+        let mut reference = embedded_runtime(
+            Arc::new(reference_sources),
+            Arc::new(reference_sink.clone()),
+        );
+        reference.placement = Placement::SingleNode;
+        run_job(tumbling_job("once"), reference).await.unwrap();
+        let expected = reference_sink.take("out").len();
+        assert!(expected > 0, "fixture must produce output");
+
+        let sources = InMemorySourceProvider::new();
+        sources.insert("events", batches);
+        let sink = InMemorySinkProvider::new();
+        let mut rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+        rt.placement = Placement::SingleNode;
+        rt.checkpoint = Arc::new(FlakyCheckpointService::new(u32::MAX));
+
+        let err = run_job(tumbling_job("dup"), rt)
+            .await
+            .expect_err("the persist failure must surface");
+        assert!(matches!(err, EngineError::Checkpoint(_)), "got {err}");
+        assert_eq!(
+            sink.take("out").len(),
+            expected,
+            "a retried job wrote its output more than once"
+        );
     }
 
     /// A transient checkpoint failure must not kill the streaming loop, and the

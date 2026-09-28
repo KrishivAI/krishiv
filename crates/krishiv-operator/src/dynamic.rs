@@ -33,7 +33,8 @@ pub async fn patch_krishivjob_finalizer(
     }
     let patch = json!({ "metadata": { "finalizers": finalizers } });
     let params = PatchParams::default();
-    jobs.patch(&resource.metadata.name, &params, &Patch::Merge(&patch))
+    object_api(jobs, resource)
+        .patch(&resource.metadata.name, &params, &Patch::Merge(&patch))
         .await?;
     Ok(())
 }
@@ -51,7 +52,8 @@ pub async fn remove_krishivjob_finalizer(
         .collect();
     let patch = json!({ "metadata": { "finalizers": finalizers } });
     let params = PatchParams::default();
-    jobs.patch(&resource.metadata.name, &params, &Patch::Merge(&patch))
+    object_api(jobs, resource)
+        .patch(&resource.metadata.name, &params, &Patch::Merge(&patch))
         .await?;
     Ok(())
 }
@@ -70,9 +72,27 @@ pub async fn patch_krishivjob_status(
         "metadata": { "name": &resource.metadata.name },
         "status": status,
     });
-    jobs.patch_status(&resource.metadata.name, &params, &Patch::Apply(doc))
+    object_api(jobs, resource)
+        .patch_status(&resource.metadata.name, &params, &Patch::Apply(doc))
         .await?;
     Ok(())
+}
+
+/// The handle for one object's own URL.
+///
+/// Under `--all-namespaces` the controller holds a cluster-scoped handle, but
+/// `KrishivJob` is namespaced: a get/patch by name through that handle hits the
+/// cluster-scoped URL and the API server answers 404. Per-object calls go
+/// through the object's namespace whenever it has one.
+fn object_api(jobs: &Api<DynamicObject>, resource: &KrishivJobResource) -> Api<DynamicObject> {
+    match resource.metadata.namespace.as_deref() {
+        Some(namespace) if jobs.namespace().is_none() => Api::namespaced_with(
+            jobs.clone().into_client(),
+            namespace,
+            &krishivjob_api_resource(),
+        ),
+        _ => jobs.clone(),
+    }
 }
 
 /// Build the Kubernetes status merge patch.

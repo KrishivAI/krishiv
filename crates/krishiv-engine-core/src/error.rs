@@ -49,8 +49,13 @@ impl EngineError {
             Self::Checkpoint(_) => true,
             Self::Runtime(msg) | Self::Source(msg) => {
                 let lower = msg.to_lowercase();
+                // Whole phrases: a bare "connect" also matched "connector",
+                // so "connector 'x' is not available" was retried.
                 lower.contains("connection")
-                    || lower.contains("connect")
+                    || lower.contains("failed to connect")
+                    || lower.contains("could not connect")
+                    || lower.contains("unable to connect")
+                    || lower.contains("connect error")
                     || lower.contains("timeout")
                     || lower.contains("timed out")
                     || lower.contains("reset")
@@ -68,3 +73,28 @@ impl EngineError {
 
 /// Result alias for engine operations.
 pub type EngineResult<T> = Result<T, EngineError>;
+
+#[cfg(test)]
+mod tests {
+    use super::EngineError;
+
+    #[test]
+    fn a_missing_connector_is_not_transient() {
+        let err = EngineError::Runtime("connector 'x' is not available".into());
+        assert!(!err.is_transient(), "{err}");
+        let err = EngineError::Source("unknown connector kind 'foo'".into());
+        assert!(!err.is_transient(), "{err}");
+    }
+
+    #[test]
+    fn network_failures_are_transient() {
+        for msg in [
+            "connection refused",
+            "failed to connect to 10.0.0.1:9000",
+            "request timed out",
+            "service unavailable",
+        ] {
+            assert!(EngineError::Runtime(msg.into()).is_transient(), "{msg}");
+        }
+    }
+}

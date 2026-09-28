@@ -570,10 +570,11 @@ impl StateBackend for DisaggregatedStateBackend {
 
     fn snapshot(&self) -> StateResult<Vec<u8>> {
         use std::io::Write;
-        // Snapshot format: version + manifest entries
+        // Snapshot format: the shared v1 layout (`crate::snapshot`), so the
+        // executor's restore, merge and rescale paths can decode it.
         // Each entry: namespace_op_id + namespace_state_name + key + value
         let mut buf = Vec::new();
-        buf.write_all(&2u32.to_le_bytes())
+        buf.write_all(&1u32.to_le_bytes())
             .map_err(|e| StateError::BackendUnavailable {
                 message: format!("snapshot write failed: {e}"),
                 source: Some(Box::new(e)),
@@ -668,9 +669,12 @@ impl StateBackend for DisaggregatedStateBackend {
                 message: format!("snapshot read failed: {e}"),
                 source: Some(Box::new(e)),
             })?;
-        if u32::from_le_bytes(version) != 2 {
+        // Version 2 is the same layout, written by DFS snapshots before they
+        // were aligned with the shared codec; keep reading those checkpoints.
+        let version = u32::from_le_bytes(version);
+        if version != 1 && version != 2 {
             return Err(StateError::BackendUnavailable {
-                message: "unsupported snapshot version".into(),
+                message: format!("unsupported snapshot version {version}"),
                 source: None,
             });
         }
@@ -979,5 +983,45 @@ mod tests {
             .load_snapshot(&bytes)
             .expect_err("oversized length prefix must error, not allocate");
         assert!(err.to_string().contains("claims"), "got: {err}");
+    }
+
+    /// The executor restores, merges and rescales every backend's snapshot
+    /// through the shared v1 codec, so a DFS snapshot must decode there.
+    #[test]
+    fn snapshot_decodes_with_shared_codec() {
+        let mut backend = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        let ns = Namespace::new("op-1", "state");
+        backend.put(&ns, b"k1".to_vec(), b"v1".to_vec()).unwrap();
+
+        let snapshot = backend.snapshot().unwrap();
+        let entries = crate::snapshot::decode_snapshot_entries(&snapshot)
+            .expect("DFS snapshot must decode with the shared codec");
+        assert_eq!(entries.len(), 1);
+    }
+
+    /// The executor's empty-restore path hands every backend the shared
+    /// codec's encoding of zero entries.
+    #[test]
+    fn load_snapshot_accepts_shared_codec_output() {
+        let mut backend = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        let empty = crate::snapshot::encode_snapshot_entries(&[]);
+        backend
+            .load_snapshot(&empty)
+            .expect("a v1 snapshot from the shared codec must load");
+    }
+
+    /// Checkpoints written before the version fix carry version 2 with the
+    /// same layout; they must still restore.
+    #[test]
+    fn load_snapshot_accepts_legacy_v2() {
+        let ns = Namespace::new("op-1", "state");
+        let mut source = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        source.put(&ns, b"k".to_vec(), b"v".to_vec()).unwrap();
+        let mut legacy = source.snapshot().unwrap();
+        legacy[..4].copy_from_slice(&2u32.to_le_bytes());
+
+        let mut backend = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        backend.load_snapshot(&legacy).unwrap();
+        assert_eq!(backend.get(&ns, b"k").unwrap(), Some(b"v".to_vec()));
     }
 }
