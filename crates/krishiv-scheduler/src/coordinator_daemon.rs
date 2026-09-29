@@ -1739,6 +1739,17 @@ fn validate_runtime_security_config(
         )
         .into());
     }
+    // The co-located Flight SQL sidecar runs arbitrary SQL. Durable profiles
+    // already require API keys; this covers dev-local bound off loopback.
+    if let Some(flight_addr) = config.flight_addr {
+        let api_keys = env::var("KRISHIV_API_KEYS").is_ok_and(|keys| !keys.trim().is_empty());
+        krishiv_common::auth_util::check_anonymous_exposure(
+            "Flight SQL",
+            flight_addr,
+            api_keys,
+            config.insecure,
+        )?;
+    }
     Ok(())
 }
 
@@ -2366,6 +2377,25 @@ mod parse_tests {
         .unwrap();
 
         validate_runtime_security_config(&config, true, true).unwrap();
+    }
+
+    #[test]
+    fn an_open_flight_sidecar_off_loopback_needs_insecure() {
+        let mut config = CoordinatorDaemonConfig::http_sidecar(DurabilityProfile::DevLocal);
+        config.flight_addr = Some("0.0.0.0:2003".parse().unwrap());
+        config.insecure = false;
+        if std::env::var("KRISHIV_API_KEYS").is_ok_and(|keys| !keys.trim().is_empty()) {
+            return;
+        }
+        let error = validate_runtime_security_config(&config, false, false).unwrap_err();
+        assert!(error.to_string().contains("Flight SQL"), "{error}");
+
+        config.insecure = true;
+        validate_runtime_security_config(&config, false, false).unwrap();
+
+        config.insecure = false;
+        config.flight_addr = Some("127.0.0.1:2003".parse().unwrap());
+        validate_runtime_security_config(&config, false, false).unwrap();
     }
 
     #[test]

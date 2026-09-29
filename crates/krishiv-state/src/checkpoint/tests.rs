@@ -135,6 +135,30 @@ fn manifest_serialize_deserialize_roundtrip() {
     assert_eq!(m, parsed);
 }
 
+/// Damage that still reads as the same entries must not pass: nothing else
+/// vouches for the manifest's own bytes.
+#[test]
+fn a_manifest_damaged_into_an_equivalent_encoding_is_rejected() {
+    let mut manifest = IntegrityManifest::new();
+    manifest.insert_bytes("metadata.json", b"{}");
+    let good = manifest.serialize();
+    assert!(IntegrityManifest::deserialize(&good).is_ok());
+
+    // The trailing newline with two bits flipped is a tab.
+    let mut flipped = good.clone();
+    let last = flipped.last_mut().expect("manifest has bytes");
+    *last ^= 3;
+    assert!(IntegrityManifest::deserialize(&flipped).is_err());
+
+    let mut padded = good.clone();
+    padded.extend_from_slice(b"\n");
+    assert!(IntegrityManifest::deserialize(&padded).is_err());
+
+    let mut duplicated = good.clone();
+    duplicated.extend_from_slice(&good);
+    assert!(IntegrityManifest::deserialize(&duplicated).is_err());
+}
+
 #[test]
 fn manifest_verify_detects_corruption() {
     let mut m = IntegrityManifest::new();
@@ -1144,16 +1168,14 @@ fn manifest_deserialize_missing_separator() {
 }
 
 #[test]
-fn manifest_deserialize_blank_lines_skipped() {
+fn manifest_deserialize_rejects_added_blank_lines() {
+    // The writer never emits blank lines, so they are damage: the manifest is
+    // the one file no checksum covers, and only its exact form is trusted.
     let mut m = IntegrityManifest::new();
     m.insert("a.bin", "aaa");
-    let mut serialized = m.serialize();
-    // Insert blank lines
-    let s = String::from_utf8(serialized.clone()).unwrap();
+    let s = String::from_utf8(m.serialize()).unwrap();
     let with_blanks = format!("\n\n{s}\n\n");
-    serialized = with_blanks.into_bytes();
-    let parsed = IntegrityManifest::deserialize(&serialized).unwrap();
-    assert_eq!(parsed.len(), 1);
+    assert!(IntegrityManifest::deserialize(with_blanks.as_bytes()).is_err());
 }
 
 #[test]

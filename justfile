@@ -216,14 +216,14 @@ undeploy-k8s:
 # `test` + `test-integration` + `test-doc`; the tier map with a named
 # rationale per exclusion lives in docs/architecture/17-testing-and-quality.md):
 test:
-    {{ sccache_env }} {{ cargo_test }} --workspace --lib --bins \
+    {{ sccache_env }} {{ cargo_test }} --workspace --lib --bins --no-fail-fast \
         --exclude krishiv-python \
         --exclude krishiv-chaos
 
 # All crates' tests/*.rs integration suites. External-service tests inside
 # them are `#[ignore = "requires …"]`-gated and stay opt-in (see docs/architecture/17-testing-and-quality.md).
 test-integration:
-    {{ sccache_env }} {{ cargo_test }} --workspace --tests \
+    {{ sccache_env }} {{ cargo_test }} --workspace --tests --no-fail-fast \
         --exclude krishiv-python \
         --exclude krishiv-chaos \
         --exclude krishiv-bench
@@ -310,6 +310,26 @@ test-feature-arms:
 # this crate enables — were compiled by nothing. They pass; they were just dark.
 test-chaos:
     {{ sccache_env }} {{ cargo }} test -p krishiv-chaos
+
+# krishiv-python's Rust unit tests and doctests. The crate is excluded from
+# every workspace recipe (it links libpython), and `check-excluded` only
+# compiles it, so a doc example that rustdoc tried to compile as Rust failed
+# for a whole commit without any recipe noticing. The link path comes from the
+# interpreter itself rather than a hard-coded version directory.
+test-python-rust:
+    RUSTFLAGS="-L $(python3 -c 'import sysconfig; print(sysconfig.get_config_var("LIBPL"))')" \
+    CARGO_TARGET_DIR=target/py \
+        {{ cargo }} test -p krishiv-python --no-fail-fast
+
+# The commit gate: everything the CI `fmt-lint` and `test` jobs run, as one
+# command, so a local green means the same thing as a CI green.
+#
+# Scoping a gate to "the crates I touched" is how two breaks were committed on
+# 2026-09-28: krishiv-common holds tree-wide structural guards (env registry vs
+# source, bearer parsing outside auth_util) that fail on edits made in OTHER
+# crates. `--no-fail-fast` on the test recipes matters for the same reason:
+# without it the first failing test binary hides every later one.
+gate: fmt lint lint-features test test-integration test-doc test-etcd test-embedded test-k8s test-chaos test-feature-arms check-excluded test-python-rust
 
 # Kubernetes operator unit tests
 test-k8s:

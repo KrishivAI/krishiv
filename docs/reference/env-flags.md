@@ -8,7 +8,7 @@ Regenerate with:
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `KRISHIV_ALLOW_ANONYMOUS` | bool | `false` | Allow unauthenticated coordinator gRPC (operator + coordinator daemon). Production profiles refuse to start with this set unless explicitly overridden. |
+| `KRISHIV_ALLOW_ANONYMOUS` | bool | `false` | Allow unauthenticated listeners: coordinator gRPC (same as --insecure), and executor task/barrier gRPC, Flight SQL and the shuffle services when bound off loopback without credentials. Durable profiles refuse to start with this set. |
 | `KRISHIV_ALLOW_ANONYMOUS_HTTP` | bool | `false` | Allow unauthenticated HTTP control-plane routes. Logs a warning when active in production mode. |
 | `KRISHIV_ALLOW_FULL_PRIVILEGE_UDFS` | bool | `false` | Permit native (full-privilege) scalar UDF registration under restrictive durability profiles. |
 | `KRISHIV_ALLOW_LEGACY_FRAGMENTS` | bool | `false` | Permit untyped legacy task fragments (stream:*, raw SQL strings) outside dev-local. |

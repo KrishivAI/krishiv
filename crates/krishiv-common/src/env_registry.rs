@@ -128,7 +128,7 @@ pub static FLAGS: &[FlagSpec] = &[
         "KRISHIV_ALLOW_ANONYMOUS",
         FlagKind::Bool,
         "false",
-        "Allow unauthenticated coordinator gRPC (operator + coordinator daemon). Production profiles refuse to start with this set unless explicitly overridden.",
+        "Allow unauthenticated listeners: coordinator gRPC (same as --insecure), and executor task/barrier gRPC, Flight SQL and the shuffle services when bound off loopback without credentials. Durable profiles refuse to start with this set.",
     ),
     rt(
         "KRISHIV_ALLOW_ANONYMOUS_HTTP",

@@ -89,7 +89,9 @@ fn decode_agg_state_binary(bytes: &[u8]) -> StateResult<AggState> {
         .and_then(|s| s.try_into().ok())
         .ok_or_else(|| corrupt("missing entry count"))?;
     let n = u32::from_le_bytes(n_arr) as usize;
-    let mut entries = Vec::with_capacity(n);
+    // Bounded by the payload, never by the count alone: a corrupt count must
+    // fail as truncated below, not reserve gigabytes here.
+    let mut entries = Vec::with_capacity(n.min(body.len() / AGG_ENTRY_LEN.max(1)));
     let mut off = 4usize;
     let rd_i64 = |s: &[u8]| -> Option<i64> { s.try_into().ok().map(i64::from_le_bytes) };
     let rd_u64 = |s: &[u8]| -> Option<u64> { s.try_into().ok().map(u64::from_le_bytes) };
@@ -127,7 +129,7 @@ fn decode_agg_state_binary(bytes: &[u8]) -> StateResult<AggState> {
         let set_count = rd_u32(body.get(off..off + 4).unwrap_or_default())
             .ok_or_else(|| corrupt("missing distinct set count"))? as usize;
         off += 4;
-        let mut sets = Vec::with_capacity(set_count);
+        let mut sets = Vec::with_capacity(set_count.min(body.len().saturating_sub(off) / 4));
         for _ in 0..set_count {
             let len = rd_u32(body.get(off..off + 4).unwrap_or_default())
                 .ok_or_else(|| corrupt("missing distinct set length"))?
@@ -500,6 +502,16 @@ mod tests {
             assert_eq!(d.float_value.to_bits(), o.float_value.to_bits());
             assert_eq!(d.sq_sum.to_bits(), o.sq_sum.to_bits());
         }
+    }
+
+    /// A corrupt entry count must be reported as corruption, not turned into
+    /// a reservation sized by the count.
+    #[test]
+    fn an_absurd_entry_count_is_rejected_without_allocating_it() {
+        let mut blob = vec![AGG_STATE_BINARY_V2];
+        blob.extend_from_slice(&u32::MAX.to_le_bytes());
+        blob.extend_from_slice(&[0u8; 16]);
+        assert!(decode_agg_state_binary(&blob).is_err());
     }
 
     #[test]

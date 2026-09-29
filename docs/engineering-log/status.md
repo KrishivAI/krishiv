@@ -1,5 +1,29 @@
 # Krishiv Implementation Status
 
+## 2026-09-30 — post-review hardening (branch `review-fixes-2026-09-28`)
+
+- `just gate`: one command for everything the CI fmt-lint and test jobs run,
+  plus `test-python-rust` (krishiv-python's Rust tests, which no recipe ran).
+  `test` / `test-integration` now use `--no-fail-fast`.
+- Open listeners: executor task/barrier gRPC, Flight SQL and both shuffle
+  services refuse to start on a non-loopback address without credentials
+  unless `KRISHIV_ALLOW_ANONYMOUS=true` (coordinator: `--insecure`), in every
+  profile. **The executor's default barrier address is `0.0.0.0:2006`, so a
+  token-less dev executor now needs the flag or a loopback bind.**
+  `krishiv-dev.yaml` and `stream-verify.yaml` set it.
+- Checkpoint integrity manifest must be byte-for-byte canonical: a property
+  test found that damage to the manifest's own whitespace still validated.
+- Kafka transactional sink is listed as best-effort, not exactly-once.
+- Four more checkpoint decoders bound their allocations by the bytes left.
+- Removed `krishiv-operator::jcp_pod` (leftover of the deleted JCP daemon).
+
+Not done, by decision: replacing the Delta reader with delta-rs, collapsing
+the streaming loops into one, merging crates. Unreferenced public modules
+left in place pending a product decision: dataflow `delta_join`, state
+`async_operator` / `incremental_trace`, executor `aligned_join`, sql
+`vector_quantize`, api `materialized_table`, connectors `vortex` /
+`transactional_kafka`, python `arrow_fast`.
+
 ## 2026-09-29 — review closed: all items fixed (branch `review-fixes-2026-09-28`)
 
 Every item in `docs/engineering-log/review-2026-09-28-todo.md` is now `[x]`.

@@ -240,6 +240,16 @@ impl IntegrityManifest {
                 })?;
             manifest.insert(path.trim(), hex.trim());
         }
+        // The manifest vouches for every other file in the epoch, and nothing
+        // vouches for it. The lenient parse above accepts damaged bytes that
+        // still read as the same entries (a flipped trailing newline, stray
+        // whitespace, a duplicated line), so require the exact bytes the
+        // writer produces: any other encoding is damage, not a dialect.
+        if manifest.serialize() != bytes {
+            return Err(CheckpointError::Storage {
+                message: String::from("manifest is not in canonical form (damaged or hand-edited)"),
+            });
+        }
         Ok(manifest)
     }
 }

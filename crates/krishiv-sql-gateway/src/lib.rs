@@ -13,10 +13,18 @@
 //!
 //! ## Architecture
 //!
+//! Two separate paths reach the engine. The Flight SQL server does **not**
+//! route through this crate (it does not depend on it); this crate is for a
+//! Rust program that wants gateway-style sessions and SQLSTATE codes
+//! in-process.
+//!
 //! ```text
-//! JDBC Driver (Arrow Flight SQL)
+//! JDBC/ODBC/ADBC driver
 //!   → Flight SQL wire protocol (DoGet / DoPut)
 //!   → krishiv-flight-sql (tonic server)
+//!   → krishiv-api / krishiv-sql
+//!
+//! Rust caller, in-process
 //!   → krishiv-sql-gateway (SQLSTATE mapping, connection pooling)
 //!   → krishiv-api (Session, DataFrame)
 //!   → krishiv-sql / DataFusion (planning + execution)

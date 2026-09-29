@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc b5146c006db2d18b1f098154dee11edf5e952ad9291588082c20662b7e127de5 # shrinks to epoch_snapshots = [[[], []]], file_pick = Index(78743), byte_pick = Index(11081972770095317421), flip = 112
+cc f512e8566ac149e7542115851019968968e088f2505cee5fbcdfb9d30b502692 # shrinks to epoch_snapshots = [[[]]], file_pick = Index(0), byte_pick = Index(18343110680037026046), flip = 3

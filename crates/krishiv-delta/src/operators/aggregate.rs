@@ -1178,7 +1178,10 @@ impl IncrementalAggOp {
         let mut state: GroupStateMap = AHashMap::with_capacity(n_groups);
         for key in keys {
             let n_states = read_u32(bytes, &mut pos)? as usize;
-            let mut states: Vec<AggState> = Vec::with_capacity(n_states);
+            // Bounded by the bytes left, never by the count alone: a corrupt
+            // count must fail as truncated, not reserve gigabytes.
+            let mut states: Vec<AggState> =
+                Vec::with_capacity(n_states.min(bytes.len().saturating_sub(pos)));
             for _ in 0..n_states {
                 states.push(AggState::read_bytes(bytes, &mut pos, v4)?);
             }

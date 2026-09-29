@@ -614,6 +614,12 @@ pub async fn serve<S: ShuffleStore + Send + Sync + 'static>(
         krishiv_common::resolve_durability_profile(),
     )
     .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
+    krishiv_common::auth_util::check_anonymous_exposure_from_env(
+        "shuffle Flight service",
+        addr,
+        token.is_some(),
+    )
+    .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
     serve_with_token(addr, store, token).await
 }
 

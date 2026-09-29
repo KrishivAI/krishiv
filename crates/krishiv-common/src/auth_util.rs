@@ -24,6 +24,46 @@ pub fn bearer_token(header_value: Option<&str>) -> Option<&str> {
         .filter(|token| !token.is_empty())
 }
 
+/// Env flag that explicitly permits an unauthenticated listener.
+pub const ALLOW_ANONYMOUS_ENV: &str = "KRISHIV_ALLOW_ANONYMOUS";
+
+/// Refuse to serve `surface` without authentication on an address other
+/// machines can reach, unless the operator opted out explicitly.
+///
+/// The durability-profile guards only fail closed under durable profiles, so
+/// the default `dev-local` profile bound to `0.0.0.0` used to serve an open
+/// data or control plane with nothing but a log line. A loopback bind stays
+/// permissive (nothing off the host can reach it); anything wider needs either
+/// credentials or a stated decision.
+pub fn check_anonymous_exposure(
+    surface: &str,
+    addr: std::net::SocketAddr,
+    authenticated: bool,
+    anonymous_allowed: bool,
+) -> Result<(), String> {
+    if authenticated || anonymous_allowed || addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(format!(
+        "refusing to serve {surface} on {addr} without authentication: the address is          reachable from other machines. Configure credentials for it, bind a loopback          address, or set {ALLOW_ANONYMOUS_ENV}=true to accept an open listener."
+    ))
+}
+
+/// [`check_anonymous_exposure`] with the opt-out read from
+/// [`ALLOW_ANONYMOUS_ENV`].
+pub fn check_anonymous_exposure_from_env(
+    surface: &str,
+    addr: std::net::SocketAddr,
+    authenticated: bool,
+) -> Result<(), String> {
+    check_anonymous_exposure(
+        surface,
+        addr,
+        authenticated,
+        crate::truthy_env(ALLOW_ANONYMOUS_ENV),
+    )
+}
+
 /// Redact a credential for logging: a 16-hex-char hash tagged `bearer:`.
 ///
 /// Stable within a process run so operators can correlate requests from the
@@ -61,6 +101,23 @@ mod tests {
         assert_eq!(redacted, redact_token(token));
         // distinct tokens redact differently
         assert_ne!(redacted, redact_token("other-token"));
+    }
+
+    #[test]
+    fn an_open_listener_off_loopback_needs_a_stated_decision() {
+        let public: std::net::SocketAddr = "0.0.0.0:7000".parse().expect("addr");
+        let local: std::net::SocketAddr = "127.0.0.1:7000".parse().expect("addr");
+        let local6: std::net::SocketAddr = "[::1]:7000".parse().expect("addr");
+
+        let refused = check_anonymous_exposure("shuffle", public, false, false)
+            .expect_err("open public listener must be refused");
+        assert!(refused.contains(ALLOW_ANONYMOUS_ENV), "{refused}");
+        assert!(refused.contains("shuffle"), "{refused}");
+
+        assert!(check_anonymous_exposure("shuffle", public, true, false).is_ok());
+        assert!(check_anonymous_exposure("shuffle", public, false, true).is_ok());
+        assert!(check_anonymous_exposure("shuffle", local, false, false).is_ok());
+        assert!(check_anonymous_exposure("shuffle", local6, false, false).is_ok());
     }
 
     /// Structural guard (audit §11): hand-rolled bearer parsing must not

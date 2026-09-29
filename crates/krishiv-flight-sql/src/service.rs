@@ -1446,6 +1446,13 @@ fn configure_flight_auth_from_env(
     }
 }
 
+/// Flight SQL runs arbitrary SQL, so an anonymous listener other machines can
+/// reach needs a stated decision, whatever the durability profile.
+fn check_flight_exposure(addr: std::net::SocketAddr) -> Result<(), String> {
+    let authenticated = std::env::var("KRISHIV_API_KEYS").is_ok_and(|v| !v.trim().is_empty());
+    krishiv_common::auth_util::check_anonymous_exposure_from_env("Flight SQL", addr, authenticated)
+}
+
 fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
     let raw = match std::env::var("KRISHIV_API_KEYS") {
         Ok(v) if !v.trim().is_empty() => v,
@@ -1477,6 +1484,10 @@ fn auth_provider_from_env() -> Result<Option<Arc<dyn AuthProvider>>, String> {
 }
 
 /// Run the Arrow Flight SQL server with a pre-built execution host and a bound listener.
+///
+/// The caller owns the exposure decision for the listener it bound: the
+/// coordinator validates its `--flight-addr` at startup, where `--insecure` is
+/// known and a refusal can stop the boot rather than log from a spawned task.
 ///
 /// Used by the coordinator to start a co-located Flight SQL sidecar via
 /// `spawn_coordinator_sidecars`. The listener is bound by the caller before the
@@ -1512,6 +1523,7 @@ pub async fn run_flight_server_from_env() -> Result<(), Box<dyn std::error::Erro
 pub async fn run_flight_server(
     addr: std::net::SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    check_flight_exposure(addr)?;
     tracing::info!(addr = %addr, "krishiv-flight-server listening");
     let host = FlightExecutionHost::from_env()?;
     #[cfg(feature = "rest-catalog")]

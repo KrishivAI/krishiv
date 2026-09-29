@@ -223,10 +223,17 @@ pub fn data_path_matrix() -> Vec<DataPathCell> {
         DataPathCell {
             source: "Kafka",
             sink: "Kafka (transactional)",
-            delivery: ExactlyOnce,
+            // Not ExactlyOnce: a guarantee that holds only while nothing
+            // crashes is not the guarantee. See the evidence text.
+            delivery: BestEffort,
             status: Preview,
             evidence: "two-phase transactional Kafka sink (transactional_kafka); \
-                       barrier-aligned prepare/commit — Preview: no prod kill-loop cert yet",
+                       barrier-aligned prepare/commit gives read_committed consumers \
+                       exactly-once output while the executor survives, but a crash after \
+                       a checkpoint completes and before its transaction commits aborts \
+                       that epoch's output with no recovery — so an epoch can be lost. \
+                       Refused under durable profiles without \
+                       KRISHIV_KAFKA_SINK_ALLOW_UNRECOVERABLE_TXN=1",
         },
         DataPathCell {
             source: "batch SQL",

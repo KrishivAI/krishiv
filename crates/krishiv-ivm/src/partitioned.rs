@@ -908,7 +908,8 @@ impl PartitionedIncrementalFlow {
 
     fn read_streaming_prev(&self, bytes: &[u8], pos: &mut usize) -> IvmResult<()> {
         let count = read_u32(bytes, pos)? as usize;
-        let mut map: HashMap<String, RecordBatch> = HashMap::with_capacity(count);
+        let mut map: HashMap<String, RecordBatch> =
+            HashMap::with_capacity(count.min(bytes.len().saturating_sub(*pos) / 4));
         for _ in 0..count {
             let name_len = read_u32(bytes, pos)? as usize;
             let name = std::str::from_utf8(bytes.get(*pos..*pos + name_len).ok_or_else(slice_err)?)

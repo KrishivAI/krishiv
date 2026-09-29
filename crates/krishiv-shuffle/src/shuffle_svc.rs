@@ -121,6 +121,11 @@ pub async fn run_shuffle_svc(
         token_val.is_some(),
         krishiv_common::resolve_durability_profile(),
     )?;
+    krishiv_common::auth_util::check_anonymous_exposure_from_env(
+        "shuffle HTTP service",
+        addr,
+        token_val.is_some(),
+    )?;
     let token = Arc::new(std::sync::RwLock::new(token_val));
     let ess_index = SortShuffleIndex::new();
     let state = ShuffleSvcState {

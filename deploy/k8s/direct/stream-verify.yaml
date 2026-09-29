@@ -133,6 +133,8 @@ spec:
             # exists to exercise the streaming data plane, not the auth path.
             - name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH
               value: "false"
+            - name: KRISHIV_ALLOW_ANONYMOUS
+              value: "true"
             - name: POD_NAME
               valueFrom: { fieldRef: { fieldPath: metadata.name } }
             - name: POD_IP

@@ -11,7 +11,6 @@ pub mod crd;
 #[cfg(feature = "k8s")]
 pub mod dynamic;
 pub mod error;
-pub mod jcp_pod;
 #[cfg(feature = "k8s")]
 pub mod lease;
 pub mod pod_failure;

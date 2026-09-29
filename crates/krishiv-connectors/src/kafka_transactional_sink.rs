@@ -1,5 +1,5 @@
-// RdkafkaTransactionalSink: wraps rdkafka's transactional producer for exactly-once
-// Kafka writes.  Implements TwoPhaseCommitSink where Handle = String (transaction ID).
+// RdkafkaTransactionalSink: wraps rdkafka's transactional producer for Kafka
+// writes.  Implements TwoPhaseCommitSink where Handle = String (transaction ID).
 //
 // Construction: takes bootstrap_servers, topic, transactional_id.
 // prepare(epoch, batch): serialize batch as Arrow IPC bytes, begin transaction if
@@ -80,11 +80,20 @@ fn producer_config(
     Ok(cfg)
 }
 
-/// An rdkafka-backed exactly-once Kafka sink.
+/// An rdkafka-backed transactional Kafka sink.
 ///
-/// Uses Kafka transactions (EOS) to implement [`TwoPhaseCommitSink`].
+/// Uses Kafka transactions to implement [`TwoPhaseCommitSink`].
 /// `prepare` stages messages under an open transaction; `commit` finalises it;
 /// `abort` rolls it back.
+///
+/// # Guarantee
+///
+/// Output is exactly-once for `read_committed` consumers only while the
+/// process survives. A prepared transaction cannot be resumed by a new
+/// producer: `init_transactions` on restart aborts it. A crash between a
+/// checkpoint completing and its transaction committing therefore loses that
+/// epoch's output, which is why durable profiles refuse this sink without
+/// [`ALLOW_UNRECOVERABLE_TXN_ENV`].
 ///
 /// # Configuration
 ///
@@ -120,7 +129,7 @@ pub struct RdkafkaTransactionalSink {
 }
 
 impl RdkafkaTransactionalSink {
-    /// Build an exactly-once transactional sink.
+    /// Build a transactional sink (see the type docs for the guarantee).
     ///
     /// Calls `init_transactions()` during construction so the producer is
     /// immediately ready to begin transactions.

@@ -1480,6 +1480,19 @@ impl ExecutorCliConfig {
         if self.task_grpc_addr.is_some() {
             auth.validate_required()?;
         }
+        for (surface, addr) in [
+            ("executor task gRPC", self.task_grpc_addr),
+            ("executor barrier gRPC", self.barrier_grpc_addr),
+        ] {
+            if let Some(addr) = addr {
+                krishiv_common::auth_util::check_anonymous_exposure_from_env(
+                    surface,
+                    addr,
+                    auth.has_bearer_token(),
+                )
+                .map_err(|message| crate::ExecutorError::LocalExecution { message })?;
+            }
+        }
         Ok(())
     }
 
@@ -2065,12 +2078,40 @@ mod tests {
 
     #[test]
     fn required_task_auth_allows_disabled_task_grpc_without_token() {
-        let config =
-            ExecutorCliConfig::parse([String::from("--task-grpc-addr"), String::from("off")])
-                .unwrap();
+        let config = ExecutorCliConfig::parse([
+            String::from("--task-grpc-addr"),
+            String::from("off"),
+            String::from("--barrier-grpc-addr"),
+            String::from("127.0.0.1:2006"),
+        ])
+        .unwrap();
         let auth = ExecutorTaskAuthConfig::new(true, None);
 
         config.validate_task_auth_startup(&auth).unwrap();
+    }
+
+    /// A listener other machines can reach needs credentials or a stated
+    /// opt-out, whatever the durability profile.
+    #[test]
+    fn an_open_listener_off_loopback_is_refused_without_a_token() {
+        if krishiv_common::truthy_env(krishiv_common::auth_util::ALLOW_ANONYMOUS_ENV) {
+            return;
+        }
+        let config = ExecutorCliConfig::parse([
+            String::from("--task-grpc-addr"),
+            String::from("off"),
+            String::from("--barrier-grpc-addr"),
+            String::from("0.0.0.0:2006"),
+        ])
+        .unwrap();
+
+        let error = config
+            .validate_task_auth_startup(&ExecutorTaskAuthConfig::new(false, None))
+            .unwrap_err();
+        assert!(error.to_string().contains("barrier gRPC"), "{error}");
+
+        let with_token = ExecutorTaskAuthConfig::new(false, Some(String::from("s3cret")));
+        config.validate_task_auth_startup(&with_token).unwrap();
     }
 
     #[test]
