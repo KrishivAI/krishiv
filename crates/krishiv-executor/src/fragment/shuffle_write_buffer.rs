@@ -634,12 +634,19 @@ impl ShuffleWriteBuffer {
             .join(krishiv_shuffle::spill_file_name(seq, index));
         let dir = self.spill_dir.clone();
         let write_path = path.clone();
+        // The run owns (and on drop unlinks) the file from before it exists:
+        // a failed write (ENOSPC) or a cancel that detaches the write must not
+        // leave an unowned spill behind for the life of the executor. The
+        // blocking task holds a clone, so the unlink waits for it to finish.
+        let owner = std::sync::Arc::new(SpillRun { path, rows });
+        let writer_owner = std::sync::Arc::clone(&owner);
 
         // #223: the IPC write is synchronous `std::fs` work with no await of
         // its own. Run inline it would give task cancellation nothing to
         // interrupt for as long as the write takes; `spawn_blocking` gives the
         // awaiting future a real yield point.
         let task = tokio::task::spawn_blocking(move || -> ExecutorResult<()> {
+            let _owner = writer_owner;
             std::fs::create_dir_all(&dir).map_err(|e| io_err("create shuffle spill dir", &e))?;
             let schema = match batches.first() {
                 Some(batch) => batch.schema(),
@@ -672,9 +679,13 @@ impl ShuffleWriteBuffer {
             Ok(())
         });
         task.await.map_err(|e| io_err("shuffle spill join", &e))??;
+        // The write has returned, so this is the only reference left.
+        let run = std::sync::Arc::try_unwrap(owner).map_err(|_| ExecutorError::LocalExecution {
+            message: "shuffle spill still shared after its write finished".into(),
+        })?;
 
         if let Some(runs) = self.spills.get_mut(index) {
-            runs.push(SpillRun { path, rows });
+            runs.push(run);
         }
         if let Some(reservation) = &self.reservation
             && freed > 0

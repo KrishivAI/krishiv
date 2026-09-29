@@ -12,6 +12,7 @@
 //! delivers it to the coordinator in bounded chunks via `PushTaskResult`.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::record_batch::RecordBatch;
@@ -93,6 +94,25 @@ impl Drop for SpooledTaskResult {
     }
 }
 
+/// Owns a spool file while it is being written: dropped before the result is
+/// complete (stream error, write error, cancel, timeout), it deletes the file.
+///
+/// Shared with each `spawn_blocking` write so that when a cancel drops the
+/// draining future mid-write, the delete runs only after the detached write
+/// finishes — deleting first would let that write recreate the file.
+struct PartialSpool {
+    path: PathBuf,
+    handed_off: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for PartialSpool {
+    fn drop(&mut self) {
+        if !self.handed_off.load(Ordering::Acquire) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 // The spool is identified by its unique path; equality on (path, size) keeps
 // ExecutorTaskOutput's PartialEq derivable.
 impl PartialEq for SpooledTaskResult {
@@ -152,18 +172,25 @@ async fn join_blocking<T: Send + 'static>(
 /// live-measured taking the cancel path over 2s past its bound this way.
 /// `spawn_blocking` gives the awaiting future a real yield point: dropping
 /// it (on cancel) detaches from the write immediately rather than waiting
-/// for it, at the cost of an orphaned spool file on that specific abandoned
-/// write — acceptable since spooled files already only live as long as the
-/// (ephemeral, regularly-recycled) executor pod's temp dir.
+/// for it. The partial file is owned by a [`PartialSpool`] shared with the
+/// detached write, so it is deleted once that write finishes.
 pub(crate) async fn drain_stream_with_spool(
+    stream: krishiv_sql::SqlStream,
+    threshold: Option<usize>,
+) -> ExecutorResult<(DrainedResult, DrainedShape)> {
+    drain_stream_with_spool_in(stream, threshold, spool_dir()).await
+}
+
+async fn drain_stream_with_spool_in(
     mut stream: krishiv_sql::SqlStream,
     threshold: Option<usize>,
+    dir: PathBuf,
 ) -> ExecutorResult<(DrainedResult, DrainedShape)> {
     let mut shape = DrainedShape::default();
     let mut buffered: Vec<RecordBatch> = Vec::new();
     let mut buffered_bytes: usize = 0;
     let mut writer: Option<SpoolWriter> = None;
-    let mut spool_path: Option<PathBuf> = None;
+    let mut spool: Option<Arc<PartialSpool>> = None;
 
     while let Some(batch) = stream.next().await {
         let batch = batch.map_err(|e| ExecutorError::LocalExecution {
@@ -176,7 +203,9 @@ pub(crate) async fn drain_stream_with_spool(
         }
 
         if let Some(mut w) = writer.take() {
+            let owner = spool.clone();
             let task = tokio::task::spawn_blocking(move || {
+                let _owner = owner;
                 w.write(&batch)
                     .map_err(|e| io_err("result spool write", &e))?;
                 Ok(w)
@@ -194,10 +223,15 @@ pub(crate) async fn drain_stream_with_spool(
             // Overflow: open the spool and move every buffered batch into it.
             let to_spool = std::mem::take(&mut buffered);
             let seq = SPOOL_SEQ.fetch_add(1, Ordering::Relaxed);
+            let owner = Arc::new(PartialSpool {
+                path: dir.join(format!("executor-{}-{}.arrow-ipc", std::process::id(), seq)),
+                handed_off: std::sync::atomic::AtomicBool::new(false),
+            });
+            spool = Some(Arc::clone(&owner));
+            let dir = dir.clone();
             let task = tokio::task::spawn_blocking(move || {
-                let dir = spool_dir();
                 std::fs::create_dir_all(&dir).map_err(|e| io_err("create result spool dir", &e))?;
-                let path = dir.join(format!("executor-{}-{}.arrow-ipc", std::process::id(), seq));
+                let path = owner.path.clone();
                 let file =
                     std::fs::File::create(&path).map_err(|e| io_err("create result spool", &e))?;
                 let Some(schema) = to_spool.first().map(|b| b.schema()) else {
@@ -213,17 +247,17 @@ pub(crate) async fn drain_stream_with_spool(
                 for b in &to_spool {
                     w.write(b).map_err(|e| io_err("result spool write", &e))?;
                 }
-                Ok((w, path))
+                Ok(w)
             });
-            let (w, path) = join_blocking("result spool overflow join", task).await?;
+            let w = join_blocking("result spool overflow join", task).await?;
             buffered_bytes = 0;
-            spool_path = Some(path);
             writer = Some(w);
         }
     }
 
-    match (writer, spool_path) {
-        (Some(w), Some(path)) => {
+    match (writer, spool) {
+        (Some(w), Some(owner)) => {
+            let path = owner.path.clone();
             let task = tokio::task::spawn_blocking(move || {
                 let mut inner = w
                     .into_inner()
@@ -264,6 +298,9 @@ pub(crate) async fn drain_stream_with_spool(
                     .map(|m| (path, m.len()))
             });
             let (path, total_bytes) = join_blocking("result spool finish join", task).await?;
+            // Complete: ownership moves to the result, which deletes the file
+            // once its chunks have been pushed.
+            owner.handed_off.store(true, Ordering::Release);
             Ok((
                 DrainedResult::Spooled(SpooledTaskResult { path, total_bytes }),
                 shape,
@@ -385,6 +422,34 @@ mod tests {
         let path = spool.path().to_path_buf();
         drop(spool);
         assert!(!path.exists(), "spool must delete on drop");
+    }
+
+    /// M21: a stream error after the spool opened must not leave the partial
+    /// spool on disk — nothing owned it until the result was complete.
+    #[tokio::test]
+    async fn a_failed_drain_leaves_no_spool_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let items: Vec<Result<RecordBatch, krishiv_sql::SqlError>> = vec![
+            Ok(batch(1000)),
+            Ok(batch(1000)),
+            Err(krishiv_sql::SqlError::DataFusion {
+                message: "boom".into(),
+            }),
+        ];
+        let err = drain_stream_with_spool_in(
+            Box::pin(futures::stream::iter(items)),
+            Some(16),
+            dir.path().to_path_buf(),
+        )
+        .await
+        .expect_err("the stream error must fail the drain");
+        assert!(err.to_string().contains("boom"), "{err}");
+        let left: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "partial spool leaked: {left:?}");
     }
 
     #[tokio::test]

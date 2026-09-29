@@ -482,6 +482,11 @@ impl ShuffleStore for LocalDiskShuffleStore {
         // path, so it must stay small.
         let (tx, mut rx) =
             tokio::sync::mpsc::channel::<ShuffleResult<arrow::record_batch::RecordBatch>>(2);
+        // A closed channel alone does not mean "end of stream": executor
+        // cancel and timeout drop this future, which also closes it. The
+        // writer commits only if the producer says it drained the stream.
+        let stream_complete = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_saw_complete = Arc::clone(&stream_complete);
 
         // P0.4: Wrap all blocking filesystem I/O in spawn_blocking so the
         // async executor thread is never stalled by synchronous disk calls.
@@ -544,6 +549,11 @@ impl ShuffleStore for LocalDiskShuffleStore {
                     writer
                         .write(&batch)
                         .map_err(|e| io_err(format!("failed to write Parquet batch: {e}")))?;
+                }
+                if !writer_saw_complete.load(Ordering::Acquire) {
+                    return Err(io_err(
+                        "shuffle write abandoned before the end of its input; nothing committed",
+                    ));
                 }
                 let (tmp_file, hash) = writer
                     .into_inner()
@@ -671,10 +681,15 @@ impl ShuffleStore for LocalDiskShuffleStore {
         {
             use futures::StreamExt as _;
             let mut batches = batches;
+            let mut drained = true;
             while let Some(batch) = batches.next().await {
                 if tx.send(batch).await.is_err() {
+                    drained = false;
                     break;
                 }
+            }
+            if drained {
+                stream_complete.store(true, std::sync::atomic::Ordering::Release);
             }
         }
         // Closing the channel is what ends the writer's receive loop. It must
@@ -1184,6 +1199,54 @@ mod tests {
     /// a `*.tmp.N`, and the only thing that ever removed those was
     /// `cleanup_temp_files` at store construction — i.e. at executor boot,
     /// which is exactly what a node that filled its disk cannot do.
+    /// M20: executor cancel and timeout work by dropping the write future. The
+    /// writer thread then saw a closed channel as end-of-stream and committed a
+    /// truncated partition with a valid checksum sidecar.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_dropped_write_commits_nothing() {
+        let dir = tempdir().unwrap();
+        let store = Arc::new(LocalDiskShuffleStore::new(dir.path()).expect("store"));
+        let partition = id("job-drop", "stage-1", 0);
+        let good = make_batch(&[1, 2, 3]);
+        let schema = good.schema();
+
+        // One batch, then a source that never ends.
+        use futures::StreamExt as _;
+        let items = futures::stream::iter(vec![Ok(good)]).chain(futures::stream::pending());
+        let write = {
+            let (store, partition) = (Arc::clone(&store), partition.clone());
+            tokio::spawn(async move {
+                store
+                    .write_partition_stream(partition, schema, Box::pin(items), 1)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        write.abort();
+        let _ = write.await;
+
+        // The writer thread outlives the dropped future; give it time to
+        // finish whatever it decides.
+        let stage_dir = dir.path().join("job-drop").join("stage-1");
+        for _ in 0..50 {
+            let staging_left = std::fs::read_dir(&stage_dir)
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.file_name().to_string_lossy().contains(".tmp."))
+                })
+                .unwrap_or(false);
+            if !staging_left {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            store.read_partition(&partition).await.unwrap().is_none(),
+            "a cancelled write published a truncated partition"
+        );
+    }
+
     #[tokio::test]
     async fn a_failed_stream_commits_nothing_and_leaves_no_staging_files() {
         let dir = tempdir().unwrap();

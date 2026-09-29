@@ -81,9 +81,12 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
   - fixed 2026-09-28: iterator/restore target consumed only after a successful AWS call; idle shard returns `Ok(None)`; `a_failed_read_keeps_the_shard_position`
 - [x] M19 `krishiv-connectors/src/two_phase.rs:303` local Parquet 2PC: no fsync of tmp or dir
   - fixed 2026-09-28: prepare fsyncs the staging file and dir, commit fsyncs the dir after rename (no crash test possible)
-- [ ] M20 `krishiv-shuffle/src/disk_store.rs:524` dropped writer future commits truncated partition with valid sidecar
-- [ ] M21 `krishiv-executor/src/runner/result_spool.rs:196` partial spool leaked on error/cancel
-- [ ] M22 `krishiv-executor/src/fragment/shuffle_write_buffer.rs:642` failed/cancelled spill file leaked
+- [x] M20 `krishiv-shuffle/src/disk_store.rs:524` dropped writer future commits truncated partition with valid sidecar
+  - fixed 2026-09-28: writer commits only when the producer drained the stream; a dropped future aborts the write; `a_dropped_write_commits_nothing`
+- [x] M21 `krishiv-executor/src/runner/result_spool.rs:196` partial spool leaked on error/cancel
+  - fixed 2026-09-28: `PartialSpool` guard (shared with detached writes) deletes an incomplete spool; `a_failed_drain_leaves_no_spool_file`
+- [x] M22 `krishiv-executor/src/fragment/shuffle_write_buffer.rs:642` failed/cancelled spill file leaked
+  - fixed 2026-09-28: `SpillRun` owns the file before the write starts, shared with the blocking task (no dedicated test)
 - [ ] M23 `krishiv-dataflow/src/window/session.rs:415` single open session per key mishandles admitted out-of-order events
 - [ ] M24 `krishiv-ivm/src/window_rewrite.rs:365` streaming TopN rewrite case-sensitive column compare → rewrites valid SQL
 - [ ] M25 `krishiv-executor/src/fragment/run_loop_classes.rs:377` rjoin/rpipe/rbatch bypass StreamingLoop gate; RunLoop EOS flush
