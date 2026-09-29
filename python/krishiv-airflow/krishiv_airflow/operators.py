@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import json
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Optional, Sequence
 
 
 class KrishivSubmitJobOperator:
-    """Submit a Krishiv job via the CLI (coordinator integration)."""
+    """Submit a Krishiv job via the CLI, run in-process by the CLI.
+
+    ``krishiv submit`` has no remote-submission path: it runs the job inside
+    the CLI process. A ``coordinator_url`` is therefore refused rather than
+    silently ignored — the job would run locally while a sensor watched the
+    coordinator for a job that never arrives there.
+    """
 
     template_fields: Sequence[str] = ("job_id", "job_name")
 
@@ -29,6 +38,12 @@ class KrishivSubmitJobOperator:
         self.xcom_job_id: Optional[str] = None
 
     def execute(self, context: Any) -> str:
+        if self.coordinator_url:
+            raise ValueError(
+                "KrishivSubmitJobOperator cannot submit to a remote coordinator: "
+                "`krishiv submit` runs the job in the CLI process. Submit through "
+                "the coordinator's API instead."
+            )
         cmd = [
             "krishiv",
             "submit",
@@ -40,45 +55,58 @@ class KrishivSubmitJobOperator:
             str(self.tasks),
             "--launch",
         ]
-        if self.coordinator_url:
-            cmd = ["krishiv", "-c", self.coordinator_url, *cmd[1:]]
         subprocess.run(cmd, check=True, capture_output=True, text=True)
         self.xcom_job_id = self.job_id
         return self.job_id
 
 
 class KrishivJobSensor:
-    """Poll job status via `krishiv jobs` until terminal state."""
+    """Poll a job's state on the coordinator until it reaches a terminal state.
+
+    Reads ``GET {coordinator_url}/api/v1/jobs/{job_id}`` and compares the job's
+    own ``state`` field. (It used to scan ``krishiv jobs`` output, which lists
+    only jobs in the CLI's own process, for state names anywhere in the text.)
+    """
 
     def __init__(
         self,
         *,
         job_id: str,
+        coordinator_url: str,
+        token: Optional[str] = None,
         poke_interval: int = 30,
+        timeout_s: float = 30.0,
         success_states: Optional[set[str]] = None,
         failure_states: Optional[set[str]] = None,
         **kwargs: Any,
     ) -> None:
         self.job_id = job_id
+        self.coordinator_url = coordinator_url.rstrip("/")
+        self.token = token
         self.poke_interval = poke_interval
-        self.success_states = success_states or {"Completed", "Succeeded"}
+        self.timeout_s = timeout_s
+        self.success_states = success_states or {"Succeeded"}
         self.failure_states = failure_states or {"Failed", "Cancelled"}
         self.kwargs = kwargs
 
+    def _job_state(self) -> Optional[str]:
+        url = f"{self.coordinator_url}/api/v1/jobs/{urllib.parse.quote(self.job_id, safe='')}"
+        request = urllib.request.Request(url, headers={"Accept": "application/json"})
+        if self.token:
+            request.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_s) as response:
+                body = json.load(response)
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return None  # not visible yet (or already garbage-collected)
+            raise
+        return body.get("state")
+
     def poke(self, context: Any) -> bool:
-        result = subprocess.run(
-            ["krishiv", "jobs"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        output = result.stdout
-        if self.job_id not in output:
+        state = self._job_state()
+        if state is None:
             return False
-        for state in self.success_states:
-            if state in output and self.job_id in output:
-                return True
-        for state in self.failure_states:
-            if state in output and self.job_id in output:
-                raise RuntimeError(f"job {self.job_id} failed with state {state}")
-        return False
+        if state in self.failure_states:
+            raise RuntimeError(f"job {self.job_id} finished in state {state}")
+        return state in self.success_states

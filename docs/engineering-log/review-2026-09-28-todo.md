@@ -113,16 +113,26 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
 
 ## Medium — broken as shipped
 - [ ] M35 `krishiv-scheduler/src/coordinator_daemon.rs:2180` JCP daemon calls unserved `/federation/*`; `deploy/k8s/operator/jcp-pod-template.yaml` bad flags → wire or delete
-- [ ] M36 `krishiv/src/cli.rs:855` `savepoint --label` dropped
-- [ ] M37 `krishiv/src/cli.rs:973` `restore -c` hard-codes `./krishiv-checkpoints`; `from_savepoint` always false
-- [ ] M38 `krishiv/src/cluster_cmd.rs:170` `cluster start` boots clusterd rejecting all RPCs; failed executor spawns hidden
-- [ ] M39 `krishiv-operator/src/reconciler.rs:131` standby acts on deletions (strips finalizer, deletes pods)
-- [ ] M40 `krishiv-operator/src/controller.rs:344` executor pod creation one-shot; launch-failure detection unreachable
-- [ ] M41 `krishiv-python/src/session.rs:1361` `Session.close()` never closes
-- [ ] M42 `krishiv-metrics/src/counters.rs:670` `remove_job` has no production caller → unbounded cardinality
-- [ ] M43 `python/krishiv-airflow/krishiv_airflow/operators.py:68` sensor can never complete
-- [ ] M44 `python/krishiv-dbt-adapter/krishiv_dbt_adapter/impl.py:39` silently no-op without flightsql
-- [ ] M45 `krishiv-runtime/src/flight_client.rs:1452-1512` four `#[ignore]` regression tests with stale reason (register note wrong)
+- [x] M36 `krishiv/src/cli.rs:855` `savepoint --label` dropped
+  - fixed 2026-09-29: remote savepoint sends `--label`; local mode no longer echoes a label it did not apply
+- [x] M37 `krishiv/src/cli.rs:973` `restore -c` hard-codes `./krishiv-checkpoints`; `from_savepoint` always false
+  - fixed 2026-09-29: remote restore requires `--storage-path`; `--savepoint` added (remote only); `remote_restore_requires_an_explicit_storage_path`, `savepoint_restore_needs_a_coordinator`
+- [x] M38 `krishiv/src/cluster_cmd.rs:170` `cluster start` boots clusterd rejecting all RPCs; failed executor spawns hidden
+  - fixed 2026-09-29: clusterd gets rocksdb metadata under the data dir and `--insecure` (the removed `json` backend made it fail too); spawn failures reported; `clusterd_args_parse_and_run_insecure_on_loopback`
+- [x] M39 `krishiv-operator/src/reconciler.rs:131` standby acts on deletions (strips finalizer, deletes pods)
+  - fixed 2026-09-29: a standby returns InactiveCoordinator from the deletion path instead of stripping the finalizer; `a_standby_leaves_deletion_to_the_leader`
+- [x] M40 `krishiv-operator/src/controller.rs:344` executor pod creation one-shot; launch-failure detection unreachable
+  - fixed 2026-09-29: `ensure_executor_pods` on Submitted/Observed/WaitingForExecutors for live jobs: missing pods re-created, launch failures re-checked (no dedicated test: needs a kube mock)
+- [x] M41 `krishiv-python/src/session.rs:1361` `Session.close()` never closes
+  - fixed 2026-09-29: `Session::close_shared(&self)`; Python `close()` uses it; `closing_through_a_shared_handle_releases_shared_state`
+- [x] M42 `krishiv-metrics/src/counters.rs:670` `remove_job` has no production caller → unbounded cardinality
+  - fixed 2026-09-29: coordinator removes per-job metric series when it evicts a finished job; `evicting_a_job_removes_its_metric_series` (mutation-checked). Executor-side `executor_slots_used` still open.
+- [x] M43 `python/krishiv-airflow/krishiv_airflow/operators.py:68` sensor can never complete
+  - fixed 2026-09-29: sensor polls `GET /api/v1/jobs/{id}` and compares the exact `state`; operator refuses `coordinator_url` (CLI has no remote submit)
+- [x] M44 `python/krishiv-dbt-adapter/krishiv_dbt_adapter/impl.py:39` silently no-op without flightsql
+  - fixed 2026-09-29: missing flightsql raises; `dry_run=True` for record-only use
+- [x] M45 `krishiv-runtime/src/flight_client.rs:1452-1512` four `#[ignore]` regression tests with stale reason (register note wrong)
+  - fixed 2026-09-29: four `do_action_*` tests un-ignored (they bind 127.0.0.1:0 like their siblings); justfile line removed
 
 ## Low
 - [ ] L1 `krishiv-scheduler/src/store.rs:1501` terminal latch checked before store lock (resurrection race)

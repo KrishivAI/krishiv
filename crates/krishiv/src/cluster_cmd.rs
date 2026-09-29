@@ -166,32 +166,20 @@ fn cluster_start(args: &[&str]) -> CliResponse {
         Err(e) => return CliResponse::err(e, 2),
     };
     fs::create_dir_all(&data_dir).ok();
-    let metadata_path = data_dir.join("metadata.json");
-    let meta = metadata_path
-        .to_str()
-        .unwrap_or("/tmp/krishiv-metadata.json");
+    let metadata_path = data_dir.join("metadata");
     let http_addr = requested_http_addr.unwrap_or_else(|| DEFAULT_HTTP_ADDR.to_string());
-    let clusterd_pid = match spawn_krishiv_daemon(
-        "clusterd",
-        &[
-            "--grpc-addr",
-            "127.0.0.1:2001",
-            "--http-addr",
-            &http_addr,
-            "--metadata-backend",
-            "json",
-            "--metadata-path",
-            meta,
-        ],
-    ) {
+    let clusterd = clusterd_args(&http_addr, &metadata_path);
+    let clusterd_refs: Vec<&str> = clusterd.iter().map(String::as_str).collect();
+    let clusterd_pid = match spawn_krishiv_daemon("clusterd", &clusterd_refs) {
         Ok(pid) => pid,
         Err(e) => return CliResponse::err(format!("failed to spawn clusterd: {e}"), 1),
     };
     let mut executor_pids = Vec::new();
+    let mut spawn_failures = Vec::new();
     for i in 0..executor_count {
         let (task_addr, barrier_addr) = executor_bind_addrs(i);
         let exec_id = format!("exec-{i}");
-        if let Ok(pid) = spawn_krishiv_daemon(
+        match spawn_krishiv_daemon(
             "executor",
             &[
                 "--connect",
@@ -205,7 +193,8 @@ fn cluster_start(args: &[&str]) -> CliResponse {
                 &barrier_addr,
             ],
         ) {
-            executor_pids.push(pid);
+            Ok(pid) => executor_pids.push(pid),
+            Err(e) => spawn_failures.push(format!("{exec_id}: {e}")),
         }
     }
     let cfg = ClusterConfig {
@@ -219,11 +208,40 @@ fn cluster_start(args: &[&str]) -> CliResponse {
     if let Err(e) = cfg.save() {
         return CliResponse::err(e, 1);
     }
+    let failures = if spawn_failures.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "  executors that failed to start:\n    {}\n",
+            spawn_failures.join("\n    ")
+        )
+    };
     CliResponse::ok(format!(
-        "Krishiv cluster started in {}\n  clusterd: http://127.0.0.1:2001\n  UI: {}\n  executors: {executor_count}\n  export KRISHIV_COORDINATOR=http://127.0.0.1:2001\n",
+        "Krishiv cluster started in {}\n  clusterd: http://127.0.0.1:2001\n  UI: {}\n  executors: {} of {executor_count}\n{failures}  export KRISHIV_COORDINATOR=http://127.0.0.1:2001\n",
         data_dir.display(),
-        cfg.ui_url()
+        cfg.ui_url(),
+        cfg.executor_pids.len(),
     ))
+}
+
+/// Arguments for the local cluster's clusterd.
+///
+/// It binds loopback only and has no auth provider configured, so it runs
+/// `--insecure` like `local start`; without it clusterd rejects every RPC,
+/// executor registration included. Metadata goes to a RocksDB store under
+/// the cluster's data directory (the old `json` backend no longer exists).
+fn clusterd_args(http_addr: &str, metadata_path: &std::path::Path) -> Vec<String> {
+    vec![
+        "--grpc-addr".into(),
+        "127.0.0.1:2001".into(),
+        "--http-addr".into(),
+        http_addr.into(),
+        "--metadata-backend".into(),
+        "rocksdb".into(),
+        "--metadata-path".into(),
+        metadata_path.to_string_lossy().into_owned(),
+        "--insecure".into(),
+    ]
 }
 
 fn cluster_stop(args: &[&str]) -> CliResponse {
@@ -349,6 +367,17 @@ fn cluster_verify_network(args: &[&str]) -> CliResponse {
 #[cfg(test)]
 mod tests {
     use super::{executor_bind_addrs, executor_port_pair};
+
+    /// M38: the arguments `cluster start` gives clusterd must be ones clusterd
+    /// accepts, and must not leave it rejecting every RPC.
+    #[test]
+    fn clusterd_args_parse_and_run_insecure_on_loopback() {
+        let args = super::clusterd_args("127.0.0.1:9090", std::path::Path::new("/tmp/kc/metadata"));
+        assert!(args.iter().any(|a| a == "--insecure"));
+        let config = krishiv_scheduler::parse_coordinator_daemon_config(args)
+            .expect("clusterd must accept the arguments cluster start passes");
+        assert!(config.insecure);
+    }
 
     #[test]
     fn executor_addrs_stride_2_no_collision() {

@@ -1464,7 +1464,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
     async fn do_action_rejects_response_exceeding_size_cap()
     -> Result<(), Box<dyn std::error::Error>> {
         // 40 chunks * 2 MiB = 80 MiB, over the 64 MiB cap while each chunk
@@ -1485,7 +1484,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
     async fn do_action_single_chunk_between_grpc_default_and_app_cap_succeeds()
     -> Result<(), Box<dyn std::error::Error>> {
         // The real server (do_action_fallback) always sends the whole
@@ -1504,7 +1502,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
     async fn do_action_single_chunk_over_app_cap_is_rejected_cleanly()
     -> Result<(), Box<dyn std::error::Error>> {
         // Same one-shot shape as the real server, sized past the 64 MiB app
@@ -1524,7 +1521,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "requires binding a local TCP listener; run with --ignored outside restricted sandboxes"]
     async fn do_action_single_chunk_exceeding_grpc_decode_limit_is_classified_as_too_large()
     -> Result<(), Box<dyn std::error::Error>> {
         // Live testing caught this: a response bigger than

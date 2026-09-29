@@ -205,6 +205,13 @@ pub enum KrishivJobPhase {
     Cancelled,
 }
 
+impl KrishivJobPhase {
+    /// Whether the job has finished (no pods are needed any more).
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
 impl From<JobState> for KrishivJobPhase {
     fn from(value: JobState) -> Self {
         match value {

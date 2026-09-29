@@ -557,6 +557,32 @@ mod operator_tests {
         assert_eq!(outcome.status().phase, KrishivJobPhase::Cancelled);
     }
 
+    /// M39: a standby cannot cancel the job, so it must not strip the
+    /// finalizer (and let its pods be deleted) either — the leader handles it.
+    #[test]
+    fn a_standby_leaves_deletion_to_the_leader() {
+        let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();
+        let reconciler = KrishivJobReconciler::new(coordinator_id.clone());
+        let mut coordinator = demo_coordinator(coordinator_id, 2).unwrap();
+        reconciler
+            .reconcile(&mut coordinator, &sample_resource())
+            .unwrap();
+        coordinator.demote_to_standby();
+
+        let mut resource = sample_resource();
+        resource.metadata.deletion_timestamp = Some(String::from("2026-05-18T00:00:00Z"));
+        let result = reconciler.reconcile(&mut coordinator, &resource);
+        assert!(
+            matches!(
+                result,
+                Err(OperatorError::Scheduler(
+                    krishiv_scheduler::SchedulerError::InactiveCoordinator { .. }
+                ))
+            ),
+            "a standby must not report FinalizerRemoved"
+        );
+    }
+
     #[test]
     fn reconcile_delete_calls_cancel_job_before_removing_finalizer() {
         let coordinator_id = CoordinatorId::try_new("coord-1").unwrap();

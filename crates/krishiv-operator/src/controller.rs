@@ -340,37 +340,8 @@ pub async fn reconcile_dynamic_object_with_runtime(
         }
         ReconcileAction::Submitted => {
             if let Some(ref job_id) = job_id {
-                // BUG-2: Create executor Pods so the scheduler has executors to
-                // assign tasks to.  Without pods, submitted jobs stay permanently
-                // in the WaitingForExecutors state.
-                if let Some(pod_manager) = runtime.pod_manager() {
-                    match pod_manager.create_executor_pods(&resource).await {
-                        Ok(executor_ids) => {
-                            tracing::info!(
-                                job_id = %job_id,
-                                pod_count = executor_ids.len(),
-                                "created executor pods for submitted job"
-                            );
-                            if let Some(failure) = pod_manager
-                                .detect_executor_pod_launch_failure(&resource)
-                                .await
-                            {
-                                let mut coordinator = runtime.coordinator.write().await;
-                                outcome = runtime.reconciler.reconcile_with_executor_pod_failure(
-                                    &mut coordinator,
-                                    &resource,
-                                    Some(failure),
-                                )?;
-                            }
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                job_id = %job_id,
-                                error = %err,
-                                "executor pod creation failed; job will remain WaitingForExecutors"
-                            );
-                        }
-                    }
+                if let Some(failed) = ensure_executor_pods(runtime, &resource, job_id).await? {
+                    outcome = failed;
                 }
                 runtime
                     .reconciler
@@ -381,6 +352,20 @@ pub async fn reconcile_dynamic_object_with_runtime(
                         "dedicated in-process JCP bookkeeping enabled"
                     );
                 }
+            }
+        }
+        // Pod creation used to run once, on Submitted: a failed or partial
+        // create (quota, webhook, API 5xx) was never retried, and launch
+        // failures were checked only before the kubelet could report them.
+        // Every later reconcile of a live job tops up missing pods (creation
+        // is idempotent) and re-checks for launch failures.
+        ReconcileAction::Observed | ReconcileAction::WaitingForExecutors
+            if !outcome.status().phase.is_terminal() =>
+        {
+            if let Some(ref job_id) = job_id
+                && let Some(failed) = ensure_executor_pods(runtime, &resource, job_id).await?
+            {
+                outcome = failed;
             }
         }
         ReconcileAction::FinalizerRemoved => {
@@ -410,6 +395,48 @@ pub async fn reconcile_dynamic_object_with_runtime(
         action: outcome.action(),
         status: outcome.status().clone(),
     })
+}
+
+/// Create any missing executor pods for `resource` and report a launch
+/// failure, if one is visible, as a re-reconciled outcome.
+async fn ensure_executor_pods(
+    runtime: &KubernetesControllerRuntime,
+    resource: &crate::crd::job::KrishivJobResource,
+    job_id: &krishiv_proto::JobId,
+) -> OperatorResult<Option<crate::reconciler::ReconcileOutcome>> {
+    let Some(pod_manager) = runtime.pod_manager() else {
+        return Ok(None);
+    };
+    match pod_manager.create_executor_pods(resource).await {
+        Ok(executor_ids) => {
+            tracing::debug!(
+                job_id = %job_id,
+                pod_count = executor_ids.len(),
+                "executor pods present for job"
+            );
+        }
+        Err(err) => {
+            tracing::warn!(
+                job_id = %job_id,
+                error = %err,
+                "executor pod creation failed; retrying on the next reconcile"
+            );
+        }
+    }
+    let Some(failure) = pod_manager
+        .detect_executor_pod_launch_failure(resource)
+        .await
+    else {
+        return Ok(None);
+    };
+    let mut coordinator = runtime.coordinator.write().await;
+    Ok(Some(
+        runtime.reconciler.reconcile_with_executor_pod_failure(
+            &mut coordinator,
+            resource,
+            Some(failure),
+        )?,
+    ))
 }
 
 /// Reconcile one Kubernetes dynamic object and patch its status.

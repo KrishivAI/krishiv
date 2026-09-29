@@ -852,7 +852,7 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     // Remote coordinator path.
     if let CoordinatorMode::Remote(url) = mode {
         let mut client = RemoteCoordinatorClient::new(url.clone());
-        return match block_on_remote(client.trigger_savepoint(job_id_str)) {
+        return match block_on_remote(client.trigger_savepoint(job_id_str, label_opt.as_deref())) {
             Ok(()) => {
                 let label_display = label_opt.as_deref().unwrap_or("(none)");
                 CliResponse::ok(format!(
@@ -874,7 +874,12 @@ fn run_savepoint(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     };
     match coordinator.trigger_checkpoint_for_job(&job_id) {
         Ok(_) => {
-            let label_display = label_opt.as_deref().unwrap_or("(none)");
+            // A local checkpoint carries no label; say so rather than echo one.
+            let label_display = if label_opt.is_some() {
+                "(not applied: labels need --coordinator)"
+            } else {
+                "(none)"
+            };
             CliResponse::ok(format!(
                 "Savepoint initiated\nJob:   {job_id}\nLabel: {label_display}\n\
                  Note: in local mode the coordinator holds no running jobs.\n"
@@ -908,12 +913,15 @@ pub fn restore_help() -> String {
         "Restore a streaming job from a checkpoint or savepoint.\n\
          \n\
          Usage:\n\
-           krishiv restore --job <JOB_ID> --epoch <N> [--storage-path <PATH>]\n\
+           krishiv restore --job <JOB_ID> --epoch <N> [--storage-path <PATH>] [--savepoint]\n\
          \n\
          Options:\n\
            --job <JOB_ID>          Job ID of the streaming job (required)\n\
            --epoch <N>             Checkpoint epoch to restore from (required)\n\
-           --storage-path <PATH>   Checkpoint storage base path (optional, uses job default)\n\
+           --storage-path <PATH>   Checkpoint storage base path (required with --coordinator;\n\
+                                   locally defaults to ./krishiv-checkpoints)\n\
+           --savepoint             Restore from a savepoint rather than a checkpoint\n\
+                                   (requires --coordinator)\n\
            -h, --help              Show help\n",
     )
 }
@@ -922,6 +930,7 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
     let mut job_id: Option<&str> = None;
     let mut epoch: Option<&str> = None;
     let mut storage_path: Option<&str> = None;
+    let mut from_savepoint = false;
     let mut i = 0;
     while i < args.len() {
         let Some(&arg) = args.get(i) else {
@@ -939,6 +948,10 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
             "--storage-path" if i + 1 < args.len() => {
                 storage_path = args.get(i + 1).copied();
                 i += 2;
+            }
+            "--savepoint" => {
+                from_savepoint = true;
+                i += 1;
             }
             other => {
                 return CliResponse::err(
@@ -969,9 +982,20 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
 
     // Remote coordinator path.
     if let CoordinatorMode::Remote(url) = mode {
+        // The coordinator resolves the path itself: a relative default would
+        // name a directory in ITS working directory, not the job's storage.
+        let Some(path) = storage_path else {
+            return CliResponse::err(
+                format!(
+                    "--storage-path is required with --coordinator (the job's checkpoint \
+                     storage, e.g. s3://bucket/checkpoints)\n\n{}",
+                    restore_help()
+                ),
+                2,
+            );
+        };
         let mut client = RemoteCoordinatorClient::new(url.clone());
-        let path = storage_path.unwrap_or("./krishiv-checkpoints");
-        return match block_on_remote(client.restore(job_id, epoch_num, path)) {
+        return match block_on_remote(client.restore(job_id, epoch_num, path, from_savepoint)) {
             Ok(()) => CliResponse::ok(format!(
                 "Restore requested\nJob:         {job_id}\nEpoch:       {epoch_num}\nCoordinator: {url}\n"
             )),
@@ -979,6 +1003,12 @@ fn run_restore(args: &[&str], mode: &CoordinatorMode) -> CliResponse {
         };
     }
 
+    if from_savepoint {
+        return CliResponse::err(
+            format!("--savepoint needs --coordinator\n\n{}", restore_help()),
+            2,
+        );
+    }
     let path = storage_path.unwrap_or("./krishiv-checkpoints");
     let storage = match LocalFsCheckpointStorage::new(path) {
         Ok(s) => s,
@@ -1460,6 +1490,31 @@ mod tests {
         assert!(response.stdout.contains("restore"));
     }
 
+    /// M37: a remote restore without a path used to send
+    /// `./krishiv-checkpoints`, which resolves in the COORDINATOR's working
+    /// directory, not the job's storage.
+    #[test]
+    fn remote_restore_requires_an_explicit_storage_path() {
+        let response = dispatch(&[
+            "-c",
+            "http://127.0.0.1:9",
+            "restore",
+            "--job",
+            "job-1",
+            "--epoch",
+            "3",
+        ]);
+        assert_eq!(response.exit_code, 2, "{response:?}");
+        assert!(response.stderr.contains("--storage-path"), "{response:?}");
+    }
+
+    #[test]
+    fn savepoint_restore_needs_a_coordinator() {
+        let response = dispatch(&["restore", "--job", "job-1", "--epoch", "3", "--savepoint"]);
+        assert_eq!(response.exit_code, 2, "{response:?}");
+        assert!(response.stderr.contains("coordinator"), "{response:?}");
+    }
+
     #[test]
     fn restore_requires_job_and_epoch() {
         let response = dispatch(&["restore", "--job", "job-1"]);
@@ -1670,6 +1725,8 @@ mod tests {
             "job-rs-1",
             "--epoch",
             "5",
+            "--storage-path",
+            "s3://bucket/checkpoints",
         ]);
         let combined = format!("{} {}", response.stdout, response.stderr);
         assert!(

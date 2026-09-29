@@ -1193,6 +1193,16 @@ impl Session {
     /// can outlive the session object via cloned `Arc<dyn ExecutionRuntime>`
     /// handles held by spawned DataFrames.
     pub fn close(self) {
+        self.close_shared();
+    }
+
+    /// [`Self::close`] through a shared handle.
+    ///
+    /// The registries are shared by every clone of a session, so this releases
+    /// the same state no matter which handle calls it — the Python binding
+    /// holds the session behind an `Arc` it can never own exclusively while a
+    /// DataFrame or stream still references it.
+    pub fn close_shared(&self) {
         // Abort submitted SQL job tasks.
         for entry in self.submitted_sql_job_aborts.iter() {
             entry.value().abort();
@@ -4907,5 +4917,20 @@ mod remote_session_parity_tests {
             "embedded execution resolves the table in process; spilling it to \
              parquet is pure cost"
         );
+    }
+}
+
+#[cfg(test)]
+mod close_shared_tests {
+    use super::Session;
+
+    /// M41: closing through one handle releases the state every clone shares.
+    #[test]
+    fn closing_through_a_shared_handle_releases_shared_state() {
+        let session = Session::builder().build().expect("session");
+        session.set_config("k", "v");
+        let other = session.clone();
+        other.close_shared();
+        assert_eq!(session.get_config("k"), None);
     }
 }

@@ -88,10 +88,14 @@ impl RemoteCoordinatorClient {
     }
 
     /// Trigger a savepoint for the given job on the remote coordinator.
-    pub async fn trigger_savepoint(&mut self, job_id: &str) -> Result<(), RemoteClientError> {
+    pub async fn trigger_savepoint(
+        &mut self,
+        job_id: &str,
+        label: Option<&str>,
+    ) -> Result<(), RemoteClientError> {
         let req = krishiv_proto::wire::v1::TriggerSavepointRequest {
             job_id: job_id.to_owned(),
-            label: String::new(),
+            label: label.unwrap_or_default().to_owned(),
             stop: false,
         };
         let request = self.request(req)?;
@@ -108,12 +112,13 @@ impl RemoteCoordinatorClient {
         job_id: &str,
         epoch: u64,
         storage_path: &str,
+        from_savepoint: bool,
     ) -> Result<(), RemoteClientError> {
         let req = krishiv_proto::wire::v1::RestoreJobRequest {
             job_id: job_id.to_owned(),
             epoch,
             storage_path: storage_path.to_owned(),
-            from_savepoint: false,
+            from_savepoint,
         };
         let request = self.request(req)?;
         let resp = self

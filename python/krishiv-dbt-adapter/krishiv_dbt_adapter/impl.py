@@ -19,25 +19,36 @@ class KrishivCredentials:
 
 
 class KrishivConnection:
-    """Flight SQL connection for dbt (uses flightsql-dbapi when installed)."""
+    """Flight SQL connection for dbt (requires ``flightsql-dbapi``).
 
-    def __init__(self, credentials: KrishivCredentials) -> None:
+    ``dry_run=True`` records statements without a server, for compile-only
+    use. Without it, a missing driver is an error: this used to fall back to
+    recording silently, so ``dbt run`` reported success while nothing ran.
+    """
+
+    def __init__(self, credentials: KrishivCredentials, *, dry_run: bool = False) -> None:
         self.credentials = credentials
         self._queries: list[str] = []
         self._cursor = None
+        self._conn = None
+        if dry_run:
+            return
         try:
             from flightsql import dbapi
-
-            self._conn = dbapi.connect(
-                self.credentials.grpc_target,
-                db_kwargs={
-                    "database": self.credentials.database,
-                    "schema": self.credentials.schema,
-                },
-            )
-            self._cursor = self._conn.cursor()
-        except ImportError:
-            self._conn = None
+        except ImportError as error:
+            raise RuntimeError(
+                "the Krishiv dbt adapter needs the Flight SQL driver: "
+                "pip install flightsql-dbapi (or open with dry_run=True to only "
+                "record statements)"
+            ) from error
+        self._conn = dbapi.connect(
+            self.credentials.grpc_target,
+            db_kwargs={
+                "database": self.credentials.database,
+                "schema": self.credentials.schema,
+            },
+        )
+        self._cursor = self._conn.cursor()
 
     def execute(self, sql: str) -> None:
         self._queries.append(sql)

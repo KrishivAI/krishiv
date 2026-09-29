@@ -1222,6 +1222,10 @@ impl Coordinator {
         }
         self.job_coordinators.remove(job_id);
         self.purge_job_scoped_state(job_id);
+        // Per-job metric series (watermark, checkpoint epoch, per-task
+        // counters, latency histograms) would otherwise live for the life of
+        // the process, one set per job ever run.
+        krishiv_metrics::global_metrics().remove_job(job_id.as_str());
 
         // Retire the durable record too, so the store's live-job set tracks
         // this map instead of accumulating forever. `on_job_terminal` already
@@ -1492,6 +1496,32 @@ mod terminal_id_reuse_tests {
                 "sql: select 1",
             )),
         )
+    }
+
+    /// M42: evicting a finished job drops its per-job metric series.
+    #[test]
+    fn evicting_a_job_removes_its_metric_series() {
+        let mut coordinator = Coordinator::new_active(None)
+            .unwrap()
+            .with_store(InMemoryMetadataStore::default());
+        let job_id = JobId::try_new("job-metrics-m42").unwrap();
+        coordinator
+            .submit_job(single_task_job(&job_id, "t0"))
+            .unwrap();
+        krishiv_metrics::global_metrics().set_watermark_ms(job_id.as_str(), 42);
+        assert!(
+            krishiv_metrics::global_metrics()
+                .render_prometheus()
+                .contains("job-metrics-m42")
+        );
+        coordinator.cancel_job(&job_id).unwrap();
+        coordinator.evict_completed_job(&job_id);
+        assert!(
+            !krishiv_metrics::global_metrics()
+                .render_prometheus()
+                .contains("job-metrics-m42"),
+            "an evicted job's series must not be exported"
+        );
     }
 
     /// M10: cancelling a job that already finished must not rewrite its

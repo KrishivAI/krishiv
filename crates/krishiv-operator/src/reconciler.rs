@@ -136,6 +136,13 @@ impl KrishivJobReconciler {
                 && let Err(error) = coordinator.cancel_job(&job_id)
                 && !matches!(error, SchedulerError::UnknownJob { .. })
             {
+                // A standby cannot cancel the job; if it went on to strip the
+                // finalizer and delete the pods, the leader's scheduler job
+                // would never be cancelled (the Delete event is not watched).
+                // Leave the deletion to the leader.
+                if matches!(error, SchedulerError::InactiveCoordinator { .. }) {
+                    return Err(error.into());
+                }
                 // UnknownJob is expected when the coordinator restarted without
                 // durable state; surface anything else so the operator does
                 // not get stuck in Terminating.

@@ -1348,34 +1348,14 @@ impl PySession {
     ///
     /// .. warning::
     ///
-    ///    The underlying Rust ``Session::close`` takes ownership by value.
-    ///    Because Python sessions are reference-counted, calling ``close()``
-    ///    releases the same registries but does not prevent other references
-    ///    from using the session. For exclusive cleanup, ensure no other
-    ///    references to the session object exist.
+    ///    Other references to the session (DataFrames, stream handles) share
+    ///    its registries, so they see the session closed too.
     pub fn close(&self) -> PyResult<()> {
-        // Clone the Arc and try to unwrap it. If other references exist
-        // (common in Python: DataFrames, StreamJobs, etc.), fall back to
-        // explicitly clearing the Python session's internal registries
-        // without consuming the Arc.
-        match Arc::try_unwrap(self.inner.clone()) {
-            Ok(session) => {
-                // Sole owner — consume and fully tear down server-side state.
-                session.close();
-            }
-            Err(_arc) => {
-                // Multiple references exist (DataFrames, StreamJobs, …). The Rust
-                // `Session::close` takes ownership by value, so we cannot fully
-                // close while other handles are live, and `&self` cannot rebind
-                // `self.inner`. Best-effort: leave the shared session intact for
-                // the other references (as the docstring warns) rather than
-                // silently swapping this handle onto a fresh empty session.
-                tracing::warn!(
-                    "Session.close() called while other references are alive; \
-                     server-side state was not fully released"
-                );
-            }
-        }
+        // The registries are shared by every handle, so closing through this
+        // one releases them even while DataFrames or streams still hold the
+        // session. `Arc::try_unwrap(self.inner.clone())` could never succeed —
+        // `self.inner` itself is a second reference — so this never closed.
+        self.inner.close_shared();
         Ok(())
     }
 
