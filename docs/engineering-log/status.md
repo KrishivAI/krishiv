@@ -1,5 +1,27 @@
 # Krishiv Implementation Status
 
+## 2026-09-29 — review medium items: 43 of 45 fixed (branch `review-fixes-2026-09-28`)
+
+Per-item notes in `docs/engineering-log/review-2026-09-28-todo.md`. Commits:
+security M1–M8 (`2c5b6c7`), scheduler M9–M11 (`c33b3f9`), SQL M13–M16
+(`64ce91c`), connectors/lakehouse M17–M19 + M31–M34 (`8ba6759`),
+executor/shuffle M20–M22 (`0df4787`), streaming M23/M24/M30 (`888926a`),
+state/runtime M26–M29 (`51b163b`), shipped surfaces M36–M45 (`61bdf76`).
+Each fix has a red-then-green test except where noted in the todo file
+(durability/fsync items, M9, M22, M40).
+
+New flags: `KRISHIV_FLIGHT_ALLOW_FILE_SQL` (file SQL over Flight in durable
+profiles), `KRISHIV_MCP_BEARER_TOKEN` (required for a non-loopback MCP HTTP
+bind). Behaviour changes worth knowing: server binaries refuse an unparsable
+`KRISHIV_DURABILITY_PROFILE`; `krishiv restore -c` requires `--storage-path`;
+session windows close only on the watermark; the Airflow sensor needs
+`coordinator_url`; the dbt adapter needs `flightsql-dbapi` (or `dry_run=True`).
+
+Open, need a decision: M25 (rjoin/rpipe/rbatch loops outside the
+StreamingLoop gate — a multi-crate refactor), M35 (JCP daemon calls an
+unserved `/federation` API — wire it or delete the daemon/binary/template),
+H8 remainder (Kafka prepared-transaction recovery).
+
 ## 2026-09-28 — full-tree review; high-priority fixes (branch `review-fixes-2026-09-28`, uncommitted)
 
 Review of all 27 crates found ~80 issues not in the audit register; the list
