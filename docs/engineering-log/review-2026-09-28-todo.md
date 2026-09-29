@@ -87,14 +87,17 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
   - fixed 2026-09-28: `PartialSpool` guard (shared with detached writes) deletes an incomplete spool; `a_failed_drain_leaves_no_spool_file`
 - [x] M22 `krishiv-executor/src/fragment/shuffle_write_buffer.rs:642` failed/cancelled spill file leaked
   - fixed 2026-09-28: `SpillRun` owns the file before the write starts, shared with the blocking task (no dedicated test)
-- [ ] M23 `krishiv-dataflow/src/window/session.rs:415` single open session per key mishandles admitted out-of-order events
-- [ ] M24 `krishiv-ivm/src/window_rewrite.rs:365` streaming TopN rewrite case-sensitive column compare → rewrites valid SQL
+- [x] M23 `krishiv-dataflow/src/window/session.rs:415` single open session per key mishandles admitted out-of-order events
+  - fixed 2026-09-29: multiple open sessions per key, merged when an event bridges them (`AggState::merge`), closed only by the watermark; `session_window_places_admitted_out_of_order_events_correctly`
+- [x] M24 `krishiv-ivm/src/window_rewrite.rs:365` streaming TopN rewrite case-sensitive column compare → rewrites valid SQL
+  - fixed 2026-09-29: identifiers normalised like the planner (unquoted → lowercase); `streaming_topn_compares_names_the_way_the_planner_does`
 - [ ] M25 `krishiv-executor/src/fragment/run_loop_classes.rs:377` rjoin/rpipe/rbatch bypass StreamingLoop gate; RunLoop EOS flush
 - [ ] M26 `krishiv-state/src/dfs_backend.rs:660` DFS restore doesn't delete post-checkpoint records
 - [ ] M27 `krishiv-state/src/dfs_backend.rs:178` DFS write not atomic; torn record decodes OK
 - [ ] M28 `krishiv-runtime/src/flight_client.rs:655` `do_action` retries non-idempotent push/drain after server applied
 - [ ] M29 `krishiv-state/src/checkpoint/io.rs:364` sync manifest validation builds a Tokio runtime per entry on S3
-- [ ] M30 `krishiv-delta/src/snapshot_index.rs:269` Raw arm propagates SchemaMismatch → view stops advancing (error discarded at `krishiv-ivm/src/flow.rs:1324`)
+- [x] M30 `krishiv-delta/src/snapshot_index.rs:269` Raw arm propagates SchemaMismatch → view stops advancing (error discarded at `krishiv-ivm/src/flow.rs:1324`)
+  - fixed 2026-09-29: Raw arm falls back to the whole-snapshot path on SchemaMismatch; the discarded error at flow.rs is now logged; `a_raw_state_accepts_a_drifted_delta`
 - [x] M31 `krishiv-connectors/src/lakehouse/local_delta.rs:157` time travel past latest / negative / pre-creation returns latest
   - fixed 2026-09-28: versions past the log, negative versions and pre-creation timestamps are NotFound; `time_travel_outside_the_log_is_an_error`
 - [x] M32 `krishiv-connectors/src/lakehouse/iceberg_fs.rs:170` metadata-vN.json created then filled (not atomic)

@@ -57,8 +57,9 @@ pub(crate) struct SessionState {
 /// unbounded.
 pub struct SessionWindowOperator {
     spec: SessionWindowSpec,
-    // Keyed by serialised key value.
-    sessions: HashMap<String, SessionState>,
+    // Keyed by serialised key value; each key's open sessions are disjoint
+    // (separated by at least one gap) and sorted by start.
+    sessions: HashMap<String, Vec<SessionState>>,
     prev_watermark_ms: i64,
     /// Total late events dropped by this operator since creation.
     pub late_events_dropped: u64,
@@ -143,7 +144,7 @@ impl SessionWindowOperator {
 
     /// Number of open sessions.
     pub fn open_session_count(&self) -> usize {
-        self.sessions.len()
+        self.sessions.values().map(Vec::len).sum()
     }
 
     /// Persist open sessions to `StateBackend`.
@@ -165,9 +166,14 @@ impl SessionWindowOperator {
 
         let op_id = namespace.operator_id();
         let name = namespace.state_name();
-        let mut state_keys = Vec::with_capacity(self.sessions.len());
-        let mut values = Vec::with_capacity(self.sessions.len());
-        for (key, session) in &self.sessions {
+        let open = self.open_session_count();
+        let mut state_keys = Vec::with_capacity(open);
+        let mut values = Vec::with_capacity(open);
+        let all_sessions = self
+            .sessions
+            .iter()
+            .flat_map(|(key, list)| list.iter().map(move |session| (key, session)));
+        for (key, session) in all_sessions {
             let mut payload = serde_json::json!({
                 "session_start_ms": session.session_start_ms,
                 "last_event_time_ms": session.last_event_time_ms,
@@ -236,7 +242,7 @@ impl SessionWindowOperator {
         backend: &dyn StateBackend,
         namespace: &Namespace,
     ) -> StateResult<()> {
-        let mut restored = HashMap::new();
+        let mut restored: HashMap<String, Vec<SessionState>> = HashMap::new();
         for key_bytes in backend.list_keys(namespace)? {
             if key_bytes.get(..4).is_none_or(|p| p != b"ses:") {
                 continue;
@@ -325,15 +331,15 @@ impl SessionWindowOperator {
                     }
                     agg.distinct = sets;
                 }
-                restored.insert(
-                    key,
-                    SessionState {
-                        session_start_ms,
-                        last_event_time_ms,
-                        agg,
-                    },
-                );
+                restored.entry(key).or_default().push(SessionState {
+                    session_start_ms,
+                    last_event_time_ms,
+                    agg,
+                });
             }
+        }
+        for list in restored.values_mut() {
+            list.sort_by_key(|session| session.session_start_ms);
         }
         self.sessions = restored;
         if let Some(wm) =
@@ -387,21 +393,14 @@ impl SessionWindowOperator {
 
         let late_threshold = self.prev_watermark_ms;
         let gap = i64::try_from(self.spec.session_gap_ms).unwrap_or(i64::MAX);
-        let mut output = Vec::new();
-        // ST-5: collect gap-triggered session closes so they can be emitted as
-        // one multi-row batch rather than one RecordBatch per row.
-        let mut gap_keys: Vec<String> = Vec::new();
-        let mut gap_starts: Vec<i64> = Vec::new();
-        let mut gap_ends: Vec<i64> = Vec::new();
-        let mut gap_states: Vec<AggState> = Vec::new();
 
         // Pre-downcast the aggregate input columns once for the whole batch so
         // the per-row update avoids a `schema().index_of()` + `downcast_ref()`.
         let pre_cols = crate::aggregate::downcast_agg_input_cols(batch, &self.spec.agg_exprs)?;
 
-        // STREAM-2: Sort rows by event time before processing so out-of-order
-        // events within a batch don't trigger premature session closes.
-        // Real sources (Kafka, Kinesis) don't guarantee intra-batch ordering.
+        // STREAM-2: Sort rows by event time before processing. Correctness no
+        // longer depends on it (sessions merge whatever the arrival order),
+        // but in-order arrival merges less.
         let mut row_order: Vec<usize> = (0..batch.num_rows()).collect();
         row_order.sort_unstable_by_key(|&r| time_arr.value(r));
 
@@ -412,58 +411,58 @@ impl SessionWindowOperator {
                 continue;
             }
             let key = extract_agg_key(batch, key_idx, row)?.to_string();
-            if let Some(existing) = self.sessions.get(&key)
-                && event_time_ms >= existing.last_event_time_ms.saturating_add(gap)
-                && let Some(s) = self.sessions.remove(&key)
-            {
-                if let Some(budget) = &self.memory_budget {
-                    budget.release(128);
-                }
-                gap_ends.push(s.last_event_time_ms.saturating_add(gap));
-                gap_starts.push(s.session_start_ms);
-                gap_keys.push(key.clone());
-                gap_states.push(s.agg);
-            }
-            // Reserve memory for a new session entry (~128 bytes for key + state).
-            let is_new_entry = !self.sessions.contains_key(&key);
-            if is_new_entry
-                && let Some(budget) = &self.memory_budget
-                && !budget.try_reserve(128)
-            {
-                return Err(ExecError::Oom(format!(
-                    "session window exceeded memory budget ({} bytes used, limit {} bytes)",
-                    budget.used_bytes(),
-                    budget.limit().unwrap_or(0),
-                )));
-            }
-            let session = self.sessions.entry(key).or_insert_with(|| SessionState {
+
+            // The event's own session, then every open session of this key
+            // within one gap of it merged in: an admitted out-of-order event
+            // can bridge two sessions, and must not stretch one it is more
+            // than a gap away from. Sessions close only when the watermark
+            // passes their end (`flush_closed_sessions`), never because a
+            // later event arrived — an earlier one may still be admitted.
+            let mut merged = SessionState {
                 session_start_ms: event_time_ms,
                 last_event_time_ms: event_time_ms,
                 agg: AggState::new(&self.spec.agg_exprs),
-            });
-            if event_time_ms < session.session_start_ms {
-                session.session_start_ms = event_time_ms;
-            }
-            if event_time_ms > session.last_event_time_ms {
-                session.last_event_time_ms = event_time_ms;
-            }
-            session
+            };
+            merged
                 .agg
                 .update_pre(&self.spec.agg_exprs, &pre_cols, row)?;
+            let list = self.sessions.entry(key).or_default();
+            let mut absorbed = 0usize;
+            let mut kept = Vec::with_capacity(list.len() + 1);
+            for session in list.drain(..) {
+                let touches = event_time_ms < session.last_event_time_ms.saturating_add(gap)
+                    && session.session_start_ms < event_time_ms.saturating_add(gap);
+                if touches {
+                    merged.session_start_ms = merged.session_start_ms.min(session.session_start_ms);
+                    merged.last_event_time_ms =
+                        merged.last_event_time_ms.max(session.last_event_time_ms);
+                    merged.agg.merge(&session.agg, &self.spec.agg_exprs)?;
+                    absorbed += 1;
+                } else {
+                    kept.push(session);
+                }
+            }
+            kept.push(merged);
+            kept.sort_by_key(|session| session.session_start_ms);
+            *list = kept;
+
+            // Budget: ~128 bytes per open session.
+            if let Some(budget) = &self.memory_budget {
+                if absorbed == 0 {
+                    if !budget.try_reserve(128) {
+                        return Err(ExecError::Oom(format!(
+                            "session window exceeded memory budget ({} bytes used, limit {} bytes)",
+                            budget.used_bytes(),
+                            budget.limit().unwrap_or(0),
+                        )));
+                    }
+                } else if absorbed > 1 {
+                    budget.release(128 * (absorbed as u64 - 1));
+                }
+            }
         }
 
-        // Emit gap-triggered session closes as one multi-row batch (ST-5).
-        if !gap_keys.is_empty() {
-            let key_refs: Vec<&str> = gap_keys.iter().map(String::as_str).collect();
-            let state_refs: Vec<&AggState> = gap_states.iter().collect();
-            output.push(self.build_multi_row_output_batch(
-                &key_refs,
-                &gap_starts,
-                &gap_ends,
-                &state_refs,
-            )?);
-        }
-
+        let mut output = Vec::new();
         if new_watermark_ms >= self.prev_watermark_ms {
             self.prev_watermark_ms = new_watermark_ms;
         }
@@ -480,26 +479,22 @@ impl SessionWindowOperator {
         // Use saturating_add to prevent i64 overflow when last_event_time_ms is
         // near i64::MAX (e.g. from a malformed event).  An overflow would wrap
         // to a negative value, making every session appear closed spuriously.
-        let mut closed: Vec<String> = self
+        let is_closed =
+            |session: &SessionState| session.last_event_time_ms.saturating_add(gap) <= watermark_ms;
+        let mut closed: Vec<(&String, &SessionState)> = self
             .sessions
             .iter()
-            .filter(|(_, v)| v.last_event_time_ms.saturating_add(gap) <= watermark_ms)
-            .map(|(k, _)| k.clone())
+            .flat_map(|(key, list)| list.iter().map(move |session| (key, session)))
+            .filter(|(_, session)| is_closed(session))
             .collect();
         if closed.is_empty() {
             return Ok(vec![]);
         }
         // Sort by (session_start_ms, key) for determinism.
-        closed.sort_by(|a, b| {
-            let sa = self
-                .sessions
-                .get(a)
-                .map_or(i64::MIN, |s| s.session_start_ms);
-            let sb = self
-                .sessions
-                .get(b)
-                .map_or(i64::MIN, |s| s.session_start_ms);
-            sa.cmp(&sb).then(a.cmp(b))
+        closed.sort_by(|(ka, a), (kb, b)| {
+            a.session_start_ms
+                .cmp(&b.session_start_ms)
+                .then_with(|| ka.cmp(kb))
         });
         let mut keys = Vec::with_capacity(closed.len());
         let mut starts = Vec::with_capacity(closed.len());
@@ -507,24 +502,22 @@ impl SessionWindowOperator {
         let mut states = Vec::with_capacity(closed.len());
         // STREAM-8: Build the output batch BEFORE removing sessions from state.
         // If batch construction fails, sessions must remain so they aren't lost.
-        for key in &closed {
-            if let Some(s) = self.sessions.get(key) {
-                ends.push(s.last_event_time_ms.saturating_add(gap));
-                starts.push(s.session_start_ms);
-                keys.push(key.clone());
-                states.push(s.agg.clone());
-            }
+        for (key, session) in &closed {
+            ends.push(session.last_event_time_ms.saturating_add(gap));
+            starts.push(session.session_start_ms);
+            keys.push((*key).clone());
+            states.push(&session.agg);
         }
-        let state_refs: Vec<&AggState> = states.iter().collect();
         let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-        let batch = self.build_multi_row_output_batch(&key_refs, &starts, &ends, &state_refs)?;
+        let batch = self.build_multi_row_output_batch(&key_refs, &starts, &ends, &states)?;
         // Only now that the batch is built, remove the closed sessions.
-        for key in &closed {
-            if self.sessions.remove(key).is_some()
-                && let Some(budget) = &self.memory_budget
-            {
-                budget.release(128);
-            }
+        let removed = closed.len() as u64;
+        for list in self.sessions.values_mut() {
+            list.retain(|session| !is_closed(session));
+        }
+        self.sessions.retain(|_, list| !list.is_empty());
+        if let Some(budget) = &self.memory_budget {
+            budget.release(128 * removed);
         }
         Ok(vec![batch])
     }

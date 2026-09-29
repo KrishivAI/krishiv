@@ -578,6 +578,50 @@ impl AggState {
     /// [`downcast_agg_input_cols`]. Equivalent to [`update`](Self::update) but
     /// without the per-row `index_of` / `downcast_ref` cost — this is the path
     /// the streaming window operators take on their hot loop.
+    /// Fold `other` (state over a disjoint set of rows) into `self`, as if
+    /// every row `other` saw had been fed here. Used when two session windows
+    /// merge because an event bridged the gap between them.
+    pub(crate) fn merge(&mut self, other: &AggState, agg_exprs: &[AggExpr]) -> ExecResult<()> {
+        for (i, expr) in agg_exprs.iter().enumerate() {
+            let (Some(entry), Some(theirs)) = (self.entries.get_mut(i), other.entries.get(i))
+            else {
+                return Err(ExecError::InvalidInput(format!(
+                    "agg state index {i} out of range while merging"
+                )));
+            };
+            let overflow = || ExecError::InvalidInput("aggregate overflow while merging".into());
+            match expr.function {
+                AggFunction::CountDistinct => {
+                    if let (Some(set), Some(their_set)) =
+                        (self.distinct.get_mut(i), other.distinct.get(i))
+                    {
+                        set.extend(their_set.iter().cloned());
+                        entry.value = i64::try_from(set.len()).map_err(|_| overflow())?;
+                    }
+                }
+                AggFunction::Count | AggFunction::Sum => {
+                    entry.value = entry.value.checked_add(theirs.value).ok_or_else(overflow)?;
+                    entry.float_value += theirs.float_value;
+                }
+                AggFunction::Min => {
+                    entry.value = entry.value.min(theirs.value);
+                    entry.float_value = entry.float_value.min(theirs.float_value);
+                }
+                AggFunction::Max => {
+                    entry.value = entry.value.max(theirs.value);
+                    entry.float_value = entry.float_value.max(theirs.float_value);
+                }
+                AggFunction::Avg | AggFunction::Stddev => {
+                    entry.avg_sum += theirs.avg_sum;
+                    entry.avg_count += theirs.avg_count;
+                    entry.sq_sum += theirs.sq_sum;
+                }
+            }
+            entry.has_value |= theirs.has_value;
+        }
+        Ok(())
+    }
+
     pub(crate) fn update_pre(
         &mut self,
         agg_exprs: &[AggExpr],

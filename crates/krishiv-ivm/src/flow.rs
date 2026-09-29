@@ -1329,7 +1329,12 @@ impl IncrementalFlow {
                 }
                 // The caller supplied this delta; nothing advanced the diff
                 // baseline for it, so it must advance here (IVM-AUD-CORE-18).
-                let _ = view.apply_output_delta(&delta);
+                if let Err(error) = view.apply_output_delta(&delta) {
+                    // Not fatal to the step, but the view's snapshot and diff
+                    // baseline did not advance; a silent drop here once hid a
+                    // view that stopped updating for good.
+                    tracing::warn!(%error, "failed to apply a caller-supplied view delta");
+                }
             }
         }
         Ok(StepSummary {

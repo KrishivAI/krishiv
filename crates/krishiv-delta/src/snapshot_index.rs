@@ -267,9 +267,16 @@ impl ViewState {
                 // schema the row format cannot encode stays Raw and keeps the
                 // old behaviour.
                 if let Some(mut idx) = SnapshotIndex::from_batch(prev.schema(), prev) {
-                    let clamped = idx.apply(delta)?;
-                    *self = Self::Indexed(idx);
-                    return Ok(clamped);
+                    match idx.apply(delta) {
+                        Ok(clamped) => {
+                            *self = Self::Indexed(idx);
+                            return Ok(clamped);
+                        }
+                        // Drifted delta: stay Raw and take the whole-snapshot
+                        // path, exactly as the Indexed arm falls back.
+                        Err(DeltaError::SchemaMismatch(_)) => {}
+                        Err(other) => return Err(other),
+                    }
                 }
                 let updated = crate::operators::stream::apply_delta(Some(prev.clone()), delta)?;
                 let clamped = clamped_rows(Some(prev), delta, &updated);
@@ -328,4 +335,36 @@ fn clamped_rows(prev: Option<&RecordBatch>, delta: &DeltaBatch, updated: &Record
     }
     let clamped = (updated.num_rows() as i64).saturating_sub(expected).max(0);
     u64::try_from(clamped).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+    use arrow::array::Int64Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    fn batch(nullable: bool, values: &[i64]) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "v",
+            DataType::Int64,
+            nullable,
+        )]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values.to_vec()))]).unwrap()
+    }
+
+    /// M30: once a view's state is Raw through schema drift, a later drifted
+    /// delta must still apply (the Indexed arm already falls back); the Raw
+    /// arm returned the mismatch, and the flow dropped every later tick.
+    #[test]
+    fn a_raw_state_accepts_a_drifted_delta() {
+        let mut state = ViewState::Raw(batch(false, &[1]));
+        let drifted = DeltaBatch::from_inserts(batch(true, &[2])).unwrap();
+        let schema = batch(false, &[]).schema();
+        state.apply(&schema, &drifted).expect("first drifted delta");
+        state
+            .apply(&schema, &drifted)
+            .expect("second drifted delta");
+        assert_eq!(state.batch().unwrap().unwrap().num_rows(), 3);
+    }
 }

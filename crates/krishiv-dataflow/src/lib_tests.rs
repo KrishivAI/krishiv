@@ -750,6 +750,52 @@ fn session_window_closes_after_gap() {
     assert_eq!(cnt, 2);
 }
 
+/// M23: an out-of-order event that is still admitted (not late) must land in
+/// the session it belongs to. With one open session per key it was merged into
+/// whatever session was open (stretching it backwards across the gap), and a
+/// later event closed the previous session before the watermark passed it.
+#[test]
+fn session_window_places_admitted_out_of_order_events_correctly() {
+    let spec = SessionWindowSpec {
+        session_gap_ms: 100,
+        ..session_spec()
+    };
+    let mut op = SessionWindowOperator::new(spec);
+    let mut out = Vec::new();
+    // Watermark lags far behind, so every event below is admitted.
+    for ts in [1000, 1300, 1050] {
+        out.extend(
+            op.process_batch(&make_stream_batch_i64(vec!["a"], vec![ts], vec![1]), 0)
+                .unwrap(),
+        );
+    }
+    assert!(
+        out.is_empty(),
+        "no session may close before the watermark passes it"
+    );
+    out.extend(
+        op.process_batch(&make_stream_batch_i64(vec![], vec![], vec![]), 10_000)
+            .unwrap(),
+    );
+    let mut sessions: Vec<(i64, i64, i64)> = Vec::new();
+    for b in &out {
+        let col = |name: &str| {
+            b.column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone()
+        };
+        let (start, end, cnt) = (col("session_start_ms"), col("session_end_ms"), col("cnt"));
+        for i in 0..b.num_rows() {
+            sessions.push((start.value(i), end.value(i), cnt.value(i)));
+        }
+    }
+    sessions.sort();
+    assert_eq!(sessions, vec![(1000, 1150, 2), (1300, 1400, 1)]);
+}
+
 #[test]
 fn session_window_separate_keys_independent() {
     let mut op = SessionWindowOperator::new(session_spec());

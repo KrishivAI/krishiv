@@ -300,11 +300,21 @@ pub fn rewrite_streaming_topn(sql: &str) -> Option<String> {
     {
         return None;
     }
-    // A bare (possibly qualified) column reference, by its unqualified name.
+    // A bare (possibly qualified) column reference, by its unqualified name,
+    // normalised as the planner resolves it: unquoted identifiers fold to
+    // lower case, quoted ones are exact. Comparing raw text made `Auction`
+    // and `auction` different columns and claimed valid grouped SQL.
+    let normalise = |id: &sqlparser::ast::Ident| {
+        if id.quote_style.is_some() {
+            id.value.clone()
+        } else {
+            id.value.to_ascii_lowercase()
+        }
+    };
     let bare_name = |e: &SqlExpr| -> Option<String> {
         match e {
-            SqlExpr::Identifier(id) => Some(id.value.clone()),
-            SqlExpr::CompoundIdentifier(ids) => ids.last().map(|id| id.value.clone()),
+            SqlExpr::Identifier(id) => Some(normalise(id)),
+            SqlExpr::CompoundIdentifier(ids) => ids.last().map(normalise),
             _ => None,
         }
     };
@@ -628,6 +638,28 @@ mod tests {
         // No window marker in the GROUP BY: not the streaming idiom.
         assert!(
             rewrite_streaming_topn("SELECT a, b FROM t GROUP BY a ORDER BY b LIMIT 1").is_none()
+        );
+    }
+
+    /// M24: `Auction` and `auction` name the same column once unquoted
+    /// identifiers are normalised, so this is valid, fully grouped SQL — not
+    /// the ranking idiom. Rewriting it returned raw rows per group.
+    #[test]
+    fn streaming_topn_compares_names_the_way_the_planner_does() {
+        assert!(
+            rewrite_streaming_topn(
+                "SELECT Auction, window_start, window_end FROM b \
+             GROUP BY auction, window_start, window_end ORDER BY auction LIMIT 3"
+            )
+            .is_none()
+        );
+        // Quoted identifiers are exact, so "Auction" and auction differ.
+        assert!(
+            rewrite_streaming_topn(
+                "SELECT \"Auction\", window_start FROM b \
+             GROUP BY auction, window_start, window_end ORDER BY auction LIMIT 3"
+            )
+            .is_some()
         );
     }
 
