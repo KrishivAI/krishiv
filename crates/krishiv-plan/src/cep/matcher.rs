@@ -32,11 +32,12 @@ pub struct PartialMatch {
 /// Per-key CEP state.
 ///
 /// `Serialize`/`Deserialize` (via `serde`) allow per-key state to be
-/// snapshotted by the checkpoint coordinator. The `partial` field is
-/// not serialised directly because `RecordBatch` does not implement
-/// `Serialize`; the metadata captured in the separate
-/// `captured_event_count` field on `PartialMatch` is enough to recover
-/// the partial state from a replay log on restart.
+/// snapshotted by the checkpoint coordinator. The `partial` field is NOT
+/// serialised (`RecordBatch` does not implement `Serialize`) and nothing
+/// replays the events it held, so a restore drops every in-flight partial
+/// match: a pattern that had started before the checkpoint can only match
+/// again from events after the restore. Durable partial matches would need
+/// the captured events themselves persisted.
 #[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CepKeyState {
     #[serde(skip)]

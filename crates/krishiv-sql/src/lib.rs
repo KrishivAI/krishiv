@@ -126,7 +126,6 @@ pub mod spark_sql_ext;
 pub mod spillable_join;
 pub mod sqlstate;
 pub mod subquery;
-pub mod unnest_sql;
 pub mod unspillable_headroom;
 
 pub mod ann_rewrite;

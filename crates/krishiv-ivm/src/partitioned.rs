@@ -211,7 +211,7 @@ impl PartitionedIncrementalFlow {
         match memo.as_ref() {
             Some((seen_class, seen_type)) if *seen_class != class => {
                 Err(IvmError::execution(format!(
-                    "key column '{}' was routed as {seen_type} and this feed carries                      {data_type}; the two hash differently, so the same key would land                      in two shards. Cast the source to one key type.",
+                    "key column '{}' was routed as {seen_type} and this feed carries {data_type}; the two hash differently, so the same key would land in two shards. Cast the source to one key type.",
                     self.key_column
                 )))
             }
@@ -2234,7 +2234,7 @@ mod tests {
             let h = provenance_hash_of_insert(&batch, row);
             assert!(
                 part.query_provenance(h).unwrap().is_some(),
-                "row {row} was fed to some shard; its provenance must be queryable                  through the partitioned flow"
+                "row {row} was fed to some shard; its provenance must be queryable through the partitioned flow"
             );
         }
 

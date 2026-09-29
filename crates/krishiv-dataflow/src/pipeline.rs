@@ -287,6 +287,84 @@ impl JoinAggPipeline {
         }
         Ok(carried)
     }
+
+    /// Tick stages `[from..to)` with the wall clock, cascading: what one
+    /// stage closes is fed to the next before that one ticks.
+    fn tick_stage_range(
+        &mut self,
+        from: usize,
+        to: usize,
+        wall_clock_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let mut carried: Vec<RecordBatch> = Vec::new();
+        for stage in self.stages.iter_mut().take(to).skip(from) {
+            let mut out = if carried.is_empty() {
+                Vec::new()
+            } else {
+                let input = Self::coerce_for(stage, std::mem::take(&mut carried))?;
+                stage.drain(input)?
+            };
+            out.extend(stage.tick(wall_clock_ms)?);
+            carried = out;
+        }
+        Ok(carried)
+    }
+
+    /// Split-phase tick of the join-co-located stages `[..split]`; like
+    /// [`Self::flush_pre_split`], the output is for the EXCHANGE.
+    ///
+    /// # Errors
+    /// Propagates stage errors.
+    pub fn tick_pre_split(
+        &mut self,
+        split: usize,
+        wall_clock_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        self.tick_stage_range(0, split, wall_clock_ms)
+    }
+
+    /// Split-phase tick of the post-exchange stages `[split..]`.
+    ///
+    /// # Errors
+    /// Propagates stage errors.
+    pub fn tick_post_split(
+        &mut self,
+        split: usize,
+        wall_clock_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        let stages = self.stages.len();
+        self.tick_stage_range(split, stages, wall_clock_ms)
+    }
+}
+
+impl crate::stream_driver::TwoInputStep for JoinAggPipeline {
+    fn step_left(&mut self, batch: &RecordBatch) -> ExecResult<Vec<RecordBatch>> {
+        self.on_left(batch)
+    }
+    fn step_right(&mut self, batch: &RecordBatch) -> ExecResult<Vec<RecordBatch>> {
+        self.on_right(batch)
+    }
+    fn advance_watermark(&mut self, watermark_ms: i64) {
+        JoinAggPipeline::advance_watermark(self, watermark_ms);
+    }
+    fn buffered_rows(&self) -> usize {
+        self.join.active_key_count()
+    }
+}
+
+impl crate::stream_driver::PipelineStep for JoinAggPipeline {
+    fn tick(&mut self, wall_clock_ms: i64) -> ExecResult<Vec<RecordBatch>> {
+        let stages = self.stages.len();
+        self.tick_stage_range(0, stages, wall_clock_ms)
+    }
+    fn flush(&mut self) -> ExecResult<Vec<RecordBatch>> {
+        self.flush_all()
+    }
+    fn has_open_windows(&self) -> bool {
+        self.stages
+            .iter()
+            .any(ContinuousWindowExecutor::has_open_windows)
+    }
 }
 
 #[cfg(test)]

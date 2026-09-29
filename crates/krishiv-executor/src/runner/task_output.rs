@@ -513,9 +513,6 @@ pub struct ShuffleContext {
     /// asserts the collision and will fail the moment task identity is added —
     /// invert it into a correctness check then, and only then set this.
     pub ess_index: Option<krishiv_shuffle::SortShuffleIndex>,
-    /// T12: optional push-shuffle store — when set, each partition's IPC bytes
-    /// are also pushed here so reduce-side tasks can read without a Flight hop.
-    pub push_store: Option<std::sync::Arc<krishiv_shuffle::PushShuffleStore>>,
 }
 
 impl fmt::Debug for ShuffleContext {

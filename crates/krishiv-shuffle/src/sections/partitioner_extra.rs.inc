@@ -296,7 +296,6 @@ async fn http_shuffle_svc_token_auth_enforced() {
         store,
         token: Arc::new(std::sync::RwLock::new(Some("secure-api-key".to_owned()))),
         ess_index: crate::shuffle_svc::SortShuffleIndex::new(),
-        push_store: crate::push_shuffle::PushShuffleStore::new(),
     };
     let app = axum::Router::new()
         .route(

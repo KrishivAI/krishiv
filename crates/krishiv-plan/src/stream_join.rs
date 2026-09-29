@@ -187,12 +187,12 @@ impl StreamingPipelineSpec {
         for (index, stage) in self.stages.iter().enumerate().skip(split) {
             if stage.key_is_synthetic || !stage.key_parts.is_empty() {
                 return Err(format!(
-                    "stage {index} groups by a composite or synthetic key after the                      re-key point (stage {split}); a single exchange cannot co-locate it"
+                    "stage {index} groups by a composite or synthetic key after the re-key point (stage {split}); a single exchange cannot co-locate it"
                 ));
             }
             if stage.key_column != exchange_key {
                 return Err(format!(
-                    "stage {index} groups by '{}' but the re-key point (stage {split})                      exchanges by '{exchange_key}'; one exchange cannot serve both",
+                    "stage {index} groups by '{}' but the re-key point (stage {split}) exchanges by '{exchange_key}'; one exchange cannot serve both",
                     stage.key_column
                 ));
             }

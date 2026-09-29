@@ -24,7 +24,7 @@
 //!
 //! - `LATERAL VIEW explode(x)` produced `explode(x)`, which is neither a
 //!   DataFusion function nor registered by this engine. It now emits `UNNEST`,
-//!   matching what [`crate::unnest_sql`] produces for the same shape.
+//!   which DataFusion plans natively.
 //! - `SHOW TBLPROPERTIES` produced a query against
 //!   `information_schema.table_properties`, which DataFusion does not define,
 //!   and interpolated the table name unescaped. It now reports the feature as
@@ -124,9 +124,8 @@ fn rewrite_lateral_view_at(sql: &str, pos: usize, keyword: &str, is_outer: bool)
     let rest = &sql[pos + consumed..];
 
     // Spark's generator functions are spelled `explode`/`posexplode`; neither
-    // exists in DataFusion. `UNNEST` is the equivalent and is what
-    // `unnest_sql::rewrite_lateral_unnest` emits for the same shape, so the two
-    // Spark-compat paths agree on one target.
+    // exists in DataFusion. `UNNEST` is the equivalent, which DataFusion plans
+    // natively.
     let func_call = &spark_generator_to_unnest(func_call);
 
     let join_type = if is_outer {

@@ -54,7 +54,17 @@ fn node_op_to_fragment(op: &NodeOp) -> Option<String> {
                         return None;
                     }
                 }
-                let where_clause = filters.join(" AND ");
+                // Each filter is its own predicate: parenthesise before joining,
+                // or a top-level OR in one regroups with its neighbours.
+                let where_clause = if let [only] = filters.as_slice() {
+                    only.clone()
+                } else {
+                    filters
+                        .iter()
+                        .map(|f| format!("({f})"))
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
+                };
                 format!("SELECT * FROM {quoted} WHERE {where_clause}")
             };
             Some(format!("sql:{sql}"))
@@ -124,6 +134,20 @@ mod tests {
 
     use crate::ExecutionKind;
 
+    /// L12: AND binds tighter than OR, so joining `a = 1 OR b = 2` and
+    /// `c = 3` unparenthesised meant `a = 1 OR (b = 2 AND c = 3)`.
+    #[test]
+    fn scan_filters_keep_their_own_grouping() {
+        let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
+            table: String::from("t"),
+            filters: vec![String::from("a = 1 OR b = 2"), String::from("c = 3")],
+        });
+        assert_eq!(
+            encode_task_fragment(&node),
+            "sql:SELECT * FROM \"t\" WHERE (a = 1 OR b = 2) AND (c = 3)"
+        );
+    }
+
     #[test]
     fn scan_table_is_double_quoted_in_fragment() {
         let node = PlanNode::new("scan", "scan", ExecutionKind::Batch).with_op(NodeOp::Scan {
@@ -167,7 +191,7 @@ mod tests {
         let frag = encode_task_fragment(&node);
         assert_eq!(
             frag,
-            "sql:SELECT * FROM \"orders\" WHERE amount > 100 AND status = 'active'"
+            "sql:SELECT * FROM \"orders\" WHERE (amount > 100) AND (status = 'active')"
         );
     }
 

@@ -37,7 +37,6 @@ enforced in the store, not by the scheduler's belief about who is alive.
 | `LocalDiskShuffleStore` | local Parquet/IPC files | `single-node-durable` | streaming writes; page-cache eviction after durable write |
 | `ObjectStoreShuffleStore` | S3/GCS/Azure/local via `object_store` | remote tier | BLAKE3 content hash verified on read |
 | `TieredShuffleStore` | local + object store | `distributed-durable` | write acknowledged only after **both** tiers commit; read local first, fall back to remote on miss *or* on `ContentHashMismatch` |
-| `PushShuffleStore` | memory, bounded by `KRISHIV_SHUFFLE_STORE_BYTES` | any | map output pushed to the reducer's executor ahead of the read |
 
 `open_shuffle_backend_from_uri` (`storage_uri.rs`) selects a backend from
 `KRISHIV_SHUFFLE_URI` (`memory://`, `file:///path`, `s3://bucket/prefix`,

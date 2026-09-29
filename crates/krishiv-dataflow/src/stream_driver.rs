@@ -239,6 +239,19 @@ pub enum StreamingLoop {
     /// unmatched buffered events that will never produce output, which is not
     /// an open window.
     EmbeddedJoinBounded,
+    /// `execute_rjoin_fragment` — long-lived distributed two-input join
+    /// (`stream:rjoin:`). The join semantics of [`Self::EmbeddedJoinBounded`]
+    /// with a run-loop's lifecycle: cancelled, never exhausted.
+    RunLoopJoin,
+    /// `execute_rpipe_fragment` — long-lived distributed join → windowed-stage
+    /// pipeline (`stream:rpipe:`). Its stages hold windows, so it needs the
+    /// wall-clock tick a quiet source otherwise never gives them, and the
+    /// coordinator's end-of-stream directive flushes them.
+    RunLoopPipeline,
+    /// `execute_rbatch_fragment` — long-lived stateless per-batch query
+    /// (`stream:rbatch:`). No windows, no join state, no key routing: every
+    /// axis is "nothing to decide", which is still an answer.
+    RunLoopStateless,
 }
 
 impl StreamingLoop {
@@ -257,7 +270,7 @@ impl StreamingLoop {
     /// The residual exposure is a policy that contradicts itself in a loop
     /// nobody listed, which the cross-loop corpus would still catch the moment
     /// it changed output.
-    pub const VARIANT_COUNT: usize = 6;
+    pub const VARIANT_COUNT: usize = 9;
 
     /// Every variant, in [`StreamingLoop::ordinal`] order.
     pub const ALL: &'static [StreamingLoop] = &[
@@ -267,6 +280,9 @@ impl StreamingLoop {
         StreamingLoop::Cycle,
         StreamingLoop::RunLoop,
         StreamingLoop::EmbeddedJoinBounded,
+        StreamingLoop::RunLoopJoin,
+        StreamingLoop::RunLoopPipeline,
+        StreamingLoop::RunLoopStateless,
     ];
 
     /// This loop's answers.
@@ -321,9 +337,12 @@ impl StreamingLoop {
             },
             // Long-lived and cancelled rather than completed. Coerces its own
             // input before routing, so the driver must not cast a second time.
+            // Flushes only when the coordinator's `stream-eos` directive says
+            // the input is over (the executor's EOS handler); a plain cancel
+            // does not flush — its open windows are partial.
             StreamingLoop::RunLoop => DriverPolicy {
                 idle_tick: IdleTick::WallClock,
-                end_of_stream: EndOfStream::NoFlush,
+                end_of_stream: EndOfStream::FlushOnDirective,
                 input_typing: InputTyping::PreCoerced,
                 lifecycle: Lifecycle::LongLived,
                 egress: Egress::CappedDropOldest,
@@ -343,6 +362,38 @@ impl StreamingLoop {
                 egress: Egress::Backpressure,
                 null_key: NullKey::Fatal,
             },
+            // The bounded join's answers, long-lived: matches emit on arrival,
+            // the residue is unmatched events (nothing to flush), and a NULL
+            // join key can never match, so it is a data defect.
+            StreamingLoop::RunLoopJoin => DriverPolicy {
+                idle_tick: IdleTick::None,
+                end_of_stream: EndOfStream::NoFlush,
+                input_typing: InputTyping::PreCoerced,
+                lifecycle: Lifecycle::LongLived,
+                egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
+            },
+            // Windowed stages behind a join: wall-clock ticks close session and
+            // processing-time windows on a quiet source; the EOS directive
+            // flushes them. Join input arrives pre-typed (the stages coerce
+            // their own input inside the pipeline).
+            StreamingLoop::RunLoopPipeline => DriverPolicy {
+                idle_tick: IdleTick::WallClock,
+                end_of_stream: EndOfStream::FlushOnDirective,
+                input_typing: InputTyping::PreCoerced,
+                lifecycle: Lifecycle::LongLived,
+                egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
+            },
+            // Stateless: nothing to tick, nothing to flush, nothing keyed.
+            StreamingLoop::RunLoopStateless => DriverPolicy {
+                idle_tick: IdleTick::None,
+                end_of_stream: EndOfStream::NoFlush,
+                input_typing: InputTyping::PreCoerced,
+                lifecycle: Lifecycle::LongLived,
+                egress: Egress::Backpressure,
+                null_key: NullKey::Fatal,
+            },
         }
     }
 
@@ -359,6 +410,9 @@ impl StreamingLoop {
             StreamingLoop::Cycle => 3,
             StreamingLoop::RunLoop => 4,
             StreamingLoop::EmbeddedJoinBounded => 5,
+            StreamingLoop::RunLoopJoin => 6,
+            StreamingLoop::RunLoopPipeline => 7,
+            StreamingLoop::RunLoopStateless => 8,
         }
     }
 
@@ -372,6 +426,9 @@ impl StreamingLoop {
             StreamingLoop::Cycle => "cycle",
             StreamingLoop::RunLoop => "run-loop",
             StreamingLoop::EmbeddedJoinBounded => "embedded-join-bounded",
+            StreamingLoop::RunLoopJoin => "run-loop-join",
+            StreamingLoop::RunLoopPipeline => "run-loop-pipeline",
+            StreamingLoop::RunLoopStateless => "run-loop-stateless",
         }
     }
 }
@@ -755,6 +812,24 @@ pub trait TwoInputStep {
     fn buffered_rows(&self) -> usize;
 }
 
+/// A join feeding windowed stages (`stream:rpipe:`): join input plus the
+/// window vocabulary the stages need — a wall-clock tick for quiet sources and
+/// a cascade flush at end of stream.
+pub trait PipelineStep: TwoInputStep {
+    /// Tick every stage with the wall clock, cascading what closes.
+    ///
+    /// # Errors
+    /// Propagates stage failures.
+    fn tick(&mut self, wall_clock_ms: i64) -> ExecResult<Vec<RecordBatch>>;
+    /// Flush every stage in cascade because the input is over.
+    ///
+    /// # Errors
+    /// Propagates stage failures.
+    fn flush(&mut self) -> ExecResult<Vec<RecordBatch>>;
+    /// Is there window state a flush would emit?
+    fn has_open_windows(&self) -> bool;
+}
+
 /// Which side of a two-input join a batch belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JoinSide {
@@ -909,14 +984,50 @@ impl StreamDriver {
         exec: &mut W,
         now_ms: i64,
     ) -> ExecResult<Vec<RecordBatch>> {
-        if self.policy().idle_tick == IdleTick::None {
+        if !self.take_idle_tick() {
             return Ok(Vec::new());
+        }
+        exec.tick(now_ms)
+    }
+
+    /// Whether this loop ticks now: its policy has a wall clock and the
+    /// interval has elapsed. Consumes the tick when it returns `true`.
+    fn take_idle_tick(&mut self) -> bool {
+        if self.policy().idle_tick == IdleTick::None {
+            return false;
         }
         if self.last_tick.elapsed() < self.idle_period {
-            return Ok(Vec::new());
+            return false;
         }
         self.last_tick = Instant::now();
-        exec.tick(now_ms)
+        true
+    }
+
+    /// Whether a stop for `reason` flushes under this loop's policy.
+    fn flushes_on(&self, reason: StopReason) -> bool {
+        match (self.policy().end_of_stream, reason) {
+            (EndOfStream::FlushOnSourceExhausted, StopReason::SourceExhausted)
+            | (EndOfStream::FlushOnDirective, StopReason::CoordinatorDirective) => true,
+            (EndOfStream::FlushOnSourceExhausted | EndOfStream::FlushOnDirective, _) => false,
+            (EndOfStream::NoFlush | EndOfStream::DelegatedToRuntime, _) => false,
+        }
+    }
+
+    fn not_flushed_because(&self) -> &'static str {
+        match self.policy().end_of_stream {
+            EndOfStream::NoFlush => {
+                "this loop does not flush on stop; its source is never exhausted"
+            }
+            EndOfStream::DelegatedToRuntime => {
+                "this loop holds no local operator; the runtime owns the flush"
+            }
+            EndOfStream::FlushOnSourceExhausted => {
+                "stopped without the source being exhausted, so open windows are partial"
+            }
+            EndOfStream::FlushOnDirective => {
+                "stopped without an end-of-stream directive from the control plane"
+            }
+        }
     }
 
     /// Stop, flushing or not according to this loop's policy.
@@ -933,32 +1044,53 @@ impl StreamDriver {
         exec: &mut W,
         reason: StopReason,
     ) -> ExecResult<StopOutcome> {
-        let flush_now = match (self.policy().end_of_stream, reason) {
-            (EndOfStream::FlushOnSourceExhausted, StopReason::SourceExhausted)
-            | (EndOfStream::FlushOnDirective, StopReason::CoordinatorDirective) => true,
-            (EndOfStream::FlushOnSourceExhausted | EndOfStream::FlushOnDirective, _) => false,
-            (EndOfStream::NoFlush | EndOfStream::DelegatedToRuntime, _) => false,
-        };
-        if flush_now {
+        if self.flushes_on(reason) {
             return Ok(StopOutcome::Flushed(exec.flush()?));
         }
         Ok(StopOutcome::NotFlushed {
             open_windows: exec.has_open_windows(),
-            because: match self.policy().end_of_stream {
-                EndOfStream::NoFlush => {
-                    "this loop does not flush on stop; its source is never exhausted"
-                }
-                EndOfStream::DelegatedToRuntime => {
-                    "this loop holds no local operator; the runtime owns the flush"
-                }
-                EndOfStream::FlushOnSourceExhausted => {
-                    "stopped without the source being exhausted, so open windows are partial"
-                }
-                EndOfStream::FlushOnDirective => {
-                    "stopped without an end-of-stream directive from the control plane"
-                }
-            },
+            because: self.not_flushed_because(),
         })
+    }
+
+    /// [`Self::on_idle`] for a join → windowed-stage pipeline.
+    ///
+    /// # Errors
+    /// Propagates operator failures.
+    pub fn on_pipeline_idle<P: PipelineStep + ?Sized>(
+        &mut self,
+        pipeline: &mut P,
+        now_ms: i64,
+    ) -> ExecResult<Vec<RecordBatch>> {
+        if !self.take_idle_tick() {
+            return Ok(Vec::new());
+        }
+        pipeline.tick(now_ms)
+    }
+
+    /// [`Self::on_stop`] for a join → windowed-stage pipeline.
+    ///
+    /// # Errors
+    /// Propagates operator failures.
+    pub fn on_pipeline_stop<P: PipelineStep + ?Sized>(
+        &mut self,
+        pipeline: &mut P,
+        reason: StopReason,
+    ) -> ExecResult<StopOutcome> {
+        if self.flushes_on(reason) {
+            return Ok(StopOutcome::Flushed(pipeline.flush()?));
+        }
+        Ok(StopOutcome::NotFlushed {
+            open_windows: pipeline.has_open_windows(),
+            because: self.not_flushed_because(),
+        })
+    }
+
+    /// Whether a wall-clock tick is due for a loop that must drive the tick
+    /// itself (a split pipeline ticks two stage ranges around an exchange).
+    /// Consumes the tick when it returns `true`.
+    pub fn idle_tick_due(&mut self) -> bool {
+        self.take_idle_tick()
     }
 }
 
@@ -966,6 +1098,117 @@ impl StreamDriver {
 mod tests {
     use super::*;
     use crate::ExecError;
+
+    /// A join feeding a SESSION stage over key "k": the stage kind that only a
+    /// wall-clock tick can close on a quiet source.
+    fn pipeline() -> crate::pipeline::JoinAggPipeline {
+        let mut stage = WindowExecutionSpec::tumbling("left_k", "left_ts", 60_000);
+        stage.window_kind = krishiv_plan::window::WindowKind::Session;
+        stage.window_size_ms = 0;
+        stage.session_gap_ms = Some(10_000);
+        stage.watermark_lag_ms = 120_000;
+        crate::pipeline::JoinAggPipeline::new(&krishiv_plan::stream_join::StreamingPipelineSpec {
+            join: krishiv_plan::stream_join::StreamingJoinSpec {
+                left_source: "l".into(),
+                right_source: "r".into(),
+                time_column: "ts".into(),
+                left_key_column: "k".into(),
+                right_key_column: "k".into(),
+                window_ms: 60_000,
+            },
+            stages: vec![stage],
+        })
+        .expect("pipeline")
+    }
+
+    fn keyed(k: &str, ts: i64) -> RecordBatch {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        RecordBatch::try_new(
+            std::sync::Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Utf8, false),
+                Field::new("ts", DataType::Int64, false),
+            ])),
+            vec![
+                std::sync::Arc::new(StringArray::from(vec![k])),
+                std::sync::Arc::new(Int64Array::from(vec![ts])),
+            ],
+        )
+        .expect("batch")
+    }
+
+    /// M25: `stream:rpipe` held no driver, so a pipeline's windowed stages
+    /// never received a wall-clock tick: on a quiet source they never closed.
+    /// Through the driver, an idle tick closes them and cascades.
+    #[test]
+    fn a_pipeline_driver_ticks_quiet_windows_closed() {
+        let mut pipe = pipeline();
+        let mut driver = StreamDriver::new(StreamingLoop::RunLoopPipeline);
+        let mut out = driver
+            .on_join_input(&mut pipe, JoinSide::Left, &keyed("a", 1_000))
+            .expect("left");
+        out.extend(
+            driver
+                .on_join_input(&mut pipe, JoinSide::Right, &keyed("a", 1_500))
+                .expect("right"),
+        );
+        assert!(out.is_empty(), "nothing closes on input alone here");
+        assert!(PipelineStep::has_open_windows(&pipe));
+
+        driver.last_tick = Instant::now() - Duration::from_secs(3600);
+        let ticked = driver
+            .on_pipeline_idle(&mut pipe, 10_000_000)
+            .expect("idle tick");
+        assert!(
+            !ticked.is_empty(),
+            "a quiet source's windows must close on the tick"
+        );
+    }
+
+    /// The join loop has no windows: its policy gives no idle tick, and the
+    /// pipeline API respects that.
+    #[test]
+    fn a_join_loop_never_ticks_a_pipeline() {
+        let mut pipe = pipeline();
+        let mut driver = StreamDriver::new(StreamingLoop::RunLoopJoin);
+        driver.last_tick = Instant::now() - Duration::from_secs(3600);
+        assert!(
+            driver
+                .on_pipeline_idle(&mut pipe, 10_000_000)
+                .expect("idle")
+                .is_empty()
+        );
+    }
+
+    /// A cancelled pipeline does not flush (partial windows); the EOS
+    /// directive does.
+    #[test]
+    fn a_pipeline_flushes_on_the_eos_directive_only() {
+        let mut pipe = pipeline();
+        let mut driver = StreamDriver::new(StreamingLoop::RunLoopPipeline);
+        driver
+            .on_join_input(&mut pipe, JoinSide::Left, &keyed("a", 1_000))
+            .expect("left");
+        driver
+            .on_join_input(&mut pipe, JoinSide::Right, &keyed("a", 1_500))
+            .expect("right");
+        assert!(matches!(
+            driver
+                .on_pipeline_stop(&mut pipe, StopReason::Cancelled)
+                .expect("stop"),
+            StopOutcome::NotFlushed {
+                open_windows: true,
+                ..
+            }
+        ));
+        match driver
+            .on_pipeline_stop(&mut pipe, StopReason::CoordinatorDirective)
+            .expect("stop")
+        {
+            StopOutcome::Flushed(batches) => assert!(!batches.is_empty()),
+            other => panic!("the EOS directive must flush a pipeline, got {other:?}"),
+        }
+    }
 
     /// A spec the driver can coerce toward. The stub operator ignores batches,
     /// so only the column names matter for the policy tests.
@@ -1121,7 +1364,10 @@ mod tests {
         assert_eq!(exec.flushes, 1, "cancellation must not have flushed");
     }
 
-    /// A long-lived loop never flushes on stop, whatever the reason.
+    /// The run-loop never flushes on its own account — a cancel's open windows
+    /// are partial, and its source is never exhausted. Only the coordinator's
+    /// end-of-stream directive flushes it (the executor's `stream-eos`
+    /// handler), which its policy now says instead of claiming `NoFlush`.
     #[test]
     fn a_long_lived_loop_reports_what_it_left_behind_instead_of_flushing() {
         let mut driver = StreamDriver::new(StreamingLoop::RunLoop);
@@ -1129,12 +1375,15 @@ mod tests {
             open: true,
             ..RecordingStep::default()
         };
+        assert!(matches!(
+            driver
+                .on_stop(&mut exec, StopReason::CoordinatorDirective)
+                .expect("on_stop"),
+            StopOutcome::Flushed(_)
+        ));
+        exec.open = true;
 
-        for reason in [
-            StopReason::SourceExhausted,
-            StopReason::Cancelled,
-            StopReason::CoordinatorDirective,
-        ] {
+        for reason in [StopReason::SourceExhausted, StopReason::Cancelled] {
             let outcome = driver.on_stop(&mut exec, reason).expect("on_stop");
             assert!(
                 matches!(
@@ -1147,7 +1396,7 @@ mod tests {
                 "the run-loop must not force-flush an unbounded job ({reason:?})"
             );
         }
-        assert_eq!(exec.flushes, 0);
+        assert_eq!(exec.flushes, 1, "only the directive flushed");
     }
 
     /// The cycle flushes only when told to, because it cannot see its own source.

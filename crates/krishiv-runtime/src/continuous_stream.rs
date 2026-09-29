@@ -378,10 +378,6 @@ impl ContinuousStreamRegistry {
                     message: error.to_string(),
                 })?;
 
-        // BATCH-2: Reject drain outputs that exceed the byte limit to prevent
-        // OOM in the caller and Flight/HTTP transport overflows.
-        check_drain_output_size(&output)?;
-
         let mut queued = entry
             .input
             .lock()
@@ -394,6 +390,16 @@ impl ContinuousStreamRegistry {
             let _ = queued.batches.pop_front();
         }
         drop(queued);
+
+        // BATCH-2: Reject drain outputs that exceed the byte limit to prevent
+        // OOM in the caller and Flight/HTTP transport overflows. Checked only
+        // after the consumed input is popped: the operator state already
+        // advanced, so leaving the input queued applied it twice on the next
+        // drain (double-counted aggregates).
+        check_drain_output_size(&output).map_err(|error| ContinuousStreamError::Execution {
+            job_id: job_id.to_owned(),
+            message: format!("{error}; the windows this drain closed were not delivered"),
+        })?;
         let mut output = output;
         output.extend(self.early_fire_snapshot(&entry, &exec));
         Ok(output)

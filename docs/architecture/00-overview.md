@@ -110,7 +110,7 @@ Numbers are the documents in this directory.
 
 | Crate | Owns | Document |
 |---|---|---|
-| `krishiv` | The unified binary: `sql`, `explain`, `stream`, `ivm`, `table`, `doctor`, `capabilities`, `local`, `cluster`, and the daemons (`coordinator`/`clusterd`, `job-coordinator`, `executor`, `flight-server`, `shuffle-svc`, `mcp`) | 11, 14 |
+| `krishiv` | The unified binary: `sql`, `explain`, `stream`, `ivm`, `table`, `doctor`, `capabilities`, `local`, `cluster`, and the daemons (`coordinator`/`clusterd`, `executor`, `flight-server`, `shuffle-svc`, `mcp`) | 11, 14 |
 | `krishiv-api` | `Session`/`SessionBuilder`, `DataFrame`, `StreamingDataFrame`, `IncrementalFlow`/`IncrementalDataFrame`, `QueryHandle`, prepared statements, typed expressions, reader/writer builders, the declarative `Pipeline`, the blocking facade, and the connector-backed embedded `EngineRuntime` | 11, 08, 09 |
 | `krishiv-engine-core` | `EngineKind`, `CompiledJob`, the `ComputeEngine` contract, runtime services (checkpoint, changelog sink, consolidating and upsert sink wrappers) | 00, 09 |
 | `krishiv-engines` | `BatchEngine`, `IncrementalEngine`, `StreamingEngine`, and `run_job` dispatch | 00 |

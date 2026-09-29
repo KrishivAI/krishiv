@@ -63,7 +63,7 @@ pub const TASK_SLOTS_ENV: &str = "KRISHIV_TASK_SLOTS";
 pub const QUERY_MEMORY_LIMIT_ENV: &str = "KRISHIV_QUERY_MEMORY_LIMIT_BYTES";
 /// Environment override for per-task DataFusion `target_partitions`.
 pub const TASK_TARGET_PARALLELISM_ENV: &str = "KRISHIV_TASK_TARGET_PARALLELISM";
-/// Environment override for the push-shuffle store's memory ceiling, in bytes.
+/// Environment override for the in-memory shuffle store's memory ceiling, in bytes.
 pub const SHUFFLE_STORE_LIMIT_ENV: &str = "KRISHIV_SHUFFLE_STORE_BYTES";
 
 /// Bytes held back from the cgroup limit for everything that is not query

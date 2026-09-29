@@ -11,7 +11,7 @@ them together; the data plane they command is `05-executor-and-data-plane.md`.
 | Role | Type | Scope |
 |---|---|---|
 | **Cluster control plane (CCP)** | `ClusterControlPlane` / `Coordinator` | cluster membership, admission, queues, placement across every job; one leader at a time |
-| **Job control plane (JCP)** | `JobCoordinator` (`job_coordinator.rs`) | one job's stage progression, retries, checkpoint barriers; may run inside the CCP process or as a dedicated `krishiv job-coordinator` process |
+| **Job control plane (JCP)** | `JobCoordinator` (`job_coordinator.rs`) | one job's stage progression, retries, checkpoint barriers; runs inside the CCP process (or the operator, for `dedicatedCoordinator` jobs) |
 
 The `Coordinator` struct is the CCP state machine. It is shared behind
 `SharedCoordinator` (an `Arc<RwLock<Coordinator>>`) by the gRPC service, the
@@ -169,8 +169,10 @@ The coordinator hosts two engines' control logic directly:
 | console | `krishiv-ui` | `/console` SPA over the same `/api/v1` routes (`11`) |
 
 Authentication for both gRPC and HTTP is in `12-security.md`. The daemon
-binaries are `krishiv clusterd` (alias `coordinator`) and
-`krishiv job-coordinator`.
+binary is `krishiv clusterd` (alias `coordinator`). Per-job coordination
+(`JobCoordinator`) runs in-process — inside the operator for
+`dedicatedCoordinator: true` jobs; the standalone `job-coordinator` daemon was
+removed because it called a `/federation` API no coordinator serves.
 
 ## Invariants worth restating
 

@@ -152,6 +152,10 @@ pub(crate) async fn execute_rbatch_fragment(
     let task_id = assignment.task_id().as_str().to_owned();
     let state_key = rloop_state_key(job_id, parsed.subtask);
     let input_key = format!("{job_id}#{task_id}");
+    // Declared, not driven: a stateless per-batch query has no window to
+    // tick, nothing to flush and no key to route, and its policy says exactly
+    // that. Held so the loop exists in the gate like every other.
+    let _driver = StreamDriver::new(StreamingLoop::RunLoopStateless);
 
     let executor_arc = {
         let entry = runner
@@ -374,7 +378,9 @@ pub(crate) async fn execute_rjoin_fragment(
     let source_cache = runner.shared_continuous_connector_sources();
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
     let idleness = watermark_idleness();
-    let mut driver = StreamDriver::new(StreamingLoop::EmbeddedJoinBounded);
+    // Long-lived distributed join: `EmbeddedJoinBounded`'s answers with a
+    // run-loop's lifecycle. It used to borrow that bounded loop's policy.
+    let mut driver = StreamDriver::new(StreamingLoop::RunLoopJoin);
     let mut left_wm = SplitWatermarks::default();
     let mut right_wm = SplitWatermarks::default();
     let mut rows_emitted: u64 = 0;
@@ -598,7 +604,7 @@ async fn route_stage_exchange(
         let routed = route_batch_by_key_group(batch, key_column, parallelism, subtask)?;
         if routed.null_key_rows > 0 {
             return Err(local_err(format!(
-                "stream:rpipe NULL stage key in column '{key_column}' at the re-key                  point: refusing to route it silently"
+                "stream:rpipe NULL stage key in column '{key_column}' at the re-key point: refusing to route it silently"
             )));
         }
         if let Some(own) = routed.owned {
@@ -619,7 +625,7 @@ async fn route_stage_exchange(
         let Some(peer) = peers.iter().find(|p| p.subtask == peer_subtask) else {
             return Err(ExecutorError::InvalidAssignment {
                 message: format!(
-                    "stream:rpipe stage exchange has rows for peer {peer_subtask} but no                      peer entry"
+                    "stream:rpipe stage exchange has rows for peer {peer_subtask} but no peer entry"
                 ),
             });
         };
@@ -681,7 +687,7 @@ pub(crate) async fn execute_rpipe_fragment(
             Err(reason) => {
                 return Err(ExecutorError::InvalidAssignment {
                     message: format!(
-                        "stream:rpipe parallelism {} is not supported for this pipeline:                          {reason}",
+                        "stream:rpipe parallelism {} is not supported for this pipeline: {reason}",
                         parsed.parallelism
                     ),
                 });
@@ -757,6 +763,10 @@ pub(crate) async fn execute_rpipe_fragment(
 
     let source_cache = runner.shared_continuous_connector_sources();
     let idle_floor = Duration::from_micros(RLOOP_IDLE_FLOOR_US);
+    // The pipeline's policy: wall-clock idle ticks (session/processing-time
+    // stages close on a quiet source only that way) and a flush on the EOS
+    // directive. It used to hold no driver at all.
+    let mut driver = StreamDriver::new(StreamingLoop::RunLoopPipeline);
     let idleness = watermark_idleness();
     let mut left_wm = SplitWatermarks::default();
     let mut right_wm = SplitWatermarks::default();
@@ -911,6 +921,49 @@ pub(crate) async fn execute_rpipe_fragment(
                 *batches = owned_batches;
             }
         }
+        // Offer the driver an idle tick every iteration, quiet ones included;
+        // its policy and interval decide whether it fires.
+        let mut ticked: Vec<RecordBatch> = Vec::new();
+        match &stage_split {
+            None => {
+                let mut pipe = pipe_arc.lock().await;
+                ticked = driver
+                    .on_pipeline_idle(&mut *pipe, now_ms())
+                    .map_err(|e| local_err(format!("stream:rpipe idle tick: {e}")))?;
+            }
+            Some((split, stage_key_column)) => {
+                if driver.idle_tick_due() {
+                    let now = now_ms();
+                    let pre = {
+                        let mut pipe = pipe_arc.lock().await;
+                        pipe.tick_pre_split(*split, now)
+                            .map_err(|e| local_err(format!("stream:rpipe idle tick: {e}")))?
+                    };
+                    if !pre.is_empty() {
+                        let owned = route_stage_exchange(
+                            runner,
+                            job_id,
+                            &peers,
+                            parsed.parallelism,
+                            parsed.subtask,
+                            stage_key_column,
+                            pre,
+                        )
+                        .await?;
+                        stage_in.extend(owned);
+                    }
+                    let mut pipe = pipe_arc.lock().await;
+                    ticked = pipe
+                        .tick_post_split(*split, now)
+                        .map_err(|e| local_err(format!("stream:rpipe idle tick: {e}")))?;
+                }
+            }
+        }
+        if !ticked.is_empty() {
+            rows_emitted += ticked.iter().map(|b| b.num_rows() as u64).sum::<u64>();
+            batches_emitted += ticked.len() as u64;
+            crate::erased(runner.stage_rloop_outputs(job_id, assignment, &ticked)).await?;
+        }
         if left_in.is_empty() && right_in.is_empty() && stage_in.is_empty() {
             drop(busy_iteration);
             tokio::select! {
@@ -932,7 +985,8 @@ pub(crate) async fn execute_rpipe_fragment(
                         left_wm.observe("#L", ts);
                     }
                     outputs.extend(
-                        pipe.on_left(b)
+                        driver
+                            .on_join_input(&mut *pipe, JoinSide::Left, b)
                             .map_err(|e| local_err(format!("stream:rpipe left: {e}")))?,
                     );
                 }
@@ -941,14 +995,15 @@ pub(crate) async fn execute_rpipe_fragment(
                         right_wm.observe("#R", ts);
                     }
                     outputs.extend(
-                        pipe.on_right(b)
+                        driver
+                            .on_join_input(&mut *pipe, JoinSide::Right, b)
                             .map_err(|e| local_err(format!("stream:rpipe right: {e}")))?,
                     );
                 }
                 if let (Some(l), Some(r)) =
                     (left_wm.combined(idleness), right_wm.combined(idleness))
                 {
-                    pipe.advance_watermark(l.min(r));
+                    driver.on_join_watermark(&mut *pipe, l.min(r));
                 }
             }
             Some((split, stage_key_column)) => {

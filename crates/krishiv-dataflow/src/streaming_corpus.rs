@@ -432,7 +432,7 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: true,
         spec_must_contain: Some("key_column: \"k\""),
         error_must_contain: None,
-        why: "The canonical shape. Every rejection below is only meaningful if               this is accepted — otherwise they would all pass against a               compiler that refused everything.",
+        why: "The canonical shape. Every rejection below is only meaningful if this is accepted — otherwise they would all pass against a compiler that refused everything.",
     },
     QueryShape {
         name: "top_level_where",
@@ -440,7 +440,7 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: true,
         spec_must_contain: Some("row_filter: Some"),
         error_must_contain: None,
-        why: "The predicate was silently discarded for the lifetime of the               compiler: `WHERE v > 100` compiled, registered, and counted every               row. Asserts it REACHES the spec, because 'it compiles' was               exactly the state the defect was in.",
+        why: "The predicate was silently discarded for the lifetime of the compiler: `WHERE v > 100` compiled, registered, and counted every row. Asserts it REACHES the spec, because 'it compiles' was exactly the state the defect was in.",
     },
     QueryShape {
         name: "multi_column_group_by",
@@ -448,7 +448,7 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: true,
         spec_must_contain: Some("\"k2\""),
         error_must_contain: None,
-        why: "A composite key once silently collapsed to the first column and               aggregated across the second. Multi-key landed (register §48);               the assertion now guards the opposite failure — the SECOND               column must REACH the spec, because a collapse back to one key               would still compile.",
+        why: "A composite key once silently collapsed to the first column and aggregated across the second. Multi-key landed (register §48); the assertion now guards the opposite failure — the SECOND column must REACH the spec, because a collapse back to one key would still compile.",
     },
     QueryShape {
         name: "global_aggregate_no_key",
@@ -456,7 +456,7 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: true,
         spec_must_contain: Some("key_is_synthetic: true"),
         error_must_contain: None,
-        why: "Global aggregation landed (task #140): the compiler injects a               constant key and marks it synthetic so the emit path suppresses               it. The assertion pins the MARK, not just compilation — a spec               that compiles with key_is_synthetic false would publish a               __krishiv_global column the user never named.",
+        why: "Global aggregation landed (task #140): the compiler injects a constant key and marks it synthetic so the emit path suppresses it. The assertion pins the MARK, not just compilation — a spec that compiles with key_is_synthetic false would publish a __krishiv_global column the user never named.",
     },
     QueryShape {
         name: "per_key_top_n",
@@ -464,7 +464,7 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: true,
         spec_must_contain: Some("top_n: Some"),
         error_must_contain: None,
-        why: "ORDER BY + LIMIT on a windowed query is the per-key top-N shape               (task #142). The assertion pins that the clause REACHES the spec               — ORDER BY was refused outright before, and a compiler that               starts accepting it while dropping it would emit every row.",
+        why: "ORDER BY + LIMIT on a windowed query is the per-key top-N shape (task #142). The assertion pins that the clause REACHES the spec — ORDER BY was refused outright before, and a compiler that starts accepting it while dropping it would emit every row.",
     },
     QueryShape {
         name: "ungrouped_bare_column",
@@ -472,7 +472,7 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: false,
         spec_must_contain: None,
         error_must_contain: Some("v"),
-        why: "A bare selected column that is neither grouped nor aggregated was               SILENTLY DROPPED from output for the lifetime of the compiler.               Refused since task #142; the error must NAME the column.",
+        why: "A bare selected column that is neither grouped nor aggregated was SILENTLY DROPPED from output for the lifetime of the compiler. Refused since task #142; the error must NAME the column.",
     },
     QueryShape {
         name: "windowless_projection",
@@ -480,6 +480,6 @@ pub const QUERY_SHAPES: &[QueryShape] = &[
         compiles: false,
         spec_must_contain: None,
         error_must_contain: Some("window"),
-        why: "A stateless query is not a windowed one. It must be refused HERE               and routed to the stateless path by the caller — the routing               decision that used to swallow every other error on this list.",
+        why: "A stateless query is not a windowed one. It must be refused HERE and routed to the stateless path by the caller — the routing decision that used to swallow every other error on this list.",
     },
 ];

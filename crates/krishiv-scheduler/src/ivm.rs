@@ -967,7 +967,7 @@ impl IvmJobRegistry {
         let per_job = all.entry(job_id.to_string()).or_default();
         if per_job.contains_key(&view.view_name) {
             return Err(IvmError::execution(format!(
-                "vector view '{}' is already registered on IVM job '{job_id}';                  delete it first to replace it",
+                "vector view '{}' is already registered on IVM job '{job_id}'; delete it first to replace it",
                 view.view_name
             )));
         }

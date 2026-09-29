@@ -1384,7 +1384,7 @@ impl ContinuousRegisterOptions {
                     "sink: requested kind '{requested_kind}', coordinator armed '{applied}'"
                 )),
                 None => disagreements.push(format!(
-                    "sink: requested kind '{requested_kind}', not reported — the                      coordinator dropped the sink and the job writes nowhere"
+                    "sink: requested kind '{requested_kind}', not reported — the coordinator dropped the sink and the job writes nowhere"
                 )),
             }
         }

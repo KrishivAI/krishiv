@@ -30,7 +30,6 @@ use tokio::net::TcpListener;
 use tokio::time::{Duration, interval};
 
 use crate::InMemoryMetadataStore;
-use crate::auth::configured_coordinator_bearer_token;
 use crate::rpc_drain::InFlightTracker;
 use crate::store::MetadataStore;
 use crate::{
@@ -1258,7 +1257,7 @@ async fn api_executor_logs(
         return (
             axum::http::StatusCode::NOT_FOUND,
             Json(serde_json::json!({
-                "error": "executor unknown or does not advertise an HTTP endpoint                           (older executor build?)",
+                "error": "executor unknown or does not advertise an HTTP endpoint (older executor build?)",
                 "executor_id": executor_id,
             })),
         );
@@ -1823,7 +1822,7 @@ fn log_coordinator_security_posture(config: &CoordinatorDaemonConfig, grpc_auth_
                 surfaces.push("gRPC control-plane");
             }
             if http {
-                surfaces.push("HTTP admin/federation");
+                surfaces.push("HTTP admin");
             }
             let bar = "=".repeat(72);
             tracing::warn!(
@@ -1901,7 +1900,7 @@ pub fn coordinator_daemon_help() -> &'static str {
      Options:\n\
        --coordinator-id <ID>     Coordinator id (KRISHIV_COORDINATOR_ID, default coord-local)\n\
        --grpc-addr <HOST:PORT>     gRPC listen address (KRISHIV_GRPC_ADDR, default 0.0.0.0:2001)\n\
-       --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics /federation (default 0.0.0.0:2002)\n\
+       --http-addr <HOST:PORT>     HTTP for /healthz /readyz /metrics (default 0.0.0.0:2002)\n\
        --shuffle-dir <PATH>        Local shuffle store directory (optional)\n\
        --durability-profile <NAME> dev-local | single-node-durable | distributed-durable\n\
        --metadata-backend <TYPE>   memory | rocksdb | etcd\n\
@@ -2048,212 +2047,16 @@ pub async fn run_clusterd_daemon(
     run_cluster_control_plane(ccp, listener).await
 }
 
-/// Per-job coordinator process configuration.
-///
-/// The standalone JCP daemon is an HTTP **client** of the cluster control
-/// plane.  It does NOT run independent orchestration loops or own a separate
-/// `Coordinator` — A3 in the audit demonstrated that pattern produced a stuck
-/// process because executors register with the CCP, not the JCP, so the JCP's
-/// view of the world was always empty.
-///
-/// Instead, the JCP:
-///   1. Submits the job to the CCP (if not already present) via the federation
-///      HTTP endpoint.
-///   2. Polls job status until it reaches a terminal state.
-///   3. Exits with code 0 (Succeeded) / 1 (Failed) / 2 (Cancelled).
-///
-/// For Kubernetes `dedicatedCoordinator: true` deployments the per-job loops
-/// continue to run inside the operator process via
-/// [`crate::JobCoordinator::spawn_job_orchestration_loops`] which DOES share
-/// the operator's `SharedCoordinator`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct JobCoordinatorDaemonConfig {
-    pub job_id: String,
-    /// Cluster control-plane HTTP base URL, e.g. `http://krishiv-clusterd:18080`.
-    pub coordinator_http: String,
-    /// How often to poll the CCP for job status.
-    pub poll_interval: std::time::Duration,
-    pub help: bool,
-}
-
-/// Default JCP status-poll interval, pinned to the env registry's declared
-/// default for `KRISHIV_JCP_POLL_INTERVAL_SECS`.
-pub(crate) const DEFAULT_JCP_POLL_INTERVAL_SECS: u64 = 2;
-
 /// Default etcd leader-lease TTL, pinned to the env registry's declared
 /// default for `KRISHIV_LEADER_LEASE_SECS`.
 pub(crate) const DEFAULT_LEADER_LEASE_SECS: u64 = 15;
 
-/// Clamp a JCP status-poll interval to at least one second.
-///
-/// `run_job_coordinator_daemon`'s watch loop has no delay other than this
-/// interval, so a zero turns the status poll into an unbounded request flood
-/// against the CCP's HTTP surface — the same surface that serves `/readyz`, so
-/// one misconfigured JCP pod degrades the coordinator's Kubernetes probes for
-/// the whole cluster. `--poll-interval-secs` already clamped with `.max(1)`;
-/// the env var did not, and the env var is the path Kubernetes pods actually
-/// take (the operator sets env, not argv). The clamp lives here so the flag
-/// and its env twin cannot drift apart again.
-fn jcp_poll_interval(secs: u64) -> std::time::Duration {
-    std::time::Duration::from_secs(secs.max(1))
-}
-
-/// Parse `krishiv job-coordinator` flags.
-pub fn parse_job_coordinator_daemon_config(
-    args: impl IntoIterator<Item = String>,
-) -> Result<JobCoordinatorDaemonConfig, Box<dyn Error>> {
-    let mut config = JobCoordinatorDaemonConfig {
-        job_id: env::var("KRISHIV_JOB_ID").unwrap_or_default(),
-        coordinator_http: env::var("KRISHIV_COORDINATOR_HTTP")
-            .unwrap_or_else(|_| String::from("http://127.0.0.1:18080")),
-        poll_interval: jcp_poll_interval(
-            env::var("KRISHIV_JCP_POLL_INTERVAL_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DEFAULT_JCP_POLL_INTERVAL_SECS),
-        ),
-        help: false,
-    };
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--job-id" => config.job_id = next_daemon_arg(&mut args, "--job-id")?,
-            "--coordinator-http" => {
-                config.coordinator_http = next_daemon_arg(&mut args, "--coordinator-http")?;
-            }
-            "--poll-interval-secs" => {
-                let v = next_daemon_arg(&mut args, "--poll-interval-secs")?;
-                let secs: u64 = v.parse().map_err(|_| "--poll-interval-secs must be u64")?;
-                config.poll_interval = jcp_poll_interval(secs);
-            }
-            "--help" | "-h" => config.help = true,
-            unknown => {
-                return Err(format!(
-                    "unknown option: {unknown}\n\n{}",
-                    job_coordinator_daemon_help()
-                )
-                .into());
-            }
-        }
-    }
-    Ok(config)
-}
-
-pub fn job_coordinator_daemon_help() -> &'static str {
-    "Run a per-job coordinator (JCP) as a CCP client process.\n\
-     \n\
-     Usage:\n\
-       krishiv job-coordinator --job-id <ID> [--coordinator-http <URL>]\n\
-     \n\
-     Options:\n\
-       --job-id <ID>              Job id to watch (also KRISHIV_JOB_ID)\n\
-       --coordinator-http <URL>   CCP federation HTTP endpoint (also KRISHIV_COORDINATOR_HTTP, default http://127.0.0.1:18080)\n\
-       --poll-interval-secs <N>   Status poll interval (also KRISHIV_JCP_POLL_INTERVAL_SECS, default 2)\n\
-     \n\
-     Optional env KRISHIV_JOB_SPEC_JSON to submit the job on first connect.\n"
-}
-
-#[derive(serde::Deserialize)]
-struct JcpJobStatusResponse {
-    #[serde(default)]
-    pub state: String,
-}
-
-/// Run the per-job coordinator loop as a CCP client (A3).
-pub async fn run_job_coordinator_daemon(
-    jcp_config: JobCoordinatorDaemonConfig,
-) -> Result<(), Box<dyn Error>> {
-    krishiv_common::log_env_issues();
-    if jcp_config.job_id.is_empty() {
-        return Err("--job-id is required".into());
-    }
-    if jcp_config.coordinator_http.is_empty() {
-        return Err("--coordinator-http is required".into());
-    }
-    let job_id = jcp_config.job_id.clone();
-    let base = jcp_config
-        .coordinator_http
-        .trim_end_matches('/')
-        .to_string();
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
-
-    // First-time submit: if KRISHIV_JOB_SPEC_JSON is provided, submit through
-    // the federation endpoint.  If the CCP already knows the job, the endpoint
-    // returns BAD_REQUEST (DuplicateJob) which is fine.
-    if let Ok(spec_json) = env::var("KRISHIV_JOB_SPEC_JSON") {
-        let body = serde_json::json!({
-            "job_id": job_id,
-            "spec_json": spec_json,
-        });
-        let url = format!("{base}/federation/v1/jobs");
-        let mut submit = client.post(&url).json(&body);
-        if let Some(token) = configured_coordinator_bearer_token() {
-            submit = submit.header("Authorization", format!("Bearer {token}"));
-        }
-        match submit.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                tracing::info!(job_id = %job_id, base = %base, "Krishiv JCP: submitted job");
-            }
-            Ok(resp) => {
-                tracing::warn!(
-                    status = %resp.status(),
-                    "JCP submit returned non-success (already-submitted is typical)"
-                );
-            }
-            Err(e) => {
-                return Err(format!("submit job to {url}: {e}").into());
-            }
-        }
-    }
-
-    tracing::info!(job_id = %job_id, base = %base, poll_interval = ?jcp_config.poll_interval, "Krishiv JCP watching job");
-
-    let status_url = format!("{base}/federation/v1/jobs/{}", urlencoding::encode(&job_id));
-    loop {
-        let mut status_req = client.get(&status_url);
-        if let Some(token) = configured_coordinator_bearer_token() {
-            status_req = status_req.header("Authorization", format!("Bearer {token}"));
-        }
-        match status_req.send().await {
-            Ok(resp) if resp.status().is_success() => {
-                match resp.json::<JcpJobStatusResponse>().await {
-                    Ok(status) => {
-                        tracing::info!(job_id = %job_id, state = %status.state, "Krishiv JCP: job state");
-                        let terminal =
-                            matches!(status.state.as_str(), "Succeeded" | "Failed" | "Cancelled");
-                        if terminal {
-                            return match status.state.as_str() {
-                                "Succeeded" => Ok(()),
-                                "Cancelled" => Err("job cancelled".into()),
-                                _ => Err("job failed".into()),
-                            };
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "JCP failed to decode status payload");
-                    }
-                }
-            }
-            Ok(resp) => {
-                tracing::warn!(status = %resp.status(), "JCP status RPC returned non-success");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "JCP status RPC failed; will retry");
-            }
-        }
-        tokio::time::sleep(jcp_config.poll_interval).await;
-    }
-}
-
 #[cfg(test)]
 mod parse_tests {
     use super::{
-        CoordinatorDaemonConfig, CoordinatorSecurityPosture, DEFAULT_JCP_POLL_INTERVAL_SECS,
-        DEFAULT_LEADER_LEASE_SECS, build_shared_coordinator_sync,
-        classify_coordinator_security_posture, coordinator_daemon_help, jcp_poll_interval,
-        parse_coordinator_daemon_config, parse_job_coordinator_daemon_config, render_metrics_body,
+        CoordinatorDaemonConfig, CoordinatorSecurityPosture, DEFAULT_LEADER_LEASE_SECS,
+        build_shared_coordinator_sync, classify_coordinator_security_posture,
+        coordinator_daemon_help, parse_coordinator_daemon_config, render_metrics_body,
         validate_runtime_security_config,
     };
     use crate::{Coordinator, SharedCoordinator};
@@ -3069,51 +2872,6 @@ mod parse_tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// A zero poll interval must never reach the JCP watch loop.
-    ///
-    /// That loop has no delay other than this interval, so zero turns the
-    /// status poll into an unbounded request flood against the CCP's HTTP
-    /// surface — which also serves `/readyz`, so one misconfigured JCP pod
-    /// degrades the coordinator's Kubernetes probes cluster-wide.
-    /// `--poll-interval-secs` clamped with `.max(1)`; the
-    /// `KRISHIV_JCP_POLL_INTERVAL_SECS` twin did not, and env is the path
-    /// Kubernetes pods take. Both now route through `jcp_poll_interval`.
-    #[test]
-    fn jcp_poll_interval_is_never_zero() {
-        assert_eq!(
-            jcp_poll_interval(0),
-            std::time::Duration::from_secs(1),
-            "a zero interval would busy-poll the coordinator's HTTP surface"
-        );
-        assert_eq!(jcp_poll_interval(7), std::time::Duration::from_secs(7));
-
-        let config = parse_job_coordinator_daemon_config([
-            String::from("--poll-interval-secs"),
-            String::from("0"),
-        ])
-        .unwrap();
-        assert_eq!(config.poll_interval, std::time::Duration::from_secs(1));
-    }
-
-    /// The JCP help text must name the default the code actually compiles in.
-    ///
-    /// It advertised `http://127.0.0.1:2002` — the *daemon's* default HTTP
-    /// port — while the code defaults to `18080`, the port `krishiv local
-    /// start` publishes. An operator following the help would point the JCP at
-    /// a port nothing serves.
-    #[test]
-    fn jcp_help_states_the_compiled_in_coordinator_http_default() {
-        let config = parse_job_coordinator_daemon_config(std::iter::empty::<String>()).unwrap();
-        // Only meaningful when the env override is absent.
-        if std::env::var("KRISHIV_COORDINATOR_HTTP").is_err() {
-            assert_eq!(config.coordinator_http, "http://127.0.0.1:18080");
-            assert!(
-                super::job_coordinator_daemon_help().contains(&config.coordinator_http),
-                "help text must name the compiled-in default"
-            );
-        }
-    }
-
     /// Same pinning as `config.rs`'s `declared_default_guard`: the registry
     /// generates the operator-facing flag reference, and it has drifted from
     /// the compiled-in defaults before.
@@ -3121,19 +2879,11 @@ mod parse_tests {
     fn documented_daemon_defaults_match_the_compiled_in_ones() {
         use krishiv_common::env_registry::declared_default_number;
 
-        for (flag, compiled) in [
-            (
-                "KRISHIV_JCP_POLL_INTERVAL_SECS",
-                DEFAULT_JCP_POLL_INTERVAL_SECS,
-            ),
-            ("KRISHIV_LEADER_LEASE_SECS", DEFAULT_LEADER_LEASE_SECS),
-        ] {
-            assert_eq!(
-                declared_default_number(flag),
-                Some(compiled),
-                "{flag}: env registry default disagrees with the compiled-in one"
-            );
-        }
+        assert_eq!(
+            declared_default_number("KRISHIV_LEADER_LEASE_SECS"),
+            Some(DEFAULT_LEADER_LEASE_SECS),
+            "KRISHIV_LEADER_LEASE_SECS: env registry default disagrees with the compiled-in one"
+        );
     }
 
     /// Resetting the circuit breaker on an executor that does not exist is 404,

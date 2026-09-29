@@ -19,6 +19,28 @@ use crate::{ConnectorCapabilities, ConnectorError, ConnectorResult, TwoPhaseComm
 
 static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+/// Opt-in for [`RdkafkaTransactionalSink`] under a durable profile, accepting
+/// that a crash between checkpoint completion and transaction commit loses
+/// that epoch's output.
+pub const ALLOW_UNRECOVERABLE_TXN_ENV: &str = "KRISHIV_KAFKA_SINK_ALLOW_UNRECOVERABLE_TXN";
+
+fn check_durable_use(
+    profile: krishiv_common::DurabilityProfile,
+    allowed: bool,
+) -> ConnectorResult<()> {
+    if krishiv_common::forbids_simulation_connectors(profile) && !allowed {
+        return Err(ConnectorError::Config {
+            message: format!(
+                "the transactional Kafka sink cannot recover a transaction prepared before \
+                 a crash, so the epoch in flight is lost when an executor dies after its \
+                 checkpoint completes; refused under the {profile:?} profile. Set \
+                 {ALLOW_UNRECOVERABLE_TXN_ENV}=1 to accept that"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Timeout for Kafka transaction operations (init, begin, commit, abort).
 const TRANSACTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -120,6 +142,29 @@ impl RdkafkaTransactionalSink {
             transactional_id,
             DEFAULT_TRANSACTION_TIMEOUT,
         )
+    }
+
+    /// [`Self::new`], refused under a durable profile unless the operator has
+    /// opted in with [`ALLOW_UNRECOVERABLE_TXN_ENV`].
+    ///
+    /// The sink cannot resume a transaction it prepared before a crash:
+    /// librdkafka does not expose the producer id/epoch that resuming needs, so
+    /// the restarted producer's `init_transactions()` aborts it. An epoch whose
+    /// checkpoint completed before the crash, but whose transaction had not yet
+    /// committed, is lost — at-most-once for that epoch, while source offsets
+    /// already moved past it. A durable profile promises otherwise, so using
+    /// the sink there needs an explicit acknowledgement.
+    pub fn new_for_profile(
+        profile: krishiv_common::DurabilityProfile,
+        bootstrap_servers: impl AsRef<str>,
+        topic: impl Into<String>,
+        transactional_id: impl AsRef<str>,
+    ) -> ConnectorResult<Self> {
+        check_durable_use(
+            profile,
+            krishiv_common::env_registry::truthy_env(ALLOW_UNRECOVERABLE_TXN_ENV),
+        )?;
+        Self::new(bootstrap_servers, topic, transactional_id)
     }
 
     /// Like [`Self::new`] with an explicit transaction timeout.
@@ -391,6 +436,16 @@ mod tests {
     /// checkpoint that covers it completes, so a 30 s timeout aborted any
     /// epoch whose checkpoint took longer — after its source offsets had
     /// already been committed. Default to the broker's own ceiling.
+    /// H8: refused under a durable profile unless explicitly accepted.
+    #[test]
+    fn durable_profiles_need_an_explicit_opt_in() {
+        use krishiv_common::DurabilityProfile as P;
+        assert!(super::check_durable_use(P::DistributedDurable, false).is_err());
+        assert!(super::check_durable_use(P::SingleNodeDurable, false).is_err());
+        assert!(super::check_durable_use(P::DistributedDurable, true).is_ok());
+        assert!(super::check_durable_use(P::DevLocal, false).is_ok());
+    }
+
     #[test]
     fn default_transaction_timeout_is_the_broker_ceiling() {
         let cfg =

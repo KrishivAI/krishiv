@@ -9154,3 +9154,27 @@ everything around them went green, which rules out chance.
   written), so whatever it hits is untested mac-specific breakage; there is
   no mac here and no log access without a GitHub token. Needs the job log.
 
+
+## §99 — Corrections from the 2026-09-28 full-tree review
+
+The review (`review-2026-09-28-todo.md`) found four statements in this
+register that the code contradicts. Recorded here rather than edited in place,
+so the earlier entries stay as the record of what was believed at the time.
+
+- **§20 (MCP read-only gate, "closed by the engine's single-statement
+  parse") — false.** Multi-statement execution landed in `a273347`
+  (2026-07-16), a month before §20 was written, so `EXPLAIN SELECT 1; DROP
+  TABLE t` ran the DROP through `execute_sql`, and `explain_sql` had no gate at
+  all. Fixed in `c4eb1a7` (parser-based single-statement check).
+- **Ignored-test note for `flight_client` `do_action_*` ResultTooLarge tests
+  ("requires binding a local TCP listener") — stale.** Sibling tests bind
+  `127.0.0.1:0` in the default gate; the four pass in ~1 s. Un-ignored in
+  `61bdf76`.
+- **§4 ("the fencing token still prevents split-brain writes") — true for
+  checkpoint acks/commits only.** etcd metadata writes were plain `put`s with
+  no leadership check. Fixed in `9a23e2b` (`EtcdLeaderFence`: every metadata
+  put/delete is a Txn comparing the leader key's lease).
+- **§8 ("DFS snapshot v2 is DFS-local, never redistributed") — false.** The
+  executor restores, merges and rescales every backend's snapshot through the
+  shared v1 codec, so DFS checkpoints could not be restored at all. Fixed in
+  `0e868c1` (DFS writes v1, reads v1 and v2).

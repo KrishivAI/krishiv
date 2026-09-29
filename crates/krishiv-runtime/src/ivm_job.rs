@@ -259,7 +259,7 @@ impl EmbeddedIvmJob {
         // views, and handing one back would fail later and silently.
         if job.is_partitioned() {
             return Err(RuntimeError::plan_rejected(format!(
-                "ivm job '{job_id}' already exists and is key-partitioned, so it cannot be                  pinned to a single flow. A partitioned flow does not cascade a base view's                  output to derived views. Use a different name, or drop the existing job                  (Session::reset_ivm_job)."
+                "ivm job '{job_id}' already exists and is key-partitioned, so it cannot be pinned to a single flow. A partitioned flow does not cascade a base view's output to derived views. Use a different name, or drop the existing job (Session::reset_ivm_job)."
             )));
         }
         Ok(Self {

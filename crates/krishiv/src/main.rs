@@ -109,7 +109,6 @@ fn multipass_subcommand() -> Option<&'static str> {
         "krishiv-coordinator" => Some("coordinator"),
         "krishiv-clusterd" => Some("clusterd"),
         "krishiv-executor" => Some("executor"),
-        "krishiv-job-coordinator" => Some("job-coordinator"),
         "krishiv-flight-server" => Some("flight-server"),
         "krishiv-shuffle-svc" => Some("shuffle-svc"),
         "krishiv-mcp" => Some("mcp"),
@@ -137,7 +136,6 @@ mod single_query_declaration_tests {
             "executor",
             "coordinator",
             "clusterd",
-            "job-coordinator",
             "flight-server",
             "shuffle-svc",
         ] {
@@ -156,7 +154,6 @@ mod single_query_declaration_tests {
             "coordinator",
             "clusterd",
             "executor",
-            "job-coordinator",
             "flight-server",
             "shuffle-svc",
             "mcp",

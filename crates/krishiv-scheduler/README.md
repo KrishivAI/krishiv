@@ -11,7 +11,7 @@ result spools, and the gRPC + HTTP `/api/v1` control surfaces with bearer
 auth.
 
 Binaries: `krishiv-clusterd` (coordinator daemon; `krishiv clusterd`),
-`krishiv-coordinator` (alias), `krishiv-job-coordinator`. Feature `etcd`
+`krishiv-coordinator` (alias). Feature `etcd`
 enables the etcd metadata store (`just test-etcd` runs its tests).
 
 Documentation: `docs/architecture/04-scheduler-and-coordinator.md`,

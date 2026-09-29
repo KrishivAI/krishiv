@@ -1276,11 +1276,13 @@ impl PySession {
     /// window leaves that window unemitted — you poll, get nothing back, and
     /// reasonably conclude the job is finished.
     ///
-    /// Call this once after the final push::
+    /// Call this once after the final push:
     ///
-    ///     session.push_stream_job_input("j", batches)
-    ///     rows = session.poll_stream_job("j")
-    ///     rows += session.flush_stream_job("j")   # the trailing window
+    /// ```python
+    /// session.push_stream_job_input("j", batches)
+    /// rows = session.poll_stream_job("j")
+    /// rows += session.flush_stream_job("j")   # the trailing window
+    /// ```
     ///
     /// Raises if this session's runtime cannot flush, because in that case the
     /// answer is genuinely incomplete and you need to know.

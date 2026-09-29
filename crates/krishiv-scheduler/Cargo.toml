@@ -73,9 +73,6 @@ name = "krishiv-clusterd"
 path = "src/bin/krishiv_clusterd.rs"
 required-features = ["etcd"]
 
-[[bin]]
-name = "krishiv-job-coordinator"
-path = "src/bin/krishiv_job_coordinator.rs"
 
 [lints]
 workspace = true

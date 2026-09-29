@@ -129,10 +129,16 @@ impl TableProvider for DeltaScanProvider {
         // to DataFusion's own Parquet scan gives projection pushdown,
         // statistics-based row-group pruning, the limit, and per-file
         // parallelism — none of which a `MemTable` can offer.
-        let files = krishiv_connectors::lakehouse::list_table_data_files(
-            self.handle.path(),
-            self.handle.version().map(|v| v as u64),
-        )
+        // Replaying the Delta log is synchronous file I/O proportional to the
+        // log's length: keep it off the planner's async worker, as the Hudi
+        // provider beside this one does.
+        let path = self.handle.path().to_owned();
+        let version = self.handle.version().map(|v| v as u64);
+        let files = tokio::task::spawn_blocking(move || {
+            krishiv_connectors::lakehouse::list_table_data_files(&path, version)
+        })
+        .await
+        .map_err(|e| DataFusionError::External(e.to_string().into()))?
         .map_err(|e| DataFusionError::External(e.to_string().into()))?;
 
         let table = parquet_files_table(files, self.schema(), state.config().target_partitions())?;
@@ -179,12 +185,11 @@ fn parquet_files_table(
         ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
     };
 
-    // `file.exists()` mirrors `local_delta::read_table`, which skips missing
-    // files rather than failing: a concurrent vacuum can remove a file between
-    // listing and reading it.
+    // No existence filter: the listing canonicalises every path, so a data
+    // file removed from disk (e.g. by a concurrent vacuum) already fails the
+    // listing with a path error, before this point.
     let urls: Vec<ListingTableUrl> = files
         .iter()
-        .filter(|file| file.exists())
         .map(|file| ListingTableUrl::parse(file.to_string_lossy().as_ref()))
         .collect::<DfResult<Vec<_>>>()?;
     if urls.is_empty() {

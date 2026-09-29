@@ -20,7 +20,7 @@ k8s/
     namespace.yaml, serviceaccount.yaml, rbac.yaml
     operator-deployment.yaml
     coordinator-service.yaml, executor-deployment.yaml
-    network-policy.yaml, jcp-pod-template.yaml, keda-scaledobject.yaml
+    network-policy.yaml, keda-scaledobject.yaml
     samples/           example KrishivJob CRs
   direct/             Raw Deployments — no operator, no CRDs required
     krishiv-dev.yaml         single-node local cluster (uses localhost/krishiv:local)

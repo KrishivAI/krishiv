@@ -6,9 +6,8 @@
 
 use krishiv_common::async_util::block_on;
 use krishiv_scheduler::{
-    CoordinatorSidecarFn, SharedCoordinator, coordinator_daemon_help, job_coordinator_daemon_help,
-    parse_coordinator_daemon_config, parse_job_coordinator_daemon_config, run_clusterd_daemon,
-    run_job_coordinator_daemon, run_standalone_coordinator,
+    CoordinatorSidecarFn, SharedCoordinator, coordinator_daemon_help,
+    parse_coordinator_daemon_config, run_clusterd_daemon, run_standalone_coordinator,
 };
 
 use crate::cli::CliResponse;
@@ -19,11 +18,10 @@ use crate::cli::CliResponse;
 /// `try_run_daemon` it declares the process single-query, which is only true
 /// for a one-shot CLI invocation. `mcp` is the reason that matters — it builds
 /// a `Session` and serves concurrent queries from one memory pool.
-pub const DAEMON_SUBCOMMANDS: [&str; 8] = [
+pub const DAEMON_SUBCOMMANDS: [&str; 7] = [
     "coordinator",
     "clusterd",
     "executor",
-    "job-coordinator",
     "flight-server",
     "shuffle-svc",
     "mcp",
@@ -54,7 +52,6 @@ pub fn try_run_daemon(args: &[String]) -> Option<i32> {
         "coordinator" => run_coordinator(&rest),
         "clusterd" => run_clusterd(&rest),
         "executor" => run_executor(&rest),
-        "job-coordinator" => run_job_coordinator(&rest),
         "flight-server" => run_flight_server(&rest),
         "shuffle-svc" => run_shuffle_svc(&rest),
         "mcp" => run_mcp(&rest),
@@ -264,30 +261,6 @@ fn build_flight_sidecar(
     None
 }
 
-fn run_job_coordinator(args: &[String]) -> i32 {
-    match parse_job_coordinator_daemon_config(args.iter().cloned()) {
-        Ok(config) if config.help => {
-            print!("{}", job_coordinator_daemon_help());
-            0
-        }
-        Ok(config) => match block_on(async {
-            run_job_coordinator_daemon(config)
-                .await
-                .map_err(|e| e.to_string())
-        }) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("{e}");
-                2
-            }
-        },
-        Err(e) => {
-            eprintln!("{e}");
-            2
-        }
-    }
-}
-
 fn run_executor(args: &[String]) -> i32 {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         print!("{}", krishiv_executor::cli::executor_cli_help());
@@ -376,7 +349,6 @@ pub fn daemons_help() -> String {
          Usage:\n\
            krishiv coordinator [OPTIONS]     Active coordinator (was krishiv-coordinator)\n\
            krishiv clusterd [OPTIONS]        Cluster control plane (was krishiv-clusterd)\n\
-           krishiv job-coordinator [OPTS]    Per-job coordinator (was krishiv-job-coordinator)\n\
            krishiv executor [OPTIONS]        Data-plane worker (was krishiv-executor)\n",
     );
     #[cfg(feature = "flight-sql")]
@@ -420,7 +392,6 @@ pub fn daemon_help_section() -> String {
     let mut help = String::from(
         "  coordinator       Run active coordinator (distributed control plane)\n\
          clusterd          Run cluster control plane daemon (CCP)\n\
-         job-coordinator   Run per-job coordinator (JCP)\n\
          executor          Run data-plane executor worker\n",
     );
     #[cfg(feature = "flight-sql")]

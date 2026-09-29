@@ -7,6 +7,19 @@
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 
+/// Run `future` to completion with the GIL released.
+///
+/// The sinks' writes are network I/O (Kafka, Elasticsearch, Cassandra, …);
+/// holding the GIL through them stalled every other Python thread for the
+/// whole round trip.
+fn block_on_detached<F>(py: Python<'_>, future: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    py.detach(|| krishiv_common::async_util::block_on(future))
+}
+
 #[pyclass(name = "ParquetSink")]
 pub struct PyParquetSink {
     path: String,
@@ -63,10 +76,13 @@ impl PyKafkaSink {
     /// Write a list of PyBatch objects to the configured Kafka topic as JSON rows.
     ///
     /// Requires the `kafka` Cargo feature.
-    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+    pub fn write_batches(
+        &self,
+        py: Python<'_>,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<usize> {
         #[cfg(feature = "kafka")]
         {
-            use krishiv_common::async_util::block_on;
             use krishiv_connectors::kafka::{KafkaConfig, KafkaSink};
             use krishiv_connectors::sink::Sink as _;
 
@@ -95,7 +111,7 @@ impl PyKafkaSink {
             };
             let mut sink = KafkaSink::new(cfg)
                 .map_err(|e| PyRuntimeError::new_err(format!("kafka sink init: {e}")))?;
-            block_on(async {
+            block_on_detached(py, async {
                 for batch in records {
                     sink.write_batch(batch).await?;
                 }
@@ -106,7 +122,7 @@ impl PyKafkaSink {
         }
         #[cfg(not(feature = "kafka"))]
         {
-            let _ = batches;
+            let _ = (py, batches);
             Err(PyRuntimeError::new_err(
                 "KafkaSink.write_batches requires the 'kafka' feature; \
                  rebuild with: maturin develop --features kafka",
@@ -156,10 +172,13 @@ impl PyIcebergSink {
     /// `catalog` is the local filesystem base directory; `table` is the
     /// dot-separated table reference (e.g. `"db.events"`).
     /// Requires the `iceberg` Cargo feature.
-    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+    pub fn write_batches(
+        &self,
+        py: Python<'_>,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<usize> {
         #[cfg(feature = "iceberg")]
         {
-            use krishiv_common::async_util::block_on;
             use krishiv_connectors::lakehouse::{
                 IcebergFsTable, IcebergTableRef, LakehouseTable, schema_version_from_arrow,
             };
@@ -188,13 +207,13 @@ impl PyIcebergSink {
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg schema: {e}")))?;
             let tbl = IcebergFsTable::new(&base, table_ref, schema_version)
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg open: {e}")))?;
-            block_on(tbl.append(records))
+            block_on_detached(py, tbl.append(records))
                 .map_err(|e| PyRuntimeError::new_err(format!("iceberg append: {e}")))?;
             Ok(total_rows)
         }
         #[cfg(not(feature = "iceberg"))]
         {
-            let _ = batches;
+            let _ = (py, batches);
             Err(PyRuntimeError::new_err(
                 "IcebergSink.write_batches requires the 'iceberg' feature; \
                  rebuild with: maturin develop --features iceberg",
@@ -235,10 +254,13 @@ impl PyCassandraSink {
         }
     }
 
-    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+    pub fn write_batches(
+        &self,
+        py: Python<'_>,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<usize> {
         #[cfg(feature = "cassandra")]
         {
-            use krishiv_common::async_util::block_on;
             use krishiv_connectors::cassandra_sink::{CassandraConfig, CassandraSink};
 
             let records: Vec<arrow::record_batch::RecordBatch> =
@@ -253,9 +275,9 @@ impl PyCassandraSink {
                     .with_consistency_name(level)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             }
-            let sink = block_on(CassandraSink::connect(cfg))
+            let sink = block_on_detached(py, CassandraSink::connect(cfg))
                 .map_err(|e| PyRuntimeError::new_err(format!("cassandra sink init: {e}")))?;
-            block_on(async {
+            block_on_detached(py, async {
                 for batch in &records {
                     sink.write_batch(batch).await?;
                 }
@@ -266,7 +288,7 @@ impl PyCassandraSink {
         }
         #[cfg(not(feature = "cassandra"))]
         {
-            let _ = batches;
+            let _ = (py, batches);
             Err(PyRuntimeError::new_err(
                 "CassandraSink.write_batches requires the 'cassandra' feature; \
                  rebuild with: maturin develop --features cassandra",
@@ -298,10 +320,13 @@ impl PyElasticsearchSink {
         Self { url, index }
     }
 
-    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+    pub fn write_batches(
+        &self,
+        py: Python<'_>,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<usize> {
         #[cfg(feature = "elasticsearch")]
         {
-            use krishiv_common::async_util::block_on;
             use krishiv_connectors::elasticsearch_sink::{ElasticsearchConfig, ElasticsearchSink};
 
             let records: Vec<arrow::record_batch::RecordBatch> =
@@ -311,9 +336,9 @@ impl PyElasticsearchSink {
             }
             let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
             let cfg = ElasticsearchConfig::new(&self.url, &self.index);
-            let sink = block_on(ElasticsearchSink::connect(cfg))
+            let sink = block_on_detached(py, ElasticsearchSink::connect(cfg))
                 .map_err(|e| PyRuntimeError::new_err(format!("elasticsearch sink init: {e}")))?;
-            block_on(async {
+            block_on_detached(py, async {
                 for batch in &records {
                     sink.write_batch(batch).await?;
                 }
@@ -324,7 +349,7 @@ impl PyElasticsearchSink {
         }
         #[cfg(not(feature = "elasticsearch"))]
         {
-            let _ = batches;
+            let _ = (py, batches);
             Err(PyRuntimeError::new_err(
                 "ElasticsearchSink.write_batches requires the 'elasticsearch' feature; \
                  rebuild with: maturin develop --features elasticsearch",
@@ -363,10 +388,13 @@ impl PyHBaseSink {
         }
     }
 
-    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
+    pub fn write_batches(
+        &self,
+        py: Python<'_>,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<usize> {
         #[cfg(feature = "hbase")]
         {
-            use krishiv_common::async_util::block_on;
             use krishiv_connectors::hbase_connector::{HBaseConfig, HBaseSink};
 
             let records: Vec<arrow::record_batch::RecordBatch> =
@@ -376,9 +404,9 @@ impl PyHBaseSink {
             }
             let total_rows: usize = records.iter().map(|b| b.num_rows()).sum();
             let cfg = HBaseConfig::new(&self.host, &self.table, &self.column_family);
-            let sink = block_on(HBaseSink::connect(cfg))
+            let sink = block_on_detached(py, HBaseSink::connect(cfg))
                 .map_err(|e| PyRuntimeError::new_err(format!("hbase sink init: {e}")))?;
-            block_on(async {
+            block_on_detached(py, async {
                 for batch in &records {
                     sink.write_batch(batch).await?;
                 }
@@ -389,7 +417,7 @@ impl PyHBaseSink {
         }
         #[cfg(not(feature = "hbase"))]
         {
-            let _ = batches;
+            let _ = (py, batches);
             Err(PyRuntimeError::new_err(
                 "HBaseSink.write_batches requires the 'hbase' feature; \
                  rebuild with: maturin develop --features hbase",
@@ -521,8 +549,11 @@ impl PyConnectorSink {
     /// Returns the number of rows written. Flush failures fail the call: the
     /// flush is what makes the output durable, so a silent success here would
     /// acknowledge unwritten rows.
-    pub fn write_batches(&self, batches: Vec<crate::batch::PyBatch>) -> PyResult<usize> {
-        use krishiv_common::async_util::block_on;
+    pub fn write_batches(
+        &self,
+        py: Python<'_>,
+        batches: Vec<crate::batch::PyBatch>,
+    ) -> PyResult<usize> {
         use krishiv_connectors::{ConnectorConfig, default_registry};
 
         let records: Vec<arrow::record_batch::RecordBatch> =
@@ -534,7 +565,7 @@ impl PyConnectorSink {
             config = config.with_property(key, value);
         }
 
-        block_on(async move {
+        block_on_detached(py, async move {
             let registry = default_registry();
             let mut sink = registry.open_sink(&config).await.map_err(|e| {
                 PyRuntimeError::new_err(format!("connector sink open ({}): {e}", config.kind))

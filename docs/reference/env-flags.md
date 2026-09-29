@@ -82,10 +82,8 @@ Regenerate with:
 | `KRISHIV_IVM_SHARDS` | uint | `min(available_parallelism, 8)` | Shard count for an auto-partitioned coordinator-resident IVM flow; 1 disables auto-partitioning. Unset derives from CPU count, capped at 8 (`krishiv_scheduler::ivm::default_ivm_shards`), not 1. |
 | `KRISHIV_IVM_SPILL_DIR` | text | `OS temp directory` | Directory an IVM tick's DataFusion spill files are written to. |
 | `KRISHIV_IVM_SPILL_MAX_DISK_BYTES` | uint | `10737418240` | Ceiling on bytes an IVM tick's spill directory may hold; 0/unparseable falls back to the default. |
-| `KRISHIV_JCP_POLL_INTERVAL_SECS` | uint | `2` | Job-completion poll interval for job-mode coordinator runs. |
 | `KRISHIV_JOB_GC_GRACE_SECS` | uint | `30` | Grace window a terminal job stays queryable before the GC tick may evict it, so a slow consumer still observes its outcome + result. |
 | `KRISHIV_JOB_ID` | text | `unset` | Job ID for single-job (job-mode) coordinator/executor pods. |
-| `KRISHIV_JOB_SPEC_JSON` | text | `unset` | Inline JSON job spec submitted at startup in job-mode. |
 | `KRISHIV_LEADER_BACKEND` | single \| etcd | `single` | Coordinator leader-election backend. |
 | `KRISHIV_LEADER_LEASE_SECS` | uint | `15` | Leader lease TTL for etcd-backed election. |
 | `KRISHIV_LOG_FORMAT` | json \| pretty \| compact | `json` | Log/stderr output format for the tracing subscriber (json = daemon default). |
@@ -96,6 +94,7 @@ Regenerate with:
 | `KRISHIV_MAX_SHUFFLE_REGEN` | uint | `8` | Maximum times a lost shuffle partition may be regenerated before the job fails terminally (consumer-driven FetchFailed recovery bound). |
 | `KRISHIV_MCP_ADDR` | host:port | `127.0.0.1:8811` | MCP server listen address (http transport). |
 | `KRISHIV_FLIGHT_ALLOW_FILE_SQL` | bool | `false` | Allow Flight SQL clients to run SQL that reads or writes server files (COPY, CREATE EXTERNAL TABLE, parquet path directives, RegisterParquet) in durable profiles. Always allowed in dev-local. |
+| `KRISHIV_KAFKA_SINK_ALLOW_UNRECOVERABLE_TXN` | bool | `false` | Allow the transactional Kafka sink under a durable profile, accepting that an executor crash between checkpoint completion and transaction commit loses that epoch's output (the sink cannot resume a prepared transaction). |
 | `KRISHIV_MCP_ALLOW_WRITE_SQL` | bool | `false` | Allow the MCP run_sql tool to execute write statements. |
 | `KRISHIV_MCP_BEARER_TOKEN` | text | `(unset)` | Bearer token every MCP HTTP request must present. Required to bind the HTTP transport to a non-loopback address; unset on loopback means Origin/Host checks only. |
 | `KRISHIV_MCP_MAX_ROWS` | uint | `100` | Row cap on MCP query results. |

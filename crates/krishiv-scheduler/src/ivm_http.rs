@@ -417,7 +417,7 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
             _ => {
                 tracing::warn!(
                     job_id,
-                    "IVM create refused: force_diff_based needs a single (non-partitioned)                      flow, so the recompute arm runs the same route as the incremental arm"
+                    "IVM create refused: force_diff_based needs a single (non-partitioned) flow, so the recompute arm runs the same route as the incremental arm"
                 );
                 return Err(StatusCode::BAD_REQUEST);
             }

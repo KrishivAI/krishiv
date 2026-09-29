@@ -3257,7 +3257,7 @@ impl Session {
         // naming the sink instead of a job that quietly writes nowhere.
         if let Some(sink) = job.sinks.first() {
             return Err(KrishivError::unsupported(format!(
-                "distributed continuous streaming does not yet carry this job's sink                  '{}' ({} -> {}): the registration wire has no sink field, so the job's                  output would stay on the cluster's egress buffer — and be dropped past                  its cap — while the job reported Running. Use submit() for a bounded                  run, or register the sink on the coordinator directly, which has                  supported registry sinks since #197.",
+                "distributed continuous streaming does not yet carry this job's sink '{}' ({} -> {}): the registration wire has no sink field, so the job's output would stay on the cluster's egress buffer — and be dropped past its cap — while the job reported Running. Use submit() for a bounded run, or register the sink on the coordinator directly, which has supported registry sinks since #197.",
                 sink.view, sink.connector, sink.uri
             )));
         }
@@ -3462,7 +3462,7 @@ impl Session {
         let name = iv.name();
         if self.table_exists(name)? {
             return Err(KrishivError::unsupported(format!(
-                "cannot read incremental view '{name}' as a DataFrame: this session already has                  a table named '{name}', and the derived view's SQL cannot distinguish them.                  Rename the view (to_incremental(name)) or drop/rename the table."
+                "cannot read incremental view '{name}' as a DataFrame: this session already has a table named '{name}', and the derived view's SQL cannot distinguish them. Rename the view (to_incremental(name)) or drop/rename the table."
             )));
         }
         // The table always carries the view's DECLARED output schema, whether
@@ -3482,7 +3482,7 @@ impl Session {
                     let column = snapshot.column(i);
                     arrow::compute::cast(column, field.data_type()).map_err(|e| {
                         KrishivError::unsupported(format!(
-                            "incremental view '{name}' materialized column '{}' as {:?}, which                              does not fit its declared output type {:?}: {e}",
+                            "incremental view '{name}' materialized column '{}' as {:?}, which does not fit its declared output type {:?}: {e}",
                             field.name(),
                             column.data_type(),
                             field.data_type()
@@ -3493,7 +3493,7 @@ impl Session {
             batches.push(
                 RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
                     KrishivError::unsupported(format!(
-                        "incremental view '{name}' snapshot does not fit its declared output                          schema: {e}"
+                        "incremental view '{name}' snapshot does not fit its declared output schema: {e}"
                     ))
                 })?,
             );

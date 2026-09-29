@@ -126,9 +126,8 @@ impl DisaggregatedStateBackend {
     /// Compute the DFS path for a `(namespace, key)` pair.
     fn dfs_path(&self, namespace: &Namespace, key: &[u8]) -> PathBuf {
         self.config.dfs_root.join(format!(
-            "{}__{}__{}.dat",
-            namespace.operator_id(),
-            namespace.state_name(),
+            "{}{}.dat",
+            ns_file_prefix(namespace),
             Self::key_hash(key)
         ))
     }
@@ -136,9 +135,8 @@ impl DisaggregatedStateBackend {
     /// Compute the local cache path for a `(namespace, key)` pair.
     fn cache_path(&self, namespace: &Namespace, key: &[u8]) -> PathBuf {
         self.config.local_cache_dir.join(format!(
-            "{}__{}__{}.dat",
-            namespace.operator_id(),
-            namespace.state_name(),
+            "{}{}.dat",
+            ns_file_prefix(namespace),
             Self::key_hash(key)
         ))
     }
@@ -493,7 +491,7 @@ impl StateBackend for DisaggregatedStateBackend {
     fn clear_namespace(&mut self, namespace: &Namespace) -> StateResult<()> {
         // Remove all DFS files for this namespace (operator AND state name —
         // an operator-only prefix would clear sibling states too)
-        let ns_prefix = format!("{}__{}__", namespace.operator_id(), namespace.state_name());
+        let ns_prefix = ns_file_prefix(namespace);
         if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
@@ -534,11 +532,8 @@ impl StateBackend for DisaggregatedStateBackend {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str() {
                     // Format: `{op_id}__{state_name}__{hash}.dat`
-                    if let Some(rest) = name.strip_suffix(".dat") {
-                        let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                        if let [op_id, state_name, _] = parts.as_slice() {
-                            namespaces.insert(Namespace::new(*op_id, *state_name));
-                        }
+                    if let Some(namespace) = namespace_of_file(name) {
+                        namespaces.insert(namespace);
                     }
                 }
             }
@@ -547,12 +542,9 @@ impl StateBackend for DisaggregatedStateBackend {
         if let Ok(entries) = std::fs::read_dir(&self.config.local_cache_dir) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
-                    && let Some(rest) = name.strip_suffix(".dat")
+                    && let Some(namespace) = namespace_of_file(name)
                 {
-                    let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                    if let [op_id, state_name, _] = parts.as_slice() {
-                        namespaces.insert(Namespace::new(*op_id, *state_name));
-                    }
+                    namespaces.insert(namespace);
                 }
             }
         }
@@ -565,7 +557,7 @@ impl StateBackend for DisaggregatedStateBackend {
         // DFS is primary: enumerate its records (which embed the real key) so
         // a fresh instance with a cold cache sees the full keyspace.
         let mut keys = Vec::new();
-        let ns_prefix = format!("{}__{}__", namespace.operator_id(), namespace.state_name());
+        let ns_prefix = ns_file_prefix(namespace);
         if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
             for entry in entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
@@ -608,16 +600,15 @@ impl StateBackend for DisaggregatedStateBackend {
         if let Ok(dir_entries) = std::fs::read_dir(&self.config.dfs_root) {
             for entry in dir_entries.flatten() {
                 if let Some(name) = entry.file_name().to_str()
-                    && let Some(rest) = name.strip_suffix(".dat")
+                    && let Some(namespace) = namespace_of_file(name)
                 {
-                    let parts: Vec<&str> = rest.splitn(3, "__").collect();
-                    if let [op_id, state_name, _hash] = parts.as_slice() {
+                    {
                         if let Ok(record) = std::fs::read(entry.path()) {
                             // Records embed the real key: `[key_len][key][value]`
                             let (key, value) = Self::decode_dfs_record(&record)?;
                             entries.push((
-                                (*op_id).to_string(),
-                                (*state_name).to_string(),
+                                namespace.operator_id().to_string(),
+                                namespace.state_name().to_string(),
                                 key,
                                 value,
                             ));
@@ -743,6 +734,56 @@ impl StateBackend for DisaggregatedStateBackend {
         }
         Ok(())
     }
+}
+
+/// Percent-encode a namespace part for a file name: everything but ASCII
+/// letters, digits, `.` and `-` becomes `%XX`, so `_` (and with it the `__`
+/// field separator) and `/` can never appear inside a field.
+fn encode_name_part(part: &str) -> String {
+    let mut out = String::with_capacity(part.len());
+    for byte in part.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn decode_name_part(part: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(part.len());
+    let mut iter = part.bytes();
+    while let Some(byte) = iter.next() {
+        if byte == b'%' {
+            let hi = char::from(iter.next()?).to_digit(16)?;
+            let lo = char::from(iter.next()?).to_digit(16)?;
+            bytes.push(u8::try_from(hi * 16 + lo).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+/// `{op}__{state}__` — the file-name prefix shared by a namespace's records.
+fn ns_file_prefix(namespace: &Namespace) -> String {
+    format!(
+        "{}__{}__",
+        encode_name_part(namespace.operator_id()),
+        encode_name_part(namespace.state_name())
+    )
+}
+
+/// The namespace a record file belongs to, from its name.
+fn namespace_of_file(name: &str) -> Option<Namespace> {
+    let rest = name.strip_suffix(".dat")?;
+    let mut parts = rest.splitn(3, "__");
+    let (op, state, _hash) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(Namespace::new(
+        decode_name_part(op)?,
+        decode_name_part(state)?,
+    ))
 }
 
 /// Read one `[u64 LE len][bytes]` segment from `cursor`, validating the
@@ -953,6 +994,30 @@ mod tests {
 
         // Cache should have evicted some entries
         assert!(backend.cache_size_bytes() <= 100);
+    }
+
+    /// L8: `__` separates the file-name fields, so namespace parts that
+    /// contain it collided — (a__b, c) and (a, b__c) shared files — and a
+    /// state name with `__` came back under the wrong namespace.
+    #[test]
+    fn namespaces_containing_the_separator_stay_distinct() {
+        let mut backend = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        let left = Namespace::new("a__b", "c");
+        let right = Namespace::new("a", "b__c");
+        backend.put(&left, b"k".to_vec(), b"left".to_vec()).unwrap();
+        backend
+            .put(&right, b"k".to_vec(), b"right".to_vec())
+            .unwrap();
+        assert_eq!(backend.get(&left, b"k").unwrap(), Some(b"left".to_vec()));
+        assert_eq!(backend.get(&right, b"k").unwrap(), Some(b"right".to_vec()));
+
+        let snapshot = backend.snapshot().unwrap();
+        let mut restored = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        restored.load_snapshot(&snapshot).unwrap();
+        assert_eq!(restored.get(&right, b"k").unwrap(), Some(b"right".to_vec()));
+        let mut names = restored.list_namespaces().unwrap();
+        names.sort_by_key(|n| (n.operator_id().to_string(), n.state_name().to_string()));
+        assert_eq!(names, vec![right.clone(), left.clone()]);
     }
 
     /// F4: filenames must come from a stable content hash (SHA-256), not

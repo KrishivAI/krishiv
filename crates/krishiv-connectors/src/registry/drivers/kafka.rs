@@ -116,7 +116,12 @@ impl TwoPhaseSinkDriver for KafkaTransactionalSinkDriver {
             // init_transactions() talks to the broker, so keep it off the async
             // reactor like every other blocking connector open in this crate.
             let sink = tokio::task::spawn_blocking(move || {
-                RdkafkaTransactionalSink::new(bootstrap_servers, topic, transactional_id)
+                RdkafkaTransactionalSink::new_for_profile(
+                    krishiv_common::resolve_durability_profile(),
+                    bootstrap_servers,
+                    topic,
+                    transactional_id,
+                )
             })
             .await
             .map_err(|error| crate::error::ConnectorError::Kafka {

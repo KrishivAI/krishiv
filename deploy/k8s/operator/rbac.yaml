@@ -6,6 +6,10 @@ metadata:
     app.kubernetes.io/name: krishiv
     app.kubernetes.io/component: control-plane
     app.kubernetes.io/part-of: krishiv
+# Least privilege: exactly the verbs the operator's code issues. It is a
+# ClusterRole because `--all-namespaces` watches KrishivJobs (and places their
+# executor pods) in every namespace. Nothing beyond these three resource
+# groups is granted.
 rules:
   - apiGroups:
       - krishiv.io
@@ -16,33 +20,14 @@ rules:
       - get
       - list
       - watch
-      - update
       - patch
   - apiGroups:
       - ""
     resources:
       - pods
-      - services
-      - events
     verbs:
       - get
-      - list
-      - watch
       - create
-      - update
-      - patch
-      - delete
-  - apiGroups:
-      - apps
-    resources:
-      - deployments
-    verbs:
-      - get
-      - list
-      - watch
-      - create
-      - update
-      - patch
       - delete
   - apiGroups:
       - coordination.k8s.io
@@ -50,12 +35,8 @@ rules:
       - leases
     verbs:
       - get
-      - list
-      - watch
       - create
-      - update
       - patch
-      - delete
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

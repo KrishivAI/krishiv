@@ -799,7 +799,13 @@ impl std::fmt::Debug for FlightClientPool {
 
 impl Drop for FlightClientPool {
     fn drop(&mut self) {
-        // Try to stop health checks - best effort
+        // Every clone shares one health loop, and the loop task holds a clone
+        // of its own. Stop it only when this is the last handle outside the
+        // loop — count 2 is this handle plus the loop's. Dropping any clone
+        // used to abort it, and `health_started` then kept it from restarting.
+        if Arc::strong_count(&self.health_check_handle) != 2 {
+            return;
+        }
         if let Ok(mut handle_guard) = self.health_check_handle.try_lock()
             && let Some(handle) = handle_guard.take()
         {
@@ -1647,6 +1653,24 @@ mod tests {
             }
             other => panic!("expected ResultTooLarge, got {other:?}"),
         }
+    }
+
+    /// L6: every clone of the pool shares one health loop; dropping a clone
+    /// (e.g. the temporary one `spawn_health_checks` moves into its task)
+    /// aborted it, and `health_started` then kept it from ever restarting.
+    #[tokio::test]
+    async fn dropping_a_clone_keeps_the_shared_health_loop_running() {
+        let pool = FlightClientPool::new("http://127.0.0.1:1").unwrap();
+        pool.start_health_checks().await;
+        drop(pool.clone());
+        tokio::task::yield_now().await;
+        let finished = pool
+            .health_check_handle
+            .lock()
+            .await
+            .as_ref()
+            .map(tokio::task::JoinHandle::is_finished);
+        assert_eq!(finished, Some(false), "the loop died with a clone");
     }
 
     #[tokio::test]

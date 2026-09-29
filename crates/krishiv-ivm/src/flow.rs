@@ -2620,7 +2620,7 @@ impl IncrementalFlow {
                 let emitted = describe(&output_delta.data_schema().clone());
                 let declared = describe(&view.spec.output_schema);
                 let message = format!(
-                    "operator emitted columns {emitted:?} but the view declares                      {declared:?}; refusing to publish a relation the view did                      not declare (IVM-AUD-SCHEMA-1)"
+                    "operator emitted columns {emitted:?} but the view declares {declared:?}; refusing to publish a relation the view did not declare (IVM-AUD-SCHEMA-1)"
                 );
                 tracing::error!(view = %view_name, %message, "output schema mismatch");
                 errored_views.push(ViewError {

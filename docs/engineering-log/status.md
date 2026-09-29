@@ -1,5 +1,21 @@
 # Krishiv Implementation Status
 
+## 2026-09-29 — review closed: all items fixed (branch `review-fixes-2026-09-28`)
+
+Every item in `docs/engineering-log/review-2026-09-28-todo.md` is now `[x]`.
+Last batch: H8 remainder, M25, M35, L1–L20, R1–R4.
+
+Decisions: H8 — prepared-transaction crash recovery is not implemented; the
+Kafka transactional sink is refused under durable profiles unless
+`KRISHIV_KAFKA_SINK_ALLOW_UNRECOVERABLE_TXN=1`. M35 — the JCP daemon, its
+binary/alias, flag and pod template were deleted (the `/federation` API it
+called was never served). M25 — rjoin/rpipe/rbatch are gate variants
+(`RunLoopJoin`, `RunLoopPipeline`, `RunLoopStateless`); RunLoop end-of-stream
+is `FlushOnDirective` and the `stream-eos` handler flushes through the driver;
+pipelines now idle-tick quiet windows closed. L2/L4/L19 were deleted
+(ESS push path, `unnest_sql`, `two_phase_parquet_s3`); `CROSS JOIN UNNEST` is
+listed as Planned. Operator RBAC narrowed (L18).
+
 ## 2026-09-29 — review medium items: 43 of 45 fixed (branch `review-fixes-2026-09-28`)
 
 Per-item notes in `docs/engineering-log/review-2026-09-28-todo.md`. Commits:

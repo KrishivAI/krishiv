@@ -737,7 +737,6 @@ async fn heartbeat_loop(
                     local_dir,
                     flight_endpoint,
                     ess_index: None,
-                    push_store: None,
                 })
                 .with_inmem_shuffle(backend);
         }
@@ -748,7 +747,6 @@ async fn heartbeat_loop(
                     local_dir,
                     flight_endpoint: String::new(),
                     ess_index: None,
-                    push_store: None,
                 })
                 .with_inmem_shuffle(backend);
         }

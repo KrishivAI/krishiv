@@ -3,6 +3,7 @@
 pub const EXECUTOR_TASK_BEARER_TOKEN_ENV: &str = "KRISHIV_EXECUTOR_TASK_BEARER_TOKEN";
 pub const REQUIRE_EXECUTOR_TASK_AUTH_ENV: &str = "KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH";
 
+use krishiv_dataflow::stream_driver::{StopOutcome, StopReason, StreamDriver, StreamingLoop};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -278,7 +279,7 @@ impl ExecutorTaskInboxService {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(tonic::Status::deadline_exceeded(format!(
-                    "EOS quiesce for job {job_id} timed out: {pending} pushed batch(es)                      still unapplied, {busy} loop iteration(s) mid-processing — the run                      loop is wedged or the job has no live loop consuming its input"
+                    "EOS quiesce for job {job_id} timed out: {pending} pushed batch(es) still unapplied, {busy} loop iteration(s) mid-processing — the run loop is wedged or the job has no live loop consuming its input"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -320,7 +321,7 @@ impl ExecutorTaskInboxService {
             }
             if tokio::time::Instant::now() >= deadline {
                 return Err(tonic::Status::deadline_exceeded(format!(
-                    "pre-split pipeline flush for job {job_id} timed out: {}/{} subtasks                      flushed — a pipeline loop is wedged or already stopped",
+                    "pre-split pipeline flush for job {job_id} timed out: {}/{} subtasks flushed — a pipeline loop is wedged or already stopped",
                     state.done.len(),
                     expected
                 )));
@@ -356,7 +357,7 @@ impl ExecutorTaskInboxService {
                 .count();
             if state.done.len() < expected {
                 return Err(tonic::Status::failed_precondition(format!(
-                    "job {job_id} is a split pipeline: the stream-eos-prestage round must                      complete before stream-eos ({}/{} subtasks pre-flushed); is the                      coordinator too old to send it?",
+                    "job {job_id} is a split pipeline: the stream-eos-prestage round must complete before stream-eos ({}/{} subtasks pre-flushed); is the coordinator too old to send it?",
                     state.done.len(),
                     expected
                 )));
@@ -370,9 +371,17 @@ impl ExecutorTaskInboxService {
             let mut exec = entry.value().lock().map_err(|_| {
                 tonic::Status::internal("run-loop window executor lock poisoned during EOS flush")
             })?;
-            outputs.extend(exec.flush_all().map_err(|e| {
-                tonic::Status::internal(format!("EOS flush of window state failed: {e}"))
-            })?);
+            // The end-of-stream directive is a stop reason the run-loop's
+            // policy answers (`FlushOnDirective`), decided in the driver rather
+            // than by calling `flush_all` here behind the policy's back.
+            let outcome = StreamDriver::new(StreamingLoop::RunLoop)
+                .on_stop(&mut *exec, StopReason::CoordinatorDirective)
+                .map_err(|e| {
+                    tonic::Status::internal(format!("EOS flush of window state failed: {e}"))
+                })?;
+            if let StopOutcome::Flushed(batches) = outcome {
+                outputs.extend(batches);
+            }
         }
         let pipelines: Vec<_> = self
             .class_executors
@@ -383,9 +392,14 @@ impl ExecutorTaskInboxService {
             .collect();
         for pipe in pipelines {
             let mut pipe = pipe.lock().await;
-            outputs.extend(pipe.flush_all().map_err(|e| {
-                tonic::Status::internal(format!("EOS flush of pipeline state failed: {e}"))
-            })?);
+            let outcome = StreamDriver::new(StreamingLoop::RunLoopPipeline)
+                .on_pipeline_stop(&mut *pipe, StopReason::CoordinatorDirective)
+                .map_err(|e| {
+                    tonic::Status::internal(format!("EOS flush of pipeline state failed: {e}"))
+                })?;
+            if let StopOutcome::Flushed(batches) = outcome {
+                outputs.extend(batches);
+            }
         }
         // Joins emit matches eagerly and the stateless class holds no window
         // state — nothing to flush for those maps.
@@ -1445,7 +1459,7 @@ mod tests {
             .unwrap();
         assert!(
             !stale,
-            "no tombstone may survive a continuous teardown — a recreated job              reusing the id would have this subtask insta-cancelled at pickup"
+            "no tombstone may survive a continuous teardown — a recreated job reusing the id would have this subtask insta-cancelled at pickup"
         );
     }
 

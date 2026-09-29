@@ -35,9 +35,12 @@ pub fn rewrite_tumble_tvfs(sql: &str) -> Option<String> {
         let Some((start, end, table, column, size)) = find_tumble(&current) else {
             break;
         };
+        // Floored modulo: SQL `%` truncates toward zero, which would put a
+        // negative timestamp in the window after the one containing it.
+        let offset = floored_mod(&column, size);
         let replacement = format!(
-            "(SELECT *, {column} - {column} % {size} AS window_start, \
-             {column} - {column} % {size} + {size} AS window_end FROM {table}) AS {alias}",
+            "(SELECT *, {column} - {offset} AS window_start, \
+             {column} - {offset} + {size} AS window_end FROM {table}) AS {alias}",
             alias = alias_of(&table),
         );
         let (Some(before), Some(after)) = (current.get(..start), current.get(end..)) else {
@@ -50,6 +53,11 @@ pub fn rewrite_tumble_tvfs(sql: &str) -> Option<String> {
         rewrote = true;
     }
     rewrote.then_some(current)
+}
+
+/// `column mod n` rounded toward negative infinity, as SQL text.
+fn floored_mod(column: &str, n: u64) -> String {
+    format!("(({column} % {n}) + {n}) % {n}")
 }
 
 /// The alias the derived table wears: the table's bare (unqualified) name, so
@@ -92,10 +100,11 @@ pub fn rewrite_hop_tvfs(sql: &str) -> Option<String> {
         let branches: Vec<String> = (0..size / slide)
             .map(|k| {
                 let shift = k * slide;
+                let offset = floored_mod(&column, slide);
                 let ws = if shift == 0 {
-                    format!("{column} - {column} % {slide}")
+                    format!("{column} - {offset}")
                 } else {
-                    format!("{column} - {column} % {slide} - {shift}")
+                    format!("{column} - {offset} - {shift}")
                 };
                 format!("SELECT *, {ws} AS window_start, {ws} + {size} AS window_end FROM {table}")
             })
@@ -546,12 +555,57 @@ mod tests {
         let out = rewrite_tumble_tvfs(sql).expect("rewritten");
         assert!(
             out.contains(
-                "(SELECT *, \"dateTime\" - \"dateTime\" % 10000 AS window_start, \
-                 \"dateTime\" - \"dateTime\" % 10000 + 10000 AS window_end FROM bid) AS bid"
+                "(SELECT *, \"dateTime\" - ((\"dateTime\" % 10000) + 10000) % 10000 AS window_start, \
+                 \"dateTime\" - ((\"dateTime\" % 10000) + 10000) % 10000 + 10000 AS window_end FROM bid) AS bid"
             ),
             "{out}"
         );
         assert!(out.contains("GROUP BY auction, window_start, window_end"));
+    }
+
+    /// L5: SQL `%` truncates toward zero, so `ts - ts % size` put ts = -5 in
+    /// [0, 10) — a window that does not contain it. The streaming operators
+    /// floor ([-10, 0)); the rewrite must agree.
+    #[tokio::test]
+    async fn negative_timestamps_fall_in_the_window_that_contains_them() {
+        use datafusion::arrow::array::{Array as _, Int64Array};
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::record_batch::RecordBatch;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![-5_i64, 5]))])
+            .unwrap();
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_batch("t", batch).unwrap();
+        for sql in [
+            rewrite_tumble_tvfs(
+                "SELECT ts, window_start, window_end FROM TUMBLE(TABLE t, DESCRIPTOR(ts), 10)",
+            )
+            .unwrap(),
+            rewrite_hop_tvfs(
+                "SELECT ts, window_start, window_end FROM HOP(TABLE t, DESCRIPTOR(ts), 10, 10)",
+            )
+            .unwrap(),
+        ] {
+            let out = ctx.sql(&sql).await.unwrap().collect().await.unwrap();
+            let mut rows = Vec::new();
+            for b in &out {
+                let col = |i: usize| {
+                    b.column(i)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .unwrap()
+                        .clone()
+                };
+                let (ts, start, end) = (col(0), col(1), col(2));
+                for r in 0..b.num_rows() {
+                    rows.push((ts.value(r), start.value(r), end.value(r)));
+                }
+            }
+            rows.sort();
+            assert_eq!(rows, vec![(-5, -10, 0), (5, 0, 10)], "{sql}");
+        }
     }
 
     #[test]
@@ -588,8 +642,12 @@ mod tests {
                    GROUP BY auction, window_start, window_end";
         let out = rewrite_hop_tvfs(sql).expect("rewrites");
         assert_eq!(out.matches("UNION ALL").count(), 4, "5 branches: {out}");
-        assert!(out.contains("\"dateTime\" - \"dateTime\" % 2000 AS window_start"));
-        assert!(out.contains("\"dateTime\" - \"dateTime\" % 2000 - 8000 AS window_start"));
+        assert!(
+            out.contains("\"dateTime\" - ((\"dateTime\" % 2000) + 2000) % 2000 AS window_start")
+        );
+        assert!(out.contains(
+            "\"dateTime\" - ((\"dateTime\" % 2000) + 2000) % 2000 - 8000 AS window_start"
+        ));
         assert!(out.contains("- 8000 + 10000 AS window_end"));
         assert!(out.contains(") AS bid"), "wears the table alias: {out}");
     }

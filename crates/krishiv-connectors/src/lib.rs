@@ -48,8 +48,6 @@ pub mod storage_factory;
 pub mod transactional;
 #[cfg(feature = "kafka")]
 pub mod transactional_kafka;
-#[cfg(feature = "two-phase")]
-pub mod two_phase_parquet_s3;
 
 // Module facades
 pub mod capabilities;

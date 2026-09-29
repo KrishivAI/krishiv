@@ -1144,10 +1144,15 @@ impl IncrementalJoinOp {
             Ok(u32::from_le_bytes(raw.try_into().map_err(|_| truncated())?))
         };
         let n_groups = read_u32(bytes, &mut pos)? as usize;
-        let mut groups: AHashMap<Vec<Option<String>>, i64> = AHashMap::with_capacity(n_groups);
+        // Sized by what the remaining bytes could hold (each group is at
+        // least a 4-byte part count), never by the count alone: a corrupt
+        // count must fail as truncated, not reserve billions of buckets.
+        let mut groups: AHashMap<Vec<Option<String>>, i64> =
+            AHashMap::with_capacity(n_groups.min(bytes.len().saturating_sub(pos) / 4));
         for _ in 0..n_groups {
             let n_parts = read_u32(bytes, &mut pos)? as usize;
-            let mut key: Vec<Option<String>> = Vec::with_capacity(n_parts);
+            let mut key: Vec<Option<String>> =
+                Vec::with_capacity(n_parts.min(bytes.len().saturating_sub(pos)));
             for _ in 0..n_parts {
                 let present = *bytes.get(pos).ok_or_else(truncated)?;
                 pos += 1;

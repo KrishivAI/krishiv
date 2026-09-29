@@ -775,6 +775,12 @@ impl ComputeEngine for StreamingEngine {
 
     fn validate(&self, job: &CompiledJob) -> EngineResult<()> {
         job.validate_shape().map_err(EngineError::InvalidJob)?;
+        if job.engine != EngineKind::Streaming {
+            return Err(EngineError::Unsupported {
+                engine: EngineKind::Streaming,
+                reason: format!("job declares the {} engine", job.engine),
+            });
+        }
         if job.query.trim().is_empty() {
             return Err(EngineError::InvalidJob(
                 "streaming job query cannot be empty".into(),
@@ -794,11 +800,9 @@ impl ComputeEngine for StreamingEngine {
     /// memory before being written.
     #[tracing::instrument(skip(self, rt), fields(job = %job.name))]
     async fn run(&self, job: CompiledJob, rt: EngineRuntime) -> EngineResult<JobHandle> {
-        if job.query.trim().is_empty() {
-            return Err(EngineError::InvalidJob(
-                "streaming job query cannot be empty".into(),
-            ));
-        }
+        // Same gate as the batch and incremental engines: without it a job
+        // with no sinks drained its source and reported Completed.
+        self.validate(&job)?;
         // Route on whether the query IS windowed, not on whether it compiles.
         //
         // This used to be `if compile_streaming_window_sql(..).is_err()`, which
@@ -2782,6 +2786,22 @@ mod tests {
         }
     }
 
+    /// L14: StreamingEngine::run skipped `validate()`, so a job with no sinks
+    /// read its whole source, discarded the output and reported Completed.
+    #[tokio::test]
+    async fn a_streaming_job_without_sinks_is_rejected() {
+        let sources = InMemorySourceProvider::new();
+        sources.insert("events", vec![event_batch("a", 1_000, 1)]);
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(InMemorySinkProvider::new()));
+        let mut job = tumbling_job("no-sinks");
+        job.sinks.clear();
+        let err = StreamingEngine
+            .run(job, rt)
+            .await
+            .expect_err("a job with nowhere to write must be refused");
+        assert!(matches!(err, EngineError::InvalidJob(_)), "{err}");
+    }
+
     /// A whole-job retry re-runs every sink write. Once output has been handed
     /// to a sink, a later transient error (here: the final checkpoint persist,
     /// which happens after the sinks flush) must surface instead of appending
@@ -3162,7 +3182,7 @@ mod tests {
              GROUP BY region, window_start, window_end \
              HAVING COUNT(*) > 5",
             vec![SourceSpec::unbounded("events", "memory", "events")],
-            vec![],
+            vec![SinkSpec::new("out", "memory", "")],
             true,
         )
         .with_engine(EngineKind::Streaming);

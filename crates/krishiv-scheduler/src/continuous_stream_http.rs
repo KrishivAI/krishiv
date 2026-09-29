@@ -1110,7 +1110,7 @@ pub async fn api_continuous_checkpoint(
             model: if is_run_loop { "run-loop" } else { "cycle" }.to_owned(),
             snapshot_source: is_run_loop.then(|| {
                 String::from(
-                    "run-loop jobs checkpoint through the barrier pipeline into                      checkpoint_storage_path; this endpoint reads the cycle model's                      coordinator snapshot store and will always report                      snapshot_available=false for them",
+                    "run-loop jobs checkpoint through the barrier pipeline into checkpoint_storage_path; this endpoint reads the cycle model's coordinator snapshot store and will always report snapshot_available=false for them",
                 )
             }),
         }
@@ -2283,7 +2283,7 @@ async fn launch_run_loop_job(
                         .and_then(|t| t.assigned_executor().cloned());
                     let Some(executor_id) = assigned else {
                         return Err(ContinuousStreamError::Unavailable(format!(
-                            "run-loop job {job_id} subtask {index} has no executor                              (register more executors and retry)"
+                            "run-loop job {job_id} subtask {index} has no executor (register more executors and retry)"
                         )));
                     };
                     let endpoint = coord.find_executor_endpoint(&executor_id).ok_or_else(|| {

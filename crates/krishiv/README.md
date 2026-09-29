@@ -7,7 +7,7 @@ The user-facing facade and the `krishiv` command-line binary.
 - The CLI: `sql`, `explain [--analyze]`, `stream`, `ivm`, `table`, `submit`,
   `jobs`, `state`, `savepoint`, `restore`, `checkpoints`, `pipeline`,
   `doctor`, `capabilities`, and the daemons `local`, `clusterd`
-  (`coordinator`), `job-coordinator`, `executor`, `flight-server`,
+  (`coordinator`), `executor`, `flight-server`,
   `shuffle-svc`, `mcp`. Invoked as `krishiv-<name>` the binary dispatches to
   the matching subcommand.
 - Deployment feature presets live only on this crate: `local` (default),

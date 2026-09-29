@@ -697,7 +697,7 @@ pub fn arrow_schema_to_iceberg_schema(
             DataType::List(el) | DataType::LargeList(el) | DataType::FixedSizeList(el, _) => {
                 let el_prim = map_primitive(el.data_type()).map_err(|other| {
                     LakehouseError::Iceberg(format!(
-                        "durable CTAS cannot map result column '{}': list element type                          {other} has no Iceberg mapping; cast the elements in the SELECT",
+                        "durable CTAS cannot map result column '{}': list element type {other} has no Iceberg mapping; cast the elements in the SELECT",
                         field.name()
                     ))
                 })?;
@@ -712,7 +712,7 @@ pub fn arrow_schema_to_iceberg_schema(
             }
             other => Type::Primitive(map_primitive(other).map_err(|other| {
                 LakehouseError::Iceberg(format!(
-                    "durable CTAS cannot map result column '{}' of type {other} to an                      Iceberg type; cast or flatten it in the SELECT",
+                    "durable CTAS cannot map result column '{}' of type {other} to an Iceberg type; cast or flatten it in the SELECT",
                     field.name()
                 ))
             })?),

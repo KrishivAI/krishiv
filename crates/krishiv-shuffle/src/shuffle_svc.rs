@@ -9,12 +9,6 @@
 //!   directly from the index+data files produced by [`SortShuffleWriter`]. The
 //!   ESS index is a shared [`SortShuffleIndex`] populated by the executor after
 //!   a sort-shuffle write task completes.
-//!
-//! * `/ess/push/<job>/<stage>/<task>/<p>` (POST) — T12 push-based shuffle:
-//!   map tasks push their per-partition Arrow IPC payloads directly to the ESS.
-//!   `/ess/merged/<job>/<stage>/<p>` (GET) returns the concatenated stream from
-//!   all tasks that pushed for that partition, eliminating per-task connections
-//!   in the reduce fetch phase.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -29,7 +23,6 @@ use constant_time_eq::constant_time_eq;
 use dashmap::DashMap;
 use tokio::net::TcpListener;
 
-use crate::push_shuffle::PushShuffleStore;
 use crate::sort_shuffle_writer::SortShuffleFiles;
 use crate::{LocalDiskShuffleStore, PartitionId, ShuffleCompression, ShuffleStore};
 
@@ -76,9 +69,6 @@ impl SortShuffleIndex {
 pub(crate) struct ShuffleSvcState {
     pub(crate) store: Arc<dyn ShuffleStore + Send + Sync>,
     pub(crate) ess_index: SortShuffleIndex,
-    /// T12: push-based shuffle store — accumulates per-partition IPC payloads
-    /// pushed by map tasks, served merged via `/ess/merged/…`.
-    pub(crate) push_store: PushShuffleStore,
     /// DIST-6: Token stored behind a RwLock so it can be reloaded at runtime.
     pub(crate) token: Arc<std::sync::RwLock<Option<String>>>,
 }
@@ -133,29 +123,9 @@ pub async fn run_shuffle_svc(
     )?;
     let token = Arc::new(std::sync::RwLock::new(token_val));
     let ess_index = SortShuffleIndex::new();
-    // The push store's ceiling comes from the same container budget that sizes
-    // the query pool. It used to take its own 2 GiB default, which on a 4500Mi
-    // executor put total claims 0.45 GiB over the container and on a 2500Mi
-    // executor 1.22 GiB over — the executors were OOM-killed mid-sweep while
-    // the query pool, which could only see its own reservations, reported
-    // headroom throughout. `None` (no cgroup limit) keeps the previous
-    // unbounded behaviour, which is correct off a container.
-    let capacity = krishiv_common::ExecutorCapacity::detect();
-    let push_store = match capacity.shuffle_store_bytes {
-        Some(bytes) => {
-            PushShuffleStore::new().with_memory_limit(usize::try_from(bytes).unwrap_or(usize::MAX))
-        }
-        None => PushShuffleStore::new(),
-    };
-    tracing::info!(
-        shuffle_store_bytes = ?capacity.shuffle_store_bytes,
-        container_bytes = ?capacity.memory_limit_bytes,
-        "push-shuffle store sized from the container budget"
-    );
     let state = ShuffleSvcState {
         store,
         ess_index,
-        push_store,
         token,
     };
     let app = build_router(state.clone());
@@ -206,24 +176,6 @@ pub(crate) fn build_router(state: ShuffleSvcState) -> Router {
         )
         // ESS: remove all index entries for a completed job (GC).
         .route("/ess/gc/{job_id}", post(ess_gc_job))
-        // T12 push-based shuffle: map tasks POST their IPC payloads here.
-        .route(
-            "/ess/push/{job_id}/{stage_id}/{task_id}/{partition}",
-            post(ess_push_partition),
-        )
-        // T12 push-based shuffle: reduce tasks GET the merged IPC stream here.
-        .route(
-            "/ess/merged/{job_id}/{stage_id}/{partition}",
-            get(ess_merged_read),
-        )
-        // T12 push-based shuffle: GC push store for a job.
-        .route("/ess/push-gc/{job_id}", post(ess_push_gc))
-        // DIST-4: Set expected map-task push count for a partition so
-        // merged reads wait until all expected pushes have arrived.
-        .route(
-            "/ess/expect/{job_id}/{stage_id}/{partition}",
-            post(ess_set_expected_pushes),
-        )
         .route("/healthz", get(|| async { "ok\n" }))
         .with_state(state)
 }
@@ -424,93 +376,6 @@ async fn ess_gc_job(
     StatusCode::NO_CONTENT
 }
 
-// ── T12 push-shuffle handlers ────────────────────────────────────────────────
-
-/// `POST /ess/push/{job_id}/{stage_id}/{task_id}/{partition}` — map task pushes
-/// its Arrow IPC payload for `partition` to the push store.
-async fn ess_push_partition(
-    headers: axum::http::HeaderMap,
-    State(state): State<ShuffleSvcState>,
-    AxumPath((job_id, stage_id, _task_id, partition)): AxumPath<(String, String, String, u32)>,
-    body: axum::body::Bytes,
-) -> StatusCode {
-    if let Err(status) = check_bearer_token(&headers, &state.token) {
-        return status;
-    }
-    if let Err(e) = state
-        .push_store
-        .push(&job_id, &stage_id, partition, body.to_vec())
-    {
-        tracing::warn!(error = %e, "shuffle push_store.push returned error");
-        return StatusCode::INTERNAL_SERVER_ERROR;
-    }
-    StatusCode::NO_CONTENT
-}
-
-/// `GET /ess/merged/{job_id}/{stage_id}/{partition}` — returns the concatenated
-/// IPC stream from all map tasks that pushed data for this partition.
-async fn ess_merged_read(
-    headers: axum::http::HeaderMap,
-    State(state): State<ShuffleSvcState>,
-    AxumPath((job_id, stage_id, partition)): AxumPath<(String, String, u32)>,
-) -> Result<impl IntoResponse, StatusCode> {
-    check_bearer_token(&headers, &state.token)?;
-
-    let merged = state
-        .push_store
-        .merge_read(&job_id, &stage_id, partition)
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    Ok((
-        [(
-            axum::http::header::CONTENT_TYPE,
-            "application/vnd.apache.arrow.stream",
-        )],
-        merged,
-    ))
-}
-
-/// `POST /ess/push-gc/{job_id}` — remove all push-store data for `job_id`.
-async fn ess_push_gc(
-    headers: axum::http::HeaderMap,
-    State(state): State<ShuffleSvcState>,
-    AxumPath(job_id): AxumPath<String>,
-) -> StatusCode {
-    if let Err(status) = check_bearer_token(&headers, &state.token) {
-        return status;
-    }
-    state.push_store.gc_job(&job_id);
-    StatusCode::NO_CONTENT
-}
-
-/// DIST-4: `POST /ess/expect/{job_id}/{stage_id}/{partition}?count=N`
-///
-/// Sets the expected number of map-task pushes for a partition so that
-/// merge_read returns None until all expected pushes have arrived.
-/// Called by the coordinator when assigning shuffle-stage tasks.
-async fn ess_set_expected_pushes(
-    headers: axum::http::HeaderMap,
-    State(state): State<ShuffleSvcState>,
-    AxumPath((job_id, stage_id, partition)): AxumPath<(String, String, u32)>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> StatusCode {
-    if let Err(status) = check_bearer_token(&headers, &state.token) {
-        return status;
-    }
-    let count: usize = params
-        .get("count")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if count > 0 {
-        state
-            .push_store
-            .set_expected_pushes(&job_id, &stage_id, partition, count);
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::BAD_REQUEST
-    }
-}
-
 // ── Auth helper ───────────────────────────────────────────────────────────────
 
 fn check_bearer_token(
@@ -559,7 +424,6 @@ mod tests {
         ShuffleSvcState {
             store: Arc::new(LocalDiskShuffleStore::new(dir).unwrap()),
             ess_index: SortShuffleIndex::new(),
-            push_store: PushShuffleStore::new(),
             token: Arc::new(std::sync::RwLock::new(Some(TOKEN.to_string()))),
         }
     }
@@ -624,10 +488,6 @@ mod tests {
             ("GET", "/shuffle/job/stage/0"),
             ("GET", "/ess/job/stage/0"),
             ("POST", "/ess/gc/job"),
-            ("POST", "/ess/push/job/stage/task/0"),
-            ("GET", "/ess/merged/job/stage/0"),
-            ("POST", "/ess/push-gc/job"),
-            ("POST", "/ess/expect/job/stage/0?count=1"),
         ];
         for (method, uri) in routes {
             let (status, _) = call(&state, method, uri, Some("wrong"), Body::empty()).await;
@@ -825,112 +685,6 @@ mod tests {
             state.ess_index.get("other-job", "stage").is_some(),
             "GC must be scoped to the job it was asked about"
         );
-    }
-
-    /// The push path end to end: expected-count gating, then push, then merge.
-    ///
-    /// `merge_read` returning `None` before every expected push has arrived is
-    /// what stops a reduce task reading a partial partition, so the test
-    /// asserts the 404 *before* asserting the success.
-    #[tokio::test]
-    async fn pushed_partitions_merge_only_once_every_expected_push_arrives() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with(dir.path());
-
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/ess/expect/job/stage/0?count=2",
-            Some(TOKEN),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/ess/push/job/stage/task-a/0",
-            Some(TOKEN),
-            Body::from(b"AAAA".to_vec()),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let (status, _) = call(
-            &state,
-            "GET",
-            "/ess/merged/job/stage/0",
-            Some(TOKEN),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(
-            status,
-            StatusCode::NOT_FOUND,
-            "a merged read must not serve a partition that is still missing a push"
-        );
-
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/ess/push/job/stage/task-b/0",
-            Some(TOKEN),
-            Body::from(b"BBBB".to_vec()),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-
-        let (status, body) = call(
-            &state,
-            "GET",
-            "/ess/merged/job/stage/0",
-            Some(TOKEN),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body.len(),
-            8,
-            "both pushes must appear in the merged stream"
-        );
-
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/ess/push-gc/job",
-            Some(TOKEN),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, _) = call(
-            &state,
-            "GET",
-            "/ess/merged/job/stage/0",
-            Some(TOKEN),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "GC must drop pushed data");
-    }
-
-    /// `?count=0` is rejected: it would mean "this partition expects nothing",
-    /// which `merge_read` cannot distinguish from "not configured".
-    #[tokio::test]
-    async fn an_expected_push_count_of_zero_is_a_bad_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = state_with(dir.path());
-        let (status, _) = call(
-            &state,
-            "POST",
-            "/ess/expect/job/stage/0?count=0",
-            Some(TOKEN),
-            Body::empty(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// With no token configured the service is open by design — the fail-closed

@@ -136,7 +136,10 @@ impl CepOperator {
         self.last_barrier_epoch = epoch;
     }
 
-    /// Snapshot per-key partial CEP metadata to the state backend (Wave 2 durable partial state).
+    /// Snapshot per-key CEP metadata to the state backend.
+    ///
+    /// Only metadata survives: in-flight partial matches are not persisted
+    /// (see `CepKeyState`), so a restore resumes matching from new events.
     pub fn persist_to_state(
         &self,
         backend: &mut dyn StateBackend,

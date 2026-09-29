@@ -1903,9 +1903,9 @@ fn check_http_request(
         return Err(StatusCode::FORBIDDEN);
     }
     if let Some(expected) = &state.token {
-        let presented = header(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .unwrap_or("");
+        let presented =
+            krishiv_common::auth_util::bearer_token(header(axum::http::header::AUTHORIZATION))
+                .unwrap_or("");
         if !constant_time_eq::constant_time_eq(presented.as_bytes(), expected.as_bytes()) {
             return Err(StatusCode::UNAUTHORIZED);
         }

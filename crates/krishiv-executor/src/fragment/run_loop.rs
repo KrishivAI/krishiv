@@ -1222,8 +1222,10 @@ pub(crate) async fn execute_run_loop_fragment(
     // path both warn when they give something up; this path is the larger loss
     // of the three and said nothing.
     //
-    // The decision not to flush is `StreamingLoop::RunLoop`'s
-    // `EndOfStream::NoFlush`, and `on_stop` is what reads it. Routing that
+    // The decision not to flush on cancel is `StreamingLoop::RunLoop`'s
+    // `EndOfStream::FlushOnDirective` read against `StopReason::Cancelled`
+    // (only the coordinator's `stream-eos` directive flushes, in the EOS
+    // handler), and `on_stop` is what reads it. Routing that
     // through the driver rather than checking `has_open_windows` inline means
     // this loop's refusal and the embedded bounded loop's flush are the same
     // decision answered differently, in one place, rather than two unrelated
@@ -1601,7 +1603,7 @@ impl ExecutorTaskRunner {
                     .lock()
                     .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
                         message: format!(
-                            "iceberg sink participant lock poisoned for job {job};                              sink state is unreliable — restart the job"
+                            "iceberg sink participant lock poisoned for job {job}; sink state is unreliable — restart the job"
                         ),
                     })?;
             for batch in &batches {
@@ -1666,7 +1668,8 @@ impl ExecutorTaskRunner {
         let batches = outputs.to_vec();
         tokio::task::spawn_blocking(move || {
             let participant = registry.get_or_register(&job, || {
-                let sink = krishiv_connectors::RdkafkaTransactionalSink::new(
+                let sink = krishiv_connectors::RdkafkaTransactionalSink::new_for_profile(
+                    krishiv_common::resolve_durability_profile(),
                     &bootstrap_servers,
                     topic,
                     &transactional_id,
@@ -1678,7 +1681,7 @@ impl ExecutorTaskRunner {
                     .lock()
                     .map_err(|_| krishiv_connectors::ConnectorError::Protocol {
                         message: format!(
-                            "kafka sink participant lock poisoned for job {job};                              sink state is unreliable — restart the job"
+                            "kafka sink participant lock poisoned for job {job}; sink state is unreliable — restart the job"
                         ),
                     })?;
             for batch in &batches {

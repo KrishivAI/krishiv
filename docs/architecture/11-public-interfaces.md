@@ -70,7 +70,7 @@ generated matrix; the crate is CI-tested through the `test-python` job
 |---|---|
 | query | `sql`, `explain [--analyze]`, `stream`, `table`, `ivm` |
 | jobs | `submit`, `jobs`, `state`, `savepoint`, `restore`, `checkpoints`, `pipeline` |
-| daemons | `local start|status|stop`, `cluster`, `clusterd` (= `coordinator`), `job-coordinator`, `executor`, `flight-server`, `shuffle-svc`, `mcp` |
+| daemons | `local start|status|stop`, `cluster`, `clusterd` (= `coordinator`), `executor`, `flight-server`, `shuffle-svc`, `mcp` |
 | introspection | `doctor`, `capabilities` |
 
 Execution selectors and mode flags are in `01`. Output is plain text or

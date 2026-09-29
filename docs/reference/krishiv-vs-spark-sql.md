@@ -58,7 +58,6 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `set.except` — EXCEPT
 - `lateral.unnest` — UNNEST(array_col) in FROM clause
 - `lateral.generate_series` — generate_series() table function
-- `lateral.cross_join_unnest` — CROSS JOIN UNNEST(…) AS t(col)
 - `pivot.pivot` — PIVOT(agg FOR col IN (v1, v2, …))
 - `pivot.unpivot` — UNPIVOT(value FOR col IN (c1, c2, …))
 - `functions.json.get_json_object` — get_json_object(json, path) Spark JSONPath extraction
@@ -137,6 +136,7 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 
 - `join.interval` — Streaming interval join on event-time bounds _(DataFrame-only today (audit §9b): the interval-join operator has no SQL planning path, so batch SQL cannot express it (Planned); the streaming operator exists (Partial). Corrected from the prior over-claim of batch Supported.)_
 - `join.temporal_as_of` — Temporal AS OF point-in-time join _(no SQL temporal-join planning path: `lakehouse/as_of.rs` is table time-travel (temporal.as_of), not a temporal join. Marked Planned rather than the prior Supported.)_
+- `lateral.cross_join_unnest` — CROSS JOIN UNNEST(…) AS t(col) _(planned)_
 - `functions.json.from_to_json` — from_json / to_json struct⇄JSON conversion _(requires a typed arrow⇄JSON converter + a Spark-DDL schema parser with Spark's version-specific null-field/timestamp rules; itemized shortfall, not shipped approximate)_
 - `functions.json.json_tuple` — json_tuple(json, k1, k2, …) multi-key extraction (generator) _(needs table-generating/LATERAL VIEW machinery; use get_json_object per key today)_
 - `functions.json.schema_of_json` — schema_of_json(json) infer a DDL schema string _(planned)_

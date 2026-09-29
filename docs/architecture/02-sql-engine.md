@@ -145,7 +145,7 @@ statements and functions. The complete, engine-generated feature matrix is
 - Correlated subquery decorrelation for `EXISTS`/`IN`/scalar shapes DataFusion
   rejects (`subquery`), and a guard that refuses a subquery over a streaming
   source before DataFusion's decorrelation would mishandle the unbounded input.
-- `LATERAL` / `UNNEST` pre-processing (`unnest_sql`).
+- `LATERAL VIEW` → `UNNEST` rewriting (`spark_sql_ext`); `CROSS JOIN UNNEST` is planned natively by DataFusion.
 - Vector distance built-ins (`vector_functions`, one metric definition shared
   with the IVF index in `vector_metric`) and IVF-accelerated k-NN
   (`vector_search`, scalar quantisation in `vector_quantize`).

@@ -580,12 +580,6 @@ pub static FLAGS: &[FlagSpec] = &[
          falls back to the default.",
     ),
     rt(
-        "KRISHIV_JCP_POLL_INTERVAL_SECS",
-        FlagKind::UInt,
-        "2",
-        "Job-completion poll interval for job-mode coordinator runs.",
-    ),
-    rt(
         "KRISHIV_JOB_GC_GRACE_SECS",
         FlagKind::UInt,
         "30",
@@ -597,12 +591,6 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::Text,
         "unset",
         "Job ID for single-job (job-mode) coordinator/executor pods.",
-    ),
-    rt(
-        "KRISHIV_JOB_SPEC_JSON",
-        FlagKind::Text,
-        "unset",
-        "Inline JSON job spec submitted at startup in job-mode.",
     ),
     rt(
         "KRISHIV_LEADER_BACKEND",
@@ -664,6 +652,12 @@ pub static FLAGS: &[FlagSpec] = &[
         FlagKind::Bool,
         "false",
         "Allow Flight SQL clients to run SQL that reads or writes server files (COPY, CREATE EXTERNAL TABLE, parquet path directives, RegisterParquet) in durable profiles. Always allowed in dev-local.",
+    ),
+    rt(
+        "KRISHIV_KAFKA_SINK_ALLOW_UNRECOVERABLE_TXN",
+        FlagKind::Bool,
+        "false",
+        "Allow the transactional Kafka sink under a durable profile, accepting that an executor crash between checkpoint completion and transaction commit loses that epoch's output (the sink cannot resume a prepared transaction).",
     ),
     rt(
         "KRISHIV_MCP_ALLOW_WRITE_SQL",

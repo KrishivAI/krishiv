@@ -236,10 +236,6 @@ pub static CHECKLIST: &[ChecklistCase] = &[
         "lateral.generate_series",
         "SELECT * FROM generate_series(1, 3)",
     ),
-    elsewhere(
-        "lateral.cross_join_unnest",
-        "unnest_sql.rs CROSS JOIN UNNEST coverage",
-    ),
     // ── PIVOT ─────────────────────────────────────────────────────────────────
     elsewhere("pivot.pivot", "pivot_sql.rs PIVOT rewrite coverage"),
     elsewhere("pivot.unpivot", "pivot_sql.rs UNPIVOT rewrite coverage"),

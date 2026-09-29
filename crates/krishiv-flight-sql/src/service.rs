@@ -2096,7 +2096,7 @@ mod continuous_drain_tests {
         let retried_rows: usize = retry.iter().map(RecordBatch::num_rows).sum();
         assert!(
             retried_rows > 0,
-            "the batches the dead client never received must survive;              delivered {delivered_rows} rows before death, retry saw {retried_rows}"
+            "the batches the dead client never received must survive; delivered {delivered_rows} rows before death, retry saw {retried_rows}"
         );
     }
 }

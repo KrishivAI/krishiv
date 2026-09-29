@@ -1498,15 +1498,23 @@ impl NonBlockingStoreHandle {
                             // dequeued here; if a synchronous terminal-state write
                             // (cancel_job et al.) has since latched this job_id, this
                             // is exactly the stale write the latch exists to catch.
-                            if !admit_job_write(&bg_terminal_jobs, &record) {
-                                continue;
-                            }
+                            // The check runs under the store lock: checked before
+                            // it, a synchronous terminal write could land between
+                            // the check and this write and be overwritten by it.
                             in_flight.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let bg = std::sync::Arc::clone(&bg_store);
+                            let latch = std::sync::Arc::clone(&bg_terminal_jobs);
                             let in_flight_done = std::sync::Arc::clone(&in_flight);
                             let notify_done = std::sync::Arc::clone(&notify);
                             tokio::task::spawn_blocking(move || {
                                 let mut guard = bg.lock().unwrap_or_else(|p| p.into_inner());
+                                if !admit_job_write(&latch, &record) {
+                                    drop(guard);
+                                    in_flight_done
+                                        .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                                    notify_done.notify_one();
+                                    return;
+                                }
                                 if let Err(e) = guard.save_job(&record) {
                                     tracing::error!(
                                         error = %e,
@@ -1721,10 +1729,11 @@ impl NonBlockingStoreHandle {
     /// Phase 58 chaos gate as two streaming jobs that churned for over an
     /// hour past their own cancellation.
     pub(crate) fn save_job_checked(&self, record: &JobRecord) -> SchedulerResult<bool> {
+        // Latch check and write under one store lock, like the queued path.
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         if !admit_job_write(&self.terminal_jobs, record) {
             return Ok(false);
         }
-        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         guard.save_job(record)?;
         Ok(true)
     }

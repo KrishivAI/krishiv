@@ -292,12 +292,18 @@ fn rbac_can_watch_jobs_and_update_status() {
             "- get",
             "- list",
             "- watch",
-            "- update",
             "- patch",
             "kind: ClusterRoleBinding",
             "name: krishiv-controller",
         ],
     );
+    // Least privilege: the operator never touches these (review L18).
+    for absent in ["services", "deployments", "events"] {
+        assert!(
+            !RBAC.contains(absent),
+            "rbac.yaml grants `{absent}`, which the operator does not use"
+        );
+    }
 }
 
 #[test]

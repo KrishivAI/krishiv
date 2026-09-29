@@ -583,7 +583,11 @@ static FEATURES: &[FeatureEntry] = &[
         "lateral.cross_join_unnest",
         "LATERAL",
         "CROSS JOIN UNNEST(…) AS t(col)",
-        S,
+        // DataFusion 54 has no `UNNEST` table function, and the text rewrite
+        // that was credited with this (`unnest_sql`) only produced this same
+        // unplannable form and was reached by no query. Use `LATERAL VIEW
+        // explode(…)` or `SELECT unnest(col)` instead.
+        PL,
     ),
     // ── PIVOT / UNPIVOT ───────────────────────────────────────────────────────
     FeatureEntry::batch_only("pivot.pivot", "PIVOT", "PIVOT(agg FOR col IN (v1, v2, …))", S),

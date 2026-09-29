@@ -177,7 +177,6 @@ pub fn dispatch(args: &[&str]) -> CliResponse {
         ["coordinator", ..]
         | ["clusterd", ..]
         | ["executor", ..]
-        | ["job-coordinator", ..]
         | ["flight-server", ..]
         | ["shuffle-svc", ..] => CliResponse::err(
             format!(
@@ -1513,6 +1512,14 @@ mod tests {
         let response = dispatch(&["restore", "--job", "job-1", "--epoch", "3", "--savepoint"]);
         assert_eq!(response.exit_code, 2, "{response:?}");
         assert!(response.stderr.contains("coordinator"), "{response:?}");
+    }
+
+    /// L15: `sql --analyze` used to run an ordinary query and ignore the flag.
+    #[test]
+    fn sql_rejects_the_explain_only_analyze_flag() {
+        let response = dispatch(&["sql", "--query", "select 1", "--analyze"]);
+        assert_eq!(response.exit_code, 2, "{response:?}");
+        assert!(response.stderr.contains("krishiv explain"), "{response:?}");
     }
 
     #[test]

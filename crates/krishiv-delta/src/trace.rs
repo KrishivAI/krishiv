@@ -522,7 +522,9 @@ impl Trace {
             pos += 4;
             u32::from_le_bytes(raw.try_into().map_err(|_| truncated())?) as usize
         };
-        let mut restored: Vec<DeltaBatch> = Vec::with_capacity(n);
+        // Each entry starts with an 8-byte length; bound by the bytes left.
+        let mut restored: Vec<DeltaBatch> =
+            Vec::with_capacity(n.min(bytes.len().saturating_sub(pos) / 8));
         for _ in 0..n {
             let raw = bytes.get(pos..pos + 8).ok_or_else(truncated)?;
             pos += 8;
@@ -624,6 +626,14 @@ fn build_key_set(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// L11: a corrupt count must fail as "truncated", not size an allocation
+    /// of billions of entries (which aborts the process before the fallback
+    /// to snapshot seeding can run).
+    #[test]
+    fn an_absurd_entry_count_is_rejected_without_allocating_it() {
+        assert!(Trace::decode_state(&[0xff, 0xff, 0xff, 0xff]).is_err());
+    }
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use std::sync::Arc;

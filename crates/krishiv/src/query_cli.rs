@@ -89,7 +89,8 @@ pub fn sql_help() -> String {
            --local                     Use Session::execute_local\n\
            --remote                    Use Session::execute_remote (requires coordinator)\n\
            --timeout <SECS>            Per-statement wall-clock timeout in seconds (default: none)\n\
-           --api-key <KEY>             Policy-enforced sql_as (requires KRISHIV_API_KEYS)\n\
+           --api-key <KEY>             Run as an authenticated principal via sql_as (requires\n\
+                                       KRISHIV_API_KEYS); no table policy is applied\n\
            --parquet <table=path>      Register a Parquet table (repeatable)\n\
            --primary-key <table=cols>  Declare a table's primary key, comma-separated\n\
                                        (repeatable; informational and UNVERIFIED — a key\n\
@@ -348,6 +349,14 @@ pub fn build_session(command: &QueryCommand) -> Result<Session, String> {
 }
 
 pub fn run_sql(command: &QueryCommand) -> CliResponse {
+    // The flag is parsed for both `sql` and `explain`, but only `explain`
+    // reads it; accepting it here silently ran an ordinary query.
+    if command.analyze {
+        return CliResponse::err(
+            "--analyze applies to `krishiv explain`; use `krishiv explain --analyze`\n".to_string(),
+            2,
+        );
+    }
     let session = match build_session(command) {
         Ok(session) => session,
         Err(message) => return CliResponse::err(format!("{message}\n"), 1),

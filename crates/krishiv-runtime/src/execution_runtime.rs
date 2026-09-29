@@ -1057,7 +1057,9 @@ impl ExecutionRuntime for RemoteExecutionRuntime {
             match self.pool.do_action(&action).await {
                 Ok(_) => Ok(()),
                 Err(e) if is_server_unimplemented(&e) => Err(RuntimeError::unsupported(format!(
-                    "the remote server does not implement continuous deregister; the job                      '{job_id}' keeps running and holding its executor slots until the                      server is upgraded"
+                    "the remote server does not implement continuous deregister; the job \
+                     '{job_id}' keeps running and holding its executor slots until the \
+                     server is upgraded"
                 ))),
                 Err(e) => Err(e),
             }

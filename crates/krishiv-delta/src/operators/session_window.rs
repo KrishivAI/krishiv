@@ -146,15 +146,17 @@ impl IncrementalSessionizeOp {
                 .downcast_ref::<Int64Array>()
                 .ok_or_else(|| DeltaError::Operator("sessionize timestamp not integral".into()))?;
             let weights = delta.weights();
+            // Validate before mutating: failing part-way used to leave the
+            // rows before the NULL in state but unpublished.
+            if (0..data.num_rows()).any(|i| weights.value(i) != 0 && ts_arr.is_null(i)) {
+                return Err(DeltaError::Operator(
+                    "sessionize: NULL event time has no session".into(),
+                ));
+            }
             for i in 0..data.num_rows() {
                 let w = weights.value(i);
                 if w == 0 {
                     continue;
-                }
-                if ts_arr.is_null(i) {
-                    return Err(DeltaError::Operator(
-                        "sessionize: NULL event time has no session".into(),
-                    ));
                 }
                 let part = part_rows.row(i).as_ref().to_vec();
                 let key = (ts_arr.value(i), row_rows.row(i).as_ref().to_vec());
@@ -355,6 +357,44 @@ mod tests {
     }
     fn op() -> IncrementalSessionizeOp {
         IncrementalSessionizeOp::new(source_schema(), out_schema(), vec![0], 1, 5).unwrap()
+    }
+
+    /// L10: a delta with a NULL event time is refused as a whole. It used to
+    /// fold the rows before the NULL into state without publishing them, so
+    /// they surfaced later against the wrong baseline, and the rows after it
+    /// were lost.
+    #[test]
+    fn a_null_event_time_rejects_the_whole_delta() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("bidder", DataType::Int64, false),
+            Field::new("ts", DataType::Int64, true),
+        ]));
+        let mut op =
+            IncrementalSessionizeOp::new(schema.clone(), out_schema(), vec![0], 1, 5).unwrap();
+        let bad = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 1])),
+                Arc::new(Int64Array::from(vec![Some(10_i64), None])),
+            ],
+        )
+        .unwrap();
+        assert!(op.apply(DeltaBatch::from_inserts(bad).unwrap()).is_err());
+
+        let good = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64])),
+                Arc::new(Int64Array::from(vec![Some(30_i64)])),
+            ],
+        )
+        .unwrap();
+        let out = op.apply(DeltaBatch::from_inserts(good).unwrap()).unwrap();
+        assert!(
+            canonical(&out).iter().all(|row| row.1 == 30),
+            "a row from the refused delta leaked into state: {:?}",
+            canonical(&out)
+        );
     }
 
     /// A bridging event MERGES two sessions: every row of both old sessions

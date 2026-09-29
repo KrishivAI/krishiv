@@ -564,6 +564,9 @@ fn uuid_v4_hex() -> String {
 ///
 /// The `retention_hours` argument defaults to 168 h (7 days) in the Delta
 /// specification.  Passing 0 removes all unreferenced files regardless of age.
+/// Youngest an unreferenced data file may be and still be vacuumed.
+pub const VACUUM_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(600);
+
 pub fn vacuum_table(path: &str, retention_hours: u64) -> LakehouseResult<usize> {
     let root = Path::new(path);
     if !root.exists() {
@@ -577,8 +580,13 @@ pub fn vacuum_table(path: &str, retention_hours: u64) -> LakehouseResult<usize> 
     let active: std::collections::HashSet<String> = all_logged_data_file_paths(root)?;
 
     // Cutoff: files modified before this instant are eligible for deletion.
+    // Never less than VACUUM_MIN_AGE: writers place a data file in the table
+    // before claiming its log version, so a file that is unreferenced and new
+    // may be mid-commit — deleting it made that commit log a missing file and
+    // every later read of the table fail.
     let now = std::time::SystemTime::now();
-    let cutoff_duration = std::time::Duration::from_secs(retention_hours * 3600);
+    let cutoff_duration =
+        std::time::Duration::from_secs(retention_hours * 3600).max(VACUUM_MIN_AGE);
 
     let mut removed = 0usize;
     for entry in fs::read_dir(root).map_err(|e| LakehouseError::Io(e.to_string()))? {
@@ -930,7 +938,20 @@ impl TwoPhaseCommitSink for LocalDeltaTwoPhaseCommitSink {
                 {"commitInfo":{"operation":"WRITE","epoch":handle.epoch,"handle":handle.id,"timestamp":ts}}
             );
             let add_entry = json!({"add":{"path":file_name,"size":meta.len(),"dataChange":true}});
-            let contents = format!("{commit_entry}\n{add_entry}\n");
+            let mut contents = Vec::new();
+            // Version 0 creates the table: like `write_table`, it must carry the
+            // protocol and metadata actions, or no Delta reader can open it.
+            if version == 0 {
+                let file = File::open(root.join(&file_name)).map_err(to_connector)?;
+                let schema = ParquetRecordBatchReaderBuilder::try_new(file)
+                    .map_err(to_connector)?
+                    .schema()
+                    .clone();
+                write_initial_protocol_metadata(&mut contents, &schema).map_err(to_connector)?;
+            }
+            writeln!(contents, "{commit_entry}").map_err(to_connector)?;
+            writeln!(contents, "{add_entry}").map_err(to_connector)?;
+            let contents = String::from_utf8(contents).map_err(to_connector)?;
             if claim_commit_log(root, version, &contents).map_err(to_connector)? {
                 return Ok(());
             }
@@ -1342,6 +1363,13 @@ mod tests {
         // A stray data file no log version references (e.g. an aborted write).
         let orphan = dir.path().join("part-99999-orphan.parquet");
         std::fs::write(&orphan, b"junk").unwrap();
+        // Older than the vacuum floor, like a genuinely abandoned file.
+        std::fs::File::options()
+            .write(true)
+            .open(&orphan)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - VACUUM_MIN_AGE * 2)
+            .unwrap();
 
         let removed = vacuum_table(&path, 0).unwrap();
         assert_eq!(removed, 1, "exactly the orphaned file should be removed");
@@ -1350,6 +1378,38 @@ mod tests {
         // Table still readable after vacuum.
         let rows = read_table(&path, None).unwrap();
         assert_eq!(rows.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+    }
+
+    /// L20: a data file is placed in the table before its log version is
+    /// claimed, so a fresh unreferenced file may be mid-commit; vacuum with
+    /// retention 0 must leave it alone.
+    #[test]
+    fn vacuum_never_removes_a_fresh_file_that_may_be_mid_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        write_table(&path, vec![batch(&[1])], false).unwrap();
+        let in_flight = dir.path().join("part-00001-stage-inflight.parquet");
+        std::fs::write(&in_flight, b"being committed").unwrap();
+        assert_eq!(vacuum_table(&path, 0).unwrap(), 0);
+        assert!(in_flight.exists());
+    }
+
+    /// L20: the 2PC sink creating a table writes the protocol/metadata
+    /// actions, like `write_table`.
+    #[test]
+    fn delta_two_phase_first_commit_writes_protocol_and_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sink = LocalDeltaTwoPhaseCommitSink::new(dir.path());
+        let handle = sink.prepare(1, &batch(&[1, 2])).unwrap();
+        sink.commit(handle).unwrap();
+        let log = std::fs::read_to_string(
+            dir.path()
+                .join("_delta_log")
+                .join("00000000000000000000.json"),
+        )
+        .unwrap();
+        assert!(log.contains(r#""protocol""#), "{log}");
+        assert!(log.contains(r#""metaData""#), "{log}");
     }
 
     /// Files referenced by a prior version must survive vacuum so time travel

@@ -249,7 +249,8 @@ pub static CONNECTORS: &[ConnectorEntry] = &[
          (Phase 55): exactly-once for read_committed consumers while the executor \
          survives; a crash after a checkpoint completes but before its Kafka \
          transaction commits aborts that epoch's output (no prepared-transaction \
-         recovery yet)",
+         recovery; refused under durable profiles unless \
+         KRISHIV_KAFKA_SINK_ALLOW_UNRECOVERABLE_TXN=1)",
     ),
     entry("iceberg", "sink", "preview", Yes, Yes, Yes, Yes)
         .with_note("distributed reach is the checkpoint-aligned two-phase-commit IcebergSink (G7)"),

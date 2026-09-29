@@ -2747,7 +2747,7 @@ fn build_join_plan(
             tracing::warn!(
                 left = %l,
                 right = %r,
-                "IVM plan degraded to O(state) DiffBased: join key pair is                  missing or differently typed; a raw-array trace would match                  nothing"
+                "IVM plan degraded to O(state) DiffBased: join key pair is missing or differently typed; a raw-array trace would match nothing"
             );
             return None;
         }

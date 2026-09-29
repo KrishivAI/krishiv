@@ -17,7 +17,6 @@ pub mod object_store;
 pub mod orphan;
 pub mod partitioner;
 pub mod path;
-pub mod push_shuffle;
 pub mod runtime_filter;
 pub mod shuffle_svc;
 pub mod sort_shuffle_writer;
@@ -58,7 +57,6 @@ pub use orphan::{
 };
 pub use partitioner::HashPartitioner;
 pub use path::ShufflePath;
-pub use push_shuffle::PushShuffleStore;
 pub use shuffle_svc::SortShuffleIndex;
 pub use sort_shuffle_writer::{SortShuffleFiles, SortShuffleWriter};
 

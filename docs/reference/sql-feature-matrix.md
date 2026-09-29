@@ -96,7 +96,7 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 |---|---|---|---|---|---|
 | `lateral.unnest` | UNNEST(array_col) in FROM clause | supported | n/a | n/a |  |
 | `lateral.generate_series` | generate_series() table function | supported | n/a | n/a |  |
-| `lateral.cross_join_unnest` | CROSS JOIN UNNEST(…) AS t(col) | supported | n/a | n/a |  |
+| `lateral.cross_join_unnest` | CROSS JOIN UNNEST(…) AS t(col) | planned | n/a | n/a |  |
 
 ## PIVOT
 

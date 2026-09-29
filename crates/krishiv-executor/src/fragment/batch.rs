@@ -802,33 +802,6 @@ async fn execute_shuffle_write_fragment(
         let part_batches =
             super::shuffle_write_buffer::coalesce_shuffle_batches(part_batches, &schema);
 
-        // T12: if a push-shuffle store is wired, serialise partition to IPC
-        // before transferring ownership to write_partition.
-        if let Some(ps) = ctx.push_store.as_ref() {
-            use arrow::ipc::writer::StreamWriter;
-            let mut ipc_bytes: Vec<u8> = Vec::new();
-            if !part_batches.is_empty() {
-                let mut w = StreamWriter::try_new(&mut ipc_bytes, &schema).map_err(|e| {
-                    ExecutorError::LocalExecution {
-                        message: format!("push-shuffle ipc writer init failed: {e}"),
-                    }
-                })?;
-                for batch in &part_batches {
-                    w.write(batch).map_err(|e| ExecutorError::LocalExecution {
-                        message: format!("push-shuffle ipc write failed: {e}"),
-                    })?;
-                }
-                w.finish().map_err(|e| ExecutorError::LocalExecution {
-                    message: format!("push-shuffle ipc finish failed: {e}"),
-                })?;
-            }
-            if !ipc_bytes.is_empty()
-                && let Err(e) = ps.push(job_id, stage_id, p, ipc_bytes)
-            {
-                tracing::warn!(error = %e, "shuffle push_store.push returned error");
-            }
-        }
-
         let partition = ShufflePartition {
             id,
             schema,

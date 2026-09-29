@@ -156,10 +156,15 @@ impl IncrementalDistinctOp {
             Ok(u32::from_le_bytes(raw.try_into().unwrap_or([0; 4])))
         };
         let n_rows = rd_u32(&mut pos)? as usize;
-        let mut counts: AHashMap<Vec<String>, i64> = AHashMap::with_capacity(n_rows);
+        // Bounded by the remaining bytes (each row is at least a 4-byte
+        // column count): a corrupt count must fail as truncated, not reserve
+        // billions of buckets.
+        let mut counts: AHashMap<Vec<String>, i64> =
+            AHashMap::with_capacity(n_rows.min(bytes.len().saturating_sub(pos) / 4));
         for _ in 0..n_rows {
             let n_cols = rd_u32(&mut pos)? as usize;
-            let mut key: Vec<String> = Vec::with_capacity(n_cols);
+            let mut key: Vec<String> =
+                Vec::with_capacity(n_cols.min(bytes.len().saturating_sub(pos)));
             for _ in 0..n_cols {
                 let len = rd_u32(&mut pos)? as usize;
                 let raw = bytes.get(pos..pos + len).ok_or_else(err)?;
