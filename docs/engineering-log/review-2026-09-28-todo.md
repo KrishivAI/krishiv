@@ -92,10 +92,14 @@ Status: `[ ]` open · `[~]` in progress · `[x]` fixed (with test) · `[-]` deci
 - [x] M24 `krishiv-ivm/src/window_rewrite.rs:365` streaming TopN rewrite case-sensitive column compare → rewrites valid SQL
   - fixed 2026-09-29: identifiers normalised like the planner (unquoted → lowercase); `streaming_topn_compares_names_the_way_the_planner_does`
 - [ ] M25 `krishiv-executor/src/fragment/run_loop_classes.rs:377` rjoin/rpipe/rbatch bypass StreamingLoop gate; RunLoop EOS flush
-- [ ] M26 `krishiv-state/src/dfs_backend.rs:660` DFS restore doesn't delete post-checkpoint records
-- [ ] M27 `krishiv-state/src/dfs_backend.rs:178` DFS write not atomic; torn record decodes OK
-- [ ] M28 `krishiv-runtime/src/flight_client.rs:655` `do_action` retries non-idempotent push/drain after server applied
-- [ ] M29 `krishiv-state/src/checkpoint/io.rs:364` sync manifest validation builds a Tokio runtime per entry on S3
+- [x] M26 `krishiv-state/src/dfs_backend.rs:660` DFS restore doesn't delete post-checkpoint records
+  - fixed 2026-09-29: restore writes the snapshot, then deletes DFS records not in it; `load_snapshot_removes_keys_written_after_the_checkpoint`
+- [x] M27 `krishiv-state/src/dfs_backend.rs:178` DFS write not atomic; torn record decodes OK
+  - fixed 2026-09-29: DFS writes go temp file → (fsync) → rename; fsync failures reported (no crash test possible)
+- [x] M28 `krishiv-runtime/src/flight_client.rs:655` `do_action` retries non-idempotent push/drain after server applied
+  - fixed 2026-09-29: `KrishivFlightAction::is_idempotent`; non-idempotent actions retry only the connection; `push_and_drain_are_not_retried`
+- [x] M29 `krishiv-state/src/checkpoint/io.rs:364` sync manifest validation builds a Tokio runtime per entry on S3
+  - fixed 2026-09-29: sync manifest validation reads on the caller thread and hashes chunks on the pool (no per-entry runtime)
 - [x] M30 `krishiv-delta/src/snapshot_index.rs:269` Raw arm propagates SchemaMismatch → view stops advancing (error discarded at `krishiv-ivm/src/flow.rs:1324`)
   - fixed 2026-09-29: Raw arm falls back to the whole-snapshot path on SchemaMismatch; the discarded error at flow.rs is now logged; `a_raw_state_accepts_a_drifted_delta`
 - [x] M31 `krishiv-connectors/src/lakehouse/local_delta.rs:157` time travel past latest / negative / pre-creation returns latest

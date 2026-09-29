@@ -359,29 +359,35 @@ fn validate_manifest_entries(
     // result before checking is equivalent to the serial early-return (the
     // common valid case hashes all entries anyway; only the rare invalid case
     // does marginally more work, off the latency path).
+    // Reads stay on the calling thread; only the digests run on the compute
+    // pool. Reading inside the pool put `read_bytes` on rayon threads, which
+    // have no Tokio context, so an object-store backend built a fresh
+    // multi-thread runtime (and connection pool, and TLS handshake) for every
+    // manifest entry — on the checkpoint barrier's critical path. Entries are
+    // taken a pool-width at a time so memory stays one chunk of files.
     let entries: Vec<(&str, &str)> = manifest.entries().collect();
-    let results: Vec<CheckpointResult<bool>> =
-        krishiv_common::compute_pool::par_map(entries, |(path, expected_hex)| {
+    let chunk_len = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(4)
+        .max(1);
+    for chunk in entries.chunks(chunk_len) {
+        let mut reads = Vec::with_capacity(chunk.len());
+        for (path, expected_hex) in chunk {
             validate_manifest_relative_path(path, epoch)?;
             let full = format!("{base_prefix}/{path}");
             match storage.read_bytes(&full)? {
-                None => Ok(false),
-                Some(data) => {
-                    // `data` is already fully in memory (read_bytes returns a
-                    // Vec), so a single digest pass is equivalent to the former
-                    // BufReader streaming, without the extra copy loop.
-                    // Canonical helper, not a second digest+hex implementation:
-                    // that duplication is what let the encodings drift apart
-                    // when sha2 0.11 dropped `LowerHex` on the digest type, and
-                    // this hash is compared against a value persisted in the
-                    // manifest — a changed encoding would fail verification on
-                    // every pre-existing checkpoint.
-                    Ok(krishiv_common::hash::sha256_hex(&data) == expected_hex)
-                }
+                None => return Ok(false),
+                Some(data) => reads.push((data, *expected_hex)),
             }
+        }
+        // Canonical helper, not a second digest+hex implementation: that
+        // duplication is what let the encodings drift apart when sha2 0.11
+        // dropped `LowerHex` on the digest type, and this hash is compared
+        // against a value persisted in the manifest.
+        let matched = krishiv_common::compute_pool::par_map(reads, |(data, expected_hex)| {
+            krishiv_common::hash::sha256_hex(&data) == expected_hex
         });
-    for result in results {
-        if !result? {
+        if matched.iter().any(|ok| !ok) {
             return Ok(false);
         }
     }

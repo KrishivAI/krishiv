@@ -301,6 +301,31 @@ pub enum KrishivFlightAction {
 
 impl KrishivFlightAction {
     /// Stable action type string for this variant.
+    /// Whether sending this action twice has the same effect as once.
+    ///
+    /// A transport error can arrive after the server already applied the
+    /// action (the connection dropped while the response was in flight), so
+    /// only these may be re-sent blindly. A re-sent push ingests its batch
+    /// twice; a re-sent drain loses the windows the first one took.
+    pub fn is_idempotent(&self) -> bool {
+        match self {
+            Self::RegisterParquet(_)
+            | Self::Explain(_)
+            | Self::BatchSql(_)
+            | Self::BoundedWindow(_)
+            | Self::CancelOperation(_)
+            | Self::GetOperationProgress(_)
+            | Self::ContinuousDeregister(_) => true,
+            Self::ContinuousRegister(_)
+            | Self::ContinuousPush(_)
+            | Self::ContinuousDrain(_)
+            | Self::ContinuousFlush(_)
+            | Self::ExecutePlan(_)
+            | Self::BatchSqlSink(_)
+            | Self::RegisterKafkaSource(_) => false,
+        }
+    }
+
     pub fn action_type(&self) -> String {
         let tag = match self {
             Self::RegisterParquet(_) => tags::REGISTER_PARQUET,
@@ -405,6 +430,23 @@ pub fn decode_batches(encoded: &str) -> RuntimeResult<Vec<RecordBatch>> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    /// M28: push and drain must never be re-sent after a transport error.
+    #[test]
+    fn push_and_drain_are_not_retried() {
+        let push = KrishivFlightAction::ContinuousPush(ContinuousPushBody {
+            job_id: "j".into(),
+            batches_b64: String::new(),
+        });
+        let drain =
+            KrishivFlightAction::ContinuousDrain(ContinuousDrainBody { job_id: "j".into() });
+        let explain = KrishivFlightAction::Explain(ExplainBody {
+            sql: "SELECT 1".into(),
+        });
+        assert!(!push.is_idempotent());
+        assert!(!drain.is_idempotent());
+        assert!(explain.is_idempotent());
+    }
 
     use super::*;
     use arrow::array::{Int64Array, StringArray};

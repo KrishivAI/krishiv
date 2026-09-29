@@ -660,8 +660,19 @@ impl FlightClientPool {
         // Serialise action body once; reused across retry attempts.
         let body = action.to_action_body()?;
         let action_type = action.action_type();
-        with_retry(|| async {
-            let channel = self.get_channel().await?;
+        // A non-idempotent action retries only the connection: once the
+        // request may have reached the server, a transport error is not
+        // proof it was not applied (M28).
+        let pinned_channel = if action.is_idempotent() {
+            None
+        } else {
+            Some(with_retry(|| self.get_channel()).await?)
+        };
+        let attempt = || async {
+            let channel = match &pinned_channel {
+                Some(channel) => channel.clone(),
+                None => self.get_channel().await?,
+            };
             let mut client = arrow_flight::flight_service_client::FlightServiceClient::new(channel)
                 .max_decoding_message_size(DO_ACTION_MAX_DECODE_BYTES);
             let req = arrow_flight::Action {
@@ -685,8 +696,12 @@ impl FlightClientPool {
                 }
             }
             Ok(buf)
-        })
-        .await
+        };
+        if pinned_channel.is_some() {
+            attempt().await
+        } else {
+            with_retry(attempt).await
+        }
     }
 
     pub async fn execute_sql(

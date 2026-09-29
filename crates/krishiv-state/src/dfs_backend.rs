@@ -175,15 +175,38 @@ impl DisaggregatedStateBackend {
                 source: Some(Box::new(e)),
             })?;
         }
-        std::fs::write(path, data).map_err(|e| StateError::BackendUnavailable {
-            message: format!("DFS write failed: {e}"),
+        // Write-then-rename: a crash or ENOSPC mid-write leaves the previous
+        // record (or none) in place, never a torn one that later decodes as a
+        // successful read of a truncated value.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tmp = path.with_extension(format!(
+            "tmp.{}.{}",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let failed = |what: &str, e: std::io::Error| StateError::BackendUnavailable {
+            message: format!("DFS {what} failed: {e}"),
             source: Some(Box::new(e)),
-        })?;
-        if self.config.sync_writes {
-            // Best-effort sync for local filesystem
-            if let Ok(file) = std::fs::File::open(path) {
-                let _ = file.sync_all();
+        };
+        let written = (|| {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(data)?;
+            if self.config.sync_writes {
+                file.sync_all()?;
             }
+            std::fs::rename(&tmp, path)
+        })();
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(failed("write", e));
+        }
+        if self.config.sync_writes
+            && let Some(parent) = path.parent()
+        {
+            std::fs::File::open(parent)
+                .and_then(|dir| dir.sync_all())
+                .map_err(|e| failed("directory sync", e))?;
         }
         Ok(())
     }
@@ -690,6 +713,7 @@ impl StateBackend for DisaggregatedStateBackend {
 
         self.clear_cache()?;
 
+        let mut written = std::collections::HashSet::new();
         for _ in 0..entry_count {
             let op_id = read_len_prefixed(&mut cursor, "op_id")?;
             let name = read_len_prefixed(&mut cursor, "state_name")?;
@@ -700,7 +724,22 @@ impl StateBackend for DisaggregatedStateBackend {
                 String::from_utf8_lossy(&op_id),
                 String::from_utf8_lossy(&name),
             );
+            written.insert(self.dfs_path(&ns, &key));
             self.put(&ns, key, value)?;
+        }
+        // Restore REPLACES state: records written after the checkpoint must
+        // not survive it. Written first, deleted second, so a crash part-way
+        // leaves a superset of the snapshot rather than less than it.
+        if let Ok(entries) = std::fs::read_dir(&self.config.dfs_root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "dat") && !written.contains(&path) {
+                    std::fs::remove_file(&path).map_err(|e| StateError::BackendUnavailable {
+                        message: format!("failed to remove post-checkpoint DFS record: {e}"),
+                        source: Some(Box::new(e)),
+                    })?;
+                }
+            }
         }
         Ok(())
     }
@@ -1023,5 +1062,30 @@ mod tests {
         let mut backend = DisaggregatedStateBackend::new(temp_config()).unwrap();
         backend.load_snapshot(&legacy).unwrap();
         assert_eq!(backend.get(&ns, b"k").unwrap(), Some(b"v".to_vec()));
+    }
+
+    /// M26: restoring a snapshot replaces the state. A key written after the
+    /// checkpoint must be gone afterwards — the DFS records survived before,
+    /// bringing post-checkpoint state back after a restore.
+    #[test]
+    fn load_snapshot_removes_keys_written_after_the_checkpoint() {
+        let mut backend = DisaggregatedStateBackend::new(temp_config()).unwrap();
+        let ns = Namespace::new("op-1", "state");
+        backend.put(&ns, b"before".to_vec(), b"1".to_vec()).unwrap();
+        let snapshot = backend.snapshot().unwrap();
+        backend.put(&ns, b"after".to_vec(), b"2".to_vec()).unwrap();
+
+        backend.load_snapshot(&snapshot).unwrap();
+
+        assert_eq!(backend.get(&ns, b"before").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(backend.get(&ns, b"after").unwrap(), None);
+        // And a cold instance over the same DFS root agrees.
+        let cold = DisaggregatedStateBackend::new(DisaggregatedConfig {
+            local_cache_dir: std::env::temp_dir()
+                .join(format!("krishiv-cache-cold-{}", std::process::id())),
+            ..backend.config.clone()
+        })
+        .unwrap();
+        assert_eq!(cold.get(&ns, b"after").unwrap(), None);
     }
 }
