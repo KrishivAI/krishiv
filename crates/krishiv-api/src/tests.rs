@@ -2130,7 +2130,7 @@ fn sql_as_enforces_policy_on_referenced_tables() {
 }
 
 #[test]
-fn describe_and_live_table_sql_intercepts_work() {
+fn describe_is_intercepted_and_live_table_ddl_is_not_accepted() {
     let session = Session::builder().build().unwrap();
     session
         .register_record_batches(
@@ -2154,18 +2154,17 @@ fn describe_and_live_table_sql_intercepts_work() {
     let describe = session.sql("DESCRIBE people").unwrap().collect().unwrap();
     assert_eq!(describe.row_count(), 2);
 
-    // IVM-AUD-DDL-F1: this used to assert that the statement succeeded and
-    // that the name landed in a registry — never that the table existed. It
-    // did not: the plan op had no handler, so `SELECT * FROM live_people`
-    // failed with "table not found" right after a reported success.
-    let err = session
-        .sql("CREATE LIVE TABLE live_people AS SELECT id FROM people")
-        .expect_err("CREATE LIVE TABLE must not report success for a no-op")
-        .to_string();
+    // `CREATE LIVE TABLE` (Databricks pipeline syntax) is not part of this
+    // SQL dialect. It once parsed and reported success while creating nothing
+    // (IVM-AUD-DDL-F1); whatever else happens, it must never do that again.
     assert!(
-        err.contains("live tables are not implemented") && err.contains("live_people"),
-        "the rejection must name the statement and the table; got {err}"
+        session
+            .sql("CREATE LIVE TABLE live_people AS SELECT id FROM people")
+            .and_then(|df| df.collect())
+            .is_err(),
+        "CREATE LIVE TABLE must not report success"
     );
+    assert!(session.sql("SELECT * FROM live_people").is_err());
 }
 
 // ── Unified compute API: mode-aware ivm() + one feed() ──────────────────────

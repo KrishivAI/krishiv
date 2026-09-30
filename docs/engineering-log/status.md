@@ -11,7 +11,7 @@ through a round-robin exchange). Python gains `DataFrame.replace`,
 `df.na.replace` and `coalesce`; `dropDuplicates` / `crossJoin` now call the
 native operations.
 
-**SQL** (`krishiv-vs-spark-sql.md`: one absent entry left, `ddl.live_table`).
+**SQL** (`krishiv-vs-spark-sql.md`: no absent entries).
 - `zip_with`, `map_filter`, `transform_keys`, `transform_values`
   (`higher_order_zip_map.rs`).
 - Generators (`spark_generators.rs`): `explode`, `posexplode`, `inline`,
@@ -37,12 +37,17 @@ multi-parameter lambda body is now wrapped in a pass-through call that
 references all its parameters. Fixed upstream in DataFusion 55; drop the rule
 when the engine moves to it.
 
-**Left as is, by decision.** `CREATE LIVE TABLE` stays rejected: it is
-Databricks pipeline syntax, not Apache Spark, and the obvious mapping does not
-hold — `CREATE MATERIALIZED VIEW` through a plain session reports success but
-the view is not queryable by name (`SELECT * FROM mv` → table not found); it is
-a pipeline object that needs `CREATE SOURCE` / `START PIPELINE`. That is worth
-a decision of its own.
+**Materialized views are readable by name.** `CREATE MATERIALIZED VIEW` used
+to succeed and leave nothing to read (`SELECT * FROM mv` → table not found)
+until a pipeline ran. When its query plans against session tables the name is
+now a view over it — always current, recomputed on read; `START PIPELINE`
+still replaces that with the incrementally maintained output. A view over
+`CREATE SOURCE` declarations stays a declaration until its pipeline runs.
+
+**Live-table code removed.** `CREATE LIVE TABLE` (Databricks pipeline syntax,
+not Apache Spark) was a parser that existed only to reject the statement. The
+module, its ledger entry and the stale doc references are gone; the statement
+is now an ordinary syntax error.
 
 Not attempted: Kafka prepared-transaction recovery, reading Delta tables with
 checkpoints / deletion vectors / partition values, distributed vector search.

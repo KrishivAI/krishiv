@@ -829,15 +829,18 @@ static FEATURES: &[FeatureEntry] = &[
     FeatureEntry::new(
         "ddl.create_materialized_view",
         "DDL",
-        "CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP)",
-        NA,
+        "CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT / DROP MATERIALIZED VIEW",
+        S,
         NA,
         S,
     )
     .with_note(
-        "Phase 60 SQL-DDL-for-IVM: ANSI/Spark synonym routed onto the same IVM engine as \
-         CREATE MATERIALIZED INCREMENTAL VIEW; REFRESH/DROP MATERIALIZED VIEW lifecycle; \
-         engine primitive under the platform's governed pipelines",
+        "ANSI/Spark synonym of CREATE MATERIALIZED INCREMENTAL VIEW. Batch: when the query \
+         plans against the session's tables the view is readable by name at once and always \
+         current (recomputed on read, not stored). Incremental: START PIPELINE maintains it \
+         with the IVM engine and its output then replaces the on-read view. REFRESH \
+         MATERIALIZED VIEW is rejected — there is nothing to refresh. A view over CREATE SOURCE \
+         declarations is readable only after its pipeline has run",
     ),
     FeatureEntry::new(
         "ddl.create_streaming_table",
@@ -851,19 +854,6 @@ static FEATURES: &[FeatureEntry] = &[
         "Phase 60: SQL front door + planner validation land (the body lowers through the shared \
          streaming compiler); continuous-job execution is coordinator-gated — a cluster-attached \
          session submits the validated plan via the continuous-stream registration API",
-    ),
-    FeatureEntry::batch_only(
-        "ddl.live_table",
-        "DDL",
-        "CREATE / REFRESH / DROP LIVE TABLE via session.sql()",
-        PL,
-    )
-    .with_note(
-        "Databricks pipeline syntax (not Apache Spark SQL), which Databricks has itself replaced \
-         with CREATE MATERIALIZED VIEW. Rejected at the statement rather than accepted as a \
-         no-op. Use CREATE MATERIALIZED VIEW (with CREATE SOURCE / SINK / START PIPELINE) for \
-         an incrementally-maintained table, or \
-         df.write_stream().refresh(Refresh::Batch).to_table(..) for a one-shot snapshot",
     ),
     // ── CONNECTOR DDL (Phase 60) ─────────────────────────────────────────────
     FeatureEntry::batch_only(

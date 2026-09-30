@@ -350,6 +350,10 @@ pub static CHECKLIST: &[ChecklistCase] = &[
     ),
     // ── DDL ───────────────────────────────────────────────────────────────────
     elsewhere(
+        "ddl.create_materialized_view",
+        "incremental_view.rs: a_materialized_view_over_tables_is_readable_and_current (DDL, then reads)",
+    ),
+    elsewhere(
         "ddl.create_external_table",
         "sql_tests.rs CREATE EXTERNAL TABLE (needs a file)",
     ),
@@ -376,7 +380,6 @@ pub static CHECKLIST: &[ChecklistCase] = &[
         "ddl.create_schema",
         "CREATE SCHEMA IF NOT EXISTS cov_schema",
     ),
-    elsewhere("ddl.live_table", "live_table.rs LIVE TABLE DDL coverage"),
     elsewhere(
         "ddl.connector_source_sink",
         "krishiv-api connector-registry DDL coverage",

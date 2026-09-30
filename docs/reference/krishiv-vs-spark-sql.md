@@ -126,6 +126,7 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 - `ddl.partitioned_by` — CREATE TABLE … PARTITIONED BY (col | bucket/truncate/year/month/day/hour(col)) AS SELECT _(Iceberg catalog tables only; transforms follow the Iceberg partition spec)_
 - `ddl.alter_table` — ALTER TABLE ADD/DROP COLUMN, RENAME _(Iceberg schema evolution via ALTER TABLE is supported)_
 - `ddl.create_schema` — CREATE SCHEMA name _(inherited from DataFusion's native catalog; no Krishiv-side code involved)_
+- `ddl.create_materialized_view` — CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT / DROP MATERIALIZED VIEW _(ANSI/Spark synonym of CREATE MATERIALIZED INCREMENTAL VIEW. Batch: when the query plans against the session's tables the view is readable by name at once and always current (recomputed on read, not stored). Incremental: START PIPELINE maintains it with the IVM engine and its output then replaces the on-read view. REFRESH MATERIALIZED VIEW is rejected — there is nothing to refresh. A view over CREATE SOURCE declarations is readable only after its pipeline has run)_
 - `ddl.connector_source_sink` — CREATE SOURCE/SINK … WITH (connector=…) resolved through the connector registry _(registry-backed dispatch replacing the parquet-only hardcoded factory (audit §8b); supported kinds come from connector descriptors, unsupported kinds fail loudly)_
 - `stmt.set_reset` — SET / RESET / SET TIMEZONE session config _(DataFusion-native session config)_
 - `stmt.use` — USE [CATALOG|SCHEMA] current-namespace _(Phase 60: mutates the session default catalog/schema)_
@@ -143,5 +144,4 @@ Krishiv targets Spark-SQL reference parity as a **measured** number. This page i
 
 ## Absent (planned — itemized shortfall)
 
-- `ddl.live_table` — CREATE / REFRESH / DROP LIVE TABLE via session.sql() _(Databricks pipeline syntax (not Apache Spark SQL), which Databricks has itself replaced with CREATE MATERIALIZED VIEW. Rejected at the statement rather than accepted as a no-op. Use CREATE MATERIALIZED VIEW (with CREATE SOURCE / SINK / START PIPELINE) for an incrementally-maintained table, or df.write_stream().refresh(Refresh::Batch).to_table(..) for a one-shot snapshot)_
 

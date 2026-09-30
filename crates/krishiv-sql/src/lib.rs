@@ -111,7 +111,6 @@ pub(crate) mod join_estimates;
 pub mod kafka_table;
 pub mod lakehouse;
 pub mod late_materialize;
-pub mod live_table;
 pub mod object_store_registry;
 pub mod pipe_syntax;
 pub mod pipeline_ddl;
@@ -1245,7 +1244,6 @@ pub struct SqlEngine {
     /// can dispatch maintenance operations to the right catalog.
     #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
     iceberg_catalogs: IcebergCatalogRegistry,
-    /// Live-table DDL registry shared across SQL and session APIs.
     /// Incremental-view DDL registry shared across SQL and session APIs.
     incremental_view_registry: Arc<incremental_view::IncrementalViewRegistry>,
     /// Pipeline DDL registry (CREATE SOURCE / CREATE SINK metadata).
@@ -2956,13 +2954,19 @@ impl SqlEngine {
             };
         }
 
-        // ── Reject CREATE / REFRESH / DROP LIVE TABLE (never implemented) ────
-        live_table::reject_live_table_ddl(query)?;
-
         // ── Intercept CREATE/DECLARE/REFRESH/DROP INCREMENTAL VIEW ───────────
-        if incremental_view::execute_incremental_view_ddl(&self.incremental_view_registry, query)?
-            .is_some()
+        let view_statement = incremental_view::parse_incremental_view_statement(query)?;
+        let view_was_declared = match &view_statement {
+            Some(incremental_view::IncrementalViewStatement::Create { name, .. }) => {
+                self.incremental_view_registry.contains(name)
+            }
+            _ => false,
+        };
+        if let Some(outcome) =
+            incremental_view::execute_incremental_view_ddl(&self.incremental_view_registry, query)?
         {
+            self.sync_materialized_view_table(view_statement, &outcome, view_was_declared)
+                .await?;
             let empty = self.context.sql("SELECT 1 WHERE FALSE").await?;
             return Ok(
                 self.attach_query_metadata(self.make_sql_df("incremental-view-ddl", empty), query)
@@ -3632,6 +3636,88 @@ impl SqlEngine {
                 .with_shuffle_partitions(shuffle_override),
             &rewritten,
         ))
+    }
+
+    /// Keep the catalog in step with a materialized-view declaration, so the
+    /// view can be read by name.
+    ///
+    /// `CREATE MATERIALIZED VIEW` only recorded a definition for a pipeline to
+    /// run later, so the statement succeeded and `SELECT * FROM <view>` then
+    /// failed with "table not found". A materialized view is, by definition,
+    /// its query's current result — so when the query can be planned against
+    /// the tables this engine has, the name is registered as a view over it:
+    /// always current, recomputed on read. `START PIPELINE` still replaces
+    /// that with the incrementally maintained output, as before.
+    ///
+    /// A definition that cannot be planned here (its inputs are `CREATE
+    /// SOURCE` declarations, not tables) stays a pipeline-only object, which
+    /// is what every materialized view used to be.
+    async fn sync_materialized_view_table(
+        &self,
+        statement: Option<incremental_view::IncrementalViewStatement>,
+        outcome: &incremental_view::IncrementalViewResult,
+        was_declared: bool,
+    ) -> SqlResult<()> {
+        use incremental_view::{IncrementalViewResult, IncrementalViewStatement};
+        match (statement, outcome) {
+            (_, IncrementalViewResult::Dropped(name)) => {
+                // Whatever was readable under the view's name — the view
+                // itself or a pipeline's output — goes with the declaration.
+                if self.context.table_exist(name.as_str())? {
+                    self.context.deregister_table(name.as_str())?;
+                }
+            }
+            (
+                Some(IncrementalViewStatement::Create {
+                    name,
+                    body_sql,
+                    is_materialized: true,
+                    ..
+                }),
+                IncrementalViewResult::Created(_),
+            ) => {
+                let exists = self.context.table_exist(name.as_str())?;
+                // A table of this name that no earlier declaration put there
+                // is someone else's; leave it alone.
+                if exists && !was_declared {
+                    return Ok(());
+                }
+                // Only a query is planned here: planning anything else would
+                // run it.
+                let first_word = body_sql
+                    .trim_start()
+                    .trim_start_matches('(')
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_ascii_uppercase();
+                if !matches!(first_word.as_str(), "SELECT" | "WITH" | "VALUES") {
+                    return Ok(());
+                }
+                let planned = match self.sql(body_sql.as_str()).await {
+                    Ok(dataframe) => dataframe,
+                    Err(error) => {
+                        tracing::debug!(
+                            view = %name,
+                            %error,
+                            "materialized view is not readable by name until its pipeline runs"
+                        );
+                        return Ok(());
+                    }
+                };
+                let view = datafusion::datasource::ViewTable::new(
+                    planned.dataframe.logical_plan().clone(),
+                    Some(body_sql),
+                );
+                if exists {
+                    self.context.deregister_table(name.as_str())?;
+                }
+                self.context
+                    .register_table(name.as_str(), std::sync::Arc::new(view))?;
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     /// Materialise any CTE this statement references more than once.

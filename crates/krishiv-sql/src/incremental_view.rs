@@ -44,6 +44,17 @@
 //! DROP INCREMENTAL VIEW revenue;
 //! ```
 //!
+//! # Reading a materialized view
+//!
+//! A `CREATE MATERIALIZED [INCREMENTAL] VIEW` whose query plans against the
+//! tables the engine already has is readable by name straight away, as a view
+//! over that query: always current, recomputed on each read. (It used to be
+//! only a declaration — the statement succeeded and `SELECT * FROM <view>`
+//! failed with "table not found".) `START PIPELINE` maintains the view
+//! incrementally, and its output then takes over the name. A view over
+//! `CREATE SOURCE` declarations cannot be planned until its pipeline runs, so
+//! it stays a declaration until then. `DROP` removes whatever was readable.
+//!
 //! Two deliberate non-features, both of which used to be documented as working:
 //!
 //! * **No auto-DISTINCT on `DECLARE RECURSIVE VIEW`.** Nothing rewrites the
@@ -1355,5 +1366,141 @@ mod ivm_audit_regression_tests {
             }],
             "a recursive view's LATENESS must not be discarded"
         );
+    }
+    // ── Reading a materialized view by name ───────────────────────────────────
+
+    async fn run(engine: &crate::SqlEngine, sql: &str) -> crate::SqlResult<Vec<String>> {
+        let batches = engine.sql(sql).await?.collect().await?;
+        Ok(arrow::util::pretty::pretty_format_batches(&batches)
+            .map_err(|e| crate::SqlError::DataFusion {
+                message: e.to_string(),
+            })?
+            .to_string()
+            .lines()
+            .filter(|line| line.starts_with('|'))
+            .skip(1)
+            .map(|line| line.trim_matches('|').trim().to_string())
+            .collect())
+    }
+
+    /// The statement used to succeed and leave nothing to read.
+    #[tokio::test]
+    async fn a_materialized_view_over_tables_is_readable_and_current() {
+        let engine = crate::SqlEngine::new();
+        run(
+            &engine,
+            "CREATE TABLE people AS SELECT 1 AS id UNION ALL SELECT 2",
+        )
+        .await
+        .unwrap();
+        run(
+            &engine,
+            "CREATE MATERIALIZED VIEW big AS SELECT id FROM people WHERE id > 1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(run(&engine, "SELECT id FROM big").await.unwrap(), ["2"]);
+
+        // It follows its inputs: no refresh statement is needed (or accepted).
+        run(&engine, "INSERT INTO people VALUES (3)").await.unwrap();
+        assert_eq!(
+            run(&engine, "SELECT id FROM big ORDER BY id")
+                .await
+                .unwrap(),
+            ["2", "3"]
+        );
+        // It composes like any other relation.
+        assert_eq!(
+            run(
+                &engine,
+                "SELECT count(*) FROM big b JOIN people p ON b.id = p.id"
+            )
+            .await
+            .unwrap(),
+            ["2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn replacing_and_dropping_a_materialized_view_updates_what_is_read() {
+        let engine = crate::SqlEngine::new();
+        run(
+            &engine,
+            "CREATE TABLE people AS SELECT 1 AS id UNION ALL SELECT 2",
+        )
+        .await
+        .unwrap();
+        run(
+            &engine,
+            "CREATE MATERIALIZED VIEW v AS SELECT id FROM people WHERE id = 1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(run(&engine, "SELECT id FROM v").await.unwrap(), ["1"]);
+
+        run(
+            &engine,
+            "CREATE OR REPLACE MATERIALIZED VIEW v AS SELECT id FROM people WHERE id = 2",
+        )
+        .await
+        .unwrap();
+        assert_eq!(run(&engine, "SELECT id FROM v").await.unwrap(), ["2"]);
+
+        // IF NOT EXISTS leaves the existing definition, and what is read, alone.
+        run(
+            &engine,
+            "CREATE MATERIALIZED VIEW IF NOT EXISTS v AS SELECT id FROM people WHERE id = 1",
+        )
+        .await
+        .unwrap();
+        assert_eq!(run(&engine, "SELECT id FROM v").await.unwrap(), ["2"]);
+
+        run(&engine, "DROP MATERIALIZED VIEW v").await.unwrap();
+        assert!(run(&engine, "SELECT id FROM v").await.is_err());
+        assert!(!engine.incremental_view_registry().contains("v"));
+    }
+
+    /// A view whose inputs are not tables here is still declared (a pipeline
+    /// will run it) — it is simply not readable yet, as before.
+    #[tokio::test]
+    async fn a_view_over_undeclared_inputs_stays_a_pipeline_declaration() {
+        let engine = crate::SqlEngine::new();
+        run(
+            &engine,
+            "CREATE MATERIALIZED VIEW later AS SELECT id FROM not_a_table_yet",
+        )
+        .await
+        .unwrap();
+        assert!(engine.incremental_view_registry().contains("later"));
+        assert!(run(&engine, "SELECT * FROM later").await.is_err());
+    }
+
+    /// Declaring a view must not take over a table that already has the name.
+    #[tokio::test]
+    async fn a_view_does_not_displace_an_existing_table_of_the_same_name() {
+        let engine = crate::SqlEngine::new();
+        run(&engine, "CREATE TABLE t AS SELECT 7 AS id")
+            .await
+            .unwrap();
+        run(&engine, "CREATE MATERIALIZED VIEW t AS SELECT 99 AS id")
+            .await
+            .unwrap();
+        assert_eq!(run(&engine, "SELECT id FROM t").await.unwrap(), ["7"]);
+    }
+
+    /// The plain `CREATE INCREMENTAL VIEW` keeps no snapshot and is not exposed.
+    #[tokio::test]
+    async fn a_non_materialized_incremental_view_is_not_exposed() {
+        let engine = crate::SqlEngine::new();
+        run(&engine, "CREATE TABLE people AS SELECT 1 AS id")
+            .await
+            .unwrap();
+        run(
+            &engine,
+            "CREATE INCREMENTAL VIEW iv AS SELECT id FROM people",
+        )
+        .await
+        .unwrap();
+        assert!(run(&engine, "SELECT * FROM iv").await.is_err());
     }
 }

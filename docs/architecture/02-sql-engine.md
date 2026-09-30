@@ -25,7 +25,7 @@ registries:
 - a **vector-index cache**, shared with the ANN rewrite rule;
 - UDF registries (scalar SQL-expression UDFs, Rust scalar/aggregate/table
   UDFs, Python UDFs), synced lazily by version counter;
-- the incremental-view, pipeline, live-table and operation registries;
+- the incremental-view, pipeline and operation registries;
 - the process-wide **query memory pool** (`process_query_pool`): one
   `FairSpillPool` shared by every engine in the process, with an
   unspillable-headroom slice (`unspillable_headroom`,
@@ -122,8 +122,7 @@ statements and functions. The complete, engine-generated feature matrix is
 | `CREATE SOURCE` / `CREATE SINK` / `START PIPELINE` | `pipeline_ddl` | declarative pipelines over the connector registry |
 | `CREATE [OR REPLACE] STREAMING TABLE <name> AS <select>` | `streaming_table_ddl` | the SQL front door to a continuous streaming job; validated through the streaming planner, run by the streaming coordinator |
 | `CREATE [MATERIALIZED] INCREMENTAL VIEW`, `DECLARE RECURSIVE VIEW`, `DROP INCREMENTAL VIEW` | `incremental_view` | IVM views maintained by `krishiv-ivm` (`09`) |
-| `CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT` | `incremental_view` | the ANSI/Spark spelling of an IVM view, maintained incrementally by `krishiv-ivm`; `REFRESH MATERIALIZED VIEW` is rejected (the view is always current) |
-| `CREATE LIVE TABLE` | `live_table` | parsed, then **rejected** with a typed error — never implemented, and the parser exists so the rejection is precise |
+| `CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT` | `incremental_view` | the ANSI/Spark spelling of an IVM view. Readable by name at once when its query plans against session tables (an always-current view, recomputed on read); `START PIPELINE` maintains it incrementally with `krishiv-ivm` and its output then takes the name. `REFRESH MATERIALIZED VIEW` is rejected — there is nothing to refresh |
 | `CREATE [OR REPLACE] FUNCTION … [RETURNS TABLE]` | `create_function_ddl`, `scalar_udf` | SQL-expression UDFs inlined before planning; table functions |
 | `CREATE VECTOR INDEX ON …` | `vector_index` | IVF index over a table's embedding column, persisted in Parquet footer metadata (`vector_footer`) |
 | `CREATE PREPARED STATEMENT` / `EXECUTE` | `krishiv-api::prepared` | typed positional parameters (`?` / `$N`) |

@@ -147,7 +147,7 @@ impl PivotValue {
 }
 
 /// Builder returned by [`DataFrame::write_stream`] — the DataFrame-side entry to
-/// the unified live-table write (Phase 61 keystone). Set the refresh mode, then
+/// the unified materialize-by-refresh-mode write (Phase 61 keystone). Set the refresh mode, then
 /// materialize into a named table via [`to_table`](Self::to_table).
 pub struct WriteStreamBuilder<'a> {
     df: &'a DataFrame,
@@ -1599,7 +1599,7 @@ Execution statistics:
         self.union(&right_reordered)
     }
 
-    /// Begin a live-table / streaming write (PySpark `df.writeStream`), the
+    /// Begin a materializing / streaming write (PySpark `df.writeStream`), the
     /// DataFrame-side entry to the Phase 61 keystone. The refresh mode chosen on
     /// the returned builder selects the compute engine; `to_table` needs the
     /// owning [`Session`](crate::Session) (a DataFrame carries no session ref).

@@ -1143,7 +1143,8 @@ impl fmt::Debug for Session {
     }
 }
 
-/// How a live table created by [`Session::create_live_table`] is kept current.
+/// How a table written by [`DataFrame::write_stream`](crate::DataFrame::write_stream)
+/// is kept current.
 ///
 /// This is the API-level expression of the engine-core contract (Phase 61
 /// keystone): the *refresh* mode selects the compute engine behind **one**
@@ -1152,7 +1153,7 @@ impl fmt::Debug for Session {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refresh {
     /// One-shot batch snapshot of the query result (Batch engine). The table
-    /// holds the rows as of creation; re-run `create_live_table` to refresh.
+    /// holds the rows as of creation; write it again to refresh.
     Batch,
     /// Continuously maintained by the incremental-view (IVM) engine — the table
     /// is a materialized view kept up to date as its inputs change.
@@ -1166,7 +1167,7 @@ pub enum Refresh {
 impl Refresh {
     /// The `engine-core` [`EngineKind`](krishiv_engine_core::EngineKind) this
     /// refresh mode targets — the API-level expression of the engine-core
-    /// contract (STRUCT-1/2). The refresh mode a live table is created with *is*
+    /// contract (STRUCT-1/2). The refresh mode a table is written with *is*
     /// the compute engine that maintains it: Batch → Batch, Incremental →
     /// Incremental (IVM), Continuous → Streaming. As the engine crates come to
     /// implement `ComputeEngine` directly, this is the single mapping the
@@ -2954,7 +2955,6 @@ impl Session {
         Arc::clone(self.sql_engine.operation_registry())
     }
 
-    /// Shared live-table registry backing `CREATE LIVE TABLE` DDL.
     /// Shared incremental-view registry backing `CREATE INCREMENTAL VIEW` DDL.
     pub fn incremental_view_registry(
         &self,
