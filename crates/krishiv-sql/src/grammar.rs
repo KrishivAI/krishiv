@@ -641,8 +641,9 @@ static FEATURES: &[FeatureEntry] = &[
          error); per-row length mismatches and NULL elements error — corrupt embeddings \
          must not silently rank. IVF ANN acceleration landed 2026-08-11 (vector_index: \
          k-means cells + probe, results-identical at nprobe>=nlist; vector_search: \
-         SqlEngine::ann_search over a governed table, multi-batch re-rank; vector_quantize: \
-         data-oblivious scalar codes for candidate scoring). Wire-in landed same day: \
+         SqlEngine::ann_search over a governed table, multi-batch re-rank). Candidate \
+         scoring reads full-precision vectors: the vector_quantize codes are built and \
+         tested but no query path uses them yet. Wire-in landed same day: \
          Parquet-footer index write/read (vector_footer, degrade-to-brute-force on foreign \
          footers) and the ann_rewrite optimizer rule — ORDER BY distance LIMIT k over an \
          indexed table gains an EXACT plan-time τ pre-filter under the untouched Sort \

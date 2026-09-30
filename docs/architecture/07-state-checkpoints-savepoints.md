@@ -94,8 +94,7 @@ metadata file written by a token newer than the restorer's.
 uploading only SST files not present in the previous epoch's
 `SstEpochManifest`; `EpochMetaFile` records the file set so a restore
 downloads one epoch's closure. Portable snapshots remain the fallback for
-every non-RocksDB backend. `incremental_trace.rs` records what each epoch
-uploaded for observability.
+every non-RocksDB backend.
 
 The `proptest_checkpoint_kill` suite stops the write sequence after any
 prefix and demands that recovery lands on the last sealed epoch, and flips

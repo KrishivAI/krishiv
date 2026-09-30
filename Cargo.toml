@@ -177,10 +177,6 @@ wiremock = "0.6"
 # dependency bump — so this takes the newest release that honours the MSRV we
 # advertise. Revisit together with the toolchain.
 sysinfo = "0.38.4"
-# 0.84.0, not 0.85.0 — the same MSRV wall as sysinfo: 0.85 declares
-# `rust-version = "1.95"` and this workspace publishes 1.94.1. Only surfaced
-# under `--all-features`, since vortex is an optional connector.
-vortex = { version = "0.84.0", features = ["files", "tokio"] }
 # Production allocator for server binaries. Reduces allocator contention 2-4x
 # on multi-threaded workloads and cuts peak RSS 10-20% vs the system allocator.
 # unprefixed_malloc_on_supported_platforms replaces malloc/free globally so

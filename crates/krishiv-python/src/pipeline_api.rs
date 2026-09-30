@@ -373,6 +373,9 @@ mod tests {
     /// CDC source → incremental SUM view → in-memory sink.
     #[test]
     fn py_pipeline_ivm_cdc_to_memory_sink() {
+        // Initialise here rather than rely on another test having done it:
+        // this test passed only while one that did happened to run first.
+        pyo3::Python::initialize();
         let session = krishiv_api::Session::builder().build().unwrap();
         let mut pl = PyPipeline::new(session, "revenue".to_string());
         pl.source_cdc(
@@ -400,6 +403,7 @@ mod tests {
 
     #[test]
     fn py_pipeline_expectation_drop_and_validate() {
+        pyo3::Python::initialize();
         let session = krishiv_api::Session::builder().build().unwrap();
         let mut pl = PyPipeline::new(session, "dq".to_string());
         // amounts via the `amount` column of three single-row order batches.

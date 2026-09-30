@@ -12,7 +12,7 @@ execution mode is always a runtime choice (`01`).
 
 ```
 leaf flags (krishiv-connectors)
-   kafka · avro · schema-registry · iceberg · lakehouse · vortex · cloud
+   kafka · avro · schema-registry · iceberg · lakehouse · cloud
    kinesis · pulsar-source · elasticsearch · cassandra · hbase · jdbc
    vector-sinks · qdrant · pgvector · state · two-phase
         ▼ forwarded by

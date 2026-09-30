@@ -329,7 +329,7 @@ test-python-rust:
 # source, bearer parsing outside auth_util) that fail on edits made in OTHER
 # crates. `--no-fail-fast` on the test recipes matters for the same reason:
 # without it the first failing test binary hides every later one.
-gate: fmt lint lint-features test test-integration test-doc test-etcd test-embedded test-k8s test-chaos test-feature-arms check-excluded test-python-rust
+gate: fmt lint lint-deps lint-features test test-integration test-doc test-etcd test-embedded test-k8s test-chaos test-feature-arms check-excluded test-python-rust
 
 # Kubernetes operator unit tests
 test-k8s:
@@ -437,7 +437,7 @@ lint:
 #
 # Quarantined features (pre-existing dependency-API rot in optional, non-preset
 # integrations; tracked in docs/architecture/15-configuration.md, "Cargo features"):
-#   connectors: pulsar-source, cassandra, elasticsearch, vortex, cloud
+#   connectors: pulsar-source, cassandra, elasticsearch, cloud
 #   sql:        rest-catalog, unity-catalog, glue-catalog
 #   (postgres-catalog un-quarantined 2026-07-11: fixed against iceberg 0.9.1,
 #    live-verified by `just test-external`)

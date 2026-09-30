@@ -18,11 +18,15 @@
 - Removed `krishiv-operator::jcp_pod` (leftover of the deleted JCP daemon).
 
 Not done, by decision: replacing the Delta reader with delta-rs, collapsing
-the streaming loops into one, merging crates. Unreferenced public modules
-left in place pending a product decision: dataflow `delta_join`, state
-`async_operator` / `incremental_trace`, executor `aligned_join`, sql
-`vector_quantize`, api `materialized_table`, connectors `vortex` /
-`transactional_kafka`, python `arrow_fast`.
+the streaming loops into one, merging crates.
+
+Unreferenced modules removed (2026-09-30): dataflow `delta_join`, state
+`async_operator` / `incremental_trace`, executor `aligned_join`, api
+`materialized_table`, connectors `vortex` (feature and dependency too) /
+`transactional_kafka`, python `arrow_fast`. Kept: sql `vector_quantize`,
+now documented as not wired into any query path. `CREATE MATERIALIZED VIEW`
+is documented as what it is: an IVM view via `incremental_view`, with
+`REFRESH MATERIALIZED VIEW` rejected. `just gate` also runs `lint-deps`.
 
 ## 2026-09-29 — review closed: all items fixed (branch `review-fixes-2026-09-28`)
 

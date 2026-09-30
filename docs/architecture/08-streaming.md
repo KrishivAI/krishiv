@@ -65,7 +65,6 @@ it is the single operator core every loop borrows.
 | Module | Provides |
 |---|---|
 | `interval_join` | two-stream event-time join within `[lower, upper]` bounds; `WatermarkWindowJoinOperator` |
-| `delta_join` | stateless append-only stream join (P8) |
 | `join` | keyed hash join primitives, `extract_agg_key` |
 | `dedup_operator` | first-seen dedup with TTL |
 | `cep` | `MATCH_RECOGNIZE` matcher with partition-by, `AFTER MATCH SKIP`, quantifiers |

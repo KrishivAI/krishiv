@@ -29,7 +29,6 @@ dashmap = { workspace = true }
 futures = { workspace = true }
 # `Bytes` for the ESS fetch path: reqwest already buffers the body into one,
 # and returning it avoids a second full-size copy of a merged partition.
-bytes = { workspace = true }
 indexmap = { workspace = true }
 twox-hash = { workspace = true }
 krishiv-common = { path = "../krishiv-common", version = "0.1.1" }
@@ -44,7 +43,6 @@ krishiv-sql = { path = "../krishiv-sql", version = "0.1.1" }
 krishiv-state = { path = "../krishiv-state", version = "0.1.1" }
 object_store = { workspace = true }
 parquet = { workspace = true, features = ["async", "object_store"] }
-reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["time", "signal", "sync"] }

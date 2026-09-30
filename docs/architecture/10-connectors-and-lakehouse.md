@@ -58,7 +58,6 @@ not change shape with the feature (`15`, "Feature graph").
 | `elasticsearch`, `cassandra`, `hbase` | sink | own features | |
 | `iceberg`, `delta`, `hudi` | table I/O via `lakehouse` module | `lakehouse` (+ `iceberg`) | not opened through batch drivers |
 | `memory-vector`, `lancedb`, `weaviate`, `pinecone`, `qdrant`, `pgvector` | vector sink | `vector-sinks` (+ `qdrant`/`pgvector`) | embeddings with metadata; ANN retrieval (`AnnTopKPrefilter` in `02`) |
-| `vortex` | format | `vortex` | columnar format reader |
 
 ## Lakehouse
 

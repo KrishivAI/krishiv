@@ -46,8 +46,6 @@ pub mod sql;
 /// Unified storage factory for building `Arc<dyn ObjectStore>` from URI schemes.
 pub mod storage_factory;
 pub mod transactional;
-#[cfg(feature = "kafka")]
-pub mod transactional_kafka;
 
 // Module facades
 pub mod capabilities;
@@ -65,8 +63,6 @@ pub mod two_phase;
 
 #[cfg(feature = "vector-sinks")]
 pub mod vector;
-#[cfg(feature = "vortex")]
-pub mod vortex;
 
 #[cfg(test)]
 mod tests;

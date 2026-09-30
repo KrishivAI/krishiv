@@ -122,7 +122,7 @@ statements and functions. The complete, engine-generated feature matrix is
 | `CREATE SOURCE` / `CREATE SINK` / `START PIPELINE` | `pipeline_ddl` | declarative pipelines over the connector registry |
 | `CREATE [OR REPLACE] STREAMING TABLE <name> AS <select>` | `streaming_table_ddl` | the SQL front door to a continuous streaming job; validated through the streaming planner, run by the streaming coordinator |
 | `CREATE [MATERIALIZED] INCREMENTAL VIEW`, `DECLARE RECURSIVE VIEW`, `DROP INCREMENTAL VIEW` | `incremental_view` | IVM views maintained by `krishiv-ivm` (`09`) |
-| `CREATE MATERIALIZED VIEW … [REFRESH …]` | `krishiv-api::materialized_table` | Spark-4-style materialized tables with a managed refresh lifecycle |
+| `CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT` | `incremental_view` | the ANSI/Spark spelling of an IVM view, maintained incrementally by `krishiv-ivm`; `REFRESH MATERIALIZED VIEW` is rejected (the view is always current) |
 | `CREATE LIVE TABLE` | `live_table` | parsed, then **rejected** with a typed error — never implemented, and the parser exists so the rejection is precise |
 | `CREATE [OR REPLACE] FUNCTION … [RETURNS TABLE]` | `create_function_ddl`, `scalar_udf` | SQL-expression UDFs inlined before planning; table functions |
 | `CREATE VECTOR INDEX ON …` | `vector_index` | IVF index over a table's embedding column, persisted in Parquet footer metadata (`vector_footer`) |

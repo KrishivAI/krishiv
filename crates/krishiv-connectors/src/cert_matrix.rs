@@ -227,7 +227,7 @@ pub fn data_path_matrix() -> Vec<DataPathCell> {
             // crashes is not the guarantee. See the evidence text.
             delivery: BestEffort,
             status: Preview,
-            evidence: "two-phase transactional Kafka sink (transactional_kafka); \
+            evidence: "two-phase transactional Kafka sink (kafka_transactional_sink, rdkafka); \
                        barrier-aligned prepare/commit gives read_committed consumers \
                        exactly-once output while the executor survives, but a crash after \
                        a checkpoint completes and before its transaction commits aborts \

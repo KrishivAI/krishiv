@@ -10,7 +10,7 @@ Iceberg), data-quality rules, vector sinks, and the lakehouse module
 
 Parquet and CSV are unconditional. Leaf feature flags are **defined here and
 forwarded upward**: `cloud`, `kafka`, `schema-registry`, `avro`, `lakehouse`,
-`iceberg`, `state`, `two-phase`, `vortex`, `kinesis`, `pulsar-source`,
+`iceberg`, `state`, `two-phase`, `kinesis`, `pulsar-source`,
 `elasticsearch`, `cassandra`, `hbase`, `jdbc`, `vector-sinks`, `qdrant`,
 `pgvector`. There are no presets on this crate.
 

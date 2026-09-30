@@ -2,6 +2,11 @@
 //! Data-oblivious scalar quantization for candidate scoring — Phase 36
 //! leg c, gap G19.
 //!
+//! **Not wired in.** No query path calls this module yet: `ann_search` and
+//! the `ann_rewrite` rule score candidates from full-precision vectors. It
+//! stays because it is the planned I/O reduction for disk-backed vector
+//! search; wire it into candidate scoring before describing it as a feature.
+//!
 //! The IVF probe ([`crate::vector_index`]) narrows a query to a candidate
 //! set; scoring that set still reads full-precision vectors off object
 //! storage, which is the dominant I/O on a disk-backed cluster. This

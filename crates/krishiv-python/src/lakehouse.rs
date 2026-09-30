@@ -585,6 +585,7 @@ mod catalog_tests {
 
     #[test]
     fn iceberg_rest_catalog_list_tables_returns_err_on_unreachable_server() {
+        pyo3::Python::initialize();
         let cat = PyIcebergRestCatalog::new(
             "http://127.0.0.1:19999".into(),
             None,
@@ -604,6 +605,7 @@ mod catalog_tests {
 
     #[test]
     fn iceberg_rest_catalog_load_metadata_validates_identifier_before_io() {
+        pyo3::Python::initialize();
         let cat = PyIcebergRestCatalog::new(
             "http://127.0.0.1:19999".into(),
             None,

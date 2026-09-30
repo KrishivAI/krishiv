@@ -21,14 +21,10 @@ pub mod queryable;
 pub mod savepoint;
 pub mod savepoint_rename;
 
-pub mod incremental_trace;
-
 /// T18: Flink-equivalent broadcast stream state.
 pub mod broadcast;
 
 // Named modules
-/// P6: Async Operator Execution — non-blocking state access for streaming operators.
-pub mod async_operator;
 pub mod backend;
 /// P5: Disaggregated State Backend — DFS-primary with local disk cache.
 pub mod dfs_backend;

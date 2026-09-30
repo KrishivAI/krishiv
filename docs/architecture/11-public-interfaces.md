@@ -27,7 +27,7 @@ honest — a surface may add ergonomics, never semantics.
 | `QueryHandle` (`query`) | one lifecycle path for every execution: progress, cancellation, timeout, a true awaitable |
 | `PreparedStatement` (`prepared`) | parameterised SQL |
 | `StreamingDataFrame`, `DataStreamReader`, `streaming_builder`, `window`, `timers`, `process` | the streaming API (`08`) |
-| `IncrementalDataFrame`, `incremental_flow`, `materialized_table` | the incremental API (`09`) |
+| `IncrementalDataFrame`, `incremental_flow` | the incremental API (`09`) |
 | `Pipeline` (`pipeline`) | source → operators → sink graphs submitted as one job |
 | `SqlJob` / `SubmittedSqlJobStatus` (`sql_job`), `streaming_job` | remote job handles |
 | `compute` | `CompiledJob`, `ComputeEngine`, `EngineRuntime`, `run_job` re-exports from `krishiv-engine-core` / `krishiv-engines` |
@@ -59,7 +59,7 @@ vector sinks), `ConnectorSource`, `RustScalarUdf`, `OperationRegistry`,
 `MemoCacheInfo`, and the error hierarchy (`KrishivError` → `QueryError`,
 `SchemaError`, `ConnectorError`, `CheckpointError`, `ModeError`,
 `AuthorizationError`, `UdfError`). Python UDFs run through the Arrow IPC
-bridge (`arrow_fast`) on `spawn_blocking`; a shared multi-thread Tokio
+bridge (`arrow_compat`) on `spawn_blocking`; a shared multi-thread Tokio
 runtime is built at import. PySpark parity is tracked per method in the
 generated matrix; the crate is CI-tested through the `test-python` job
 (maturin + pytest) rather than `cargo test` (`17`).

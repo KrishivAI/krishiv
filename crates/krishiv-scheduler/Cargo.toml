@@ -54,7 +54,6 @@ dashmap = { workspace = true }
 indexmap = { workspace = true }
 etcd-client = { version = "0.19", optional = true }
 thiserror = { workspace = true }
-urlencoding = { workspace = true }
 
 [dev-dependencies]
 arrow = { workspace = true }

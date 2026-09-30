@@ -2919,7 +2919,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "axum",
@@ -2950,7 +2950,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-api"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2979,7 +2979,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "hex",
@@ -2993,7 +2993,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-connectors"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3022,7 +3022,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-dataflow"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "arrow",
@@ -3043,7 +3043,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-delta"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "arrow",
@@ -3056,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-engine-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3072,7 +3072,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-engines"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3090,7 +3090,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-enterprise-examples"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -3112,12 +3112,11 @@ dependencies = [
 
 [[package]]
 name = "krishiv-executor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "axum",
  "base64 0.23.1",
- "bytes",
  "constant_time_eq 0.6.0",
  "dashmap",
  "futures",
@@ -3134,7 +3133,6 @@ dependencies = [
  "krishiv-state",
  "object_store",
  "parquet",
- "reqwest 0.13.4",
  "serde",
  "serde_json",
  "thiserror",
@@ -3148,7 +3146,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-flight-sql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3173,7 +3171,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-ivm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "arrow",
@@ -3193,15 +3191,18 @@ dependencies = [
 
 [[package]]
 name = "krishiv-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "axum",
  "base64 0.23.1",
+ "constant_time_eq 0.6.0",
  "krishiv-api",
+ "krishiv-common",
  "krishiv-connectors",
  "krishiv-ivm",
  "serde_json",
+ "sqlparser",
  "thiserror",
  "tokio",
  "tracing",
@@ -3209,7 +3210,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-metrics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "dashmap",
  "http",
@@ -3229,7 +3230,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-plan"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "chrono",
@@ -3245,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "base64 0.23.1",
@@ -3262,7 +3263,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-runtime"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "arrow-flight",
@@ -3292,7 +3293,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-scheduler"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3324,14 +3325,13 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
- "urlencoding",
  "uuid",
  "zstd",
 ]
 
 [[package]]
 name = "krishiv-shuffle"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "arrow",
@@ -3360,7 +3360,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-sql"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "async-trait",
@@ -3395,7 +3395,7 @@ dependencies = [
 
 [[package]]
 name = "krishiv-state"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3415,11 +3415,12 @@ dependencies = [
 
 [[package]]
 name = "krishiv-ui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "arrow",
  "axum",
  "constant_time_eq 0.6.0",
+ "futures",
  "krishiv-common",
  "krishiv-metrics",
  "krishiv-proto",
