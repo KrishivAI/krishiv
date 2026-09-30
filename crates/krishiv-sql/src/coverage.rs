@@ -136,6 +136,20 @@ pub static CHECKLIST: &[ChecklistCase] = &[
     sql("join.cross", "SELECT t.id, u.val FROM t CROSS JOIN u"),
     sql("join.natural", "SELECT * FROM t NATURAL JOIN u"),
     sql("join.using", "SELECT * FROM t JOIN u USING (id)"),
+    sql(
+        "join.interval",
+        "SELECT a.k, b.v FROM \
+           (SELECT 1 AS k, TIMESTAMP '2024-01-01 10:00:05' AS ts) a \
+           JOIN (SELECT 1 AS k, TIMESTAMP '2024-01-01 10:00:08' AS ts, 'x' AS v) b \
+           ON a.k = b.k AND b.ts BETWEEN a.ts - INTERVAL '5' SECOND AND a.ts + INTERVAL '5' SECOND",
+    ),
+    sql(
+        "join.temporal_as_of",
+        "SELECT a.k, b.v FROM \
+           (SELECT 1 AS k, TIMESTAMP '2024-01-01 10:00:05' AS ts) a \
+           ASOF JOIN (SELECT 1 AS k, TIMESTAMP '2024-01-01 10:00:01' AS ts, 'x' AS v) b \
+           MATCH_CONDITION (a.ts >= b.ts) ON a.k = b.k",
+    ),
     elsewhere(
         "join.lateral",
         "sql_tests.rs lateral-join coverage; correlation shape varies",
@@ -236,6 +250,14 @@ pub static CHECKLIST: &[ChecklistCase] = &[
         "lateral.generate_series",
         "SELECT * FROM generate_series(1, 3)",
     ),
+    sql(
+        "lateral.cross_join_unnest",
+        "SELECT g.id, u.v FROM (SELECT 1 AS id, [10, 20] AS arr) g CROSS JOIN UNNEST(g.arr) AS u(v)",
+    ),
+    sql(
+        "lateral.lateral_view",
+        "SELECT g.id, v FROM (SELECT 1 AS id, [10, 20] AS arr) g LATERAL VIEW explode(arr) x AS v",
+    ),
     // ── PIVOT ─────────────────────────────────────────────────────────────────
     elsewhere("pivot.pivot", "pivot_sql.rs PIVOT rewrite coverage"),
     elsewhere("pivot.unpivot", "pivot_sql.rs UNPIVOT rewrite coverage"),
@@ -248,7 +270,30 @@ pub static CHECKLIST: &[ChecklistCase] = &[
         "functions.json.json_array_length",
         "SELECT json_array_length('[1,2,3,4]') AS n",
     ),
+    sql(
+        "functions.json.from_to_json",
+        "SELECT to_json(from_json('{\"a\":1,\"b\":\"x\"}', 'a INT, b STRING')) AS j",
+    ),
+    sql(
+        "functions.json.schema_of_json",
+        "SELECT schema_of_json('{\"a\":1}') AS s",
+    ),
+    sql(
+        "functions.json.json_tuple",
+        "SELECT json_tuple('{\"a\":1,\"b\":\"x\"}', 'a', 'b')",
+    ),
     // ── FUNCTIONS: higher-order ───────────────────────────────────────────────
+    sql(
+        "functions.hof.zip_map",
+        "SELECT zip_with([1, 2], [10, 20], (x, y) -> x + y) AS z, \
+                map_filter(map(['a', 'b'], [1, 2]), (k, v) -> v > 1) AS f, \
+                transform_keys(map(['a'], [1]), (k, v) -> upper(k)) AS tk, \
+                transform_values(map(['a'], [1]), (k, v) -> v + 1) AS tv",
+    ),
+    sql(
+        "functions.spark.hash_generators",
+        "SELECT xxhash64('Spark') AS h, stack(2, 1, 'a', 2, 'b')",
+    ),
     sql(
         "functions.hof.transform",
         "SELECT transform([1, 2, 3], x -> x * 2) AS r",

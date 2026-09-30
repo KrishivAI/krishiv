@@ -112,7 +112,7 @@ const fn entry(
 }
 
 use Namespace::{Column, DataFrame, Functions, GroupedData, Reader, Window, Writer};
-use ParityStatus::{Partial, Planned, Supported};
+use ParityStatus::{Partial, Supported};
 
 /// The parity matrix. High-usage-first across the seven PySpark namespaces.
 /// Extended as the surface grows; the number it yields is the phase KPI.
@@ -140,13 +140,7 @@ pub const PARITY: &[ApiEntry] = &[
     entry(DataFrame, "groupBy", Supported, "group_by", ""),
     entry(DataFrame, "agg", Supported, "agg", ""),
     entry(DataFrame, "join", Supported, "join/join_on", ""),
-    entry(
-        DataFrame,
-        "crossJoin",
-        Planned,
-        "",
-        "no dedicated cross-join method",
-    ),
+    entry(DataFrame, "crossJoin", Supported, "cross_join", ""),
     entry(DataFrame, "orderBy", Supported, "order_by", "alias `sort`"),
     entry(DataFrame, "sort", Supported, "sort", ""),
     entry(DataFrame, "limit", Supported, "limit", ""),
@@ -154,9 +148,9 @@ pub const PARITY: &[ApiEntry] = &[
     entry(
         DataFrame,
         "dropDuplicates",
-        Planned,
-        "",
-        "Phase 61 gap: dedup on a subset of columns (distinct() is all-columns)",
+        Supported,
+        "drop_duplicates",
+        "one whole row per key; which duplicate survives is unspecified, as in Spark",
     ),
     entry(DataFrame, "union", Supported, "union", ""),
     entry(
@@ -218,9 +212,9 @@ pub const PARITY: &[ApiEntry] = &[
     entry(
         DataFrame,
         "coalesce",
-        Planned,
-        "repartition",
-        "repartition exists; no shrink-only coalesce",
+        Partial,
+        "coalesce",
+        "shrink-only like Spark's, but it shrinks through a round-robin exchange where Spark merges partitions in place",
     ),
     entry(DataFrame, "cache", Supported, "cache/persist", ""),
     entry(DataFrame, "persist", Supported, "persist", ""),
@@ -246,9 +240,9 @@ pub const PARITY: &[ApiEntry] = &[
     entry(
         DataFrame,
         "replace",
-        Planned,
-        "",
-        "Phase 61 gap: value replacement",
+        Supported,
+        "replace/replace_many",
+        "values are SQL literals in Rust; the Python surface takes PySpark's scalar, list and dict forms",
     ),
     entry(
         DataFrame,
@@ -260,9 +254,9 @@ pub const PARITY: &[ApiEntry] = &[
     entry(
         DataFrame,
         "toPandas",
-        Planned,
-        "",
-        "Phase 61 gap: zero-copy Arrow → pandas (Python surface)",
+        Supported,
+        "collect",
+        "Python surface: `DataFrame.toPandas()` is `collect().to_pandas()` (Arrow → pandas); Rust has no pandas",
     ),
     entry(DataFrame, "write", Supported, "write", "DataFrameWriter"),
     entry(

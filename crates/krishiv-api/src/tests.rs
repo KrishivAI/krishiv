@@ -2983,3 +2983,159 @@ async fn pipeline_persistent_incremental_and_refresh() {
         .unwrap();
     assert_eq!(sum_of(&s3), 100, "refresh resets to a fresh state");
 }
+
+/// The PySpark DataFrame methods the parity ledger listed as missing.
+#[test]
+fn pyspark_gap_methods_cross_join_drop_duplicates_replace() {
+    let session = Session::builder().build().unwrap();
+    let people = session
+        .sql(
+            "SELECT 1 AS id, 'ann' AS name, 10 AS score UNION ALL \
+             SELECT 2, 'bob', 10 UNION ALL \
+             SELECT 3, 'ann', 20 UNION ALL \
+             SELECT 4, 'N/A', 0",
+        )
+        .unwrap();
+    let tags = session
+        .sql("SELECT 'x' AS tag UNION ALL SELECT 'y'")
+        .unwrap();
+
+    // crossJoin: every pairing, and the columns of both sides.
+    let crossed = people.cross_join(&tags).unwrap();
+    assert_eq!(crossed.collect().unwrap().row_count(), 4 * 2);
+    assert_eq!(crossed.schema().unwrap().fields().len(), 4);
+
+    // dropDuplicates on a subset keeps one whole row per key…
+    let by_name = people.drop_duplicates(&["name"]).unwrap();
+    assert_eq!(by_name.collect().unwrap().row_count(), 3);
+    assert_eq!(by_name.schema().unwrap().fields().len(), 3);
+    let by_both = people.drop_duplicates(&["name", "score"]).unwrap();
+    assert_eq!(by_both.collect().unwrap().row_count(), 4);
+    // …and with no subset it is distinct().
+    let doubled = people.union(&people).unwrap();
+    assert_eq!(
+        doubled
+            .drop_duplicates(&[])
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        4
+    );
+    assert!(people.drop_duplicates(&["no_such_column"]).is_err());
+
+    // replace: a string literal touches string columns only.
+    let named = people.replace("'N/A'", "'unknown'", &[]).unwrap();
+    let text = named.collect().unwrap().pretty().unwrap();
+    assert!(text.contains("unknown") && !text.contains("N/A"), "{text}");
+    // A numeric literal touches numeric columns only, in the subset given.
+    let rescored = people.replace("10", "99", &["score"]).unwrap();
+    assert_eq!(
+        rescored
+            .filter("score = 99")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        2
+    );
+    assert_eq!(
+        rescored
+            .filter("id = 10 OR id = 99")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        0
+    );
+    // A numeric value named for a string column is ignored, as in Spark.
+    let untouched = people.replace("10", "99", &["name"]).unwrap();
+    assert_eq!(
+        untouched
+            .filter("score = 10")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        2
+    );
+    // The column keeps its type after a replacement.
+    assert_eq!(
+        rescored
+            .schema()
+            .unwrap()
+            .field_with_name("score")
+            .unwrap()
+            .data_type(),
+        people
+            .schema()
+            .unwrap()
+            .field_with_name("score")
+            .unwrap()
+            .data_type()
+    );
+    // Replacing with NULL is allowed.
+    let nulled = people.replace("'N/A'", "NULL", &["name"]).unwrap();
+    assert_eq!(
+        nulled
+            .filter("name IS NULL")
+            .unwrap()
+            .collect()
+            .unwrap()
+            .row_count(),
+        1
+    );
+    assert!(people.replace("1", "2", &["no_such_column"]).is_err());
+
+    // Several pairs apply at once: 10 -> 20 and 20 -> 30 must not chain the
+    // original 10s into 30.
+    let shifted = people
+        .replace_many(&[("10", "20"), ("20", "30")], &["score"])
+        .unwrap();
+    let count = |df: &crate::DataFrame, predicate: &str| {
+        df.filter(predicate).unwrap().collect().unwrap().row_count()
+    };
+    assert_eq!(count(&shifted, "score = 20"), 2);
+    assert_eq!(count(&shifted, "score = 30"), 1);
+    assert_eq!(count(&shifted, "score = 10"), 0);
+    // Pairs of different type families are refused rather than half-applied.
+    assert!(
+        people
+            .replace_many(&[("10", "20"), ("'ann'", "'x'")], &[])
+            .is_err()
+    );
+}
+
+/// `coalesce` only ever shrinks; `repartition` sets the count either way.
+#[test]
+fn coalesce_is_shrink_only() {
+    let session = Session::builder().build().unwrap();
+    let df = session.sql("SELECT 1 AS id").unwrap();
+    let base_nodes = df.logical_plan().nodes().len();
+
+    // An unpartitioned plan is already one partition: nothing to shrink.
+    let same = df.clone().coalesce(4);
+    assert_eq!(same.logical_plan().nodes().len(), base_nodes);
+
+    let wide = df.clone().repartition(8, &["id"]);
+    let wide_nodes = wide.logical_plan().nodes().len();
+    // Asking for more than it has is a no-op…
+    assert_eq!(
+        wide.clone().coalesce(16).logical_plan().nodes().len(),
+        wide_nodes
+    );
+    assert_eq!(
+        wide.clone().coalesce(8).logical_plan().nodes().len(),
+        wide_nodes
+    );
+    // …asking for fewer adds one exchange with that many buckets.
+    let narrow = wide.coalesce(2);
+    assert_eq!(narrow.logical_plan().nodes().len(), wide_nodes + 1);
+    let last = narrow.logical_plan().nodes().last().unwrap().clone();
+    assert_eq!(
+        last.partitioning(),
+        &krishiv_plan::Partitioning::RoundRobin { buckets: 2 }
+    );
+    // The result still runs.
+    assert_eq!(narrow.collect().unwrap().row_count(), 1);
+}

@@ -44,8 +44,8 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `join.natural` | NATURAL JOIN (column-name matching) | supported | n/a | partial |  |
 | `join.using` | JOIN … USING (column_list) | supported | n/a | partial |  |
 | `join.lateral` | LATERAL JOIN / CROSS JOIN LATERAL | supported | n/a | n/a |  |
-| `join.interval` | Streaming interval join on event-time bounds | planned | partial | n/a | DataFrame-only today (audit §9b): the interval-join operator has no SQL planning path, so batch SQL cannot express it (Planned); the streaming operator exists (Partial). Corrected from the prior over-claim of batch Supported. |
-| `join.temporal_as_of` | Temporal AS OF point-in-time join | planned | n/a | n/a | no SQL temporal-join planning path: `lakehouse/as_of.rs` is table time-travel (temporal.as_of), not a temporal join. Marked Planned rather than the prior Supported. |
+| `join.interval` | Interval join on event-time bounds | supported | partial | n/a | batch: an ordinary join whose ON carries the time bounds (`b.ts BETWEEN a.ts - INTERVAL … AND a.ts + INTERVAL …`), as in Spark, run as a hash join with a range filter. Streaming: the interval-join operator is reachable from the DataFrame API only (audit §9b) — it has no SQL planning path (Partial). |
+| `join.temporal_as_of` | Temporal AS OF point-in-time join | supported | n/a | n/a | asof_join: `ASOF JOIN r MATCH_CONDITION (l.ts >= r.ts) ON keys` with Snowflake's semantics (nearest qualifying right row; an unmatched left row is kept with NULLs). Planned as a range join plus a per-row rank, so it reads every qualifying right row. Flink's `FOR SYSTEM_TIME AS OF` spelling is not accepted. |
 | `join.broadcast_hint` | /*+ BROADCAST(t) */ optimizer hint | partial | n/a | n/a | hint parsed and recorded; broadcast decision is cost-based (see hints.* entries) |
 
 ## HINTS
@@ -96,7 +96,8 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 |---|---|---|---|---|---|
 | `lateral.unnest` | UNNEST(array_col) in FROM clause | supported | n/a | n/a |  |
 | `lateral.generate_series` | generate_series() table function | supported | n/a | n/a |  |
-| `lateral.cross_join_unnest` | CROSS JOIN UNNEST(…) AS t(col) | planned | n/a | n/a |  |
+| `lateral.cross_join_unnest` | CROSS JOIN UNNEST(…) AS t(col) | supported | n/a | n/a | spark_generators: a JOIN UNNEST that reads the table beside it is planned as an unnest over that table (DataFusion 54 plans a lateral UNNEST but cannot execute one) |
+| `lateral.lateral_view` | LATERAL VIEW [OUTER] generator(…) t AS c1, c2 | supported | n/a | n/a | spark_generators: explode / posexplode / inline / stack / json_tuple and the _outer forms; views chain (a later one reads an earlier one's columns) |
 
 ## PIVOT
 
@@ -111,21 +112,21 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 |---|---|---|---|---|---|
 | `functions.json.get_json_object` | get_json_object(json, path) Spark JSONPath extraction | supported | n/a | n/a |  |
 | `functions.json.json_array_length` | json_array_length(json) top-level array element count | supported | n/a | n/a |  |
-| `functions.json.from_to_json` | from_json / to_json struct⇄JSON conversion | planned | n/a | n/a | requires a typed arrow⇄JSON converter + a Spark-DDL schema parser with Spark's version-specific null-field/timestamp rules; itemized shortfall, not shipped approximate |
-| `functions.json.json_tuple` | json_tuple(json, k1, k2, …) multi-key extraction (generator) | planned | n/a | n/a | needs table-generating/LATERAL VIEW machinery; use get_json_object per key today |
-| `functions.json.schema_of_json` | schema_of_json(json) infer a DDL schema string | planned | n/a | n/a |  |
+| `functions.json.from_to_json` | from_json / to_json struct⇄JSON conversion | supported | n/a | n/a | spark_json: from_json takes a constant Spark DDL schema and parses permissively, with Spark 3.4+'s partial results (a field that does not fit is NULL, the record is kept); to_json omits NULL struct fields. The options map (mode, timestampFormat, …) is not accepted: the defaults are what is implemented |
+| `functions.json.json_tuple` | json_tuple(json, k1, k2, …) multi-key extraction (generator) | supported | n/a | n/a | columns c0, c1, … (or the aliases given); each is get_json_object of that key |
+| `functions.json.schema_of_json` | schema_of_json(json) infer a DDL schema string | supported | n/a | n/a | spark_json: BIGINT / DOUBLE / STRING / BOOLEAN / ARRAY / STRUCT with fields in name order; text that is not JSON gives NULL |
 | `functions.vector.distances` | cosine_distance / array_cosine_distance / inner_product (+ native array_distance L2) | supported | n/a | n/a | Phase 36 G19: similarity expressible in plain governed SQL over List/FixedSizeList embeddings. Zero-magnitude cosine is NULL (undefined, not an error); per-row length mismatches and NULL elements error — corrupt embeddings must not silently rank. IVF ANN acceleration landed 2026-08-11 (vector_index: k-means cells + probe, results-identical at nprobe>=nlist; vector_search: SqlEngine::ann_search over a governed table, multi-batch re-rank). Candidate scoring reads full-precision vectors: the vector_quantize codes are built and tested but no query path uses them yet. Wire-in landed same day: Parquet-footer index write/read (vector_footer, degrade-to-brute-force on foreign footers) and the ann_rewrite optimizer rule — ORDER BY distance LIMIT k over an indexed table gains an EXACT plan-time τ pre-filter under the untouched Sort (results-identical by construction; cache invalidated on every DML; KRISHIV_ANN_AUTO_REWRITE=off disables). Single-node engine only: the staged distributed planner registers the same rule over an empty cache, so it is present but inert there — distributed kNN still runs exact unaccelerated. CREATE VECTOR INDEX [name] ON t(col) WITH (metric='cosine'|'l2', nlist=N) is the governed SQL arming statement (build stats returned; the embed tick's entry point) |
 | `functions.hof.transform` | transform(array, x -> …) — Spark alias for array_transform | supported | n/a | n/a |  |
 | `functions.hof.filter` | filter(array, x -> …) — Spark alias for array_filter | supported | n/a | n/a |  |
 | `functions.hof.exists` | exists / any_match(array, x -> …) predicate-any | partial | n/a | n/a | any_match is reachable; the `exists(...)` spelling is shadowed by the EXISTS-subquery keyword in the parser (documented dialect difference) |
 | `functions.hof.forall` | forall(array, x -> …) predicate-all (new, exact all-match) | supported | n/a | n/a |  |
 | `functions.hof.aggregate` | aggregate/reduce(array, start, (acc, x) -> …) left-fold | supported | n/a | n/a | ArrayReduce; registered as aggregate / reduce / array_aggregate |
-| `functions.hof.zip_map` | zip_with, map_filter, transform_keys/values | planned | n/a | n/a | require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall |
+| `functions.hof.zip_map` | zip_with, map_filter, transform_keys/values | supported | n/a | n/a | higher_order_zip_map: zip_with pads the shorter array with NULL; transform_keys fails on a NULL or duplicate key (Spark's default EXCEPTION policy) |
 | `functions.spark.nvl` | nvl / nvl2 null-coalescing (DataFusion-native, exact) | supported | n/a | n/a |  |
 | `functions.spark.substring_index` | substring_index(str, delim, count) (DataFusion-native, exact) | supported | n/a | n/a |  |
 | `functions.spark.date_format` | date_format(ts, fmt) with **Spark** pattern letters (yyyy-MM-dd) | supported | n/a | n/a | supported Spark pattern letters translate exactly to chrono; unsupported letters (era/timezone) error clearly rather than emitting wrong output. Differs from DataFusion's chrono-pattern date_format — see honesty page. |
 | `functions.spark.crc32` | crc32(expr) IEEE CRC-32 as BIGINT (exact) | supported | n/a | n/a |  |
-| `functions.spark.hash_generators` | xxhash64, stack, posexplode, inline | planned | n/a | n/a | xxhash64 needs byte-exact replication of Spark's seed-42 typed hashing; stack/posexplode/inline need generator machinery — itemized shortfall |
+| `functions.spark.hash_generators` | xxhash64, explode, stack, posexplode, inline | supported | n/a | n/a | xxhash64 is byte-exact with Spark (seed 42, hashed by type) — an integer literal is BIGINT here and INT in Spark, so cast to reproduce Spark's value. The generators take Spark's column names (col, pos/col, key/value, struct fields, col0…) and `AS (a, b)`; one generator per SELECT list, as in Spark |
 
 ## DML
 
@@ -155,7 +156,7 @@ Each feature is dimensioned across the three Krishiv execution engines: **batch*
 | `ddl.create_schema` | CREATE SCHEMA name | supported | n/a | n/a | inherited from DataFusion's native catalog; no Krishiv-side code involved |
 | `ddl.create_materialized_view` | CREATE [OR REPLACE] MATERIALIZED VIEW … AS SELECT → IVM view (REFRESH/DROP) | n/a | n/a | supported | Phase 60 SQL-DDL-for-IVM: ANSI/Spark synonym routed onto the same IVM engine as CREATE MATERIALIZED INCREMENTAL VIEW; REFRESH/DROP MATERIALIZED VIEW lifecycle; engine primitive under the platform's governed pipelines |
 | `ddl.create_streaming_table` | CREATE [OR REPLACE] STREAMING TABLE … AS SELECT → continuous job | n/a | planned | n/a | Phase 60: SQL front door + planner validation land (the body lowers through the shared streaming compiler); continuous-job execution is coordinator-gated — a cluster-attached session submits the validated plan via the continuous-stream registration API |
-| `ddl.live_table` | CREATE / REFRESH / DROP LIVE TABLE via session.sql() | planned | n/a | n/a | not implemented and rejected at the statement: the DDL parsed and produced plan ops no executor handled, so it reported success while the table did not exist. Use CREATE MATERIALIZED VIEW for an incrementally-maintained table, or df.write_stream().refresh(Refresh::Batch).to_table(..) for a one-shot snapshot |
+| `ddl.live_table` | CREATE / REFRESH / DROP LIVE TABLE via session.sql() | planned | n/a | n/a | Databricks pipeline syntax (not Apache Spark SQL), which Databricks has itself replaced with CREATE MATERIALIZED VIEW. Rejected at the statement rather than accepted as a no-op. Use CREATE MATERIALIZED VIEW (with CREATE SOURCE / SINK / START PIPELINE) for an incrementally-maintained table, or df.write_stream().refresh(Refresh::Batch).to_table(..) for a one-shot snapshot |
 | `ddl.connector_source_sink` | CREATE SOURCE/SINK … WITH (connector=…) resolved through the connector registry | partial | n/a | n/a | registry-backed dispatch replacing the parquet-only hardcoded factory (audit §8b); supported kinds come from connector descriptors, unsupported kinds fail loudly |
 
 ## SESSION

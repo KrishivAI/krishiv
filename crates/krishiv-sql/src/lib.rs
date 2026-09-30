@@ -129,10 +129,16 @@ pub mod subquery;
 pub mod unspillable_headroom;
 
 pub mod ann_rewrite;
+mod asof_join;
 pub mod coverage;
 mod higher_order_functions;
+mod higher_order_zip_map;
 mod json_functions;
+mod lambda_params_rule;
 mod spark_functions;
+mod spark_generators;
+mod spark_json;
+mod spark_xxhash64;
 pub mod stateless_exec;
 pub mod statement_completion;
 pub mod streaming;
@@ -1608,6 +1614,18 @@ impl SqlEngine {
         higher_order_functions::register_higher_order_spark_functions(&context).map_err(|e| {
             SqlError::DataFusion {
                 message: format!("failed to register higher-order UDFs: {e}"),
+            }
+        })?;
+        higher_order_zip_map::register_zip_and_map_lambda_functions(&context).map_err(|e| {
+            SqlError::DataFusion {
+                message: format!("failed to register zip/map lambda UDFs: {e}"),
+            }
+        })?;
+        lambda_params_rule::register_lambda_params_workaround(&context);
+        asof_join::register_asof_join(&context);
+        spark_generators::register_spark_generators(&context).map_err(|e| {
+            SqlError::DataFusion {
+                message: format!("failed to register generator functions: {e}"),
             }
         })?;
         // Phase 60: Spark-parity scalar functions (Spark-pattern date_format, crc32).
@@ -3568,7 +3586,16 @@ impl SqlEngine {
             subquery::validate_no_streaming_subqueries(&rewritten, &sources)?;
         }
 
-        let dataframe = self.context.sql(&rewritten).await?;
+        // Spark generators (explode, LATERAL VIEW, JOIN UNNEST …) are rewritten
+        // on the parsed statement, which is then planned as it stands: written
+        // back out as text it would not parse to the same thing.
+        let dataframe = match spark_generators::rewrite_generator_statement(&rewritten)? {
+            Some(statement) => {
+                let plan = self.context.state().statement_to_plan(statement).await?;
+                self.context.execute_logical_plan(plan).await?
+            }
+            None => self.context.sql(&rewritten).await?,
+        };
 
         // After CREATE EXTERNAL TABLE DDL, try to extract row-count statistics
         // from the newly registered table provider so `BroadcastAutoRule` can
@@ -4683,6 +4710,26 @@ pub trait KrishivDataFrameOps: Send + Sync {
         right_on: &[&str],
     ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
 
+    /// Cartesian product with another DataFrame.
+    async fn cross_join(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Keep one row per distinct combination of `subset` (all columns when
+    /// empty). Which row of a group survives is unspecified, as in Spark.
+    async fn drop_duplicates(&self, subset: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
+    /// Replace each `(to_replace, value)` pair (SQL literals) in `subset` (all
+    /// columns when empty). The pairs apply simultaneously: a value produced
+    /// by one pair is never rewritten by another. Columns whose type does not
+    /// match the literals' are left alone, and a column keeps its type.
+    async fn replace(
+        &self,
+        replacements: &[(&str, &str)],
+        subset: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>>;
+
     /// Union this DataFrame with another (UNION ALL semantics).
     async fn union(
         &self,
@@ -5707,6 +5754,28 @@ fn sql_dataframe<'a>(
         })
 }
 
+/// The type families `DataFrame::replace` matches a literal against a column
+/// by, mirroring Spark: a numeric value is only replaced in numeric columns,
+/// a string in string columns, a boolean in boolean columns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReplaceKind {
+    Numeric,
+    Text,
+    Boolean,
+}
+
+impl ReplaceKind {
+    fn of(data_type: &datafusion::arrow::datatypes::DataType) -> Option<Self> {
+        use datafusion::arrow::datatypes::DataType;
+        match data_type {
+            DataType::Boolean => Some(Self::Boolean),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => Some(Self::Text),
+            other if other.is_numeric() => Some(Self::Numeric),
+            _ => None,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 impl KrishivDataFrameOps for SqlDataFrame {
     async fn collect(&self) -> SqlResult<Vec<RecordBatch>> {
@@ -6102,6 +6171,108 @@ impl KrishivDataFrameOps for SqlDataFrame {
             None,
         )?;
         Ok(Box::new(self.with_new_dataframe(df, "join")))
+    }
+
+    async fn cross_join(
+        &self,
+        right: &dyn KrishivDataFrameOps,
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        let right = sql_dataframe(right, "cross_join")?;
+        // An inner join with no keys is how DataFusion spells a cross join.
+        let df = self.dataframe.clone().join(
+            right.dataframe.clone(),
+            datafusion::common::JoinType::Inner,
+            &[],
+            &[],
+            None,
+        )?;
+        Ok(Box::new(self.with_new_dataframe(df, "cross_join")))
+    }
+
+    async fn drop_duplicates(&self, subset: &[&str]) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        if subset.is_empty() {
+            return self.distinct().await;
+        }
+        let on = subset
+            .iter()
+            .map(|name| datafusion::logical_expr::col(*name))
+            .collect::<Vec<_>>();
+        let all = self
+            .dataframe
+            .schema()
+            .columns()
+            .into_iter()
+            .map(datafusion::logical_expr::Expr::Column)
+            .collect::<Vec<_>>();
+        let df = self.dataframe.clone().distinct_on(on, all, None)?;
+        Ok(Box::new(self.with_new_dataframe(df, "drop_duplicates")))
+    }
+
+    async fn replace(
+        &self,
+        replacements: &[(&str, &str)],
+        subset: &[&str],
+    ) -> SqlResult<Box<dyn KrishivDataFrameOps>> {
+        use datafusion::logical_expr::ExprSchemable;
+        let schema = self.dataframe.schema().clone();
+        let mut pairs = Vec::with_capacity(replacements.len());
+        let mut kind = None;
+        for (to_replace, value) in replacements {
+            let from = self.dataframe.parse_sql_expr(to_replace)?;
+            let to = self.dataframe.parse_sql_expr(value)?;
+            let from_kind = ReplaceKind::of(&from.get_type(&schema)?);
+            if from_kind.is_none() {
+                return Err(SqlError::DataFusion {
+                    message: format!(
+                        "replace: `{to_replace}` is not a number, string or boolean literal"
+                    ),
+                });
+            }
+            if *kind.get_or_insert(from_kind) != from_kind {
+                return Err(SqlError::DataFusion {
+                    message: String::from("replace: mixed-type replacements are not supported"),
+                });
+            }
+            pairs.push((from, to));
+        }
+        for name in subset {
+            if schema.field_with_unqualified_name(name).is_err() {
+                return Err(SqlError::DataFusion {
+                    message: format!("replace: no column named '{name}'"),
+                });
+            }
+        }
+        let mut df = self.dataframe.clone();
+        let Some(kind) = kind else {
+            return Ok(Box::new(self.with_new_dataframe(df, "replace")));
+        };
+        for field in schema.fields() {
+            let name = field.name().as_str();
+            if !subset.is_empty() && !subset.contains(&name) {
+                continue;
+            }
+            // Spark ignores columns whose type does not match the value being
+            // replaced, in `subset` or not.
+            if ReplaceKind::of(field.data_type()) != kind {
+                continue;
+            }
+            let column = datafusion::logical_expr::col(name);
+            // One CASE with a branch per pair, so the pairs cannot chain.
+            let mut case: Option<datafusion::logical_expr::conditional_expressions::CaseBuilder> =
+                None;
+            for (from, to) in &pairs {
+                let when = column.clone().eq(from.clone());
+                let then = datafusion::logical_expr::cast(to.clone(), field.data_type().clone());
+                case = Some(match case {
+                    Some(mut builder) => builder.when(when, then),
+                    None => datafusion::logical_expr::when(when, then),
+                });
+            }
+            if let Some(mut builder) = case {
+                df = df.with_column(name, builder.otherwise(column)?)?;
+            }
+        }
+        Ok(Box::new(self.with_new_dataframe(df, "replace")))
     }
 
     async fn union(

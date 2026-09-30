@@ -1297,6 +1297,56 @@ Execution statistics:
         }
     }
 
+    /// Keep one row per distinct combination of `subset` (PySpark
+    /// `dropDuplicates`). An empty `subset` compares every column, which is
+    /// [`DataFrame::distinct`]. Which row of a duplicate group is kept is
+    /// unspecified.
+    pub fn drop_duplicates(&self, subset: &[&str]) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops = krishiv_common::async_util::block_on(df.drop_duplicates(subset))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None if self.pre_collected.is_some() => self.as_sql_backed()?.drop_duplicates(subset),
+            None => Err(KrishivError::unsupported(
+                "drop_duplicates requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
+    /// Replace values equal to `to_replace` with `value` (PySpark `replace`).
+    ///
+    /// Both are SQL literals (`"'N/A'"`, `"0"`, `"NULL"`). An empty `subset`
+    /// considers every column. As in Spark, a column whose type does not match
+    /// `to_replace` is left alone, and a replaced column keeps its type.
+    pub fn replace(&self, to_replace: &str, value: &str, subset: &[&str]) -> Result<DataFrame> {
+        self.replace_many(&[(to_replace, value)], subset)
+    }
+
+    /// [`DataFrame::replace`] for several `(to_replace, value)` pairs at once
+    /// (PySpark's dict and list forms). The pairs apply simultaneously — a
+    /// value produced by one is never rewritten by another — and must all be
+    /// of one type family (numeric, string or boolean).
+    pub fn replace_many(
+        &self,
+        replacements: &[(&str, &str)],
+        subset: &[&str],
+    ) -> Result<DataFrame> {
+        match &self.sql_dataframe {
+            Some(df) => {
+                let new_ops =
+                    krishiv_common::async_util::block_on(df.replace(replacements, subset))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            None if self.pre_collected.is_some() => {
+                self.as_sql_backed()?.replace_many(replacements, subset)
+            }
+            None => Err(KrishivError::unsupported(
+                "replace requires an SQL-backed DataFrame",
+            )),
+        }
+    }
+
     /// Drop rows containing nulls in any selected column. Empty `columns` checks all columns.
     pub fn drop_nulls(&self, columns: &[&str]) -> Result<DataFrame> {
         match &self.sql_dataframe {
@@ -1469,6 +1519,20 @@ Execution statistics:
             }
             _ => Err(KrishivError::unsupported(
                 "join requires both DataFrames to be SQL-backed",
+            )),
+        }
+    }
+
+    /// Cartesian product with another DataFrame (PySpark `crossJoin`).
+    pub fn cross_join(&self, right: &DataFrame) -> Result<DataFrame> {
+        match (&self.sql_dataframe, &right.sql_dataframe) {
+            (Some(left), Some(right)) => {
+                let new_ops =
+                    krishiv_common::async_util::block_on(left.cross_join(right.as_ref()))?;
+                Ok(self.with_new_ops(new_ops))
+            }
+            _ => Err(KrishivError::unsupported(
+                "cross_join requires both DataFrames to be SQL-backed",
             )),
         }
     }
@@ -2135,6 +2199,59 @@ Execution statistics:
         .with_inputs(terminals.iter().map(|s| s.to_string()))
         .with_partitioning(krishiv_plan::Partitioning::Hash {
             keys: key_columns.iter().map(|s| s.to_string()).collect(),
+            buckets: num_partitions,
+        });
+
+        self.logical_plan = self.logical_plan.with_node(exchange);
+        self
+    }
+
+    /// Reduce the plan's output to at most `num_partitions` partitions
+    /// (PySpark `coalesce`).
+    ///
+    /// Shrink-only: a plan whose output already has `num_partitions` or fewer
+    /// partitions (including an unpartitioned one) is returned unchanged, so
+    /// unlike [`DataFrame::repartition`] this never adds partitions. Where it
+    /// does shrink, it adds a round-robin exchange; Spark merges partitions
+    /// in place without one.
+    #[must_use]
+    pub fn coalesce(mut self, num_partitions: u32) -> Self {
+        let num_partitions = num_partitions.max(1);
+        let referenced: std::collections::HashSet<&str> = self
+            .logical_plan
+            .nodes()
+            .iter()
+            .flat_map(|n| n.inputs().iter().map(|s| s.as_str()))
+            .collect();
+        let terminals: Vec<&krishiv_plan::PlanNode> = self
+            .logical_plan
+            .nodes()
+            .iter()
+            .filter(|n| !referenced.contains(n.id()))
+            .collect();
+        let current = terminals
+            .iter()
+            .map(|n| match n.partitioning() {
+                krishiv_plan::Partitioning::Hash { buckets, .. }
+                | krishiv_plan::Partitioning::RoundRobin { buckets }
+                | krishiv_plan::Partitioning::Range { buckets, .. } => *buckets,
+                krishiv_plan::Partitioning::Unpartitioned
+                | krishiv_plan::Partitioning::Broadcast => 1,
+            })
+            .max()
+            .unwrap_or(1);
+        if current <= num_partitions {
+            return self;
+        }
+
+        let exchange_id = format!("coalesce-{}", self.logical_plan.nodes().len());
+        let exchange = krishiv_plan::PlanNode::new(
+            &exchange_id,
+            format!("exchange coalesce({num_partitions})"),
+            self.logical_plan.kind(),
+        )
+        .with_inputs(terminals.iter().map(|n| n.id().to_string()))
+        .with_partitioning(krishiv_plan::Partitioning::RoundRobin {
             buckets: num_partitions,
         });
 

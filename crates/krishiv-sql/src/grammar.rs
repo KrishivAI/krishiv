@@ -462,27 +462,30 @@ static FEATURES: &[FeatureEntry] = &[
     FeatureEntry::new(
         "join.interval",
         "JOIN",
-        "Streaming interval join on event-time bounds",
-        PL,
+        "Interval join on event-time bounds",
+        S,
         P,
         NA,
     )
     .with_note(
-        "DataFrame-only today (audit §9b): the interval-join operator has no SQL planning path, \
-         so batch SQL cannot express it (Planned); the streaming operator exists (Partial). \
-         Corrected from the prior over-claim of batch Supported.",
+        "batch: an ordinary join whose ON carries the time bounds (`b.ts BETWEEN a.ts - INTERVAL \
+         … AND a.ts + INTERVAL …`), as in Spark, run as a hash join with a range filter. \
+         Streaming: the interval-join operator is reachable from the DataFrame API only \
+         (audit §9b) — it has no SQL planning path (Partial).",
     ),
     FeatureEntry::new(
         "join.temporal_as_of",
         "JOIN",
         "Temporal AS OF point-in-time join",
-        PL,
+        S,
         NA,
         NA,
     )
     .with_note(
-        "no SQL temporal-join planning path: `lakehouse/as_of.rs` is table time-travel \
-         (temporal.as_of), not a temporal join. Marked Planned rather than the prior Supported.",
+        "asof_join: `ASOF JOIN r MATCH_CONDITION (l.ts >= r.ts) ON keys` with Snowflake's \
+         semantics (nearest qualifying right row; an unmatched left row is kept with NULLs). \
+         Planned as a range join plus a per-row rank, so it reads every qualifying right row. \
+         Flink's `FOR SYSTEM_TIME AS OF` spelling is not accepted.",
     ),
     FeatureEntry::new(
         "join.broadcast_hint",
@@ -583,11 +586,21 @@ static FEATURES: &[FeatureEntry] = &[
         "lateral.cross_join_unnest",
         "LATERAL",
         "CROSS JOIN UNNEST(…) AS t(col)",
-        // DataFusion 54 has no `UNNEST` table function, and the text rewrite
-        // that was credited with this (`unnest_sql`) only produced this same
-        // unplannable form and was reached by no query. Use `LATERAL VIEW
-        // explode(…)` or `SELECT unnest(col)` instead.
-        PL,
+        S,
+    )
+    .with_note(
+        "spark_generators: a JOIN UNNEST that reads the table beside it is planned as an \
+         unnest over that table (DataFusion 54 plans a lateral UNNEST but cannot execute one)",
+    ),
+    FeatureEntry::batch_only(
+        "lateral.lateral_view",
+        "LATERAL",
+        "LATERAL VIEW [OUTER] generator(…) t AS c1, c2",
+        S,
+    )
+    .with_note(
+        "spark_generators: explode / posexplode / inline / stack / json_tuple and the _outer \
+         forms; views chain (a later one reads an earlier one's columns)",
     ),
     // ── PIVOT / UNPIVOT ───────────────────────────────────────────────────────
     FeatureEntry::batch_only("pivot.pivot", "PIVOT", "PIVOT(agg FOR col IN (v1, v2, …))", S),
@@ -609,24 +622,30 @@ static FEATURES: &[FeatureEntry] = &[
         "functions.json.from_to_json",
         "FUNCTIONS",
         "from_json / to_json struct⇄JSON conversion",
-        PL,
+        S,
     )
     .with_note(
-        "requires a typed arrow⇄JSON converter + a Spark-DDL schema parser with Spark's \
-         version-specific null-field/timestamp rules; itemized shortfall, not shipped approximate",
+        "spark_json: from_json takes a constant Spark DDL schema and parses permissively, with \
+         Spark 3.4+'s partial results (a field that does not fit is NULL, the record is kept); \
+         to_json omits NULL struct fields. The options map (mode, timestampFormat, …) is not \
+         accepted: the defaults are what is implemented",
     ),
     FeatureEntry::batch_only(
         "functions.json.json_tuple",
         "FUNCTIONS",
         "json_tuple(json, k1, k2, …) multi-key extraction (generator)",
-        PL,
+        S,
     )
-    .with_note("needs table-generating/LATERAL VIEW machinery; use get_json_object per key today"),
+    .with_note("columns c0, c1, … (or the aliases given); each is get_json_object of that key"),
     FeatureEntry::batch_only(
         "functions.json.schema_of_json",
         "FUNCTIONS",
         "schema_of_json(json) infer a DDL schema string",
-        PL,
+        S,
+    )
+    .with_note(
+        "spark_json: BIGINT / DOUBLE / STRING / BOOLEAN / ARRAY / STRUCT with fields in name \
+         order; text that is not JSON gives NULL",
     ),
     // ── FUNCTIONS: vector distances (Phase 36 leg b(1), G19) ─────────────────
     FeatureEntry::batch_only(
@@ -695,9 +714,12 @@ static FEATURES: &[FeatureEntry] = &[
         "functions.hof.zip_map",
         "FUNCTIONS",
         "zip_with, map_filter, transform_keys/values",
-        PL,
+        S,
     )
-    .with_note("require DataFusion's multi-step lambda / map-lambda protocol; itemized shortfall"),
+    .with_note(
+        "higher_order_zip_map: zip_with pads the shorter array with NULL; transform_keys \
+         fails on a NULL or duplicate key (Spark's default EXCEPTION policy)",
+    ),
     // ── FUNCTIONS: Spark scalar alias layer (Phase 60) ───────────────────────
     FeatureEntry::batch_only(
         "functions.spark.nvl",
@@ -731,12 +753,14 @@ static FEATURES: &[FeatureEntry] = &[
     FeatureEntry::batch_only(
         "functions.spark.hash_generators",
         "FUNCTIONS",
-        "xxhash64, stack, posexplode, inline",
-        PL,
+        "xxhash64, explode, stack, posexplode, inline",
+        S,
     )
     .with_note(
-        "xxhash64 needs byte-exact replication of Spark's seed-42 typed hashing; \
-         stack/posexplode/inline need generator machinery — itemized shortfall",
+        "xxhash64 is byte-exact with Spark (seed 42, hashed by type) — an integer literal is \
+         BIGINT here and INT in Spark, so cast to reproduce Spark's value. The generators take \
+         Spark's column names (col, pos/col, key/value, struct fields, col0…) and `AS (a, b)`; \
+         one generator per SELECT list, as in Spark",
     ),
     // ── DML ──────────────────────────────────────────────────────────────────
     FeatureEntry::batch_only("dml.copy_to", "DML", "COPY (query) TO 'path' (FORMAT …)", S)
@@ -835,9 +859,10 @@ static FEATURES: &[FeatureEntry] = &[
         PL,
     )
     .with_note(
-        "not implemented and rejected at the statement: the DDL parsed and produced plan ops no \
-         executor handled, so it reported success while the table did not exist. Use CREATE \
-         MATERIALIZED VIEW for an incrementally-maintained table, or \
+        "Databricks pipeline syntax (not Apache Spark SQL), which Databricks has itself replaced \
+         with CREATE MATERIALIZED VIEW. Rejected at the statement rather than accepted as a \
+         no-op. Use CREATE MATERIALIZED VIEW (with CREATE SOURCE / SINK / START PIPELINE) for \
+         an incrementally-maintained table, or \
          df.write_stream().refresh(Refresh::Batch).to_table(..) for a one-shot snapshot",
     ),
     // ── CONNECTOR DDL (Phase 60) ─────────────────────────────────────────────
@@ -1163,15 +1188,23 @@ mod tests {
     }
 
     #[test]
-    fn drift_check_interval_join_has_no_batch_sql_path() {
-        // Regression: join.interval was over-claimed as batch Supported; it is
-        // DataFrame-only with no SQL planning path (audit §9b).
+    fn drift_check_interval_join_claims_are_split_by_engine() {
+        // join.interval was once claimed Supported on the strength of the
+        // streaming operator, which SQL cannot reach (audit §9b). The two
+        // engines are separate claims: batch SQL runs an interval join as an
+        // ordinary join with a range predicate — a claim the coverage
+        // checklist executes — while the streaming operator stays Partial.
         let ij = feature_matrix()
             .iter()
             .find(|e| e.id == "join.interval")
             .unwrap();
-        assert_eq!(ij.batch, FeatureStatus::Planned);
+        assert_eq!(ij.batch, FeatureStatus::Supported);
         assert_eq!(ij.streaming, FeatureStatus::Partial);
+        assert!(
+            ij.note
+                .is_some_and(|note| note.contains("DataFrame API only")),
+            "the note must keep saying the streaming operator has no SQL path"
+        );
     }
 
     #[test]

@@ -902,7 +902,66 @@ def reduce(  # noqa: A001
     return aggregate(column, initialValue, merge, finish)
 
 
+def _key_value(sql_name: str, column: ColumnLike, f: Callable) -> Column:
+    key_var = _fresh_var()
+    value_var = _fresh_var()
+    body = _to_column(f(_col(key_var), _col(value_var)))
+    return _expr(f"{sql_name}({_sql(column)}, ({key_var}, {value_var}) -> {body.sql()})")
+
+
+def map_filter(column: ColumnLike, f: Callable) -> Column:
+    """Keep the map entries for which ``f(key, value)`` is true (PySpark
+    `F.map_filter`)."""
+    return _key_value("map_filter", column, f)
+
+
+def transform_keys(column: ColumnLike, f: Callable) -> Column:
+    """Replace each map key with ``f(key, value)`` (PySpark `F.transform_keys`).
+    A NULL or repeated new key is an error, as in Spark."""
+    return _key_value("transform_keys", column, f)
+
+
+def transform_values(column: ColumnLike, f: Callable) -> Column:
+    """Replace each map value with ``f(key, value)`` (PySpark
+    `F.transform_values`)."""
+    return _key_value("transform_values", column, f)
+
+
+# ── JSON ────────────────────────────────────────────────────────────────────
+
+
+def to_json(column: ColumnLike) -> Column:
+    """A struct, array or map as a JSON string (PySpark `F.to_json`). NULL
+    struct fields are left out, as in Spark."""
+    return call_function("to_json", column)
+
+
+def from_json(column: ColumnLike, schema: str) -> Column:
+    """Parse a JSON string with a Spark DDL schema such as ``"a INT, b STRING"``
+    (PySpark `F.from_json`). Parsing is permissive: a field that is missing or
+    does not fit its type is NULL."""
+    if not isinstance(schema, str):
+        raise TypeError("from_json: schema must be a DDL string, e.g. 'a INT, b STRING'")
+    return call_function("from_json", column, lit(schema))
+
+
+def schema_of_json(column: ColumnLike) -> Column:
+    """The DDL of the schema Spark would infer for a JSON string (PySpark
+    `F.schema_of_json`)."""
+    return call_function("schema_of_json", column)
+
+
 # ── Hash functions ──────────────────────────────────────────────────────────
+
+
+def xxhash64(*columns: ColumnLike) -> Column:
+    """Spark's 64-bit xxHash of the columns (PySpark `F.xxhash64`), byte-exact
+    with Spark for values of the same type. A Python ``int`` literal is a
+    BIGINT; cast to INT to reproduce a Spark hash of an INT."""
+    if not columns:
+        raise ValueError("xxhash64 requires at least one column")
+    return call_function("xxhash64", *columns)
+
 
 
 def md5(column: ColumnLike) -> Column:
@@ -1080,7 +1139,15 @@ __all__ = [
     "zip_with",
     "aggregate",
     "reduce",
+    "map_filter",
+    "transform_keys",
+    "transform_values",
+    # json
+    "to_json",
+    "from_json",
+    "schema_of_json",
     # hashing
+    "xxhash64",
     "md5",
     "sha256",
     "sha512",

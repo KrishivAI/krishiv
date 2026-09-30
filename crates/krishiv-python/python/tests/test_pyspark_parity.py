@@ -278,6 +278,102 @@ def test_dataframe_transforms(df):
     assert df.orderBy(col("amount").desc()).first()["amount"] == 40.0
 
 
+def test_map_lambdas_json_and_xxhash64(session):
+    m = session.sql("SELECT map(make_array('a', 'b', 'c'), make_array(1, 2, 3)) AS m")
+    row = m.select(
+        F.map_filter(col("m"), lambda k, v: v > lit(1)).alias("kept"),
+        F.transform_values(col("m"), lambda k, v: v * lit(10)).alias("tens"),
+        F.transform_keys(col("m"), lambda k, v: F.upper(k)).alias("upper"),
+    ).collect_rows()[0]
+    assert dict(row["kept"]) == {"b": 2, "c": 3}
+    assert dict(row["tens"]) == {"a": 10, "b": 20, "c": 30}
+    assert dict(row["upper"]) == {"A": 1, "B": 2, "C": 3}
+
+    j = session.createDataFrame([('{"a": 1, "b": "x"}',)], ["j"])
+    parsed = j.select(F.from_json(col("j"), "a INT, b STRING").alias("s"))
+    assert parsed.collect_rows()[0]["s"] == {"a": 1, "b": "x"}
+    back = parsed.select(F.to_json(col("s")).alias("t")).collect_rows()[0]["t"]
+    assert back == '{"a":1,"b":"x"}'
+    inferred = j.select(F.schema_of_json(col("j")).alias("d")).collect_rows()[0]["d"]
+    assert inferred == "STRUCT<a: BIGINT, b: STRING>"
+    with pytest.raises(TypeError):
+        F.from_json(col("j"), T.IntegerType())
+
+    # Spark's documented example: xxhash64('Spark', array(123), 2).
+    h = session.sql(
+        "SELECT 'Spark' AS s, make_array(CAST(123 AS INT)) AS a, CAST(2 AS INT) AS n"
+    ).select(F.xxhash64(col("s"), col("a"), col("n")).alias("h"))
+    assert h.collect_rows()[0]["h"] == 5602566077635097486
+    with pytest.raises(ValueError):
+        F.xxhash64()
+
+
+def test_sql_generators(session):
+    session.sql("CREATE TABLE gen_t AS SELECT 1 AS id, make_array(10, 20) AS arr").collect()
+    rows = session.sql(
+        "SELECT id, pos, v FROM gen_t LATERAL VIEW posexplode(arr) x AS pos, v ORDER BY pos"
+    ).collect_rows()
+    assert [(r["id"], r["pos"], r["v"]) for r in rows] == [(1, 0, 10), (1, 1, 20)]
+    assert [r["col"] for r in session.sql("SELECT explode(arr) FROM gen_t ORDER BY 1").collect_rows()] == [10, 20]
+    stacked = session.sql("SELECT stack(2, 1, 'a', 2, 'b') ORDER BY col0").collect_rows()
+    assert [(r["col0"], r["col1"]) for r in stacked] == [(1, "a"), (2, "b")]
+
+
+def test_replace(session):
+    rdf = session.createDataFrame(
+        [(1, "ann", 10), (2, "bob", 10), (3, "N/A", 20)], ["id", "name", "score"]
+    )
+    rows = lambda d: sorted((r["id"], r["name"], r["score"]) for r in d.collect_rows())  # noqa: E731
+
+    # A string touches string columns only; column types are unchanged.
+    out = rdf.replace("N/A", "unknown")
+    assert rows(out) == [(1, "ann", 10), (2, "bob", 10), (3, "unknown", 20)]
+    assert out.dtypes == rdf.dtypes
+    # A number touches numeric columns only, and only the subset named.
+    assert rows(rdf.replace(10, 99, subset=["score"])) == [
+        (1, "ann", 99), (2, "bob", 99), (3, "N/A", 20)
+    ]
+    # Naming a column of the wrong type is ignored, as in PySpark.
+    assert rows(rdf.replace(10, 99, subset=["name"])) == rows(rdf)
+    # Dict and list forms apply simultaneously: 10 -> 20 must not become 30.
+    assert rows(rdf.replace({10: 20, 20: 30}, subset=["score"])) == [
+        (1, "ann", 20), (2, "bob", 20), (3, "N/A", 30)
+    ]
+    assert rows(rdf.replace(["ann", "bob"], ["a", "b"])) == [
+        (1, "a", 10), (2, "b", 10), (3, "N/A", 20)
+    ]
+    assert rows(rdf.replace(["ann", "bob"], "x")) == [(1, "x", 10), (2, "x", 10), (3, "N/A", 20)]
+    # None as the new value nulls the match; df.na.replace is the same method.
+    assert rows(rdf.na.replace("N/A", None))[2] == (3, None, 20)
+
+    with pytest.raises(TypeError):
+        rdf.replace("ann")
+    with pytest.raises(ValueError, match="same length"):
+        rdf.replace(["ann", "bob"], ["a"])
+    with pytest.raises(ValueError, match="Mixed type"):
+        rdf.replace({"ann": 1})
+
+
+def test_drop_duplicates_cross_join_coalesce(session, df):
+    # One whole row per key; which duplicate survives is unspecified.
+    deduped = df.dropDuplicates(["id"])
+    assert deduped.columns() == ["id", "name", "amount"]
+    assert sorted(r["id"] for r in deduped.collect_rows()) == [1, 2, 3]
+    assert df.drop_duplicates().count() == 4
+    with pytest.raises(TypeError):
+        df.dropDuplicates("id")
+
+    other = session.createDataFrame([("x",), ("y",)], ["tag"])
+    crossed = df.crossJoin(other)
+    assert crossed.count() == 4 * 2
+    assert crossed.columns() == ["id", "name", "amount", "tag"]
+
+    # coalesce never adds partitions and leaves the data alone.
+    assert df.coalesce(1).count() == 4
+    assert df.repartition(8, ["id"]).coalesce(2).count() == 4
+    assert sorted(df.toPandas()["id"].tolist()) == [1, 1, 2, 3]
+
+
 def test_union_by_name(session):
     a = session.createDataFrame([(1, "x")], ["id", "name"])
     b = session.createDataFrame([("y", 2)], ["name", "id"])  # different order

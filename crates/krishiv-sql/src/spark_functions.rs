@@ -35,6 +35,7 @@ use datafusion::prelude::SessionContext;
 pub fn register_spark_scalar_functions(ctx: &SessionContext) -> Result<(), DataFusionError> {
     ctx.register_udf(make_date_format());
     ctx.register_udf(make_crc32());
+    ctx.register_udf(crate::spark_xxhash64::make_xxhash64());
     Ok(())
 }
 

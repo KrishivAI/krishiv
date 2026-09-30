@@ -1,246 +1,19 @@
 //! Spark SQL feature extensions — pre-processors for SQL constructs that
 //! DataFusion doesn't parse natively.
 //!
-//! Supported Spark SQL features:
-//!
-//! - **LATERAL VIEW**: `SELECT ... FROM t LATERAL VIEW explode(arr) AS col`
-//! - **LATERAL VIEW OUTER**: `SELECT ... FROM t LATERAL VIEW OUTER explode(arr) AS col`
 //! - **TABLESAMPLE**: `SELECT ... FROM t TABLESAMPLE (10 PERCENT)`
 //! - **DESCRIBE TABLE EXTENDED**: `DESCRIBE TABLE EXTENDED t`
+//! - `TRANSFORM` and `SHOW TBLPROPERTIES` are recognised and reported as
+//!   unsupported, rather than passed to DataFusion to fail obscurely.
 //!
-//! # Status: not wired into the query path
+//! [`preprocess_spark_sql`] runs on every statement the SQL front door plans.
 //!
-//! Nothing calls this module. Every one of its public functions, including the
-//! aggregate [`preprocess_spark_sql`], has zero callers in the workspace, so no
-//! query reaches any of these rewrites. The module is compiled and its tests
-//! run, which is why that was not obvious.
-//!
-//! Whether to wire it or delete it is a product decision about how much Spark
-//! surface the SQL front door should carry, so it is recorded in
-//! `docs/engineering-log/crate-audit-register.md` rather than decided here. What
-//! *is* fixed here is everything that would have been wrong the moment it was
-//! wired — the rewrites used to emit SQL naming functions and relations that do
-//! not exist:
-//!
-//! - `LATERAL VIEW explode(x)` produced `explode(x)`, which is neither a
-//!   DataFusion function nor registered by this engine. It now emits `UNNEST`,
-//!   which DataFusion plans natively.
-//! - `SHOW TBLPROPERTIES` produced a query against
-//!   `information_schema.table_properties`, which DataFusion does not define,
-//!   and interpolated the table name unescaped. It now reports the feature as
-//!   unsupported.
-//! - `TRANSFORM` was a documented "rewrite" that returned its input untouched,
-//!   so a `TRANSFORM` query would have been passed to DataFusion verbatim. It
-//!   now reports the feature as unsupported.
+//! `LATERAL VIEW` is not here: it is rewritten on the parsed statement by
+//! [`crate::spark_generators`], together with `explode` and the other
+//! generators. The text rewrite that used to live in this module emitted a
+//! lateral `UNNEST`, which DataFusion 54 plans but cannot execute.
 
 use crate::{SqlError, SqlResult};
-
-// ── LATERAL VIEW ─────────────────────────────────────────────────────────────
-
-/// Detects `LATERAL VIEW` in SQL.
-pub fn contains_lateral_view(sql: &str) -> bool {
-    let upper = sql.to_ascii_uppercase();
-    upper.contains("LATERAL VIEW") || upper.contains("LATERAL VIEW OUTER")
-}
-
-/// Rewrites Spark-style `LATERAL VIEW` to standard SQL `CROSS JOIN LATERAL`.
-///
-/// # Transformations
-///
-/// ```sql
-/// -- Input
-/// SELECT id, val FROM t LATERAL VIEW explode(tags) AS tag
-///
-/// -- Output
-/// SELECT id, val FROM t CROSS JOIN LATERAL UNNEST(tags) AS tag
-/// ```
-///
-/// Also handles `LATERAL VIEW OUTER`:
-/// ```sql
-/// -- Input
-/// SELECT id, val FROM t LATERAL VIEW OUTER explode(tags) AS tag
-///
-/// -- Output
-/// SELECT id, val FROM t LEFT JOIN LATERAL UNNEST(tags) AS tag ON TRUE
-/// ```
-pub fn rewrite_lateral_view(sql: &str) -> SqlResult<String> {
-    if !contains_lateral_view(sql) {
-        return Ok(sql.to_string());
-    }
-
-    let mut result = sql.to_string();
-
-    // Rewrite LATERAL VIEW OUTER first (more specific pattern)
-    while let Some(pos) = find_keyword_boundary(&result, "LATERAL VIEW OUTER") {
-        if let Some(replacement) = rewrite_lateral_view_at(&result, pos, "LATERAL VIEW OUTER", true)
-        {
-            result = replacement;
-        } else {
-            break;
-        }
-    }
-
-    // Rewrite LATERAL VIEW
-    while let Some(pos) = find_keyword_boundary(&result, "LATERAL VIEW") {
-        if let Some(replacement) = rewrite_lateral_view_at(&result, pos, "LATERAL VIEW", false) {
-            result = replacement;
-        } else {
-            break;
-        }
-    }
-
-    Ok(result)
-}
-
-/// Rewrite a single LATERAL VIEW at the given position.
-fn rewrite_lateral_view_at(sql: &str, pos: usize, keyword: &str, is_outer: bool) -> Option<String> {
-    let before = &sql[..pos];
-    let after_keyword = &sql[pos + keyword.len()..];
-
-    // Parse the view definition: <func_call> AS <name> or AS <name>(<cols>)
-    // We need to find where the alias ends
-    let trimmed = after_keyword.trim_start();
-    let keyword_offset = after_keyword.len() - trimmed.len();
-
-    // Find " AS " keyword in the remaining text
-    // ASCII folding: `as_pos` below indexes `trimmed`, not this copy, so the
-    // two must have identical byte lengths. Unicode folding does not preserve
-    // length (U+FB01 folds to "FI", 3 bytes to 2), which shifts the split and
-    // can slice a multi-byte character in half.
-    let upper_trimmed = trimmed.to_ascii_uppercase();
-    let as_pos = upper_trimmed.find(" AS ")?;
-    let func_call = trimmed[..as_pos].trim();
-
-    // Parse the alias after " AS "
-    let alias_start = as_pos + 4;
-    let alias_text = &trimmed[alias_start..];
-
-    // Find end of alias: either end of string, comma, or next keyword
-    let alias_len = find_alias_length(alias_text);
-    let alias_part = alias_text[..alias_len].trim();
-
-    // Calculate what comes after the entire LATERAL VIEW construct
-    let consumed = keyword.len() + keyword_offset + as_pos + 4 + alias_len;
-    let rest = &sql[pos + consumed..];
-
-    // Spark's generator functions are spelled `explode`/`posexplode`; neither
-    // exists in DataFusion. `UNNEST` is the equivalent, which DataFusion plans
-    // natively.
-    let func_call = &spark_generator_to_unnest(func_call);
-
-    let join_type = if is_outer {
-        "LEFT JOIN LATERAL"
-    } else {
-        "CROSS JOIN LATERAL"
-    };
-
-    let on_clause = if is_outer { " ON TRUE" } else { "" };
-
-    Some(format!(
-        "{} {} {} AS {}{}{}",
-        before, join_type, func_call, alias_part, on_clause, rest
-    ))
-}
-
-/// Rewrite a Spark generator call to the equivalent `UNNEST`.
-///
-/// `explode(arr)` and `posexplode(arr)` both become `UNNEST(arr)`. Anything else
-/// is left alone — a user-defined generator may well exist.
-fn spark_generator_to_unnest(func_call: &str) -> String {
-    let trimmed = func_call.trim();
-    for generator in ["explode_outer", "posexplode_outer", "explode", "posexplode"] {
-        let prefix_len = generator.len();
-        if trimmed.len() > prefix_len
-            && trimmed
-                .get(..prefix_len)
-                .is_some_and(|head| head.eq_ignore_ascii_case(generator))
-            && trimmed
-                .get(prefix_len..)
-                .is_some_and(|r| r.starts_with('('))
-        {
-            let args = trimmed.get(prefix_len..).unwrap_or("");
-            return format!("UNNEST{args}");
-        }
-    }
-    trimmed.to_string()
-}
-
-/// Find the length of an alias in the text like "tag" or "tag(col1, col2)".
-fn find_alias_length(text: &str) -> usize {
-    let bytes = text.as_bytes();
-    let mut i = 0;
-
-    // Skip leading whitespace
-    while bytes.get(i).is_some_and(|&b| b == b' ' || b == b'\t') {
-        i += 1;
-    }
-
-    // Read alias name
-    let name_start = i;
-    while bytes
-        .get(i)
-        .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_')
-    {
-        i += 1;
-    }
-
-    if i == name_start {
-        return 0;
-    }
-
-    // Check for parenthesized column list
-    while bytes.get(i).is_some_and(|&b| b == b' ') {
-        i += 1;
-    }
-    if bytes.get(i).is_some_and(|&b| b == b'(') {
-        // Find closing paren
-        i += 1;
-        let mut depth = 1;
-        while i < bytes.len() && depth > 0 {
-            let Some(&b) = bytes.get(i) else {
-                break;
-            };
-            match b {
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-    }
-
-    i
-}
-
-fn find_keyword_boundary(sql: &str, keyword: &str) -> Option<usize> {
-    // ASCII folding: `abs_pos` is applied to `sql`.
-    let upper = sql.to_ascii_uppercase();
-    let keyword_upper = keyword.to_ascii_uppercase();
-
-    let mut search_start = 0;
-    while let Some(pos) = upper[search_start..].find(&keyword_upper) {
-        let abs_pos = search_start + pos;
-        // Check word boundary before
-        let before_ok = abs_pos == 0
-            || sql
-                .as_bytes()
-                .get(abs_pos - 1)
-                .is_some_and(|&b| b == b' ' || b == b',' || b == b'\n' || b == b'\t');
-        // Check word boundary after
-        let after_pos = abs_pos + keyword.len();
-        let after_ok = after_pos >= sql.len()
-            || sql
-                .as_bytes()
-                .get(after_pos)
-                .is_some_and(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'(');
-
-        if before_ok && after_ok {
-            return Some(abs_pos);
-        }
-        search_start = abs_pos + 1;
-    }
-    None
-}
 
 // ── TABLESAMPLE ──────────────────────────────────────────────────────────────
 
@@ -499,8 +272,6 @@ pub fn rewrite_show_tblproperties(sql: &str) -> SqlResult<String> {
 pub fn preprocess_spark_sql(sql: &str) -> SqlResult<String> {
     let mut result = sql.to_string();
 
-    // Order: LATERAL VIEW (most complex), then others
-    result = rewrite_lateral_view(&result)?;
     result = rewrite_tablesample(&result)?;
     result = rewrite_transform(&result)?;
     result = rewrite_describe_extended(&result)?;
@@ -544,44 +315,6 @@ mod tests {
         assert!(rewrite_show_tblproperties("SELECT 'ŉŉŉŉ' AS s; SHOW TBLPROPERTIES t").is_err());
     }
 
-    // ── LATERAL VIEW tests ────────────────────────────────────────────────
-
-    #[test]
-    fn lateral_view_basic() {
-        let sql = "SELECT id, val FROM t LATERAL VIEW explode(tags) AS tag";
-        let result = rewrite_lateral_view(sql).unwrap();
-        assert!(
-            result.contains("CROSS JOIN LATERAL UNNEST(tags) AS tag"),
-            "explode must become UNNEST, which DataFusion actually has: {result}"
-        );
-        assert!(!result.contains("LATERAL VIEW"));
-    }
-
-    #[test]
-    fn lateral_view_outer() {
-        let sql = "SELECT id, val FROM t LATERAL VIEW OUTER explode(tags) AS tag";
-        let result = rewrite_lateral_view(sql).unwrap();
-        assert!(
-            result.contains("LEFT JOIN LATERAL UNNEST(tags) AS tag ON TRUE"),
-            "{result}"
-        );
-        assert!(!result.contains("LATERAL VIEW"));
-    }
-
-    /// `posexplode` maps too, and a non-Spark generator is left alone.
-    #[test]
-    fn only_spark_generators_are_mapped_to_unnest() {
-        let mapped =
-            rewrite_lateral_view("SELECT a FROM t LATERAL VIEW posexplode(arr) AS p").unwrap();
-        assert!(mapped.contains("UNNEST(arr)"), "{mapped}");
-        let untouched =
-            rewrite_lateral_view("SELECT a FROM t LATERAL VIEW my_gen(arr) AS p").unwrap();
-        assert!(
-            untouched.contains("my_gen(arr)"),
-            "a user-defined generator must survive: {untouched}"
-        );
-    }
-
     /// TRANSFORM used to return its input unchanged while documenting itself as
     /// a rewrite, so the query reached DataFusion verbatim.
     #[test]
@@ -601,33 +334,6 @@ mod tests {
             .expect_err("no table-properties relation exists");
         assert!(matches!(err, SqlError::Unsupported { .. }), "{err}");
     }
-
-    #[test]
-    fn lateral_view_with_column_list() {
-        let sql = "SELECT id, val FROM t LATERAL VIEW posexplode(arr) AS pos, val";
-        let result = rewrite_lateral_view(sql).unwrap();
-        assert!(result.contains("CROSS JOIN LATERAL"));
-    }
-
-    #[test]
-    fn lateral_view_no_change_when_absent() {
-        let sql = "SELECT * FROM t WHERE id = 1";
-        let result = rewrite_lateral_view(sql).unwrap();
-        assert_eq!(result, sql);
-    }
-
-    #[test]
-    fn contains_lateral_view_true() {
-        assert!(contains_lateral_view(
-            "SELECT * FROM t LATERAL VIEW explode(a) AS x"
-        ));
-        assert!(contains_lateral_view(
-            "SELECT * FROM t LATERAL VIEW OUTER explode(a) AS x"
-        ));
-        assert!(!contains_lateral_view("SELECT * FROM t"));
-    }
-
-    // ── TABLESAMPLE tests ─────────────────────────────────────────────────
 
     #[test]
     fn tablesample_passthrough() {
@@ -716,13 +422,6 @@ mod tests {
     }
 
     // ── Unified pre-processor tests ───────────────────────────────────────
-
-    #[test]
-    fn preprocess_spark_sql_lateral_view() {
-        let sql = "SELECT id, val FROM t LATERAL VIEW explode(tags) AS tag";
-        let result = preprocess_spark_sql(sql).unwrap();
-        assert!(result.contains("CROSS JOIN LATERAL"));
-    }
 
     #[test]
     fn preprocess_spark_sql_passthrough() {

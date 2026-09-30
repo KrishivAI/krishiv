@@ -1,5 +1,52 @@
 # Krishiv Implementation Status
 
+## 2026-09-30 — Spark parity gaps closed (branch `spark-parity-gaps`)
+
+Both parity ledgers' itemized shortfalls, worked through.
+
+**DataFrame API** (`pyspark-parity.md`: 127/127 listed methods covered).
+`cross_join`, `drop_duplicates(subset)`, `replace` / `replace_many` (simultaneous,
+type-matched, type-preserving) and a shrink-only `coalesce` (Partial: it shrinks
+through a round-robin exchange). Python gains `DataFrame.replace`,
+`df.na.replace` and `coalesce`; `dropDuplicates` / `crossJoin` now call the
+native operations.
+
+**SQL** (`krishiv-vs-spark-sql.md`: one absent entry left, `ddl.live_table`).
+- `zip_with`, `map_filter`, `transform_keys`, `transform_values`
+  (`higher_order_zip_map.rs`).
+- Generators (`spark_generators.rs`): `explode`, `posexplode`, `inline`,
+  `stack`, `json_tuple` and the `_outer` forms, in the SELECT list, in
+  `LATERAL VIEW`, and as `[CROSS] JOIN UNNEST(...)`, with Spark's column names
+  and `AS (a, b)`. **`LATERAL VIEW` did not work before this**: the old text
+  rewrite emitted a lateral `UNNEST`, which DataFusion 54 plans but cannot
+  execute. It is removed.
+- `xxhash64` — byte-exact with Spark (it reproduces the value in Spark's
+  function reference). Hashes by type: an integer literal is BIGINT here and
+  INT in Spark.
+- `to_json`, `from_json` (constant Spark DDL schema, permissive, partial
+  results), `schema_of_json` (`spark_json.rs`). The options map is not accepted.
+- `ASOF JOIN r MATCH_CONDITION (l.ts >= r.ts) ON keys`, Snowflake semantics
+  (`asof_join.rs`). Planned as a range join plus a per-row rank.
+- `join.interval`: batch was already able to run it (an ordinary join with a
+  range predicate); the ledger now says so, with an executed checklist query.
+
+**DataFusion 54 defect worked around** (`lambda_params_rule.rs`): a lambda with
+two parameters that used the second and not the first — `(k, v) -> v > 1`,
+and the existing `aggregate(a, 0, (acc, x) -> x)` — failed at run time. Every
+multi-parameter lambda body is now wrapped in a pass-through call that
+references all its parameters. Fixed upstream in DataFusion 55; drop the rule
+when the engine moves to it.
+
+**Left as is, by decision.** `CREATE LIVE TABLE` stays rejected: it is
+Databricks pipeline syntax, not Apache Spark, and the obvious mapping does not
+hold — `CREATE MATERIALIZED VIEW` through a plain session reports success but
+the view is not queryable by name (`SELECT * FROM mv` → table not found); it is
+a pipeline object that needs `CREATE SOURCE` / `START PIPELINE`. That is worth
+a decision of its own.
+
+Not attempted: Kafka prepared-transaction recovery, reading Delta tables with
+checkpoints / deletion vectors / partition values, distributed vector search.
+
 ## 2026-09-30 — post-review hardening (branch `review-fixes-2026-09-28`)
 
 - `just gate`: one command for everything the CI fmt-lint and test jobs run,

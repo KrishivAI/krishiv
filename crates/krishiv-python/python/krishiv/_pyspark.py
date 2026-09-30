@@ -312,14 +312,64 @@ def _df_where(self, condition):
 
 
 def _df_dropDuplicates(self, subset=None):
-    if not subset:
-        return self.distinct()
-    partition = [col(c) for c in subset]
-    ranked = self.with_column(
-        "__krishiv_rn",
-        expr("row_number()").over(partition_by=partition, order_by=partition).sql(),
+    if isinstance(subset, str):
+        raise TypeError("subset must be a list of column names, not a string")
+    return self.dedup_on(list(subset) if subset else [])
+
+
+_NO_VALUE = object()
+
+
+def _replace_literal(value) -> str:
+    return "NULL" if value is None else lit(value).sql()
+
+
+def _replace_family(value) -> str:
+    # bool is an int in Python; keep them apart as Spark does.
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "numeric"
+    if isinstance(value, str):
+        return "string"
+    raise TypeError(
+        "to_replace should be a bool, float, int, string, list, tuple, or dict; "
+        f"got {type(value).__name__}"
     )
-    return ranked.filter_column(col("__krishiv_rn") == lit(1)).drop_columns(["__krishiv_rn"])
+
+
+def _df_replace(self, to_replace, value=_NO_VALUE, subset=None):
+    """PySpark ``DataFrame.replace``: scalar, list or dict ``to_replace``.
+
+    Replacements apply simultaneously, only touch columns whose type matches
+    the values being replaced, and leave column types unchanged.
+    """
+    if isinstance(to_replace, dict):
+        pairs = list(to_replace.items())
+    else:
+        if value is _NO_VALUE:
+            raise TypeError("value argument is required when to_replace is not a dictionary")
+        olds = list(to_replace) if isinstance(to_replace, (list, tuple)) else [to_replace]
+        if isinstance(value, (list, tuple)):
+            if len(value) != len(olds):
+                raise ValueError(
+                    "to_replace and value lists should be of the same length; "
+                    f"got {len(olds)} and {len(value)}"
+                )
+            news = list(value)
+        else:
+            news = [value] * len(olds)
+        pairs = list(zip(olds, news))
+    if not pairs:
+        return self
+    families = {_replace_family(old) for old, _ in pairs}
+    families |= {_replace_family(new) for _, new in pairs if new is not None}
+    if len(families) > 1:
+        raise ValueError("Mixed type replacements are not supported")
+    if isinstance(subset, str):
+        subset = [subset]
+    literals = [(_replace_literal(old), _replace_literal(new)) for old, new in pairs]
+    return self.replace_literals(literals, list(subset) if subset else [])
 
 
 def _df_unionByName(self, other, allowMissingColumns: bool = False):
@@ -344,8 +394,7 @@ def _df_unionAll(self, other):
 
 
 def _df_crossJoin(self, other):
-    # The engine expresses a cartesian product as an inner join with no keys.
-    return self.join(other, [], how="inner")
+    return self.cross_join(other)
 
 
 def _df_subtract(self, other):
@@ -469,6 +518,9 @@ class DataFrameNaFunctions:
             if _na_type_matches(value, schema.get(column, "")):
                 df = df.fill_null(column, literal)
         return df
+
+    def replace(self, to_replace, value=_NO_VALUE, subset=None):
+        return _df_replace(self._df, to_replace, value, subset)
 
 
 class DataFrameStatFunctions:
@@ -1018,6 +1070,7 @@ def _apply() -> None:
     DataFrame.unionByName = _df_unionByName
     DataFrame.unionAll = _df_unionAll
     DataFrame.crossJoin = _df_crossJoin
+    DataFrame.replace = _df_replace
     DataFrame.subtract = _df_subtract
     DataFrame.toDF = _df_toDF
     # DataFrame actions

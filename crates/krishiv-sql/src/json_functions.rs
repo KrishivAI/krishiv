@@ -9,9 +9,9 @@
 //! - `json_array_length(json)` — element count of a top-level JSON array, or
 //!   `NULL` when the input is not a valid JSON array.
 //!
-//! The struct/schema-typed members of the family (`from_json`, `to_json`,
-//! `json_tuple`) need schema-DDL parsing and struct/table-function machinery and
-//! are tracked as the remaining Phase-60 JSON sub-items.
+//! The schema-typed members of the family (`from_json`, `to_json`,
+//! `schema_of_json`) are in [`crate::spark_json`]; `json_tuple` is a generator
+//! and lives with the others in [`crate::spark_generators`].
 
 use std::sync::Arc;
 
@@ -25,6 +25,7 @@ use datafusion::prelude::SessionContext;
 pub fn register_json_functions(ctx: &SessionContext) -> Result<(), DataFusionError> {
     ctx.register_udf(make_get_json_object());
     ctx.register_udf(make_json_array_length());
+    crate::spark_json::register_spark_json_functions(ctx);
     Ok(())
 }
 

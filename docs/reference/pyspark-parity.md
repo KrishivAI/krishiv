@@ -3,13 +3,13 @@
 > Generated from `crates/krishiv-api/src/pyspark_parity.rs` — do not edit by hand.
 > Regenerate with `KRISHIV_BLESS_PYSPARK_PARITY=1 cargo test -p krishiv-api pyspark_parity`.
 
-**Overall parity: 122/127 = 96%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
+**Overall parity: 127/127 = 100%** of the enumerated PySpark surface (Supported or Partial). Each shortfall is itemized below.
 
 ## Coverage by namespace
 
 | Namespace | Covered | Total | % |
 |---|---|---|---|
-| DataFrame | 42 | 47 | 89% |
+| DataFrame | 47 | 47 | 100% |
 | Column | 21 | 21 | 100% |
 | functions | 35 | 35 | 100% |
 | GroupedData | 7 | 7 | 100% |
@@ -31,12 +31,12 @@
 | `groupBy` | supported | group_by |  |
 | `agg` | supported | agg |  |
 | `join` | supported | join/join_on |  |
-| `crossJoin` | planned | — | no dedicated cross-join method |
+| `crossJoin` | supported | cross_join |  |
 | `orderBy` | supported | order_by | alias `sort` |
 | `sort` | supported | sort |  |
 | `limit` | supported | limit |  |
 | `distinct` | supported | distinct |  |
-| `dropDuplicates` | planned | — | Phase 61 gap: dedup on a subset of columns (distinct() is all-columns) |
+| `dropDuplicates` | supported | drop_duplicates | one whole row per key; which duplicate survives is unspecified, as in Spark |
 | `union` | supported | union |  |
 | `unionAll` | supported | union | deprecated Spark alias of union |
 | `unionByName` | supported | union_by_name | name-aligned union; allowMissingColumns (null-fill) is the residual |
@@ -52,7 +52,7 @@
 | `printSchema` | partial | schema | schema() is programmatic; no pretty-print helper |
 | `sample` | supported | sample |  |
 | `repartition` | supported | repartition |  |
-| `coalesce` | planned | repartition | repartition exists; no shrink-only coalesce |
+| `coalesce` | partial | coalesce | shrink-only like Spark's, but it shrinks through a round-robin exchange where Spark merges partitions in place |
 | `cache` | supported | cache/persist |  |
 | `persist` | supported | persist |  |
 | `unpersist` | supported | unpersist |  |
@@ -62,9 +62,9 @@
 | `na` | partial | fill_null/drop_nulls | fill/drop reachable directly; no unified `.na` sub-API (Phase 61 gap) |
 | `fillna` | supported | fill_null |  |
 | `dropna` | supported | drop_nulls |  |
-| `replace` | planned | — | Phase 61 gap: value replacement |
+| `replace` | supported | replace/replace_many | values are SQL literals in Rust; the Python surface takes PySpark's scalar, list and dict forms |
 | `withColumnsRenamed` | supported | with_columns_renamed | bulk rename over (existing, new) pairs (Phase 61 variant-collapse) |
-| `toPandas` | planned | — | Phase 61 gap: zero-copy Arrow → pandas (Python surface) |
+| `toPandas` | supported | collect | Python surface: `DataFrame.toPandas()` is `collect().to_pandas()` (Arrow → pandas); Rust has no pandas |
 | `write` | supported | write | DataFrameWriter |
 | `writeStream` | supported | write_stream | Phase 61 keystone: df.write_stream().refresh(Batch|Incremental|Continuous).to_table(session, name) selects the engine by refresh mode; Continuous execution + Interval/cron are the coordinator/scheduler-gated residual |
 | `foreachBatch` | partial | DataStreamWriter::foreach_batch | micro-batch sink callback on write_stream()/DataStreamWriter (PySpark hangs it off writeStream); reachable, placement differs |

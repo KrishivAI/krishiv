@@ -203,6 +203,53 @@ impl PyDataFrame {
             .map_err(map_krishiv_error)
     }
 
+    /// Keep one row per distinct combination of ``subset`` (every column when
+    /// empty). Which row of a duplicate group survives is unspecified.
+    #[pyo3(signature = (subset = Vec::new()))]
+    pub fn dedup_on(&self, subset: Vec<String>) -> PyResult<Self> {
+        let refs: Vec<&str> = subset.iter().map(String::as_str).collect();
+        self.inner
+            .drop_duplicates(&refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Cartesian product with ``right``.
+    pub fn cross_join(&self, right: &PyDataFrame) -> PyResult<Self> {
+        self.inner
+            .cross_join(&right.inner)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Replace values, given ``(to_replace, value)`` pairs of SQL literals.
+    ///
+    /// The pairs apply simultaneously and must share one type family; columns
+    /// of another type are left alone. ``subset`` empty means every column.
+    #[pyo3(signature = (replacements, subset = Vec::new()))]
+    pub fn replace_literals(
+        &self,
+        replacements: Vec<(String, String)>,
+        subset: Vec<String>,
+    ) -> PyResult<Self> {
+        let pairs: Vec<(&str, &str)> = replacements
+            .iter()
+            .map(|(from, to)| (from.as_str(), to.as_str()))
+            .collect();
+        let refs: Vec<&str> = subset.iter().map(String::as_str).collect();
+        self.inner
+            .replace_many(&pairs, &refs)
+            .map(|inner| Self { inner })
+            .map_err(map_krishiv_error)
+    }
+
+    /// Reduce to at most ``num_partitions`` partitions; never adds any.
+    pub fn coalesce(&self, num_partitions: u32) -> Self {
+        Self {
+            inner: self.inner.clone().coalesce(num_partitions),
+        }
+    }
+
     #[pyo3(signature = (columns, descending=None))]
     pub fn sort(&self, columns: Vec<String>, descending: Option<Vec<bool>>) -> PyResult<Self> {
         let descending = descending.unwrap_or_else(|| vec![false; columns.len()]);
