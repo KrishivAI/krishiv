@@ -2699,6 +2699,71 @@ pub async fn execute_coordinator_ivm_snapshot(
     Ok(Some(delta.data_batch()))
 }
 
+#[derive(serde::Deserialize)]
+struct IvmViewOutputResponse {
+    #[serde(default)]
+    deltas: Vec<IvmViewOutputDelta>,
+    #[serde(default)]
+    missed: bool,
+    #[serde(default)]
+    resume_after: u64,
+}
+
+#[derive(serde::Deserialize)]
+struct IvmViewOutputDelta {
+    tick: u64,
+    delta_ipc_b64: String,
+}
+
+/// Every delta a view of a remote IVM job published after tick `after`,
+/// oldest first — the lossless change feed (IVM-AUD-INT-F5).
+pub async fn execute_coordinator_ivm_view_output_since(
+    coordinator_http: &str,
+    job_id: &str,
+    view_name: &str,
+    after: u64,
+) -> RuntimeResult<krishiv_ivm::OutputSince> {
+    let base = normalize_http_base(coordinator_http)?;
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(client.get(format!(
+        "{base}/api/v1/ivm/jobs/{}/views/{}/output?since_tick={after}",
+        seg(job_id),
+        seg(view_name)
+    )))
+    .send()
+    .await
+    .map_err(|e| RuntimeError::transport(format!("ivm view output: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "ivm view output HTTP {}",
+            resp.status()
+        )));
+    }
+    let parsed: IvmViewOutputResponse = resp
+        .json()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm view output decode: {e}")))?;
+    let deltas = parsed
+        .deltas
+        .into_iter()
+        .map(|entry| {
+            let ipc = base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                &entry.delta_ipc_b64,
+            )
+            .map_err(|e| RuntimeError::transport(format!("view output base64 decode: {e}")))?;
+            let delta = krishiv_ivm::deserialize_delta_batch(&ipc)
+                .map_err(|e| RuntimeError::transport(format!("view output delta decode: {e}")))?;
+            Ok((entry.tick, delta))
+        })
+        .collect::<RuntimeResult<Vec<_>>>()?;
+    Ok(krishiv_ivm::OutputSince {
+        deltas,
+        missed: parsed.missed,
+        resume_after: parsed.resume_after,
+    })
+}
+
 #[derive(serde::Serialize)]
 struct IvmRestoreDeltaBody {
     checkpoint_delta_b64: String,

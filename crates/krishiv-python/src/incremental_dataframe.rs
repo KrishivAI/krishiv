@@ -11,9 +11,9 @@
 //! engine nothing, and the change cursor lives here so a delta is never handed
 //! out twice.
 
+use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::thread::ThreadId;
 
 use pyo3::exceptions::PyRuntimeError;
@@ -99,10 +99,18 @@ pub struct PyIncrementalDataFrame {
     pub(crate) inner: IncrementalDataFrame,
     /// The open `transaction()` block, if any.
     txn: Mutex<Option<Txn>>,
-    /// The delta most recently handed out by [`next_change`](Self::next_change),
-    /// retained (not just fingerprinted) so the Arc addresses it is compared
-    /// against cannot be freed and reused underneath the cursor.
-    yielded: Mutex<Option<DeltaBatch>>,
+    /// Where [`next_change`](Self::next_change) has read up to: the tick of
+    /// the last delta it handed out, and the deltas already fetched after it.
+    feed: Mutex<ChangeCursor>,
+}
+
+/// The change-feed position of one Python handle.
+#[derive(Default)]
+struct ChangeCursor {
+    /// Tick of the last delta handed out (or resumed from).
+    after: u64,
+    /// Fetched, not yet handed out, oldest first.
+    buffered: std::collections::VecDeque<(u64, DeltaBatch)>,
 }
 
 impl PyIncrementalDataFrame {
@@ -110,7 +118,7 @@ impl PyIncrementalDataFrame {
         Self {
             inner,
             txn: Mutex::new(None),
-            yielded: Mutex::new(None),
+            feed: Mutex::new(ChangeCursor::default()),
         }
     }
 
@@ -120,8 +128,8 @@ impl PyIncrementalDataFrame {
         self.txn.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn yielded_guard(&self) -> MutexGuard<'_, Option<DeltaBatch>> {
-        self.yielded.lock().unwrap_or_else(|e| e.into_inner())
+    fn feed_guard(&self) -> MutexGuard<'_, ChangeCursor> {
+        self.feed.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Turn a completed tick into a `StepSummary`, failing loudly if *this*
@@ -169,26 +177,6 @@ impl PyIncrementalDataFrame {
             self.inner.name()
         ))
     }
-}
-
-/// Whether two deltas are the *same publication* — i.e. the second is a clone of
-/// the watch value the first came from, not a newly emitted delta.
-///
-/// The engine's change-feed peek is a coalescing `watch`, so an unchanged value
-/// is handed back verbatim: every column is an `Arc` clone of the same array.
-/// Comparing addresses (while holding the previous delta alive, see
-/// `PyIncrementalDataFrame::yielded`) therefore distinguishes "nothing new was
-/// published" from "a new delta was published", which comparing *contents*
-/// cannot.
-fn same_publication(a: &DeltaBatch, b: &DeltaBatch) -> bool {
-    let (a, b) = (a.inner(), b.inner());
-    if a.num_columns() == 0 || a.num_columns() != b.num_columns() {
-        return false;
-    }
-    a.columns()
-        .iter()
-        .zip(b.columns())
-        .all(|(l, r)| std::ptr::addr_eq(Arc::as_ptr(l), Arc::as_ptr(r)))
 }
 
 #[pymethods]
@@ -283,30 +271,53 @@ impl PyIncrementalDataFrame {
 
     /// The next output delta this handle has not returned yet, or ``None``.
     ///
-    /// This is the "update" output mode. Its exact contract, because the engine
-    /// only offers a *coalescing* peek here:
+    /// This is the "update" output mode, and it is lossless: every delta the
+    /// view publishes is returned exactly once, in order, however many ticks
+    /// ran between calls, and a tick that published nothing returns ``None``.
+    /// It works for an embedded and a distributed job alike.
     ///
-    /// - a delta is never returned twice, and a tick that published nothing
-    ///   returns ``None`` rather than re-serving the previous delta;
-    /// - it is **not** lossless: if several ticks publish output between two
-    ///   calls, only the newest delta survives to be returned. The engine has a
-    ///   lossless broadcast stream (`IncrementalFlow::view_output_stream`) but it
-    ///   is not reachable through `IvmJob`/`IncrementalDataFrame` yet.
-    ///
-    /// Embedded jobs only; a distributed job returns ``None`` here.
-    fn next_change(&self) -> PyResult<Option<PyDeltaBatch>> {
-        let Some(delta) = self.inner.last_output().map_err(rt_err)? else {
-            return Ok(None);
+    /// The engine retains a bounded amount of output per view. If this handle
+    /// falls further behind than that — or the job was restored underneath
+    /// it — the deltas in between no longer exist, and this raises
+    /// ``RuntimeError`` once rather than hand over a changelog with a hole in
+    /// it. Re-read :meth:`snapshot` and carry on; later calls continue from
+    /// the point the feed is whole again.
+    fn next_change(&self, py: Python<'_>) -> PyResult<Option<PyDeltaBatch>> {
+        let after = {
+            let mut feed = self.feed_guard();
+            if let Some((tick, delta)) = feed.buffered.pop_front() {
+                feed.after = tick;
+                return Ok(Some(PyDeltaBatch { inner: delta }));
+            }
+            feed.after
         };
-        let mut yielded = self.yielded_guard();
-        if yielded
-            .as_ref()
-            .is_some_and(|prev| same_publication(prev, &delta))
-        {
-            return Ok(None);
+        let since = py
+            .detach(|| crate::RUNTIME.block_on(self.inner.changes_since(after)))
+            .map_err(rt_err)?;
+        let mut feed = self.feed_guard();
+        if since.missed {
+            // Skip to where the feed is whole; what is retained from there on
+            // is still good and is handed out by the following calls.
+            feed.after = since.resume_after;
+            feed.buffered = since
+                .deltas
+                .into_iter()
+                .filter(|(tick, _)| *tick > since.resume_after)
+                .collect();
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "change feed for view '{}' has a gap: output published after tick {after} is no \
+                 longer retained (the reader fell behind the retention bound, or the job was \
+                 restored). Re-read snapshot() to resynchronise; next_change() continues from \
+                 tick {}.",
+                self.inner.name(),
+                since.resume_after
+            )));
         }
-        *yielded = Some(delta.clone());
-        Ok(Some(PyDeltaBatch { inner: delta }))
+        feed.buffered.extend(since.deltas);
+        Ok(feed.buffered.pop_front().map(|(tick, delta)| {
+            feed.after = tick;
+            PyDeltaBatch { inner: delta }
+        }))
     }
 
     /// Peek the view's latest published output delta (`None` if it has never
@@ -424,31 +435,15 @@ impl PyIncrementalDataFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{Int32Array, Int64Array};
+    use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
 
     fn one_column(values: &[i32]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(values.to_vec()))])
             .expect("valid batch")
-    }
-
-    fn two_columns(values: &[i32]) -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("x", DataType::Int32, false),
-            Field::new("y", DataType::Int64, false),
-        ]));
-        RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(Int32Array::from(values.to_vec())),
-                Arc::new(Int64Array::from(
-                    values.iter().map(|v| i64::from(*v)).collect::<Vec<_>>(),
-                )),
-            ],
-        )
-        .expect("valid batch")
     }
 
     fn delta(values: &[i32]) -> DeltaBatch {
@@ -464,40 +459,6 @@ mod tests {
             .iter()
             .map(|(source, _)| source.as_deref().unwrap_or("<none>"))
             .collect()
-    }
-
-    // ── same_publication: the change cursor's "is this new?" test ────────────
-
-    #[test]
-    fn a_clone_of_a_publication_is_the_same_publication() {
-        // What the coalescing watch actually hands back when nothing new was
-        // published: the same value, so every column Arc is shared.
-        let published = delta(&[1, 2, 3]);
-        assert!(same_publication(&published, &published.clone()));
-    }
-
-    #[test]
-    fn equal_contents_from_a_separate_publication_are_not_the_same_publication() {
-        // The whole reason the cursor compares addresses: two ticks can publish
-        // byte-identical deltas, and the second one is still new. Comparing
-        // contents would swallow it.
-        let first = delta(&[1, 2, 3]);
-        let second = delta(&[1, 2, 3]);
-        assert_eq!(first.inner().num_rows(), second.inner().num_rows());
-        assert!(!same_publication(&first, &second));
-    }
-
-    #[test]
-    fn a_different_column_count_is_not_the_same_publication() {
-        let narrow = delta(&[1, 2]);
-        let wide = DeltaBatch::from_inserts(two_columns(&[1, 2])).expect("from_inserts");
-        assert_ne!(
-            narrow.inner().num_columns(),
-            wide.inner().num_columns(),
-            "the fixtures must actually differ in width"
-        );
-        assert!(!same_publication(&narrow, &wide));
-        assert!(!same_publication(&wide, &narrow));
     }
 
     // ── Txn: the nesting marks and the abort truncation ──────────────────────

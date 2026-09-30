@@ -1,5 +1,24 @@
 # Krishiv Implementation Status
 
+## 2026-10-01 — IVM architecture fixes (branch `ivm-architecture-fixes`)
+
+Working through the items `ivm-audit-register.md` marked "needs a decision".
+
+**Write-ahead log** (`ivm_wal.rs`; DIST-D3, INT-F12, DIST-G3). A job's durable
+form is a snapshot plus a log of what it accepted since. A feed is logged
+before it is applied (so a 200 is durable), a tick appends a marker, and the
+snapshot is rewritten every `KRISHIV_IVM_SNAPSHOT_EVERY_TICKS` (32) ticks or
+past `KRISHIV_IVM_WAL_MAX_BYTES` (64 MiB). Recovery replays the log. Feed
+routes take an optional `idempotency_key`. **Feeds for a job now wait while
+that job's step runs** — that is what makes replay exact.
+
+**Lossless change feed** (INT-F5, API-B1). Views retain their published
+deltas (`KRISHIV_IVM_OUTPUT_RETAIN_TICKS` / `_BYTES`); `view_output_since`,
+`/output?since_tick=`, `IvmJob::view_output_since`,
+`IncrementalDataFrame::changes_since` and Python `next_change()` return every
+delta after a cursor, embedded or distributed, and say so when the reader is
+behind the bound.
+
 ## 2026-09-30 — Spark parity gaps closed (branch `spark-parity-gaps`)
 
 Both parity ledgers' itemized shortfalls, worked through.

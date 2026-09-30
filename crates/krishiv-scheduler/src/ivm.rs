@@ -137,6 +137,69 @@ struct PersistedIvmJob {
     /// a bump would make every already-persisted IVM job unloadable.
     #[serde(default)]
     delta_checkpoints: bool,
+    /// The write-ahead-log sequence number this snapshot covers: every log
+    /// entry up to and including it is already reflected in `checkpoint_full`,
+    /// and recovery replays only the entries after it (see `ivm_wal`).
+    ///
+    /// `serde(default)` for the same reason as the fields above. A snapshot
+    /// written before the log existed defaults to 0, and such a job has no log
+    /// entries, so it restores exactly as it always did.
+    #[serde(default)]
+    wal_seq: u64,
+    /// The last idempotency key each source accepted, so a retried feed is
+    /// recognised across a snapshot as well as across the log.
+    #[serde(default)]
+    feed_keys: HashMap<String, Vec<u8>>,
+}
+
+/// Where a job's write-ahead log stands.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IvmWalState {
+    /// The last sequence number handed out.
+    last_seq: u64,
+    /// Ticks logged since the last snapshot.
+    ticks_since_snapshot: u64,
+    /// Bytes logged since the last snapshot.
+    bytes_since_snapshot: u64,
+    /// The last idempotency key each source accepted.
+    feed_keys: HashMap<String, Vec<u8>>,
+}
+
+/// Ticks between full snapshots of a job. Override with
+/// `KRISHIV_IVM_SNAPSHOT_EVERY_TICKS`; `1` snapshots after every tick, which
+/// is what every tick used to cost.
+const DEFAULT_IVM_SNAPSHOT_EVERY_TICKS: u64 = 32;
+
+/// Log size at which a job is snapshotted early, so a job fed heavily between
+/// ticks cannot grow its log — and its recovery time — without bound.
+/// Override with `KRISHIV_IVM_WAL_MAX_BYTES`.
+const DEFAULT_IVM_WAL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Pure policy for the two log thresholds, split out for testing. A value
+/// that is absent, unparseable or zero falls back to the default: zero ticks
+/// or zero bytes would mean "snapshot always", which has its own explicit
+/// spelling (`1`).
+pub(crate) fn resolve_positive(env_override: Option<&str>, default: u64) -> u64 {
+    env_override
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn default_snapshot_every_ticks() -> u64 {
+    resolve_positive(
+        std::env::var("KRISHIV_IVM_SNAPSHOT_EVERY_TICKS")
+            .ok()
+            .as_deref(),
+        DEFAULT_IVM_SNAPSHOT_EVERY_TICKS,
+    )
+}
+
+fn default_wal_max_bytes() -> u64 {
+    resolve_positive(
+        std::env::var("KRISHIV_IVM_WAL_MAX_BYTES").ok().as_deref(),
+        DEFAULT_IVM_WAL_MAX_BYTES,
+    )
 }
 
 /// A coordinator-hosted IVM job: a single flow, or one auto-partitioned by key.
@@ -333,6 +396,16 @@ impl IvmJob {
                 None => None,
             }),
             IvmJob::Partitioned(p) => p.view_output_peek_at_tick(view),
+        }
+    }
+
+    /// Every delta `view` published after tick `after`, oldest first — the
+    /// lossless way to follow a view. See
+    /// [`IncrementalFlow::view_output_since`].
+    pub fn view_output_since(&self, view: &str, after: u64) -> IvmResult<krishiv_ivm::OutputSince> {
+        match self {
+            IvmJob::Single(f) => f.view_output_since(view, after),
+            IvmJob::Partitioned(p) => p.view_output_since(view, after),
         }
     }
 
@@ -625,6 +698,12 @@ pub struct IvmJobRegistry {
     /// `ivm_http::ensure_pending_headroom` before every feed. Held here rather
     /// than read from the environment at each call so a test can set it.
     max_pending_bytes: std::sync::atomic::AtomicU64,
+    /// Per-job write-ahead-log position and counters (see `ivm_wal`).
+    wal: Mutex<HashMap<String, IvmWalState>>,
+    /// Ticks between full snapshots; see [`DEFAULT_IVM_SNAPSHOT_EVERY_TICKS`].
+    snapshot_every_ticks: std::sync::atomic::AtomicU64,
+    /// Log size that forces an early snapshot; see [`DEFAULT_IVM_WAL_MAX_BYTES`].
+    wal_max_bytes: std::sync::atomic::AtomicU64,
     /// Vector views registered on each job: `job_id -> view_name -> view`.
     ///
     /// IVM-AUD-DIST-H3: `POST /vector-views` built an `InMemoryVectorSink`,
@@ -719,6 +798,9 @@ impl Default for IvmJobRegistry {
             dispatch: Mutex::new(HashMap::new()),
             delta_checkpoints: Mutex::new(std::collections::HashSet::new()),
             max_pending_bytes: std::sync::atomic::AtomicU64::new(default_max_pending_bytes()),
+            wal: Mutex::new(HashMap::new()),
+            snapshot_every_ticks: std::sync::atomic::AtomicU64::new(default_snapshot_every_ticks()),
+            wal_max_bytes: std::sync::atomic::AtomicU64::new(default_wal_max_bytes()),
             vector_views: Mutex::new(HashMap::new()),
         }
     }
@@ -739,6 +821,9 @@ impl IvmJobRegistry {
             dispatch: Mutex::new(HashMap::new()),
             delta_checkpoints: Mutex::new(std::collections::HashSet::new()),
             max_pending_bytes: std::sync::atomic::AtomicU64::new(default_max_pending_bytes()),
+            wal: Mutex::new(HashMap::new()),
+            snapshot_every_ticks: std::sync::atomic::AtomicU64::new(default_snapshot_every_ticks()),
+            wal_max_bytes: std::sync::atomic::AtomicU64::new(default_wal_max_bytes()),
             vector_views: Mutex::new(HashMap::new()),
         }
     }
@@ -763,6 +848,89 @@ impl IvmJobRegistry {
     pub fn set_max_pending_bytes(&self, bytes: u64) {
         self.max_pending_bytes
             .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Override how many ticks pass between full snapshots (at least 1).
+    pub fn set_snapshot_every_ticks(&self, ticks: u64) {
+        self.snapshot_every_ticks
+            .store(ticks.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Override the log size that forces an early snapshot (at least 1).
+    pub fn set_wal_max_bytes(&self, bytes: u64) {
+        self.wal_max_bytes
+            .store(bytes.max(1), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn with_wal<R>(&self, job_id: &str, f: impl FnOnce(&mut IvmWalState) -> R) -> R {
+        let mut wal = match self.wal.lock() {
+            Ok(wal) => wal,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        f(wal.entry(job_id.to_owned()).or_default())
+    }
+
+    /// Hand out the next log sequence number for `job_id`.
+    pub(crate) fn next_wal_seq(&self, job_id: &str) -> u64 {
+        self.with_wal(job_id, |wal| {
+            wal.last_seq += 1;
+            wal.last_seq
+        })
+    }
+
+    /// Record that an entry of `bytes` was appended; `is_step` for a tick.
+    pub(crate) fn note_wal_append(&self, job_id: &str, bytes: u64, is_step: bool) {
+        self.with_wal(job_id, |wal| {
+            wal.bytes_since_snapshot = wal.bytes_since_snapshot.saturating_add(bytes);
+            if is_step {
+                wal.ticks_since_snapshot += 1;
+            }
+        });
+    }
+
+    /// Whether the log has reached either threshold and a snapshot is due.
+    pub(crate) fn wal_snapshot_due(&self, job_id: &str) -> bool {
+        let every = self
+            .snapshot_every_ticks
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let max_bytes = self
+            .wal_max_bytes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        self.with_wal(job_id, |wal| {
+            wal.ticks_since_snapshot >= every || wal.bytes_since_snapshot >= max_bytes
+        })
+    }
+
+    /// The last sequence number handed out — what a snapshot taken now covers.
+    pub(crate) fn wal_last_seq(&self, job_id: &str) -> u64 {
+        self.with_wal(job_id, |wal| wal.last_seq)
+    }
+
+    /// A snapshot covering everything logged so far was written.
+    pub(crate) fn note_wal_snapshot(&self, job_id: &str) {
+        self.with_wal(job_id, |wal| {
+            wal.ticks_since_snapshot = 0;
+            wal.bytes_since_snapshot = 0;
+        });
+    }
+
+    /// Advance the log position to at least `seq` (replay on recovery).
+    pub(crate) fn observe_wal_seq(&self, job_id: &str, seq: u64) {
+        self.with_wal(job_id, |wal| wal.last_seq = wal.last_seq.max(seq));
+    }
+
+    /// Whether `key` is the key `source` last accepted — a retried feed.
+    pub(crate) fn is_repeated_feed(&self, job_id: &str, source: &str, key: &[u8]) -> bool {
+        self.with_wal(job_id, |wal| {
+            wal.feed_keys.get(source).is_some_and(|last| last == key)
+        })
+    }
+
+    /// Record `key` as the key `source` last accepted.
+    pub(crate) fn note_feed_key(&self, job_id: &str, source: &str, key: Vec<u8>) {
+        self.with_wal(job_id, |wal| {
+            wal.feed_keys.insert(source.to_owned(), key);
+        });
     }
 
     /// Switch on delta-checkpoint accumulation for `job_id`, and remember that
@@ -933,6 +1101,7 @@ impl IvmJobRegistry {
         let _ = self.step_locks.lock().map(|mut l| l.remove(job_id));
         let _ = self.pinned_single.lock().map(|mut p| p.remove(job_id));
         let _ = self.delta_checkpoints.lock().map(|mut d| d.remove(job_id));
+        let _ = self.wal.lock().map(|mut w| w.remove(job_id));
         // Drop dispatch bookkeeping (a recreated job starts unattached).
         let _ = self.dispatch.lock().map(|mut d| d.remove(job_id));
         // Stop this job's vector-view maintenance tasks (DIST-H3: they used to
@@ -1080,6 +1249,8 @@ impl IvmJobRegistry {
                 .map(|p| p.contains(job_id))
                 .unwrap_or(false),
             delta_checkpoints: self.delta_checkpoints_enabled(job_id),
+            wal_seq: self.wal_last_seq(job_id),
+            feed_keys: self.with_wal(job_id, |wal| wal.feed_keys.clone()),
         };
         serde_json::to_vec(&persisted).map_err(|e| IvmError::execution(e.to_string()))
     }
@@ -1135,6 +1306,16 @@ impl IvmJobRegistry {
         if persisted.delta_checkpoints {
             self.enable_delta_checkpoints(job_id)?;
         }
+        // The log position the snapshot covers; the caller replays what the
+        // log holds beyond it.
+        let (wal_seq, feed_keys) = (persisted.wal_seq, persisted.feed_keys);
+        self.with_wal(job_id, |wal| {
+            *wal = IvmWalState {
+                last_seq: wal_seq,
+                feed_keys,
+                ..IvmWalState::default()
+            };
+        });
         self.update_dispatch(job_id, |dispatch| *dispatch = IvmDispatchState::default());
         Ok(())
     }

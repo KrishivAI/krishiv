@@ -323,8 +323,38 @@ pub trait MetadataStore: Send + Sync {
     /// List persisted IVM job snapshots for standby recovery and discovery.
     fn list_ivm_snapshots(&self) -> Vec<(String, Vec<u8>)>;
 
-    /// Remove the persisted IVM job snapshot when the job is deleted.
+    /// Remove the persisted IVM job snapshot when the job is deleted, and the
+    /// job's write-ahead log with it.
     fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()>;
+
+    /// Append entry `seq` to a job's IVM write-ahead log.
+    ///
+    /// The log holds what a job accepted since its last snapshot — fed deltas
+    /// and step markers — so that accepting a delta costs a write the size of
+    /// the delta, not of the job's whole state. `seq` is assigned by the
+    /// caller, strictly increasing per job.
+    fn append_ivm_log(&mut self, job_id: &str, seq: u64, entry: Vec<u8>) -> SchedulerResult<()>;
+
+    /// A job's log entries with a sequence number above `after`, ascending.
+    fn load_ivm_log(&self, job_id: &str, after: u64) -> Vec<(u64, Vec<u8>)>;
+
+    /// Drop a job's log entries with a sequence number up to and including
+    /// `through` (they are covered by a snapshot).
+    fn truncate_ivm_log(&mut self, job_id: &str, through: u64) -> SchedulerResult<()>;
+}
+
+/// Entries of an in-memory IVM log above `after`, ascending. Shared by the
+/// stores that mirror the log in memory.
+pub(crate) fn ivm_log_after(
+    log: Option<&std::collections::BTreeMap<u64, Vec<u8>>>,
+    after: u64,
+) -> Vec<(u64, Vec<u8>)> {
+    log.map(|log| {
+        log.range((std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded))
+            .map(|(seq, entry)| (*seq, entry.clone()))
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 // ── InMemoryMetadataStore ─────────────────────────────────────────────────────
@@ -350,6 +380,7 @@ pub struct InMemoryMetadataStore {
     executors: Vec<ExecutorDescriptor>,
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
     ivm_snapshots: std::collections::HashMap<String, Vec<u8>>,
+    ivm_logs: std::collections::HashMap<String, std::collections::BTreeMap<u64, Vec<u8>>>,
     /// Number of events evicted by the ring buffer since the store was created.
     /// Exposed via [`InMemoryMetadataStore::evicted_event_count`] for tests and
     /// metrics.
@@ -493,6 +524,26 @@ impl MetadataStore for InMemoryMetadataStore {
 
     fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
         self.ivm_snapshots.remove(job_id);
+        self.ivm_logs.remove(job_id);
+        Ok(())
+    }
+
+    fn append_ivm_log(&mut self, job_id: &str, seq: u64, entry: Vec<u8>) -> SchedulerResult<()> {
+        self.ivm_logs
+            .entry(job_id.to_owned())
+            .or_default()
+            .insert(seq, entry);
+        Ok(())
+    }
+
+    fn load_ivm_log(&self, job_id: &str, after: u64) -> Vec<(u64, Vec<u8>)> {
+        ivm_log_after(self.ivm_logs.get(job_id), after)
+    }
+
+    fn truncate_ivm_log(&mut self, job_id: &str, through: u64) -> SchedulerResult<()> {
+        if let Some(log) = self.ivm_logs.get_mut(job_id) {
+            log.retain(|seq, _| *seq > through);
+        }
         Ok(())
     }
 
@@ -1953,6 +2004,51 @@ impl NonBlockingStoreHandle {
     }
 }
 
+/// The IVM log contract every store must meet: entries come back in
+/// sequence order from just above a position, truncation is inclusive,
+/// one job's log is invisible to another, and deleting a job takes its
+/// log.
+#[cfg(test)]
+pub(crate) fn check_ivm_log_contract(store: &mut dyn MetadataStore) {
+    for seq in [3_u64, 1, 2, 300] {
+        store
+            .append_ivm_log("job", seq, vec![seq as u8; 4])
+            .unwrap();
+    }
+    // A job whose id extends this one's must not share its log.
+    store.append_ivm_log("job-2", 1, b"other".to_vec()).unwrap();
+
+    let seqs = |store: &dyn MetadataStore, job: &str, after: u64| -> Vec<u64> {
+        store
+            .load_ivm_log(job, after)
+            .into_iter()
+            .map(|(seq, _)| seq)
+            .collect()
+    };
+    assert_eq!(seqs(store, "job", 0), [1, 2, 3, 300]);
+    assert_eq!(seqs(store, "job", 2), [3, 300]);
+    assert_eq!(seqs(store, "job", 300), Vec::<u64>::new());
+    assert_eq!(seqs(store, "job", u64::MAX), Vec::<u64>::new());
+    assert_eq!(store.load_ivm_log("job", 2)[0].1, vec![3_u8; 4]);
+    assert_eq!(seqs(store, "job-2", 0), [1]);
+    assert_eq!(seqs(store, "nobody", 0), Vec::<u64>::new());
+
+    store.truncate_ivm_log("job", 2).unwrap();
+    assert_eq!(seqs(store, "job", 0), [3, 300]);
+    assert_eq!(
+        seqs(store, "job-2", 0),
+        [1],
+        "another job's log is untouched"
+    );
+
+    store
+        .save_ivm_snapshot("job", b"snapshot".to_vec())
+        .unwrap();
+    store.remove_ivm_snapshot("job").unwrap();
+    assert_eq!(seqs(store, "job", 0), Vec::<u64>::new());
+    assert_eq!(seqs(store, "job-2", 0), [1]);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2525,5 +2621,9 @@ mod terminal_job_latch_tests {
             handle.is_terminal_latched("job-b"),
             "but the id stays latched — removal is retirement, not id release"
         );
+    }
+    #[test]
+    fn in_memory_ivm_log_meets_the_contract() {
+        check_ivm_log_contract(&mut InMemoryMetadataStore::default());
     }
 }

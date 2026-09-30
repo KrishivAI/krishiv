@@ -39,6 +39,7 @@ pub mod heartbeat;
 pub mod in_process;
 pub mod ivm;
 pub mod ivm_http;
+mod ivm_wal;
 pub mod job;
 pub mod job_coordinator;
 pub mod queryable_state_http;

@@ -250,6 +250,13 @@ impl IncrementalDataFrame {
         self.job.view_output(&self.view)
     }
 
+    /// Every output delta this view published after tick `after`, oldest
+    /// first — the lossless change feed, embedded or distributed. See
+    /// [`IvmJob::view_output_since`].
+    pub async fn changes_since(&self, after: u64) -> Result<krishiv_ivm::OutputSince> {
+        self.job.view_output_since(&self.view, after).await
+    }
+
     /// Delete the underlying IVM job — this view and every other view
     /// co-registered on the same job (a view-DAG shares one job).
     ///

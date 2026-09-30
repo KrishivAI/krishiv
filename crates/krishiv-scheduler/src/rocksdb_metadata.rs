@@ -14,7 +14,29 @@ const CF_EXECUTORS: &str = "executors";
 const CF_METADATA: &str = "metadata";
 const CF_CONTINUOUS: &str = "continuous_snapshots";
 const CF_IVM: &str = "ivm_snapshots";
+const CF_IVM_LOG: &str = "ivm_log";
 const CF_HISTORY: &str = "job_history";
+
+/// `<job id> 0x00`: every log key of one job, and no other job's. A job id is
+/// `[A-Za-z0-9_-]`, so the NUL cannot occur inside one.
+fn ivm_log_prefix(job_id: &str) -> Vec<u8> {
+    let mut prefix = job_id.as_bytes().to_vec();
+    prefix.push(0);
+    prefix
+}
+
+/// `<job id> 0x00 <seq, big-endian>`, so one job's entries iterate in order.
+fn ivm_log_key(job_id: &str, seq: u64) -> Vec<u8> {
+    let mut key = ivm_log_prefix(job_id);
+    key.extend_from_slice(&seq.to_be_bytes());
+    key
+}
+
+/// The sequence number of `key` if it is one of `prefix`'s entries.
+fn ivm_log_seq(key: &[u8], prefix: &[u8]) -> Option<u64> {
+    let tail = key.strip_prefix(prefix)?;
+    Some(u64::from_be_bytes(tail.try_into().ok()?))
+}
 
 fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
     [
@@ -24,6 +46,7 @@ fn all_cfs() -> Vec<ColumnFamilyDescriptor> {
         CF_METADATA,
         CF_CONTINUOUS,
         CF_IVM,
+        CF_IVM_LOG,
         CF_HISTORY,
     ]
     .iter()
@@ -402,12 +425,68 @@ impl MetadataStore for RocksDbMetadataStore {
     }
 
     fn remove_ivm_snapshot(&mut self, job_id: &str) -> SchedulerResult<()> {
+        {
+            let cf = self
+                .db
+                .cf_handle(CF_IVM)
+                .ok_or_else(|| Self::store_err("missing IVM snapshots CF"))?;
+            self.db
+                .delete_cf_opt(&cf, job_id, &self.write_opts())
+                .map_err(Self::store_err)?;
+        }
+        self.truncate_ivm_log(job_id, u64::MAX)
+    }
+
+    fn append_ivm_log(&mut self, job_id: &str, seq: u64, entry: Vec<u8>) -> SchedulerResult<()> {
         let cf = self
             .db
-            .cf_handle(CF_IVM)
-            .ok_or_else(|| Self::store_err("missing IVM snapshots CF"))?;
+            .cf_handle(CF_IVM_LOG)
+            .ok_or_else(|| Self::store_err("missing IVM log CF"))?;
         self.db
-            .delete_cf_opt(&cf, job_id, &self.write_opts())
+            .put_cf_opt(&cf, ivm_log_key(job_id, seq), entry, &self.write_opts())
+            .map_err(Self::store_err)
+    }
+
+    fn load_ivm_log(&self, job_id: &str, after: u64) -> Vec<(u64, Vec<u8>)> {
+        let Some(cf) = self.db.cf_handle(CF_IVM_LOG) else {
+            return Vec::new();
+        };
+        let prefix = ivm_log_prefix(job_id);
+        let start = match after.checked_add(1) {
+            Some(first) => ivm_log_key(job_id, first),
+            None => return Vec::new(),
+        };
+        self.db
+            .iterator_cf(
+                &cf,
+                rocksdb::IteratorMode::From(&start, rocksdb::Direction::Forward),
+            )
+            .map_while(|item| {
+                let (key, value) = item.ok()?;
+                let seq = ivm_log_seq(&key, &prefix)?;
+                Some((seq, value.to_vec()))
+            })
+            .collect()
+    }
+
+    fn truncate_ivm_log(&mut self, job_id: &str, through: u64) -> SchedulerResult<()> {
+        let cf = self
+            .db
+            .cf_handle(CF_IVM_LOG)
+            .ok_or_else(|| Self::store_err("missing IVM log CF"))?;
+        // `delete_range` excludes its end key, so the entry at `through` needs
+        // the key one past it — or, at the very top, the end of the prefix.
+        let end = match through.checked_add(1) {
+            Some(next) => ivm_log_key(job_id, next),
+            None => {
+                let mut end = ivm_log_prefix(job_id);
+                end.push(0xFF);
+                end.extend_from_slice(&[0xFF; 8]);
+                end
+            }
+        };
+        self.db
+            .delete_range_cf_opt(&cf, ivm_log_key(job_id, 0), end, &self.write_opts())
             .map_err(Self::store_err)
     }
 
@@ -645,5 +724,23 @@ mod tests {
         );
         store.remove_continuous_snapshot("job-1").unwrap();
         assert!(store.load_continuous_snapshot("job-1").is_none());
+    }
+    #[test]
+    fn rocksdb_ivm_log_meets_the_contract_and_survives_reopen() {
+        let mut store = RocksDbMetadataStore::in_memory().unwrap();
+        crate::store::check_ivm_log_contract(&mut store);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("meta");
+        {
+            let mut store = RocksDbMetadataStore::open(&path).unwrap();
+            store.append_ivm_log("job", 7, b"seven".to_vec()).unwrap();
+            store.append_ivm_log("job", 8, b"eight".to_vec()).unwrap();
+        }
+        let reopened = RocksDbMetadataStore::open(&path).unwrap();
+        assert_eq!(
+            reopened.load_ivm_log("job", 7),
+            vec![(8, b"eight".to_vec())]
+        );
     }
 }

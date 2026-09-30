@@ -1206,6 +1206,30 @@ pub static FLAGS: &[FlagSpec] = &[
         "Per-IVM-job cap on queued input bytes across all sources. A /feed that would push the backlog past it is refused with HTTP 429 instead of growing an unbounded in-memory queue (audit INT-F11). 0 restores the old unbounded behaviour; a value that does not parse falls back to the default.",
     ),
     rt(
+        "KRISHIV_IVM_OUTPUT_RETAIN_TICKS",
+        FlagKind::UInt,
+        "256",
+        "How many published output deltas each incremental view retains, so a reader following the view by tick (`view_output_since`, `/output?since_tick=`, Python `next_change()`) gets every delta it was not there for instead of only the newest. A reader further behind than this is told it missed output and must resynchronise from the snapshot. 0 retains nothing. Read once per process.",
+    ),
+    rt(
+        "KRISHIV_IVM_OUTPUT_RETAIN_BYTES",
+        FlagKind::UInt,
+        "67108864",
+        "Byte bound on the output deltas each incremental view retains (see KRISHIV_IVM_OUTPUT_RETAIN_TICKS); the oldest are dropped when either bound is exceeded. Read once per process.",
+    ),
+    rt(
+        "KRISHIV_IVM_SNAPSHOT_EVERY_TICKS",
+        FlagKind::UInt,
+        "32",
+        "Ticks between full snapshots of a coordinator-hosted IVM job. In between, each fed delta and each completed tick is appended to the job's write-ahead log, and recovery replays the log over the last snapshot. 1 snapshots after every tick (the cost every tick used to have); a larger value trades recovery replay for less write volume. 0 or an unparseable value falls back to the default.",
+    ),
+    rt(
+        "KRISHIV_IVM_WAL_MAX_BYTES",
+        FlagKind::UInt,
+        "67108864",
+        "Size of a coordinator-hosted IVM job's write-ahead log at which a full snapshot is taken early, so a job fed heavily between ticks cannot grow its log, and its recovery time, without bound. 0 or an unparseable value falls back to the default.",
+    ),
+    rt(
         "KRISHIV_IVM_LEGACY_TICK_WIRE",
         FlagKind::Bool,
         "false",

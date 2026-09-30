@@ -177,6 +177,29 @@ impl IvmJob {
         }
     }
 
+    /// Every delta `view` published after tick `after`, oldest first, each
+    /// with the tick it belongs to — the lossless change feed, in both modes.
+    ///
+    /// Remember the tick of the last delta you were handed and pass it back.
+    /// A reader that falls behind the stepper gets everything it missed, up to
+    /// the engine's retention bound; past that (or across a restore)
+    /// [`OutputSince::missed`](krishiv_ivm::OutputSince::missed) is set, and
+    /// the reader should resynchronise from
+    /// [`snapshot`](FeedableJob::snapshot) and continue from `resume_after`.
+    ///
+    /// Unlike [`view_output`](Self::view_output) this works for a distributed
+    /// job too, which had no change feed at all (INT-F6).
+    pub async fn view_output_since(
+        &self,
+        view: &str,
+        after: u64,
+    ) -> Result<krishiv_ivm::OutputSince> {
+        Ok(match self {
+            Self::Embedded(j) => j.view_output_since(view, after)?,
+            Self::Remote(j) => j.view_output_since(view, after).await?,
+        })
+    }
+
     /// Delete this job: the flow, its state, and (distributed) its durable
     /// snapshot on the coordinator. Returns `false` when there was no such job
     /// to remove, which is not an error.

@@ -452,6 +452,20 @@ struct IncrementalFlowInner {
     /// this tick from one that last emitted five ticks ago; the two were
     /// merged and served as "the latest delta".
     view_output_ticks: AHashMap<String, u64>,
+    /// The deltas each view has published, newest last, kept so a reader can
+    /// ask for everything after a tick (`view_output_since`) instead of only
+    /// the newest one. Bounded per view by `output_retention`.
+    ///
+    /// IVM-AUD-INT-F5 / API-B1: the only way to read a view's changes was a
+    /// coalescing watch that holds one value, so a reader slower than the
+    /// stepper lost every delta but the last, with no way to get them back.
+    output_log: AHashMap<String, OutputLog>,
+    /// A reader whose cursor is below this has missed deltas that no longer
+    /// exist anywhere: the tick a restore landed on. Replayed state has no
+    /// history before it.
+    output_log_floor: u64,
+    /// `(deltas, bytes)` each view's log may hold before the oldest goes.
+    output_retention: (usize, usize),
     /// Per-view cumulative insert/retract counters (#94); keyed by view name.
     view_delta_stats: AHashMap<String, ViewDeltaStats>,
 
@@ -465,6 +479,96 @@ struct IncrementalFlowInner {
     /// was captured under. An entry with no fingerprint, or one that disagrees
     /// with the view's current SQL, is discarded rather than adopted.
     pending_plan_logic: HashMap<String, u64>,
+}
+
+/// A view's retained output deltas, oldest first.
+#[derive(Default)]
+struct OutputLog {
+    deltas: std::collections::VecDeque<(u64, DeltaBatch)>,
+    bytes: usize,
+    /// The newest tick evicted for space: a reader whose cursor is below this
+    /// has missed at least one delta.
+    evicted_through: u64,
+}
+
+/// What a view published after a given tick.
+#[derive(Debug, Clone)]
+pub struct OutputSince {
+    /// `(tick, delta)` for each retained delta published after the cursor,
+    /// oldest first.
+    pub deltas: Vec<(u64, DeltaBatch)>,
+    /// True when deltas published after the cursor are gone — evicted to stay
+    /// within the retention bound, or from before a restore. The reader has a
+    /// gap and must resynchronise from the view's snapshot.
+    pub missed: bool,
+    /// The cursor from which the log is whole. A reader that was told it
+    /// `missed` resumes here once it has resynchronised.
+    pub resume_after: u64,
+}
+
+/// Deltas a view's output log keeps by default.
+const DEFAULT_OUTPUT_RETAIN_TICKS: usize = 256;
+/// Bytes a view's output log keeps by default.
+const DEFAULT_OUTPUT_RETAIN_BYTES: usize = 64 * 1024 * 1024;
+
+/// Pure policy for the output retention bounds, split out for testing. A
+/// value that is absent or unparseable is the default; an explicit `0` is
+/// honoured and keeps nothing, which is the behaviour before the log existed.
+pub(crate) fn resolve_output_retention(ticks: Option<&str>, bytes: Option<&str>) -> (usize, usize) {
+    let parse = |raw: Option<&str>, default: usize| {
+        raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(default)
+    };
+    (
+        parse(ticks, DEFAULT_OUTPUT_RETAIN_TICKS),
+        parse(bytes, DEFAULT_OUTPUT_RETAIN_BYTES),
+    )
+}
+
+fn output_retention_from_env() -> (usize, usize) {
+    static RETENTION: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    *RETENTION.get_or_init(|| {
+        resolve_output_retention(
+            std::env::var("KRISHIV_IVM_OUTPUT_RETAIN_TICKS")
+                .ok()
+                .as_deref(),
+            std::env::var("KRISHIV_IVM_OUTPUT_RETAIN_BYTES")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+impl IncrementalFlowInner {
+    /// Keep `delta` as what `view` published at `tick`, evicting the oldest
+    /// retained deltas while the log is over either bound.
+    fn retain_output(&mut self, view: &str, tick: u64, delta: DeltaBatch) {
+        let (max_deltas, max_bytes) = self.output_retention;
+        if delta.is_empty() {
+            return;
+        }
+        let log = self.output_log.entry(view.to_owned()).or_default();
+        log.bytes = log
+            .bytes
+            .saturating_add(delta.inner().get_array_memory_size());
+        log.deltas.push_back((tick, delta));
+        while log.deltas.len() > max_deltas || log.bytes > max_bytes {
+            let Some((evicted_tick, evicted)) = log.deltas.pop_front() else {
+                break;
+            };
+            log.bytes = log
+                .bytes
+                .saturating_sub(evicted.inner().get_array_memory_size());
+            log.evicted_through = log.evicted_through.max(evicted_tick);
+        }
+    }
+
+    /// A restore replaced the state: nothing published before it can be
+    /// served any more.
+    fn reset_output_log(&mut self) {
+        self.output_log.clear();
+        self.output_log_floor = self.tick;
+    }
 }
 
 // ── IncrementalFlow ───────────────────────────────────────────────────────────
@@ -639,6 +743,9 @@ impl IncrementalFlow {
                 pending_plan_state: HashMap::new(),
                 pending_plan_logic: HashMap::new(),
                 view_output_ticks: AHashMap::new(),
+                output_log: AHashMap::new(),
+                output_log_floor: 0,
+                output_retention: output_retention_from_env(),
             })),
             tick_ctx: Arc::new(tokio::sync::Mutex::new(CachedTickContext::default())),
             tick_memory_limit,
@@ -895,6 +1002,7 @@ impl IncrementalFlow {
         inner.view_plans.remove(name);
         inner.view_plan_sqls.remove(name);
         inner.view_output_ticks.remove(name);
+        inner.output_log.remove(name);
         inner.view_delta_stats.remove(name);
         inner.pending_plan_state.remove(name);
         inner.pending_plan_logic.remove(name);
@@ -2722,6 +2830,7 @@ impl IncrementalFlow {
             //     `force_diff_based` executor tick, a plan invalidation, a
             //     restore) diffed against `None` and re-emitted the entire view
             //     as insertions. `apply_output_delta` advances both halves.
+            let retained = output_delta.clone();
             let published = if plan_kind == ViewPlanKind::Incremental {
                 view.apply_output_delta(&output_delta)
             } else {
@@ -2734,6 +2843,7 @@ impl IncrementalFlow {
                     inner
                         .view_output_ticks
                         .insert(view_name.clone(), published_at);
+                    inner.retain_output(view_name, published_at, retained);
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -2898,6 +3008,47 @@ impl IncrementalFlow {
         let inner = self.inner.lock().map_err(lock_err)?;
         inner.view_registry.get(name).map_err(delta_err)?;
         Ok(inner.view_output_ticks.get(name).copied())
+    }
+
+    /// Every delta `name` published after tick `after`, oldest first, with
+    /// the tick each belongs to.
+    ///
+    /// This is the lossless way to follow a view: remember the tick of the
+    /// last delta you were given and pass it back. Unlike
+    /// [`view_output_peek`](Self::view_output_peek), which holds only the
+    /// newest delta, a reader that falls behind the stepper gets everything
+    /// it missed — up to the retention bound. Past that bound, and across a
+    /// restore, [`OutputSince::missed`] is true and the reader must
+    /// resynchronise from [`snapshot`](Self::snapshot) rather than carry on
+    /// with a hole in its changelog.
+    pub fn view_output_since(&self, name: &str, after: u64) -> IvmResult<OutputSince> {
+        let inner = self.inner.lock().map_err(lock_err)?;
+        inner.view_registry.get(name).map_err(delta_err)?;
+        let log = inner.output_log.get(name);
+        let gone_through = log
+            .map_or(0, |log| log.evicted_through)
+            .max(inner.output_log_floor);
+        Ok(OutputSince {
+            deltas: log
+                .map(|log| {
+                    log.deltas
+                        .iter()
+                        .filter(|(tick, _)| *tick > after)
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            missed: after < gone_through,
+            resume_after: gone_through.max(after),
+        })
+    }
+
+    /// Override how much of each view's output is retained for
+    /// [`view_output_since`](Self::view_output_since): at most `deltas`
+    /// deltas and `bytes` bytes per view.
+    pub fn set_output_retention(&self, deltas: usize, bytes: usize) -> IvmResult<()> {
+        self.inner.lock().map_err(lock_err)?.output_retention = (deltas, bytes);
+        Ok(())
     }
 
     /// Whether `name` was registered as a materialized view.
@@ -3124,6 +3275,7 @@ impl IncrementalFlow {
         }
         inner.rebuild_all_views = true;
         inner.state_epoch = inner.state_epoch.wrapping_add(1);
+        inner.reset_output_log();
         Ok(())
     }
 
@@ -3237,6 +3389,7 @@ impl IncrementalFlow {
             stats.last_tick_inserts = inserts;
             stats.last_tick_retracts = retracts;
             inner.view_output_ticks.insert(name.clone(), published_at);
+            inner.retain_output(&name, published_at, delta.clone());
             inner.last_step_outputs.insert(name, delta);
         }
         Ok(StepSummary {
@@ -3491,6 +3644,7 @@ impl IncrementalFlow {
             apply_exact_state(&mut inner, exact);
         }
         inner.state_epoch = inner.state_epoch.wrapping_add(1);
+        inner.reset_output_log();
         Ok(())
     }
 
@@ -3638,6 +3792,7 @@ impl IncrementalFlow {
         }
         inner.rebuild_all_views = true;
         inner.state_epoch = inner.state_epoch.wrapping_add(1);
+        inner.reset_output_log();
         Ok(())
     }
 }

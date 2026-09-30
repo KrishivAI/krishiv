@@ -40,6 +40,7 @@ use krishiv_proto::{JobId, JobKind, JobSpec, JobState, StageId, StageSpec, TaskI
 
 use crate::SharedCoordinator;
 use crate::ivm::{RegisteredVectorView, SharedIvmJobRegistry};
+use crate::ivm_wal::{WalEntry, decode_snapshot_batches};
 
 // ── combined router state ─────────────────────────────────────────────────────
 
@@ -117,21 +118,156 @@ async fn ensure_ivm_job(
     if let Some(job) = registry.get(job_id) {
         return Ok(job);
     }
-    let snapshot = coordinator
-        .load_ivm_snapshot(job_id)
-        .await
-        .ok_or_else(|| ivm_not_found(job_id))?;
-    registry
-        .restore_durable_snapshot(job_id, &snapshot)
-        .map_err(ivm_err)?;
+    if !rehydrate_ivm_job(registry, coordinator, job_id).await? {
+        return Err(ivm_not_found(job_id));
+    }
     registry.get(job_id).ok_or_else(|| ivm_not_found(job_id))
 }
 
+/// Rebuild a job this process has not seen from its durable form: the last
+/// snapshot, then everything the write-ahead log holds beyond it, replayed in
+/// order. Returns `false` when the job has no durable form.
+///
+/// Takes the per-job lock, so two requests arriving for a cold job rebuild it
+/// once, and no feed or step runs against a job that is half replayed.
+async fn rehydrate_ivm_job(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<bool, StatusCode> {
+    let lock = registry.step_lock(job_id);
+    let _guard = lock.lock().await;
+    if registry.get(job_id).is_some() {
+        return Ok(true);
+    }
+    let Some(snapshot) = coordinator.load_ivm_snapshot(job_id).await else {
+        return Ok(false);
+    };
+    registry
+        .restore_durable_snapshot(job_id, &snapshot)
+        .map_err(ivm_err)?;
+    if let Err(error) = replay_ivm_log(registry, coordinator, job_id).await {
+        // A job replayed part-way is in a state it was never in. Better to
+        // have no job than that one: the durable form is untouched, so the
+        // next request tries again.
+        tracing::error!(job_id, %error, "IVM log replay failed; job left unloaded");
+        registry.delete(job_id);
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    Ok(true)
+}
+
+/// Replay the log entries beyond the restored snapshot. The caller holds the
+/// per-job lock.
+async fn replay_ivm_log(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<(), String> {
+    let job = registry
+        .get(job_id)
+        .ok_or_else(|| format!("job {job_id} vanished during replay"))?;
+    let after = registry.wal_last_seq(job_id);
+    let entries = coordinator.load_ivm_log(job_id, after).await;
+    let (mut feeds, mut steps) = (0_u64, 0_u64);
+    for (seq, bytes) in entries {
+        match WalEntry::decode(&bytes).map_err(|e| format!("entry {seq}: {e}"))? {
+            WalEntry::Feed {
+                source,
+                idempotency_key,
+                delta_ipc,
+            } => {
+                // An entry is logged before the flow sees it, so a feed the
+                // flow refused is in the log too, and refusing it again here
+                // is the replay being faithful, not failing.
+                let fed = deserialize_delta_batch(&delta_ipc)
+                    .and_then(|delta| delta.drop_zeros())
+                    .map_err(|e| e.to_string())
+                    .and_then(|delta| job.feed(&source, delta).map_err(|e| e.to_string()));
+                match fed {
+                    Ok(()) => {
+                        if let Some(key) = idempotency_key {
+                            registry.note_feed_key(job_id, &source, key);
+                        }
+                        feeds += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(job_id, seq, %error, "replayed IVM feed was refused");
+                    }
+                }
+            }
+            WalEntry::Snapshot {
+                source,
+                idempotency_key,
+                snapshot_ipc,
+            } => {
+                let fed = decode_snapshot_batches(&snapshot_ipc).and_then(|batches| {
+                    job.feed_snapshot(&source, &batches)
+                        .map_err(|e| e.to_string())
+                });
+                match fed {
+                    Ok(()) => {
+                        if let Some(key) = idempotency_key {
+                            registry.note_feed_key(job_id, &source, key);
+                        }
+                        feeds += 1;
+                    }
+                    Err(error) => {
+                        tracing::warn!(job_id, seq, %error, "replayed IVM snapshot feed was refused");
+                    }
+                }
+            }
+            WalEntry::Step => {
+                job.step_datafusion()
+                    .await
+                    .map_err(|e| format!("replaying the tick at entry {seq}: {e}"))?;
+                steps += 1;
+            }
+        }
+        registry.observe_wal_seq(job_id, seq);
+    }
+    if feeds + steps > 0 {
+        tracing::info!(job_id, feeds, steps, "replayed IVM write-ahead log");
+    }
+    Ok(())
+}
+
+/// Append one entry to the job's write-ahead log. The caller holds the per-job
+/// lock, which is what makes the sequence numbers match the order the flow
+/// sees the entries in.
+async fn wal_append(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    entry: &WalEntry,
+) -> Result<(), StatusCode> {
+    let bytes = entry.encode();
+    let len = bytes.len() as u64;
+    let seq = registry.next_wal_seq(job_id);
+    coordinator
+        .append_ivm_log(job_id, seq, bytes)
+        .await
+        .map_err(|error| {
+            tracing::error!(job_id, seq, %error, "appending to the IVM log failed");
+            StatusCode::SERVICE_UNAVAILABLE
+        })?;
+    registry.note_wal_append(job_id, len, matches!(entry, WalEntry::Step));
+    Ok(())
+}
+
+/// Write a full snapshot of the job and drop the log it covers.
+///
+/// **The caller holds the per-job lock.** The snapshot records the log
+/// position it covers, so it must be taken with no feed or step in flight;
+/// and the log is truncated only after the snapshot is durable, so a crash
+/// between the two leaves entries the snapshot already covers, which recovery
+/// skips by that same recorded position.
 async fn persist_ivm_job(
     registry: &SharedIvmJobRegistry,
     coordinator: &SharedCoordinator,
     job_id: &str,
 ) -> Result<(), StatusCode> {
+    let covered = registry.wal_last_seq(job_id);
     let snapshot = registry.durable_snapshot(job_id).map_err(ivm_err)?;
     coordinator
         .save_ivm_snapshot(job_id, snapshot)
@@ -139,7 +275,27 @@ async fn persist_ivm_job(
         .map_err(|error| {
             tracing::error!(job_id, %error, "persisting IVM snapshot failed");
             StatusCode::SERVICE_UNAVAILABLE
-        })
+        })?;
+    registry.note_wal_snapshot(job_id);
+    if let Err(error) = coordinator.truncate_ivm_log(job_id, covered).await {
+        // Not a failure of the write: the snapshot is durable and recovery
+        // ignores what it covers. The log is just longer than it needs to be
+        // until the next snapshot truncates it.
+        tracing::warn!(job_id, %error, "truncating the IVM log failed");
+    }
+    Ok(())
+}
+
+/// [`persist_ivm_job`] for a caller that does not already hold the per-job
+/// lock.
+async fn persist_ivm_job_locking(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+) -> Result<(), StatusCode> {
+    let lock = registry.step_lock(job_id);
+    let _guard = lock.lock().await;
+    persist_ivm_job(registry, coordinator, job_id).await
 }
 
 /// Whether this coordinator can actually make IVM state durable, warning once
@@ -374,10 +530,8 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
     // restored flow's route.
     let mut freshly_created = false;
     if registry.get(job_id).is_none() {
-        if let Some(snapshot) = coordinator.load_ivm_snapshot(job_id).await {
-            registry
-                .restore_durable_snapshot(job_id, &snapshot)
-                .map_err(ivm_err)?;
+        if rehydrate_ivm_job(registry, coordinator, job_id).await? {
+            // Restored from its snapshot and log.
         } else if partitioned == Some(false) {
             registry
                 .create_unpartitioned(job_id.to_owned())
@@ -423,7 +577,7 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
             }
         }
     }
-    persist_ivm_job(registry, coordinator, job_id).await
+    persist_ivm_job_locking(registry, coordinator, job_id).await
 }
 
 pub async fn api_ivm_create_job(
@@ -644,6 +798,10 @@ pub async fn api_ivm_register_view(
             .map(|l| krishiv_ivm::LatenessSpec::new(l.column, l.lateness_ms))
             .collect(),
     };
+    // Under the per-job lock with the snapshot that records it: a view is part
+    // of the job's definition, which lives in the snapshot, not the log.
+    let lock = registry.step_lock(&job_id);
+    let _guard = lock.lock().await;
     registry.register_view(&job_id, spec).map_err(ivm_err)?;
     persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(RegisterViewResponse { success: true }))
@@ -663,6 +821,8 @@ pub async fn api_ivm_drop_view(
 ) -> Result<Json<DropViewResponse>, StatusCode> {
     ensure_ivm_leader(&coordinator).await?;
     let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
+    let lock = registry.step_lock(&job_id);
+    let _guard = lock.lock().await;
     let dropped = flow.drop_view(&view_name).map_err(ivm_err)?;
     persist_ivm_job(&registry, &coordinator, &job_id).await?;
     Ok(Json(DropViewResponse { dropped }))
@@ -674,11 +834,81 @@ pub async fn api_ivm_drop_view(
 pub struct FeedSourceRequest {
     /// Base64-encoded Arrow IPC bytes of a serialized `DeltaBatch`.
     pub delta_ipc_b64: String,
+    /// Optional caller-chosen key naming this feed (an offset, an LSN, a batch
+    /// id). A feed whose key equals the one this source last accepted is a
+    /// retry of it and is acknowledged without being applied again
+    /// (IVM-AUD-DIST-D3). Older clients omit it and get the old behaviour.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct FeedSourceResponse {
     pub success: bool,
+    /// True when this feed carried the same `idempotency_key` as the one the
+    /// source last accepted, so it was not applied a second time.
+    pub duplicate: bool,
+    /// Whether the accepted delta is on durable storage. False only when the
+    /// coordinator has no metadata store.
+    pub durable: bool,
+}
+
+/// What a feed route does once its body is decoded: log it, then hand it to
+/// the flow, under the per-job lock.
+///
+/// IVM-AUD-DIST-D3 / INT-F12: a feed used to be acknowledged once it sat in
+/// the flow's in-memory queue, and nothing wrote it anywhere until a later
+/// `/step`, so a crash in between lost it after a 200. It is now appended to
+/// the job's write-ahead log first — a write the size of the delta — and the
+/// 200 means it is durable.
+async fn accept_feed(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    entry: WalEntry,
+    apply: impl FnOnce(&crate::ivm::IvmJob) -> Result<(), String>,
+) -> Result<FeedSourceResponse, StatusCode> {
+    let durable = ivm_writes_are_durable(coordinator).await;
+    let lock = registry.step_lock(job_id);
+    let _guard = lock.lock().await;
+    // The job may have been deleted while this request waited for the lock.
+    let job = registry.get(job_id).ok_or_else(|| ivm_not_found(job_id))?;
+    let (source, key) = match &entry {
+        WalEntry::Feed {
+            source,
+            idempotency_key,
+            ..
+        }
+        | WalEntry::Snapshot {
+            source,
+            idempotency_key,
+            ..
+        } => (source.clone(), idempotency_key.clone()),
+        WalEntry::Step => (String::new(), None),
+    };
+    if let Some(key) = &key
+        && registry.is_repeated_feed(job_id, &source, key)
+    {
+        return Ok(FeedSourceResponse {
+            success: true,
+            duplicate: true,
+            durable,
+        });
+    }
+    wal_append(registry, coordinator, job_id, &entry).await?;
+    apply(&job).map_err(ivm_err)?;
+    if let Some(key) = key {
+        registry.note_feed_key(job_id, &source, key);
+    }
+    // A job fed heavily between ticks must not grow its log without bound.
+    if registry.wal_snapshot_due(job_id) {
+        persist_ivm_job(registry, coordinator, job_id).await?;
+    }
+    Ok(FeedSourceResponse {
+        success: true,
+        duplicate: false,
+        durable,
+    })
 }
 
 pub async fn api_ivm_feed_source(
@@ -696,12 +926,22 @@ pub async fn api_ivm_feed_source(
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
     // G7: drop zero-weight rows on ingress so downstream operators never see them.
+    // Decoded before anything is logged, so a body that is not a delta is a
+    // 400 and never reaches the log.
     let delta = deserialize_delta_batch(&ipc_bytes)
         .map_err(ivm_err)?
         .drop_zeros()
         .map_err(ivm_err)?;
-    flow.feed(&source_name, delta).map_err(ivm_err)?;
-    Ok(Json(FeedSourceResponse { success: true }))
+    let entry = WalEntry::Feed {
+        source: source_name.clone(),
+        idempotency_key: body.idempotency_key.map(String::into_bytes),
+        delta_ipc: ipc_bytes,
+    };
+    accept_feed(&registry, &coordinator, &job_id, entry, |job| {
+        job.feed(&source_name, delta).map_err(|e| e.to_string())
+    })
+    .await
+    .map(Json)
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/sources/{src}/stream-delta ────────────────
@@ -714,12 +954,13 @@ pub async fn api_ivm_feed_source(
 pub struct FeedStreamDeltaRequest {
     /// Base64-encoded Arrow IPC bytes of a pre-computed `DeltaBatch`.
     pub delta_ipc_b64: String,
+    /// See [`FeedSourceRequest::idempotency_key`].
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct FeedStreamDeltaResponse {
-    pub success: bool,
-}
+/// Same shape as a `/feed` answer: the two routes do the same thing.
+pub type FeedStreamDeltaResponse = FeedSourceResponse;
 
 pub async fn api_ivm_feed_stream_delta(
     State(registry): State<SharedIvmJobRegistry>,
@@ -741,8 +982,16 @@ pub async fn api_ivm_feed_stream_delta(
         .map_err(ivm_err)?;
     // Pre-computed delta: feed directly (same as /feed; the distinct route is
     // kept for coordinator API/wire compatibility with CDC-native producers).
-    flow.feed(&source_name, delta).map_err(ivm_err)?;
-    Ok(Json(FeedStreamDeltaResponse { success: true }))
+    let entry = WalEntry::Feed {
+        source: source_name.clone(),
+        idempotency_key: body.idempotency_key.map(String::into_bytes),
+        delta_ipc: ipc_bytes,
+    };
+    accept_feed(&registry, &coordinator, &job_id, entry, |job| {
+        job.feed(&source_name, delta).map_err(|e| e.to_string())
+    })
+    .await
+    .map(Json)
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/step ──────────────────────────────────────
@@ -1035,7 +1284,15 @@ pub async fn api_ivm_step(
     };
 
     let tick = flow.tick().unwrap_or(0);
-    persist_ivm_job(&registry, &coordinator, &job_id).await?;
+    // IVM-AUD-DIST-G3: this used to rewrite the job's whole state after every
+    // tick — O(state) against an O(Δ) engine. A completed tick is now one
+    // marker in the write-ahead log; the full snapshot is written only every
+    // `KRISHIV_IVM_SNAPSHOT_EVERY_TICKS` ticks, or sooner if the log has grown
+    // past `KRISHIV_IVM_WAL_MAX_BYTES`, and takes the log it covers with it.
+    wal_append(&registry, &coordinator, &job_id, &WalEntry::Step).await?;
+    if registry.wal_snapshot_due(&job_id) {
+        persist_ivm_job(&registry, &coordinator, &job_id).await?;
+    }
     Ok(Json(StepResponse {
         active_views: summary.active_views,
         total_output_rows: summary.total_output_rows,
@@ -1588,6 +1845,27 @@ pub struct ViewOutputResponse {
     /// shard, so a job whose shards publish at different ticks reports
     /// nonzero loss for rows that are merely still in flight.
     pub published_rows_total: u64,
+    /// With `since_tick`: **every** retained delta published after that tick,
+    /// oldest first. This is the lossless read (IVM-AUD-INT-F5): a consumer
+    /// slower than `/step` gets all the deltas it was not there for, not just
+    /// the newest. Empty without `since_tick`.
+    pub deltas: Vec<ViewOutputDelta>,
+    /// With `since_tick`: true when deltas published after that tick are gone
+    /// — past the coordinator's retention bound
+    /// (`KRISHIV_IVM_OUTPUT_RETAIN_TICKS` / `_BYTES`), or from before a
+    /// restore. `deltas` then has a hole before it: resynchronise from `/snap`
+    /// and continue from `resume_after`.
+    pub missed: bool,
+    /// With `since_tick`: the cursor from which the retained log is whole.
+    pub resume_after: u64,
+}
+
+/// One retained output delta and the tick it was published at.
+#[derive(Debug, Serialize)]
+pub struct ViewOutputDelta {
+    pub tick: u64,
+    pub delta_ipc_b64: String,
+    pub num_rows: usize,
 }
 
 pub async fn api_ivm_view_output(
@@ -1602,37 +1880,54 @@ pub async fn api_ivm_view_output(
         .map_err(ivm_err)?
         .map(|s| s.rows_inserted_total + s.rows_retracted_total)
         .unwrap_or(0);
+    // The lossless half: everything retained after the caller's cursor.
+    let (deltas, missed, resume_after) = match query.since_tick {
+        Some(since) => {
+            let since = job.view_output_since(&view_name, since).map_err(ivm_err)?;
+            let deltas = since
+                .deltas
+                .iter()
+                .map(|(tick, delta)| {
+                    let ipc = serialize_delta_batch(delta).map_err(ivm_err)?;
+                    Ok(ViewOutputDelta {
+                        tick: *tick,
+                        delta_ipc_b64: base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &ipc,
+                        ),
+                        num_rows: delta.num_rows(),
+                    })
+                })
+                .collect::<Result<Vec<_>, StatusCode>>()?;
+            (deltas, since.missed, since.resume_after)
+        }
+        None => (Vec::new(), false, 0),
+    };
     // Peek the latest output delta (for a partitioned job, the shards that
     // published at the newest tick — see `view_output_peek_at_tick`).
-    match job.view_output_peek_at_tick(&view_name).map_err(ivm_err)? {
-        None => Ok(Json(ViewOutputResponse {
-            delta_ipc_b64: None,
-            num_rows: 0,
-            tick: None,
-            published_rows_total,
-        })),
-        // Already delivered: the watch is non-consuming, so without this the
-        // same delta comes back on every poll (IVM-AUD-INT-F5).
-        Some((tick, _)) if query.since_tick.is_some_and(|since| tick <= since) => {
-            Ok(Json(ViewOutputResponse {
-                delta_ipc_b64: None,
-                num_rows: 0,
-                tick: Some(tick),
-                published_rows_total,
-            }))
-        }
-        Some((tick, delta)) => {
-            let num_rows = delta.num_rows();
-            let ipc = serialize_delta_batch(&delta).map_err(ivm_err)?;
-            let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
-            Ok(Json(ViewOutputResponse {
-                delta_ipc_b64: Some(b64),
-                num_rows,
-                tick: Some(tick),
-                published_rows_total,
-            }))
-        }
-    }
+    let (delta_ipc_b64, num_rows, tick) =
+        match job.view_output_peek_at_tick(&view_name).map_err(ivm_err)? {
+            None => (None, 0, None),
+            // Already delivered: the watch is non-consuming, so without this
+            // the same delta comes back on every poll (IVM-AUD-INT-F5).
+            Some((tick, _)) if query.since_tick.is_some_and(|since| tick <= since) => {
+                (None, 0, Some(tick))
+            }
+            Some((tick, delta)) => {
+                let ipc = serialize_delta_batch(&delta).map_err(ivm_err)?;
+                let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
+                (Some(b64), delta.num_rows(), Some(tick))
+            }
+        };
+    Ok(Json(ViewOutputResponse {
+        delta_ipc_b64,
+        num_rows,
+        tick,
+        published_rows_total,
+        deltas,
+        missed,
+        resume_after,
+    }))
 }
 
 // ── GET /api/v1/ivm/jobs/{job_id}/views/{view_name}/stats ───────────────────
@@ -1870,12 +2165,13 @@ pub async fn api_ivm_restore_delta(
 pub struct StreamBridgeRequest {
     /// Base64-encoded Arrow IPC bytes for one or more RecordBatches (full snapshot).
     pub snapshot_ipc_b64: String,
+    /// See [`FeedSourceRequest::idempotency_key`].
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct StreamBridgeResponse {
-    pub success: bool,
-}
+/// Same shape as a `/feed` answer.
+pub type StreamBridgeResponse = FeedSourceResponse;
 
 pub async fn api_ivm_stream_bridge(
     State(registry): State<SharedIvmJobRegistry>,
@@ -1892,18 +2188,18 @@ pub async fn api_ivm_stream_bridge(
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
     // Decode Arrow IPC stream to RecordBatches.
-    let batches = {
-        use arrow::ipc::reader::StreamReader;
-        let cursor = std::io::Cursor::new(&ipc_bytes);
-        let reader = StreamReader::try_new(cursor, None)
-            .map_err(|e| ivm_err(format!("IPC stream open: {e}")))?;
-        reader
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| ivm_err(format!("IPC stream read: {e}")))?
+    let batches = decode_snapshot_batches(&ipc_bytes).map_err(ivm_err)?;
+    let entry = WalEntry::Snapshot {
+        source: source_name.clone(),
+        idempotency_key: body.idempotency_key.map(String::into_bytes),
+        snapshot_ipc: ipc_bytes,
     };
-    flow.feed_snapshot(&source_name, &batches)
-        .map_err(ivm_err)?;
-    Ok(Json(StreamBridgeResponse { success: true }))
+    accept_feed(&registry, &coordinator, &job_id, entry, |job| {
+        job.feed_snapshot(&source_name, &batches)
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map(Json)
 }
 
 // ── POST /api/v1/ivm/jobs/{job_id}/vector-views ───────────────────────────────
@@ -2806,6 +3102,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64_deletes(orders(&["US", "EU"], &[5, 7])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2944,6 +3241,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: "not/base64!!".into(),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2959,6 +3257,7 @@ mod tests {
                     &base64::engine::general_purpose::STANDARD,
                     b"not arrow ipc",
                 ),
+                idempotency_key: None,
             }),
         )
         .await
@@ -2988,6 +3287,7 @@ mod tests {
             Path(("logical".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3008,6 +3308,7 @@ mod tests {
             Path(("logical".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[7])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3046,6 +3347,7 @@ mod tests {
                     &["US", "EU", "US", "APAC", "EU", "US"],
                     &[100, 50, 25, 10, 75, 5],
                 )),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3107,6 +3409,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedStreamDeltaRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[42])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3144,6 +3447,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(StreamBridgeRequest {
                 snapshot_ipc_b64: ipc_stream_b64(&batch),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3182,6 +3486,7 @@ mod tests {
                     &base64::engine::general_purpose::STANDARD,
                     b"junk",
                 ),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3221,6 +3526,7 @@ mod tests {
             Path(("j".to_owned(), "orders".to_owned())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[10])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3301,6 +3607,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US", "EU", "APAC"], &[1, 2, 3])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3635,6 +3942,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[9])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3680,6 +3988,7 @@ mod tests {
                 Path(("j".to_owned(), "orders".to_owned())),
                 Json(FeedSourceRequest {
                     delta_ipc_b64: delta_b64(orders(regions, amounts)),
+                    idempotency_key: None,
                 }),
             )
             .await
@@ -3767,6 +4076,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US", "EU"], &[1, 2])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3802,6 +4112,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[1])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3853,6 +4164,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3882,6 +4194,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[900])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -3977,6 +4290,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4103,6 +4417,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4132,6 +4447,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["EU"], &[50])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4174,6 +4490,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[100])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4290,11 +4607,30 @@ mod tests {
         )
         .await
         .expect("/output must rehydrate, not 404");
-        // 200 with a null delta, not 404: the durable snapshot carries source
-        // and view state, not the last tick's emitted delta, so after a restart
-        // there genuinely is no last output to report. "No delta since the
-        // restart" and "no such job" are different answers and the caller must
-        // be able to tell them apart.
+        // The tick is still in the write-ahead log, so rehydrating replays it
+        // and the delta it emitted is there to report again — it used to be
+        // lost with the restart, because a snapshot carries source and view
+        // state but not the last tick's output.
+        assert_eq!(
+            decode_delta_rows(out.delta_ipc_b64.as_deref().expect("replayed delta")),
+            vec![("US".to_owned(), 100.0)]
+        );
+
+        // Once a snapshot has taken that tick out of the log there is nothing
+        // to replay, and the answer is a 200 with a null delta — not a 404:
+        // "no delta since the restart" and "no such job" are different answers.
+        persist_ivm_job_locking(&registry, &coordinator, "j")
+            .await
+            .expect("snapshot");
+        assert!(registry.delete("j"));
+        let out = api_ivm_view_output(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(("j".into(), "revenue".into())),
+            axum::extract::Query(ViewOutputQuery::default()),
+        )
+        .await
+        .expect("/output must rehydrate, not 404");
         assert!(out.delta_ipc_b64.is_none());
         assert_eq!(out.num_rows, 0);
     }
@@ -4320,6 +4656,7 @@ mod tests {
                 Path(("j".into(), "orders".into())),
                 Json(FeedSourceRequest {
                     delta_ipc_b64: delta_b64(orders(&["US"], &[amount])),
+                    idempotency_key: None,
                 }),
             )
             .await
@@ -4564,6 +4901,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4580,6 +4918,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[6])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4592,6 +4931,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedStreamDeltaRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[6])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4604,6 +4944,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(StreamBridgeRequest {
                 snapshot_ipc_b64: ipc_stream_b64(&orders(&["US"], &[6])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4625,6 +4966,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[6])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4836,6 +5178,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -4911,6 +5254,7 @@ mod tests {
             Path(("j".into(), "orders".into())),
             Json(FeedSourceRequest {
                 delta_ipc_b64: delta_b64(orders(&["US"], &[5])),
+                idempotency_key: None,
             }),
         )
         .await
@@ -5005,6 +5349,7 @@ mod tests {
                 Path(("j".into(), "orders".into())),
                 Json(FeedSourceRequest {
                     delta_ipc_b64: delta_b64(orders(&["US"], &[amount])),
+                    idempotency_key: None,
                 }),
             )
             .await
@@ -5353,5 +5698,365 @@ mod tests {
             resp.expect("leader delete must succeed").deleted,
             "job should have been reported deleted"
         );
+    }
+    // ── write-ahead log (IVM-AUD-DIST-D3 / INT-F12 / DIST-G3) ────────────────
+
+    fn durable_deps(shards: usize) -> (SharedIvmJobRegistry, SharedCoordinator) {
+        (
+            std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(shards)),
+            SharedCoordinator::new(
+                Coordinator::active(CoordinatorId::try_new("wal-coord").unwrap())
+                    .with_store(crate::InMemoryMetadataStore::default()),
+            ),
+        )
+    }
+
+    /// A coordinator restart: a fresh registry over the same durable store.
+    fn restarted(shards: usize) -> SharedIvmJobRegistry {
+        std::sync::Arc::new(crate::ivm::IvmJobRegistry::with_default_shards(shards))
+    }
+
+    async fn feed_orders(
+        registry: &SharedIvmJobRegistry,
+        coordinator: &SharedCoordinator,
+        job_id: &str,
+        rows: RecordBatch,
+        key: Option<&str>,
+    ) -> FeedSourceResponse {
+        api_ivm_feed_source(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path((job_id.to_owned(), "orders".to_owned())),
+            Json(FeedSourceRequest {
+                delta_ipc_b64: delta_b64(rows),
+                idempotency_key: key.map(str::to_owned),
+            }),
+        )
+        .await
+        .expect("feed")
+        .0
+    }
+
+    async fn step_job(
+        registry: &SharedIvmJobRegistry,
+        coordinator: &SharedCoordinator,
+        job_id: &str,
+    ) {
+        let _ = api_ivm_step(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path(job_id.to_owned()),
+        )
+        .await
+        .expect("step");
+    }
+
+    async fn revenue(
+        registry: &SharedIvmJobRegistry,
+        coordinator: &SharedCoordinator,
+        job_id: &str,
+    ) -> Vec<(String, f64)> {
+        let snap = api_ivm_snapshot(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path((job_id.to_owned(), "revenue".to_owned())),
+        )
+        .await
+        .expect("snapshot");
+        snap.snapshot_ipc_b64
+            .as_deref()
+            .map(decode_delta_rows)
+            .unwrap_or_default()
+    }
+
+    fn totals(rows: &[(&str, f64)]) -> Vec<(String, f64)> {
+        rows.iter().map(|(r, t)| ((*r).to_owned(), *t)).collect()
+    }
+
+    /// The 200 used to mean "queued in memory": a crash before the next step
+    /// lost the delta.
+    #[tokio::test]
+    async fn a_fed_delta_survives_a_restart_before_any_step() {
+        let (registry, coordinator) = durable_deps(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let answer = feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU", "US"], &[10, 20]),
+            None,
+        )
+        .await;
+        assert!(answer.durable && !answer.duplicate);
+
+        let registry = restarted(1);
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 10.0), ("US", 20.0)])
+        );
+    }
+
+    /// Replay rebuilds exactly the ticks the job ran, and leaves what was fed
+    /// but not yet stepped still waiting.
+    #[tokio::test]
+    async fn replay_rebuilds_the_stepped_state_and_the_pending_feed() {
+        let (registry, coordinator) = durable_deps(1);
+        registry.set_snapshot_every_ticks(1_000);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        feed_orders(&registry, &coordinator, "j", orders(&["EU"], &[10]), None).await;
+        step_job(&registry, &coordinator, "j").await;
+        feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU", "US"], &[5, 7]),
+            None,
+        )
+        .await;
+        step_job(&registry, &coordinator, "j").await;
+        // Fed, never stepped.
+        feed_orders(&registry, &coordinator, "j", orders(&["US"], &[100]), None).await;
+        let before = revenue(&registry, &coordinator, "j").await;
+        assert_eq!(before, totals(&[("EU", 15.0), ("US", 7.0)]));
+
+        let registry = restarted(1);
+        registry.set_snapshot_every_ticks(1_000);
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            before,
+            "replay must land on the state the job was in, not past it"
+        );
+        let job = registry.get("j").expect("rehydrated");
+        assert_eq!(job.tick().unwrap(), 2, "two ticks were replayed");
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 15.0), ("US", 107.0)])
+        );
+    }
+
+    /// A tick used to rewrite the job's whole state. It is now a marker, and
+    /// the snapshot is rewritten — and the log dropped — only when due.
+    #[tokio::test]
+    async fn a_tick_appends_a_marker_and_snapshots_only_when_due() {
+        let (registry, coordinator) = durable_deps(1);
+        registry.set_snapshot_every_ticks(3);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let snapshot_at_creation = coordinator.load_ivm_snapshot("j").await.unwrap();
+
+        for amount in [1, 2] {
+            feed_orders(
+                &registry,
+                &coordinator,
+                "j",
+                orders(&["EU"], &[amount]),
+                None,
+            )
+            .await;
+            step_job(&registry, &coordinator, "j").await;
+        }
+        assert_eq!(
+            coordinator.load_ivm_snapshot("j").await.unwrap(),
+            snapshot_at_creation,
+            "two ticks must not have rewritten the snapshot"
+        );
+        assert_eq!(
+            coordinator.load_ivm_log("j", 0).await.len(),
+            4,
+            "two feeds and two tick markers"
+        );
+
+        // The third tick is the one that is due.
+        feed_orders(&registry, &coordinator, "j", orders(&["EU"], &[4]), None).await;
+        step_job(&registry, &coordinator, "j").await;
+        assert_ne!(
+            coordinator.load_ivm_snapshot("j").await.unwrap(),
+            snapshot_at_creation
+        );
+        assert!(
+            coordinator.load_ivm_log("j", 0).await.is_empty(),
+            "the snapshot takes the log it covers with it"
+        );
+
+        let registry = restarted(1);
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 7.0)])
+        );
+    }
+
+    /// A log that has grown past its cap forces the snapshot at feed time, so
+    /// a job fed heavily between ticks cannot grow it without bound — and the
+    /// snapshot carries the fed-but-unstepped input.
+    #[tokio::test]
+    async fn a_large_log_is_snapshotted_at_feed_time() {
+        let (registry, coordinator) = durable_deps(1);
+        registry.set_snapshot_every_ticks(1_000);
+        registry.set_wal_max_bytes(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        feed_orders(&registry, &coordinator, "j", orders(&["EU"], &[3]), None).await;
+        assert!(coordinator.load_ivm_log("j", 0).await.is_empty());
+
+        let registry = restarted(1);
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 3.0)])
+        );
+    }
+
+    /// A client that times out and retries must not double-apply.
+    #[tokio::test]
+    async fn a_retried_feed_with_the_same_key_is_applied_once() {
+        let (registry, coordinator) = durable_deps(1);
+        registry.set_snapshot_every_ticks(1_000);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let first = feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU"], &[10]),
+            Some("offset-1"),
+        )
+        .await;
+        let retry = feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU"], &[10]),
+            Some("offset-1"),
+        )
+        .await;
+        assert!(!first.duplicate && retry.duplicate);
+        // A new key applies; no key always applies.
+        feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU"], &[1]),
+            Some("offset-2"),
+        )
+        .await;
+        feed_orders(&registry, &coordinator, "j", orders(&["EU"], &[1]), None).await;
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 12.0)])
+        );
+
+        // The last key is remembered across a restart, from the log…
+        let registry = restarted(1);
+        registry.set_snapshot_every_ticks(1);
+        let retry = feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU"], &[1]),
+            Some("offset-2"),
+        )
+        .await;
+        assert!(retry.duplicate);
+        // …and, after a snapshot has dropped the log, from the snapshot.
+        step_job(&registry, &coordinator, "j").await;
+        assert!(coordinator.load_ivm_log("j", 0).await.is_empty());
+        let registry = restarted(1);
+        let retry = feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU"], &[1]),
+            Some("offset-2"),
+        )
+        .await;
+        assert!(retry.duplicate);
+    }
+
+    /// A key-partitioned job replays the same way as a single flow.
+    #[tokio::test]
+    async fn a_partitioned_job_replays_its_log() {
+        let (registry, coordinator) = durable_deps(4);
+        registry.set_snapshot_every_ticks(1_000);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        assert!(registry.get("j").unwrap().is_partitioned());
+        feed_orders(
+            &registry,
+            &coordinator,
+            "j",
+            orders(&["EU", "US", "APAC"], &[1, 2, 3]),
+            None,
+        )
+        .await;
+        step_job(&registry, &coordinator, "j").await;
+        feed_orders(&registry, &coordinator, "j", orders(&["EU"], &[10]), None).await;
+
+        let registry = restarted(4);
+        assert!(registry.get("j").is_none());
+        step_job(&registry, &coordinator, "j").await;
+        assert!(registry.get("j").unwrap().is_partitioned());
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("APAC", 3.0), ("EU", 11.0), ("US", 2.0)])
+        );
+    }
+
+    /// `/stream-bridge` snapshots are logged and replayed too, so the diff the
+    /// next snapshot is taken against survives a restart.
+    #[tokio::test]
+    async fn stream_bridge_snapshots_are_replayed() {
+        let (registry, coordinator) = durable_deps(1);
+        registry.set_snapshot_every_ticks(1_000);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let bridge = |registry: SharedIvmJobRegistry, rows: RecordBatch| {
+            let coordinator = coordinator.clone();
+            async move {
+                api_ivm_stream_bridge(
+                    State(registry),
+                    State(coordinator),
+                    Path(("j".to_owned(), "orders".to_owned())),
+                    Json(StreamBridgeRequest {
+                        snapshot_ipc_b64: ipc_stream_b64(&rows),
+                        idempotency_key: None,
+                    }),
+                )
+                .await
+                .expect("bridge")
+            }
+        };
+        let _ = bridge(registry.clone(), orders(&["EU", "US"], &[10, 20])).await;
+        step_job(&registry, &coordinator, "j").await;
+
+        let registry = restarted(1);
+        // The next snapshot drops US: replay must have kept the previous one
+        // for this to diff into a retraction rather than two inserts.
+        let _ = bridge(registry.clone(), orders(&["EU"], &[10])).await;
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 10.0)])
+        );
+    }
+
+    /// Deleting a job takes its log with it, so a recreated job of the same
+    /// name does not inherit the old one's feeds.
+    #[tokio::test]
+    async fn deleting_a_job_drops_its_log() {
+        let (registry, coordinator) = durable_deps(1);
+        registry.set_snapshot_every_ticks(1_000);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        feed_orders(&registry, &coordinator, "j", orders(&["EU"], &[10]), None).await;
+        assert_eq!(coordinator.load_ivm_log("j", 0).await.len(), 1);
+        let _ = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".to_owned()),
+        )
+        .await
+        .expect("delete");
+        assert!(coordinator.load_ivm_log("j", 0).await.is_empty());
+
+        create_revenue_job(&registry, &coordinator, "j").await;
+        step_job(&registry, &coordinator, "j").await;
+        assert!(revenue(&registry, &coordinator, "j").await.is_empty());
     }
 }

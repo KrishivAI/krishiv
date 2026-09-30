@@ -8,8 +8,9 @@ that keeps serving the last value forever:
 
 * ``last_output()`` — the peek: repeats, and survives a tick that published
   nothing;
-* ``next_change()`` — the cursor over it: hands each published delta over at
-  most once, and returns ``None`` after a tick that published nothing.
+* ``next_change()`` — the change feed: hands over every published delta
+  exactly once, in order, however many ticks ran since the last call, and
+  returns ``None`` after a tick that published nothing.
 """
 
 import os
@@ -78,4 +79,28 @@ def test_change_feed_is_empty_before_the_first_tick():
     s = _orders_session()
     iv = s.sql(VIEW).to_incremental()
     assert iv.last_output() is None
+    assert iv.next_change() is None
+
+
+def test_next_change_is_lossless_across_several_ticks():
+    """Three ticks between two reads used to cost the reader two of the three
+    deltas: the feed was a peek at a value that holds only the newest."""
+    s = _orders_session()
+    iv = s.sql(VIEW).to_incremental()
+
+    iv.insert(pa.record_batch({"k": ["a"], "v": [10]}))
+    iv.insert(pa.record_batch({"k": ["b"], "v": [5]}))
+    iv.delete(pa.record_batch({"k": ["b"], "v": [5]}))
+
+    # The peek still has only the last one…
+    assert _weights(iv.last_output()) == {("b", 5): -1}
+    # …the feed has all three, oldest first.
+    assert _weights(iv.next_change()) == {("a", 10): 1}
+    assert _weights(iv.next_change()) == {("b", 5): 1}
+    assert _weights(iv.next_change()) == {("b", 5): -1}
+    assert iv.next_change() is None
+
+    # And it carries on from there.
+    iv.insert(pa.record_batch({"k": ["c"], "v": [1]}))
+    assert _weights(iv.next_change()) == {("c", 1): 1}
     assert iv.next_change() is None

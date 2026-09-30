@@ -547,6 +547,53 @@ impl PartitionedIncrementalFlow {
         Ok(Some((newest, merged)))
     }
 
+    /// Every delta `view` published after tick `after`, oldest first: each
+    /// tick's delta is the shards' deltas for that tick, concatenated.
+    ///
+    /// `missed` is true if any shard has lost deltas past the cursor, since
+    /// the merged changelog then has a hole whichever shard it is in.
+    pub fn view_output_since(&self, view: &str, after: u64) -> IvmResult<crate::OutputSince> {
+        let mut by_tick: std::collections::BTreeMap<u64, Vec<DeltaBatch>> =
+            std::collections::BTreeMap::new();
+        let mut missed = false;
+        let mut resume_after = after;
+        for shard in &self.shards {
+            let since = shard.view_output_since(view, after)?;
+            missed |= since.missed;
+            resume_after = resume_after.max(since.resume_after);
+            for (tick, delta) in since.deltas {
+                by_tick.entry(tick).or_default().push(delta);
+            }
+        }
+        let deltas = by_tick
+            .into_iter()
+            .map(|(tick, parts)| {
+                DeltaBatch::concat(&parts)
+                    .map(|merged| (tick, merged))
+                    .map_err(|e| IvmError::execution(e.to_string()))
+            })
+            .collect::<IvmResult<Vec<_>>>()?;
+        // Deltas below the furthest shard's gap are part of a broken run.
+        let deltas = deltas
+            .into_iter()
+            .filter(|(tick, _)| *tick > resume_after || !missed)
+            .collect();
+        Ok(crate::OutputSince {
+            deltas,
+            missed,
+            resume_after,
+        })
+    }
+
+    /// Override every shard's output retention; see
+    /// [`IncrementalFlow::set_output_retention`].
+    pub fn set_output_retention(&self, deltas: usize, bytes: usize) -> IvmResult<()> {
+        for shard in &self.shards {
+            shard.set_output_retention(deltas, bytes)?;
+        }
+        Ok(())
+    }
+
     /// AUD-9 (loud degradation): how this view actually executes on the shards
     /// — `(incremental, human_reason)`, `None` if not registered.
     ///

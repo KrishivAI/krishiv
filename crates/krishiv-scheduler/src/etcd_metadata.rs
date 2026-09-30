@@ -180,6 +180,11 @@ const JOB_KEY_PREFIX: &str = "/krishiv/jobs/";
 const EXECUTOR_KEY_PREFIX: &str = "/krishiv/executors/";
 const CONTINUOUS_KEY_PREFIX: &str = "/krishiv/continuous/";
 const IVM_KEY_PREFIX: &str = "/krishiv/ivm/";
+/// IVM write-ahead log entries: `/krishiv/ivmlog/<job>/<seq:016x>`, with an
+/// entry too large for one etcd value spilling into `…#<chunk:08x>` keys the
+/// same way a snapshot does. Deliberately not under `IVM_KEY_PREFIX`, which
+/// the snapshot loader scans whole.
+const IVM_LOG_KEY_PREFIX: &str = "/krishiv/ivmlog/";
 const HISTORY_KEY_PREFIX: &str = "/krishiv/history/";
 
 /// Durable metadata store backed by per-record etcd keys.
@@ -210,6 +215,7 @@ pub struct EtcdMetadataStore {
     startup_executors: Vec<krishiv_proto::ExecutorDescriptor>,
     continuous_snapshots: std::collections::HashMap<String, ContinuousSnapshot>,
     ivm_snapshots: std::collections::HashMap<String, Vec<u8>>,
+    ivm_logs: IvmLogs,
     history: Vec<JobHistoryRecord>,
     /// When set, every write is conditional on this process still holding the
     /// leader key (see [`EtcdLeaderFence`]). Unset for a single-coordinator
@@ -332,6 +338,12 @@ impl EtcdMetadataStore {
                     message: format!("etcd IVM snapshots load failed: {e}"),
                 })?;
 
+        let ivm_logs = load_ivm_logs(&mut kv)
+            .await
+            .map_err(|e| SchedulerError::Transport {
+                message: format!("etcd IVM log load failed: {e}"),
+            })?;
+
         let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
             .await
             .map_err(|e| SchedulerError::Transport {
@@ -345,6 +357,7 @@ impl EtcdMetadataStore {
             startup_executors: executor_descriptors,
             continuous_snapshots,
             ivm_snapshots,
+            ivm_logs,
             history: truncate_history(sort_history(history)),
             leader_fence: None,
         })
@@ -376,42 +389,56 @@ impl MetadataStore for EtcdMetadataStore {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let (jobs, executors, snapshots, ivm_snapshots, history) = etcd_block_on_bounded(
-            async move {
-                let mut kv = wide_kv(&client);
-                let jobs = load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
+        let (jobs, executors, snapshots, ivm_snapshots, ivm_logs, history) =
+            etcd_block_on_bounded(
+                async move {
+                    let mut kv = wide_kv(&client);
+                    let jobs =
+                        load_prefix::<PersistedJobRecord, JobRecord>(&mut kv, JOB_KEY_PREFIX)
+                            .await
+                            .map_err(|e| SchedulerError::Transport {
+                                message: format!("etcd jobs refresh failed: {e}"),
+                            })?;
+                    let executors = load_prefix::<
+                        PersistedExecutorDescriptor,
+                        krishiv_proto::ExecutorDescriptor,
+                    >(&mut kv, EXECUTOR_KEY_PREFIX)
                     .await
                     .map_err(|e| SchedulerError::Transport {
-                        message: format!("etcd jobs refresh failed: {e}"),
+                        message: format!("etcd executors refresh failed: {e}"),
                     })?;
-                let executors = load_prefix::<
-                    PersistedExecutorDescriptor,
-                    krishiv_proto::ExecutorDescriptor,
-                >(&mut kv, EXECUTOR_KEY_PREFIX)
-                .await
-                .map_err(|e| SchedulerError::Transport {
-                    message: format!("etcd executors refresh failed: {e}"),
-                })?;
-                let snapshots = load_continuous_snapshots(&mut kv).await.map_err(|e| {
-                    SchedulerError::Transport {
-                        message: format!("etcd continuous snapshots refresh failed: {e}"),
-                    }
-                })?;
-                let ivm_snapshots =
-                    load_ivm_snapshots(&mut kv)
+                    let snapshots = load_continuous_snapshots(&mut kv).await.map_err(|e| {
+                        SchedulerError::Transport {
+                            message: format!("etcd continuous snapshots refresh failed: {e}"),
+                        }
+                    })?;
+                    let ivm_snapshots = load_ivm_snapshots(&mut kv).await.map_err(|e| {
+                        SchedulerError::Transport {
+                            message: format!("etcd IVM snapshots refresh failed: {e}"),
+                        }
+                    })?;
+                    let ivm_logs =
+                        load_ivm_logs(&mut kv)
+                            .await
+                            .map_err(|e| SchedulerError::Transport {
+                                message: format!("etcd IVM log refresh failed: {e}"),
+                            })?;
+                    let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
                         .await
                         .map_err(|e| SchedulerError::Transport {
-                            message: format!("etcd IVM snapshots refresh failed: {e}"),
+                            message: format!("etcd job history refresh failed: {e}"),
                         })?;
-                let history = load_json_prefix::<JobHistoryRecord>(&mut kv, HISTORY_KEY_PREFIX)
-                    .await
-                    .map_err(|e| SchedulerError::Transport {
-                        message: format!("etcd job history refresh failed: {e}"),
-                    })?;
-                Ok::<_, SchedulerError>((jobs, executors, snapshots, ivm_snapshots, history))
-            },
-            ETCD_REFRESH_TIMEOUT,
-        )??;
+                    Ok::<_, SchedulerError>((
+                        jobs,
+                        executors,
+                        snapshots,
+                        ivm_snapshots,
+                        ivm_logs,
+                        history,
+                    ))
+                },
+                ETCD_REFRESH_TIMEOUT,
+            )??;
 
         // Replace the recovery cache only after every prefix loaded successfully;
         // a partial etcd read must never become a promotable coordinator view.
@@ -419,6 +446,7 @@ impl MetadataStore for EtcdMetadataStore {
         self.startup_executors = executors;
         self.continuous_snapshots = snapshots;
         self.ivm_snapshots = ivm_snapshots;
+        self.ivm_logs = ivm_logs;
         self.history = truncate_history(sort_history(history));
         Ok(())
     }
@@ -565,6 +593,52 @@ impl MetadataStore for EtcdMetadataStore {
         let chunk_prefix_end = prefix_range_end(&chunk_prefix);
         self.delete_range(chunk_prefix.into_bytes(), chunk_prefix_end)?;
         self.ivm_snapshots.remove(job_id);
+        self.truncate_ivm_log(job_id, u64::MAX)
+    }
+
+    fn append_ivm_log(&mut self, job_id: &str, seq: u64, entry: Vec<u8>) -> SchedulerResult<()> {
+        // Same layout as a snapshot: compressed, inline in one value when it
+        // fits, else chunk keys written before the manifest that commits them.
+        let raw_len = entry.len() as u64;
+        let (codec, payload) = compress_ivm_payload(&entry);
+        let key = ivm_log_key(job_id, seq);
+        if payload.len() <= IVM_INLINE_MAX {
+            let mut value = ivm_manifest_header(codec, 0, raw_len);
+            value.extend_from_slice(&payload);
+            self.put_key(key, value)?;
+        } else {
+            let chunks: Vec<&[u8]> = payload.chunks(IVM_CHUNK_BYTES).collect();
+            let chunk_count = chunks.len() as u32;
+            for (i, chunk) in chunks.iter().enumerate() {
+                self.put_key(
+                    format!("{key}{IVM_CHUNK_SEP}{:08x}", i as u32),
+                    chunk.to_vec(),
+                )?;
+            }
+            self.put_key(key, ivm_manifest_header(codec, chunk_count, raw_len))?;
+        }
+        self.ivm_logs
+            .entry(job_id.to_owned())
+            .or_default()
+            .insert(seq, entry);
+        Ok(())
+    }
+
+    fn load_ivm_log(&self, job_id: &str, after: u64) -> Vec<(u64, Vec<u8>)> {
+        crate::store::ivm_log_after(self.ivm_logs.get(job_id), after)
+    }
+
+    fn truncate_ivm_log(&mut self, job_id: &str, through: u64) -> SchedulerResult<()> {
+        // An entry's chunk keys sort between it and the next entry, so one
+        // range up to the key after `through` takes them too.
+        let end = match through.checked_add(1) {
+            Some(next) => ivm_log_key(job_id, next).into_bytes(),
+            None => prefix_range_end(&ivm_log_job_prefix(job_id)),
+        };
+        self.delete_range(ivm_log_key(job_id, 0).into_bytes(), end)?;
+        if let Some(log) = self.ivm_logs.get_mut(job_id) {
+            log.retain(|seq, _| *seq > through);
+        }
         Ok(())
     }
 
@@ -616,6 +690,32 @@ fn ivm_chunk_prefix(job_id: &str) -> String {
 /// in ascending chunk-index order under an etcd range scan.
 fn ivm_chunk_key(job_id: &str, index: u32) -> String {
     format!("{IVM_KEY_PREFIX}{job_id}{IVM_CHUNK_SEP}{index:08x}")
+}
+
+/// In-memory mirror of the IVM logs: `job -> seq -> entry`.
+type IvmLogs = std::collections::HashMap<String, std::collections::BTreeMap<u64, Vec<u8>>>;
+
+/// `/krishiv/ivmlog/<job>/` — one job's log. The trailing `/` keeps job `a`
+/// from matching job `a-b`.
+fn ivm_log_job_prefix(job_id: &str) -> String {
+    format!("{IVM_LOG_KEY_PREFIX}{job_id}/")
+}
+
+/// `/krishiv/ivmlog/<job>/<seq:016x>` — zero-padded hex, so a range scan
+/// returns a job's entries in sequence order.
+fn ivm_log_key(job_id: &str, seq: u64) -> String {
+    format!("{}{seq:016x}", ivm_log_job_prefix(job_id))
+}
+
+/// Split a log key's tail (after the prefix) into job, sequence number and,
+/// for a chunk key, the chunk index.
+fn parse_ivm_log_key(remainder: &str) -> Option<(&str, u64, Option<u32>)> {
+    let (job_id, tail) = remainder.rsplit_once('/')?;
+    let (seq_hex, chunk) = match tail.split_once(IVM_CHUNK_SEP) {
+        Some((seq_hex, index_hex)) => (seq_hex, Some(u32::from_str_radix(index_hex, 16).ok()?)),
+        None => (tail, None),
+    };
+    Some((job_id, u64::from_str_radix(seq_hex, 16).ok()?, chunk))
 }
 
 fn history_key(job_id: &str) -> String {
@@ -1042,6 +1142,46 @@ async fn load_ivm_snapshots(
         manifest_count - snapshots.len(),
     )?;
     Ok(snapshots)
+}
+
+/// Load every IVM log entry under `/krishiv/ivmlog/`, reassembling chunked
+/// entries.
+///
+/// An entry that cannot be reassembled fails the load rather than being
+/// skipped: a log with a hole in it replays to a state the job was never in,
+/// which is worse than refusing to start.
+async fn load_ivm_logs(client: &mut KvClient) -> Result<IvmLogs, String> {
+    use std::collections::{BTreeMap, HashMap};
+    let kvs = get_prefix_paged(client, IVM_LOG_KEY_PREFIX).await?;
+
+    let mut manifests: HashMap<(String, u64), Vec<u8>> = HashMap::new();
+    let mut chunks: HashMap<(String, u64), BTreeMap<u32, Vec<u8>>> = HashMap::new();
+    for kv in &kvs {
+        let key = kv.key_str().unwrap_or("?");
+        let (job_id, seq, chunk) = key
+            .strip_prefix(IVM_LOG_KEY_PREFIX)
+            .and_then(parse_ivm_log_key)
+            .ok_or_else(|| format!("etcd IVM log key is malformed: {key}"))?;
+        match chunk {
+            Some(index) => {
+                chunks
+                    .entry((job_id.to_owned(), seq))
+                    .or_default()
+                    .insert(index, kv.value().to_vec());
+            }
+            None => {
+                manifests.insert((job_id.to_owned(), seq), kv.value().to_vec());
+            }
+        }
+    }
+
+    let mut logs: IvmLogs = HashMap::new();
+    for ((job_id, seq), manifest_value) in manifests {
+        let entry = reassemble_ivm_snapshot(&manifest_value, chunks.get(&(job_id.clone(), seq)))
+            .map_err(|error| format!("IVM log entry {seq} of job {job_id}: {error}"))?;
+        logs.entry(job_id).or_default().insert(seq, entry);
+    }
+    Ok(logs)
 }
 
 #[cfg(feature = "etcd")]
@@ -1521,5 +1661,30 @@ mod tests {
         assert!(result.is_err());
         fence.set_lease(Some(7));
         assert!(EtcdMetadataStore::fenced_txn(&fence, TxnOp::put("x", "y", None)).is_ok());
+    }
+    /// A log entry's chunk keys must sort after it and before the next entry,
+    /// which is what lets one range delete truncate both; and one job's keys
+    /// must not fall inside another's prefix.
+    #[test]
+    fn ivm_log_keys_sort_by_sequence_with_chunks_in_between() {
+        let entry = ivm_log_key("job", 5);
+        let chunk = format!("{entry}{IVM_CHUNK_SEP}{:08x}", 3);
+        let next = ivm_log_key("job", 6);
+        assert!(entry < chunk && chunk < next);
+        assert!(ivm_log_key("job", 0xff) < ivm_log_key("job", 0x100));
+        assert!(!ivm_log_key("job-2", 1).starts_with(&ivm_log_job_prefix("job")));
+        assert!(!IVM_LOG_KEY_PREFIX.starts_with(IVM_KEY_PREFIX));
+    }
+
+    #[test]
+    fn ivm_log_keys_parse_back() {
+        let key = ivm_log_key("my-job_1", 0x2a);
+        let tail = key.strip_prefix(IVM_LOG_KEY_PREFIX).unwrap();
+        assert_eq!(parse_ivm_log_key(tail), Some(("my-job_1", 0x2a, None)));
+        let chunk = format!("{tail}{IVM_CHUNK_SEP}{:08x}", 7);
+        assert_eq!(parse_ivm_log_key(&chunk), Some(("my-job_1", 0x2a, Some(7))));
+        for bad in ["", "job", "job/zz", "job/000000000000002a#xyz"] {
+            assert_eq!(parse_ivm_log_key(bad), None, "{bad}");
+        }
     }
 }

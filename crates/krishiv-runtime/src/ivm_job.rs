@@ -150,6 +150,21 @@ impl RemoteIvmJob {
         execute_coordinator_ivm_snapshot(&self.coordinator_http, &self.job_id, view_name).await
     }
 
+    /// Every delta `view_name` published after tick `after`, oldest first.
+    pub async fn view_output_since(
+        &self,
+        view_name: &str,
+        after: u64,
+    ) -> RuntimeResult<krishiv_ivm::OutputSince> {
+        crate::coordinator_http_client::execute_coordinator_ivm_view_output_since(
+            &self.coordinator_http,
+            &self.job_id,
+            view_name,
+            after,
+        )
+        .await
+    }
+
     /// Advance one clock tick on the coordinator.
     pub async fn step(&self) -> RuntimeResult<RemoteStepSummary> {
         execute_coordinator_ivm_step(&self.coordinator_http, &self.job_id).await
@@ -336,6 +351,18 @@ impl EmbeddedIvmJob {
     pub fn view_output(&self, view_name: &str) -> RuntimeResult<Option<DeltaBatch>> {
         self.job()?
             .view_output_peek(view_name)
+            .map_err(|e| RuntimeError::transport(e.to_string()))
+    }
+
+    /// Every delta `view_name` published after tick `after`, oldest first —
+    /// the lossless change feed.
+    pub fn view_output_since(
+        &self,
+        view_name: &str,
+        after: u64,
+    ) -> RuntimeResult<krishiv_ivm::OutputSince> {
+        self.job()?
+            .view_output_since(view_name, after)
             .map_err(|e| RuntimeError::transport(e.to_string()))
     }
 

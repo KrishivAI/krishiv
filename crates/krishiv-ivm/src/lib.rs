@@ -18,8 +18,8 @@ pub mod window_rewrite;
 pub use decompose::{Hop, decompose};
 pub use error::{IvmError, IvmResult};
 pub use flow::{
-    ATTACH_ECHO_MAGIC, IVM_TICK_WIRE_VERSION, IncrementalFlow, RetainedState, StepSummary,
-    TickHealth, TickResult, ViewDeltaStats, ViewError, ViewErrorKind, ViewExecution,
+    ATTACH_ECHO_MAGIC, IVM_TICK_WIRE_VERSION, IncrementalFlow, OutputSince, RetainedState,
+    StepSummary, TickHealth, TickResult, ViewDeltaStats, ViewError, ViewErrorKind, ViewExecution,
     WireCapabilities, WireViewError, coalesce_pending, decode_attach_echo, decode_delta_map,
     decode_tick_result, encode_attach_echo, encode_delta_map, encode_ivm_attach_fragment,
     encode_ivm_detach_fragment, encode_ivm_tick_fragment, encode_tick_result, view_error_kind_name,

@@ -534,6 +534,40 @@ impl SharedCoordinator {
         guard.save_ivm_snapshot(job_id, snapshot)
     }
 
+    /// Append one entry to a job's IVM write-ahead log. A no-op without a
+    /// metadata store, like [`save_ivm_snapshot`](Self::save_ivm_snapshot).
+    pub async fn append_ivm_log(
+        &self,
+        job_id: &str,
+        seq: u64,
+        entry: Vec<u8>,
+    ) -> SchedulerResult<()> {
+        let store = { self.inner.read().await.store.clone() };
+        let Some(store) = store else {
+            return Ok(());
+        };
+        let mut guard = store.inner();
+        guard.append_ivm_log(job_id, seq, entry)
+    }
+
+    /// A job's IVM log entries above `after`, in order.
+    pub async fn load_ivm_log(&self, job_id: &str, after: u64) -> Vec<(u64, Vec<u8>)> {
+        let Some(store) = ({ self.inner.read().await.store.clone() }) else {
+            return Vec::new();
+        };
+        store.inner().load_ivm_log(job_id, after)
+    }
+
+    /// Drop a job's IVM log entries up to and including `through`.
+    pub async fn truncate_ivm_log(&self, job_id: &str, through: u64) -> SchedulerResult<()> {
+        let store = { self.inner.read().await.store.clone() };
+        let Some(store) = store else {
+            return Ok(());
+        };
+        let mut guard = store.inner();
+        guard.truncate_ivm_log(job_id, through)
+    }
+
     /// Reject the call unless this coordinator is the active leader.
     ///
     /// IVM-AUD-DIST-E1: no IVM endpoint had any leader check, so a demoted

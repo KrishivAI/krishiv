@@ -467,7 +467,12 @@ def test_apply_cdc_insert_delete_and_update():
     iv.apply_cdc(before=pa.record_batch({"k": ["a"], "v": [10]}),
                  after=pa.record_batch({"k": ["a"], "v": [70]}))
     assert _totals(iv) == {"a": 70}
+    # The feed hands over each of the three events' deltas, in order — the
+    # last being the update as one atomic retraction-plus-insertion.
+    assert _weights(iv.next_change()) == {("a", 10): 1, ("b", 5): 1}
+    assert _weights(iv.next_change()) == {("b", 5): -1}
     assert _weights(iv.next_change()) == {("a", 10): -1, ("a", 70): 1}
+    assert iv.next_change() is None
 
 
 def test_apply_cdc_without_a_row_image_raises():
