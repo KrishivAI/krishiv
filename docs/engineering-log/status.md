@@ -19,6 +19,32 @@ deltas (`KRISHIV_IVM_OUTPUT_RETAIN_TICKS` / `_BYTES`); `view_output_since`,
 delta after a cursor, embedded or distributed, and say so when the reader is
 behind the bound.
 
+**Binary feed wire + in-flight budget** (DIST-G1). Feed routes take the delta
+as an Arrow IPC body as well as JSON; each body reserves its size against
+`KRISHIV_IVM_MAX_INFLIGHT_FEED_BYTES` (1 GiB) before it is read. The Rust
+client sends binary and falls back to JSON against an older coordinator.
+
+**Executors** (DIST-A2, DIST-A1). A resident job's fragments are pinned to the
+executor holding its flow (`JobSpec::pinned_executor`). A key-partitioned job
+— the single-column `GROUP BY` case, which used to compute entirely on the
+coordinator — now runs one resident flow per shard, spread across executors,
+with per-shard central fallback. Job ids may not contain `#`.
+
+**Single-node** (API-A2, INT-F13). A `SingleNode` session's `ivm` job is
+hosted by the daemon, not the client process. A submitted incremental job
+checkpoints view state + source offsets and resumes on the next run
+(at-least-once to the sink).
+
+**Source order** (API-E5). The pipeline driver and the incremental engine feed
+one batch per source in turn.
+
+**SQL pipelines.** `DROP SINK` / `DROP SOURCE` / `DROP … VIEW` end the
+`sql::<sink>` jobs built from the dropped declaration; they used to outlive
+it. Not done: a view created through the DataFrame/IVM API is still not
+readable from SQL by name (use `Session::view`), and a `MATERIALIZED VIEW`
+over ordinary tables is still recomputed on read — tables produce no change
+feed for the incremental engine to consume.
+
 ## 2026-09-30 — Spark parity gaps closed (branch `spark-parity-gaps`)
 
 Both parity ledgers' itemized shortfalls, worked through.

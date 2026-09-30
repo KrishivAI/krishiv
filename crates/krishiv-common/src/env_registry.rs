@@ -1206,6 +1206,12 @@ pub static FLAGS: &[FlagSpec] = &[
         "Per-IVM-job cap on queued input bytes across all sources. A /feed that would push the backlog past it is refused with HTTP 429 instead of growing an unbounded in-memory queue (audit INT-F11). 0 restores the old unbounded behaviour; a value that does not parse falls back to the default.",
     ),
     rt(
+        "KRISHIV_IVM_MAX_INFLIGHT_FEED_BYTES",
+        FlagKind::UInt,
+        "1073741824",
+        "Bytes of IVM feed request bodies a coordinator holds in memory at once, across all jobs. A feed reserves its Content-Length against this budget before its body is read, so concurrent feeds queue instead of adding up (audit DIST-G1). A single body larger than the budget is admitted alone. 0 or an unparseable value falls back to the default. Read once per process.",
+    ),
+    rt(
         "KRISHIV_IVM_OUTPUT_RETAIN_TICKS",
         FlagKind::UInt,
         "256",

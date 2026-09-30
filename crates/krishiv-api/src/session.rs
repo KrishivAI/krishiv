@@ -2720,14 +2720,79 @@ impl Session {
             Some(PipelineStatement::RefreshPipeline { sink, full }) => {
                 if full {
                     // Full refresh: reset the persisted job before re-running.
-                    self.reset_ivm_job(&format!("sql::{sink}"));
+                    self.reset_ivm_job_async(&format!("sql::{sink}")).await;
                 }
                 return self.run_sql_pipeline(&sink).await;
             }
             _ => {}
         }
 
-        self.sql_plain(&query).await
+        // Worked out before the statement runs: once a view is dropped, the
+        // sinks that read it can no longer be traced to it.
+        let ended_jobs = self.ivm_jobs_ended_by(&query, pipeline.as_ref())?;
+        let result = self.sql_plain(&query).await?;
+        for job in ended_jobs {
+            self.reset_ivm_job_async(&job).await;
+        }
+        Ok(result)
+    }
+
+    /// The pipeline jobs a `DROP` statement ends.
+    ///
+    /// A SQL pipeline is declared in the SQL registries (`CREATE SOURCE` /
+    /// `INCREMENTAL VIEW` / `SINK`) and runs as the IVM job `sql::<sink>`.
+    /// The two were only joined in one direction: `START PIPELINE` built the
+    /// job from the declarations, and nothing ended the job when a declaration
+    /// went away. A dropped pipeline kept its job — and every row it had
+    /// absorbed — for the life of the session (or, on a coordinator, until
+    /// someone deleted it by hand), and redeclaring the sink resumed from that
+    /// state. Dropping a declaration now drops the jobs built from it:
+    ///
+    /// * `DROP SINK s` — `sql::s`;
+    /// * `DROP … VIEW v` — every sink whose view is, or reads, `v`;
+    /// * `DROP SOURCE` — every sink, since each pipeline is fed every source.
+    fn ivm_jobs_ended_by(
+        &self,
+        query: &str,
+        pipeline: Option<&krishiv_sql::pipeline_ddl::PipelineStatement>,
+    ) -> Result<Vec<String>> {
+        use krishiv_sql::incremental_view::{
+            IncrementalViewStatement, parse_incremental_view_statement,
+        };
+        use krishiv_sql::pipeline_ddl::PipelineStatement;
+        let pipe_reg = self.sql_engine.pipeline_registry();
+        let job_of = |sink: &String| format!("sql::{sink}");
+        match pipeline {
+            Some(PipelineStatement::DropSink { name }) => return Ok(vec![job_of(name)]),
+            Some(PipelineStatement::DropSource { .. }) => {
+                let sinks = pipe_reg.sink_names().map_err(KrishivError::from)?;
+                return Ok(sinks.iter().map(job_of).collect());
+            }
+            Some(_) => return Ok(Vec::new()),
+            None => {}
+        }
+        // Not a view statement this engine recognises: the statement itself
+        // reports whatever is wrong with it.
+        let Ok(Some(IncrementalViewStatement::Drop { name })) =
+            parse_incremental_view_statement(query)
+        else {
+            return Ok(Vec::new());
+        };
+        let view_reg = self.sql_engine.incremental_view_registry();
+        let mut ended = Vec::new();
+        for sink in pipe_reg.sink_names().map_err(KrishivError::from)? {
+            let Some(view) = pipe_reg.view_for_sink(&sink).map_err(KrishivError::from)? else {
+                continue;
+            };
+            let mut closure = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            collect_pipeline_view_deps(&view, view_reg, &mut closure, &mut seen)
+                .map_err(KrishivError::from)?;
+            if closure.contains(&name) {
+                ended.push(job_of(&sink));
+            }
+        }
+        Ok(ended)
     }
 
     /// Run a SQL statement without the `START PIPELINE` interception. Used
@@ -3378,22 +3443,17 @@ impl Session {
     /// under a name a partitioned job already holds, and vice versa. That is
     /// refused rather than silently reinterpreted (IVM-AUD-INT-F16).
     ///
-    /// # `SingleNode` gets the embedded job, not the daemon's
+    /// # Where the job lives
     ///
-    /// IVM-AUD-API-A2 / INT-F14. A `SingleNode` session has a coordinator and
-    /// routes [`submit`](Self::submit) through it with on-disk checkpoints, but
-    /// IVM is not routed there: the arm below treats `SingleNode` exactly like
-    /// `Embedded`, so the job lives in this process's registry, the local
-    /// daemon cannot see or list it, and nothing about it survives the process.
-    /// Same session, same mode: `submit` is daemon-backed and `ivm` is not.
+    /// An `Embedded` session hosts the job in this process: nothing else can
+    /// see it and it ends with the process. A `SingleNode` or `Distributed`
+    /// session hosts it on the coordinator — it is listed and served by
+    /// `/api/v1/ivm/*`, each accepted feed is logged before it is
+    /// acknowledged, and the job resumes after a coordinator restart, provided
+    /// the coordinator has a metadata store (every response says whether it
+    /// does, as `durable`). `SingleNode` used to be hosted in-process like
+    /// `Embedded` (IVM-AUD-API-A2 / INT-F14).
     ///
-    /// Two further consequences worth knowing before you rely on it: the
-    /// coordinator's `/api/v1/ivm/*` surface (`/stats`, `/snap`, `DELETE`) does
-    /// not reach this job, and neither does `krishiv ivm run --mode single-node`
-    /// as a way to attach to it. Whether SingleNode IVM *should* route to the
-    /// daemon is an open decision, recorded in
-    /// `docs/engineering-log/ivm-audit-register.md`; until it is taken, this doc
-    /// is the whole of the contract.
     /// Auto-partitions: if the job's first view is key-shardable it is spread
     /// across shards. Fast for a single view, and **cannot host a view-DAG** —
     /// a partitioned flow never cascades a base view's output into a derived
@@ -3627,11 +3687,34 @@ impl Session {
         crate::pipeline::PipelineBuilder::new(self.clone(), name)
     }
 
-    /// Drop a persisted embedded IVM job by name so the next `ivm`/pipeline run
-    /// starts from fresh, empty state (the "full refresh" primitive). Returns
-    /// `true` if a job existed.
+    /// Drop an IVM job by name so the next `ivm`/pipeline run starts from
+    /// fresh, empty state (the "full refresh" primitive). Returns `true` if a
+    /// job existed.
+    ///
+    /// The job is dropped where it lives: in this process for an `Embedded`
+    /// session, on the coordinator otherwise. A coordinator that cannot be
+    /// reached is logged and reported as `false`.
     pub fn reset_ivm_job(&self, name: &str) -> bool {
-        self.ivm_registry.delete(name)
+        block_on(self.reset_ivm_job_async(name))
+    }
+
+    /// [`reset_ivm_job`](Self::reset_ivm_job), for callers already in async
+    /// code.
+    pub async fn reset_ivm_job_async(&self, name: &str) -> bool {
+        let local = self.ivm_registry.delete(name);
+        let (false, Some(url)) = (
+            matches!(self.mode, ExecutionMode::Embedded),
+            self.ivm_http_url(),
+        ) else {
+            return local;
+        };
+        match krishiv_runtime::execute_coordinator_ivm_delete_job(url, name).await {
+            Ok(remote) => local || remote,
+            Err(error) => {
+                tracing::warn!(job = name, %error, "could not drop the coordinator's IVM job");
+                local
+            }
+        }
     }
 
     /// Execute a SQL query and feed its result as insertions into an IVM job,

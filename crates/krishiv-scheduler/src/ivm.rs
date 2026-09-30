@@ -613,8 +613,10 @@ fn default_ivm_shards() -> usize {
 pub struct IvmDispatchRecord {
     /// Flow tick this decision applied to.
     pub tick: u64,
-    /// "resident" | "central-fallback" | "central-no-executors" |
-    /// "central-partitioned".
+    /// "resident" | "central-fallback" | "central-no-executors" for a
+    /// single-flow job; "resident-partitioned" |
+    /// "resident-partitioned-with-central-fallback" | "central-partitioned"
+    /// (no executors) for a key-partitioned one.
     pub mode: String,
     /// Human-readable reason (error text for fallbacks; empty for resident).
     pub reason: String,
@@ -669,6 +671,26 @@ pub struct IvmDispatchState {
     /// price of that guess is a failed tick, a detach, and a full
     /// `checkpoint_full` re-attach — per tick, for the length of a rollout.
     pub wire: krishiv_ivm::WireCapabilities,
+    /// The executor holding this job's resident flow, once attached.
+    ///
+    /// IVM-AUD-DIST-A2: fragments used to be submitted with no placement
+    /// constraint while the flow lived on whichever executor the attach had
+    /// landed on, so with two or more executors every tick was a coin flip
+    /// between that executor and one with no such flow. Attach, tick and
+    /// detach are now pinned to this executor.
+    pub executor: Option<krishiv_proto::ExecutorId>,
+}
+
+/// `<job>#s` — the prefix of the ids a partitioned job's shards are attached
+/// to executors under. Job creation refuses an id containing `#`, so no other
+/// job's id or shard id starts with it.
+fn shard_dispatch_prefix(job_id: &str) -> String {
+    format!("{job_id}#s")
+}
+
+/// The id shard `shard` of `job_id` is attached to an executor under.
+pub(crate) fn shard_dispatch_id(job_id: &str, shard: usize) -> String {
+    format!("{}{shard}", shard_dispatch_prefix(job_id))
 }
 
 /// Registry of IVM jobs hosted on this coordinator process.
@@ -983,6 +1005,22 @@ impl IvmJobRegistry {
         f(map.entry(job_id.to_string()).or_default());
     }
 
+    /// The dispatch state of `job_id` and of each of its shards, keyed by the
+    /// id the resident flow is known to its executor by.
+    pub fn resident_dispatches(&self, job_id: &str) -> Vec<(String, IvmDispatchState)> {
+        let shard_prefix = shard_dispatch_prefix(job_id);
+        self.dispatch
+            .lock()
+            .map(|dispatch| {
+                dispatch
+                    .iter()
+                    .filter(|(id, _)| *id == job_id || id.starts_with(&shard_prefix))
+                    .map(|(id, state)| (id.clone(), state.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Return the per-job async step lock (creating it if absent).
     ///
     /// The lock serializes concurrent `step`/dispatch calls for one job. It is
@@ -1102,8 +1140,12 @@ impl IvmJobRegistry {
         let _ = self.pinned_single.lock().map(|mut p| p.remove(job_id));
         let _ = self.delta_checkpoints.lock().map(|mut d| d.remove(job_id));
         let _ = self.wal.lock().map(|mut w| w.remove(job_id));
-        // Drop dispatch bookkeeping (a recreated job starts unattached).
-        let _ = self.dispatch.lock().map(|mut d| d.remove(job_id));
+        // Drop dispatch bookkeeping (a recreated job starts unattached) — the
+        // job's own and, for a partitioned job, each shard's.
+        let _ = self.dispatch.lock().map(|mut d| {
+            let shard_prefix = shard_dispatch_prefix(job_id);
+            d.retain(|id, _| id != job_id && !id.starts_with(&shard_prefix));
+        });
         // Stop this job's vector-view maintenance tasks (DIST-H3: they used to
         // outlive the job forever, holding a flow that nothing else referenced).
         // Dropping a `VectorViewHandle` aborts its task.

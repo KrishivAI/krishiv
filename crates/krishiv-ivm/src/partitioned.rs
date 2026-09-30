@@ -282,7 +282,25 @@ impl PartitionedIncrementalFlow {
     pub async fn step_datafusion(&self) -> IvmResult<StepSummary> {
         let results =
             futures::future::join_all(self.shards.iter().map(|s| s.step_datafusion())).await;
+        Self::merge_shard_steps(results)
+    }
 
+    /// The shard flows, in shard order.
+    ///
+    /// For a caller that steps the shards itself instead of through
+    /// [`step_datafusion`](Self::step_datafusion) — the coordinator, which
+    /// runs each shard on an executor — and then hands the per-shard results
+    /// to [`merge_shard_steps`](Self::merge_shard_steps).
+    pub fn shard_flows(&self) -> &[IncrementalFlow] {
+        &self.shards
+    }
+
+    /// Fold one tick's per-shard results, in shard order, into the job's.
+    ///
+    /// Every shard has run to completion by the time this is called; a failed
+    /// shard has already returned its input to pending.
+    pub fn merge_shard_steps(results: Vec<IvmResult<StepSummary>>) -> IvmResult<StepSummary> {
+        let shard_count = results.len();
         let mut merged = StepSummary::default();
         let mut failures: Vec<String> = Vec::new();
         for (shard_idx, result) in results.into_iter().enumerate() {
@@ -316,7 +334,7 @@ impl PartitionedIncrementalFlow {
                 "{} of {} shards failed this tick ({}); their input deltas were \
                  returned to pending and will be reprocessed on the next step",
                 failures.len(),
-                self.shards.len(),
+                shard_count,
                 failures.join("; ")
             )));
         }

@@ -47,16 +47,11 @@ impl IncrementalDataFrame {
     /// it `None` produce DataFrames with no SQL, and this call needs a body —
     /// so it exists for direct callers of this function (its own tests).
     ///
-    /// # `SingleNode` is handled as `Embedded`
+    /// # Where the view lives
     ///
-    /// IVM-AUD-API-A2 / INT-F14: the match arm below is
-    /// `Embedded | SingleNode`, so a single-node session's incremental view
-    /// runs in the client process with no daemon visibility, no durable state
-    /// and no restart-resume — while the same session's
-    /// [`Session::submit`](crate::Session::submit) routes a job to the local
-    /// daemon with on-disk checkpoints. That divergence is deliberate only in
-    /// the sense that nobody has decided otherwise; it is recorded as an open
-    /// decision in `docs/engineering-log/ivm-audit-register.md`.
+    /// In the client process for an `Embedded` session; on the coordinator for
+    /// `SingleNode` and `Distributed`, where it is durable and visible to the
+    /// daemon. See [`Session::ivm`](crate::Session::ivm).
     pub(crate) async fn from_view_sql(
         name: &str,
         body_sql: String,

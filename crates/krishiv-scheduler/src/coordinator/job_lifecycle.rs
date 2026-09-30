@@ -92,12 +92,19 @@ impl Coordinator {
         // circuit-broken executor is refused by the launch path, reset to
         // Pending, and re-placed identically — forever.
         let submit_now_ms = u64::try_from(krishiv_common::async_util::unix_now_ms()).unwrap_or(0);
-        let executors = self
+        let mut executors = self
             .exec
             .executors
             .schedulable_executor_placements_excluding(
                 &self.circuit_broken_executors(submit_now_ms),
             );
+        // A pinned job may only be placed on its executor — here as in the
+        // orchestration-tick path (`assign_pending_tasks_capped`). This is the
+        // path a freshly submitted job actually takes, so a pin honoured only
+        // there was not honoured at all.
+        if let Some(pin) = spec.pinned_executor() {
+            executors.retain(|placement| placement.executor_id == *pin);
+        }
         let job_id = spec.job_id().clone();
         let _job_name = spec.name().to_owned();
         let _namespace = spec

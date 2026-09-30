@@ -2390,6 +2390,35 @@ struct IvmFeedSourceBody {
     delta_ipc_b64: String,
 }
 
+/// Content type of a binary IVM feed body; must match the coordinator's.
+const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
+
+/// POST Arrow IPC bytes to an IVM feed route as the body itself — no JSON, no
+/// base64 (IVM-AUD-DIST-G1).
+///
+/// Returns `false` when the coordinator answers 415: it predates the binary
+/// body and the caller falls back to the JSON one. Any other non-success is an
+/// error.
+async fn post_ivm_feed_binary(url: &str, ipc: Vec<u8>, what: &str) -> RuntimeResult<bool> {
+    let client = coordinator_http_client()?;
+    let resp = apply_coordinator_bearer(client.post(url))
+        .header(reqwest::header::CONTENT_TYPE, ARROW_STREAM_CONTENT_TYPE)
+        .body(ipc)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("{what}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::UNSUPPORTED_MEDIA_TYPE {
+        return Ok(false);
+    }
+    if !resp.status().is_success() {
+        return Err(RuntimeError::transport(format!(
+            "{what} HTTP {}",
+            resp.status()
+        )));
+    }
+    Ok(true)
+}
+
 /// Feed a `DeltaBatch` to a named source on a remote IVM job.
 pub async fn execute_coordinator_ivm_feed_source(
     coordinator_http: &str,
@@ -2401,17 +2430,25 @@ pub async fn execute_coordinator_ivm_feed_source(
     let client = coordinator_http_client()?;
     let ipc = krishiv_ivm::serialize_delta_batch(delta)
         .map_err(|e| RuntimeError::transport(format!("delta serialize: {e}")))?;
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
-    let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
-    let resp = apply_coordinator_bearer(client.post(format!(
+    let url = format!(
         "{base}/api/v1/ivm/jobs/{}/sources/{}/feed",
         seg(job_id),
         seg(source_name)
-    )))
-    .json(&body)
-    .send()
-    .await
-    .map_err(|e| RuntimeError::transport(format!("ivm feed source: {e}")))?;
+    );
+    if post_ivm_feed_binary(&url, ipc, "ivm feed source").await? {
+        return Ok(());
+    }
+    // An older coordinator: the JSON body it understands. Serialized again
+    // rather than kept, so the common path never holds a second copy.
+    let ipc = krishiv_ivm::serialize_delta_batch(delta)
+        .map_err(|e| RuntimeError::transport(format!("delta serialize: {e}")))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
+    let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
+    let resp = apply_coordinator_bearer(client.post(url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm feed source: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm feed source HTTP {}",
@@ -2847,20 +2884,26 @@ pub async fn execute_coordinator_ivm_stream_bridge(
             .finish()
             .map_err(|e| RuntimeError::transport(format!("stream-bridge IPC finish: {e}")))?;
     }
+    let url = format!(
+        "{base}/api/v1/ivm/jobs/{}/sources/{}/stream-bridge",
+        seg(job_id),
+        seg(source_name)
+    );
+    // Binary first; a copy is kept only because a 415 needs it for the JSON
+    // body an older coordinator understands.
+    if post_ivm_feed_binary(&url, buf.clone(), "ivm stream-bridge").await? {
+        return Ok(());
+    }
     let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf);
 
     let body = IvmStreamBridgeBody {
         snapshot_ipc_b64: b64,
     };
-    let resp = apply_coordinator_bearer(client.post(format!(
-        "{base}/api/v1/ivm/jobs/{}/sources/{}/stream-bridge",
-        seg(job_id),
-        seg(source_name)
-    )))
-    .json(&body)
-    .send()
-    .await
-    .map_err(|e| RuntimeError::transport(format!("ivm stream-bridge: {e}")))?;
+    let resp = apply_coordinator_bearer(client.post(url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm stream-bridge: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm stream-bridge HTTP {}",
@@ -2884,17 +2927,23 @@ pub async fn execute_coordinator_ivm_feed_stream_delta(
     let client = coordinator_http_client()?;
     let ipc = krishiv_ivm::serialize_delta_batch(delta)
         .map_err(|e| RuntimeError::transport(format!("delta serialize: {e}")))?;
-    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
-    let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
-    let resp = apply_coordinator_bearer(client.post(format!(
+    let url = format!(
         "{base}/api/v1/ivm/jobs/{}/sources/{}/stream-delta",
         seg(job_id),
         seg(source_name)
-    )))
-    .json(&body)
-    .send()
-    .await
-    .map_err(|e| RuntimeError::transport(format!("ivm stream-delta: {e}")))?;
+    );
+    if post_ivm_feed_binary(&url, ipc, "ivm stream-delta").await? {
+        return Ok(());
+    }
+    let ipc = krishiv_ivm::serialize_delta_batch(delta)
+        .map_err(|e| RuntimeError::transport(format!("delta serialize: {e}")))?;
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &ipc);
+    let body = IvmFeedSourceBody { delta_ipc_b64: b64 };
+    let resp = apply_coordinator_bearer(client.post(url))
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RuntimeError::transport(format!("ivm stream-delta: {e}")))?;
     if !resp.status().is_success() {
         return Err(RuntimeError::transport(format!(
             "ivm stream-delta HTTP {}",

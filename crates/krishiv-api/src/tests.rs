@@ -2346,6 +2346,50 @@ fn sql_pipeline_create_source_view_sink_start() {
     assert_eq!(total, 150);
 }
 
+/// Dropping a pipeline's declaration ends the IVM job built from it. The job
+/// used to outlive the declaration, keeping everything it had absorbed.
+#[test]
+fn dropping_a_sql_pipeline_declaration_drops_its_ivm_job() {
+    fn started() -> Session {
+        let session = Session::builder().build().unwrap();
+        session
+            .register_record_batches("orders_raw", vec![amounts(&[100, 50])])
+            .unwrap();
+        for statement in [
+            "CREATE SOURCE orders AS SELECT * FROM orders_raw",
+            "CREATE INCREMENTAL VIEW revenue AS SELECT SUM(amount) AS total FROM orders",
+            "CREATE INCREMENTAL VIEW doubled AS SELECT total * 2 AS twice FROM revenue",
+            "CREATE INCREMENTAL VIEW other AS SELECT COUNT(*) AS n FROM orders",
+            "CREATE SINK out FROM doubled",
+            "START PIPELINE out",
+        ] {
+            session.sql(statement).unwrap();
+        }
+        session
+    }
+
+    // Control: the pipeline's job is there to be dropped.
+    assert!(started().reset_ivm_job("sql::out"));
+
+    for (statement, ends_the_job) in [
+        ("DROP SINK out", true),
+        ("DROP SOURCE orders", true),
+        // The sink's own view, and a view that one reads.
+        ("DROP INCREMENTAL VIEW doubled", true),
+        ("DROP INCREMENTAL VIEW revenue", true),
+        // A view the pipeline does not read.
+        ("DROP INCREMENTAL VIEW other", false),
+    ] {
+        let session = started();
+        session.sql(statement).unwrap();
+        assert_eq!(
+            !session.reset_ivm_job("sql::out"),
+            ends_the_job,
+            "{statement}"
+        );
+    }
+}
+
 // ── Connector-backed pipeline + streaming-mode inference ────────────────────
 
 /// A bounded in-memory connector source (drains a queue of batches).
@@ -3137,4 +3181,76 @@ fn coalesce_is_shrink_only() {
     );
     // The result still runs.
     assert_eq!(narrow.collect().unwrap().row_count(), 1);
+}
+
+/// IVM-AUD-API-E5: a multi-source pipeline feeds its sources a round at a
+/// time. Drained one after the other, a join sees the whole of the first
+/// source with nothing to match it and emits nothing until the second one
+/// starts — so its first output arrives only after every batch of the first.
+#[tokio::test]
+async fn a_multi_source_pipeline_interleaves_its_sources() {
+    use crate::pipeline::CdcChange;
+    use crate::{IvmJob, RunPolicy};
+    use std::sync::{Arc as StdArc, Mutex};
+
+    fn row(key_name: &str, value_name: &str, key: i64, value: i64) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new(key_name, DataType::Int64, false),
+                Field::new(value_name, DataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![key])),
+                Arc::new(Int64Array::from(vec![value])),
+            ],
+        )
+        .unwrap()
+    }
+
+    let sink: StdArc<Mutex<Vec<RecordBatch>>> = StdArc::new(Mutex::new(Vec::new()));
+    let session = Session::builder().build().unwrap();
+    session
+        .pipeline("interleaved")
+        .source_cdc(
+            "orders",
+            (1..=3)
+                .map(|k| CdcChange::insert(row("order_id", "amount", k, k * 10)))
+                .collect(),
+        )
+        .source_cdc(
+            "payments",
+            (1..=3)
+                .map(|k| CdcChange::insert(row("pay_order_id", "paid", k, k)))
+                .collect(),
+        )
+        .view(
+            "settled",
+            "SELECT o.order_id, o.amount, p.paid FROM orders o \
+             JOIN payments p ON o.order_id = p.pay_order_id",
+            true,
+        )
+        .sink_memory("settled", sink.clone())
+        .run(RunPolicy::OnChange)
+        .await
+        .unwrap();
+
+    // The result is the same either way…
+    let rows: usize = sink.lock().unwrap().iter().map(RecordBatch::num_rows).sum();
+    assert_eq!(rows, 3);
+
+    // …what differs is when the join first had something to say. One step per
+    // fed batch: interleaved, the first pair is complete after two of them;
+    // sequentially it took all three orders plus the first payment.
+    let job: IvmJob = session.ivm("interleaved").await.unwrap();
+    let since = job.view_output_since("settled", 0).await.unwrap();
+    let ticks: Vec<u64> = since.deltas.iter().map(|(tick, _)| *tick).collect();
+    assert_eq!(ticks.len(), 3, "one joined row per round: {ticks:?}");
+    assert!(
+        ticks[0] <= 2,
+        "the first joined row must appear once the first pair is fed, got ticks {ticks:?}"
+    );
+    assert!(
+        ticks[2] - ticks[0] >= 4,
+        "the joined rows are spread across the rounds, got ticks {ticks:?}"
+    );
 }

@@ -1,6 +1,6 @@
 //! Job specs.
 
-use crate::ids::{JobId, StageId};
+use crate::ids::{ExecutorId, JobId, StageId};
 use crate::io::{ResourceProfile, TaskSpec};
 use crate::lifecycle::JobKind;
 
@@ -27,6 +27,15 @@ pub struct JobSpec {
     streaming_profile: Option<StreamingExecutionProfile>,
     /// Output buffer policy for streaming emission.
     output_buffer: Option<OutputBufferPolicy>,
+    /// The one executor this job's tasks may run on, if it is pinned.
+    ///
+    /// For work whose state lives on a particular executor — a resident IVM
+    /// flow — and is meaningless anywhere else. A pin is a constraint, not a
+    /// preference: if that executor cannot take work the tasks wait rather
+    /// than run somewhere they would fail. It is scheduling input for the
+    /// coordinator that submitted the job and is not part of the job's
+    /// persisted form.
+    pinned_executor: Option<ExecutorId>,
 }
 
 impl JobSpec {
@@ -45,7 +54,20 @@ impl JobSpec {
             memory_limit_bytes: None,
             streaming_profile: None,
             output_buffer: None,
+            pinned_executor: None,
         }
+    }
+
+    /// Restrict this job's tasks to one executor. See `pinned_executor`.
+    #[must_use]
+    pub fn with_pinned_executor(mut self, executor_id: ExecutorId) -> Self {
+        self.pinned_executor = Some(executor_id);
+        self
+    }
+
+    /// The executor this job is pinned to, if any.
+    pub fn pinned_executor(&self) -> Option<&ExecutorId> {
+        self.pinned_executor.as_ref()
     }
 
     /// Attach a stage.

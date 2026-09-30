@@ -57,11 +57,17 @@ impl IvmJob {
         partitioned: bool,
     ) -> Result<Self> {
         match mode {
-            crate::ExecutionMode::Distributed => {
+            // A single-node session talks to a daemon, and the daemon is where
+            // its job lives: listed by `/api/v1/ivm/jobs`, logged per feed and
+            // resumed after a restart. It used to be hosted in the client
+            // process like an embedded job — invisible to the daemon and gone
+            // with the process — while `submit` in the same session was
+            // durable (IVM-AUD-API-A2 / INT-F14).
+            crate::ExecutionMode::Distributed | crate::ExecutionMode::SingleNode => {
                 let url = coordinator_http.ok_or_else(|| {
                     KrishivError::unsupported(
-                        "distributed IVM requires a coordinator URL; connect the session with \
-                         with_coordinator()/http_url",
+                        "IVM outside embedded mode is hosted by the coordinator and requires \
+                         its URL; connect the session with with_coordinator()/http_url",
                     )
                 })?;
                 if partitioned {
@@ -70,7 +76,7 @@ impl IvmJob {
                     Self::remote_unpartitioned(url, name).await
                 }
             }
-            crate::ExecutionMode::Embedded | crate::ExecutionMode::SingleNode => {
+            crate::ExecutionMode::Embedded => {
                 let registry = registry.ok_or_else(|| {
                     KrishivError::unsupported("embedded IVM requires the session's job registry")
                 })?;
@@ -768,6 +774,39 @@ mod tests {
         assert!(
             whole.view_health.is_complete(),
             "an untruncated report is complete"
+        );
+    }
+
+    /// IVM-AUD-API-A2 / INT-F14: a single-node job is the daemon's, not this
+    /// process's. It used to take the embedded arm, so a registry was enough
+    /// and the coordinator was never contacted.
+    #[tokio::test]
+    async fn a_single_node_job_is_hosted_by_the_coordinator_not_this_process() {
+        let registry: SharedIvmJobRegistry = Arc::new(IvmJobRegistry::with_default_shards(1));
+        let no_url = IvmJob::for_mode(
+            crate::ExecutionMode::SingleNode,
+            None,
+            Some(&registry),
+            "j",
+            true,
+        )
+        .await;
+        assert!(no_url.is_err(), "a registry alone must not be enough");
+
+        // Nothing listens here: the job is asked of the coordinator, fails,
+        // and is not quietly created in-process instead.
+        let unreachable = IvmJob::for_mode(
+            crate::ExecutionMode::SingleNode,
+            Some("http://127.0.0.1:1"),
+            Some(&registry),
+            "j",
+            true,
+        )
+        .await;
+        assert!(unreachable.is_err());
+        assert!(
+            !registry.delete("j"),
+            "no in-process job may have been created"
         );
     }
 

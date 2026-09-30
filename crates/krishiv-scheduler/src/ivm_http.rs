@@ -559,10 +559,10 @@ pub(crate) async fn create_or_rehydrate_ivm_job(
     if delta_checkpoints {
         registry.enable_delta_checkpoints(job_id).map_err(ivm_err)?;
     }
-    // Creation-time only, and only for a Single flow: a Partitioned job routes
-    // to `central-partitioned` and never dispatches, so honouring the flag
-    // there would silently compare two different ROUTES as if they were two
-    // modes — the error that produced the retracted 28.5x claim (register §68).
+    // Creation-time only, and only for a Single flow: a Partitioned job takes
+    // a different route (one flow per shard), so honouring the flag there
+    // would silently compare two different ROUTES as if they were two modes —
+    // the error that produced the retracted 28.5x claim (register §68).
     if force_diff_based && freshly_created {
         match registry.get(job_id) {
             Some(crate::ivm::IvmJob::Single(flow)) => {
@@ -589,6 +589,12 @@ pub async fn api_ivm_create_job(
     let job_id = body
         .job_id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // `<job>#s<n>` names shard `n` of `<job>` on an executor, so a job id may
+    // not contain `#`: job `a#s1` would otherwise share a resident flow with
+    // shard 1 of job `a`.
+    if job_id.contains('#') {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     create_or_rehydrate_ivm_job(
         &registry,
         &coordinator,
@@ -699,13 +705,21 @@ pub async fn api_ivm_delete_job(
     // executor round trip. If it fails, the orphaned flow is bounded by the
     // executor process lifetime and a re-created same-id job re-attaches
     // (replacing the entry) anyway.
-    if registry.dispatch_state(&job_id).attached {
+    // One per resident flow: the job's own, or each shard's if it is
+    // partitioned. Each goes to the executor that holds that flow. It used to
+    // go to whichever executor the scheduler picked, which freed the flow only
+    // by luck and leaked it otherwise (IVM-AUD-DIST-A2).
+    for (resident_id, dispatch) in registry.resident_dispatches(&job_id) {
+        let (true, Some(executor)) = (dispatch.attached, dispatch.executor) else {
+            continue;
+        };
         let coordinator = coordinator.clone();
-        let detach = krishiv_ivm::encode_ivm_detach_fragment(&job_id);
-        let job = job_id.clone();
+        let detach = krishiv_ivm::encode_ivm_detach_fragment(&resident_id);
         tokio::spawn(async move {
-            if let Err(e) = run_ivm_fragment_job(&coordinator, detach, "ivm-detach").await {
-                tracing::warn!(job_id = %job, error = %e, "resident IVM detach failed");
+            if let Err(e) =
+                run_ivm_fragment_job(&coordinator, detach, "ivm-detach", &executor).await
+            {
+                tracing::warn!(job_id = %resident_id, error = %e, "resident IVM detach failed");
             }
         });
     }
@@ -917,14 +931,35 @@ pub async fn api_ivm_feed_source(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedSourceRequest>,
 ) -> Result<Json<FeedSourceResponse>, StatusCode> {
-    ensure_ivm_leader(&coordinator).await?;
-    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
-    ensure_pending_headroom(&registry, &flow, &job_id)?;
     let ipc_bytes = base64::Engine::decode(
         &base64::engine::general_purpose::STANDARD,
         &body.delta_ipc_b64,
     )
     .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
+    feed_delta_bytes(
+        &registry,
+        &coordinator,
+        &job_id,
+        source_name,
+        ipc_bytes,
+        body.idempotency_key,
+    )
+    .await
+    .map(Json)
+}
+
+/// Feed a serialized `DeltaBatch`, however it arrived on the wire.
+async fn feed_delta_bytes(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    source_name: String,
+    ipc_bytes: Vec<u8>,
+    idempotency_key: Option<String>,
+) -> Result<FeedSourceResponse, StatusCode> {
+    ensure_ivm_leader(coordinator).await?;
+    let flow = ensure_ivm_job(registry, coordinator, job_id).await?;
+    ensure_pending_headroom(registry, &flow, job_id)?;
     // G7: drop zero-weight rows on ingress so downstream operators never see them.
     // Decoded before anything is logged, so a body that is not a delta is a
     // 400 and never reaches the log.
@@ -934,12 +969,240 @@ pub async fn api_ivm_feed_source(
         .map_err(ivm_err)?;
     let entry = WalEntry::Feed {
         source: source_name.clone(),
-        idempotency_key: body.idempotency_key.map(String::into_bytes),
+        idempotency_key: idempotency_key.map(String::into_bytes),
         delta_ipc: ipc_bytes,
     };
-    accept_feed(&registry, &coordinator, &job_id, entry, |job| {
+    accept_feed(registry, coordinator, job_id, entry, |job| {
         job.feed(&source_name, delta).map_err(|e| e.to_string())
     })
+    .await
+}
+
+/// Feed a full snapshot (an Arrow IPC stream), however it arrived on the wire.
+async fn feed_snapshot_bytes(
+    registry: &SharedIvmJobRegistry,
+    coordinator: &SharedCoordinator,
+    job_id: &str,
+    source_name: String,
+    ipc_bytes: Vec<u8>,
+    idempotency_key: Option<String>,
+) -> Result<FeedSourceResponse, StatusCode> {
+    ensure_ivm_leader(coordinator).await?;
+    let flow = ensure_ivm_job(registry, coordinator, job_id).await?;
+    ensure_pending_headroom(registry, &flow, job_id)?;
+    let batches = decode_snapshot_batches(&ipc_bytes).map_err(ivm_err)?;
+    let entry = WalEntry::Snapshot {
+        source: source_name.clone(),
+        idempotency_key: idempotency_key.map(String::into_bytes),
+        snapshot_ipc: ipc_bytes,
+    };
+    accept_feed(registry, coordinator, job_id, entry, |job| {
+        job.feed_snapshot(&source_name, &batches)
+            .map_err(|e| e.to_string())
+    })
+    .await
+}
+
+// ── The feed routes' wire: JSON, or a binary Arrow body ───────────────────────
+
+/// Content type of a binary feed body: the Arrow IPC bytes themselves.
+pub const ARROW_STREAM_CONTENT_TYPE: &str = "application/vnd.apache.arrow.stream";
+
+/// Query string of a feed route. Only read for a binary body, whose
+/// idempotency key has nowhere else to go; a JSON body carries its own.
+#[derive(Debug, Deserialize, Default)]
+pub struct FeedWireQuery {
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Feed bodies a coordinator will hold in memory at once, across all jobs.
+/// Override with `KRISHIV_IVM_MAX_INFLIGHT_FEED_BYTES`.
+const DEFAULT_IVM_MAX_INFLIGHT_FEED_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// One permit per KiB of feed body in flight.
+const INFLIGHT_PERMIT_BYTES: u64 = 1024;
+
+/// Pure policy for the in-flight budget, split out for testing: the number of
+/// permits for a byte budget, never zero, and never more than a semaphore
+/// holds.
+fn inflight_permits(budget_bytes: u64) -> u32 {
+    u32::try_from(budget_bytes.div_ceil(INFLIGHT_PERMIT_BYTES))
+        .unwrap_or(u32::MAX)
+        .clamp(1, tokio::sync::Semaphore::MAX_PERMITS as u32)
+}
+
+/// Permits a body of `content_length` bytes takes out of a budget of `total`
+/// permits. A body larger than the whole budget takes all of it — it runs
+/// alone rather than never.
+fn permits_for_body(content_length: u64, total: u32) -> u32 {
+    u32::try_from(content_length.div_ceil(INFLIGHT_PERMIT_BYTES))
+        .unwrap_or(u32::MAX)
+        .clamp(1, total)
+}
+
+fn inflight_feed_budget() -> &'static (tokio::sync::Semaphore, u32) {
+    static BUDGET: std::sync::OnceLock<(tokio::sync::Semaphore, u32)> = std::sync::OnceLock::new();
+    BUDGET.get_or_init(|| {
+        let bytes = crate::ivm::resolve_positive(
+            std::env::var("KRISHIV_IVM_MAX_INFLIGHT_FEED_BYTES")
+                .ok()
+                .as_deref(),
+            DEFAULT_IVM_MAX_INFLIGHT_FEED_BYTES,
+        );
+        let permits = inflight_permits(bytes);
+        (tokio::sync::Semaphore::new(permits as usize), permits)
+    })
+}
+
+/// A feed body, read only once there is room for it.
+///
+/// IVM-AUD-DIST-G1. Every feed route took `Json<T>`, which buffers the whole
+/// body, and the body carried the delta as base64 inside JSON — so one 384 MiB
+/// delta was resident as the raw body, the JSON string, the decoded bytes and
+/// the Arrow arrays at once, and K concurrent feeds multiplied that with no
+/// limit anywhere. Two changes:
+///
+/// - a body may be sent as `application/vnd.apache.arrow.stream` — the IPC
+///   bytes themselves, with no JSON and no base64 — which is what this
+///   repository's own client now sends;
+/// - before any body is read, its `Content-Length` is reserved against a
+///   process-wide budget, so concurrent feeds queue instead of adding up.
+struct FeedBody {
+    bytes: Vec<u8>,
+    binary: bool,
+    _reservation: tokio::sync::SemaphorePermit<'static>,
+}
+
+async fn read_feed_body(request: axum::extract::Request) -> Result<FeedBody, StatusCode> {
+    let headers = request.headers();
+    let binary = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case(ARROW_STREAM_CONTENT_TYPE))
+        });
+    let limit = crate::coordinator_daemon::PROTECTED_HTTP_BODY_LIMIT_BYTES;
+    // A body that does not declare its length is budgeted as the largest one
+    // the route accepts.
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(limit as u64);
+    if declared > limit as u64 {
+        return Err(StatusCode::PAYLOAD_TOO_LARGE);
+    }
+    let (budget, total) = inflight_feed_budget();
+    let reservation = budget
+        .acquire_many(permits_for_body(declared, *total))
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let bytes = axum::body::to_bytes(request.into_body(), limit)
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "reading an IVM feed body failed");
+            StatusCode::PAYLOAD_TOO_LARGE
+        })?;
+    Ok(FeedBody {
+        bytes: bytes.into(),
+        binary,
+        _reservation: reservation,
+    })
+}
+
+fn json_body<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, StatusCode> {
+    serde_json::from_slice(bytes).map_err(|e| ivm_err(format!("request body: {e}")))
+}
+
+fn decode_b64(encoded: &str) -> Result<Vec<u8>, StatusCode> {
+    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+        .map_err(|e| ivm_err(format!("base64 decode: {e}")))
+}
+
+/// `POST …/feed` as the router serves it: a binary Arrow body or the JSON one.
+pub async fn api_ivm_feed_source_wire(
+    State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
+    Path((job_id, source_name)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<FeedWireQuery>,
+    request: axum::extract::Request,
+) -> Result<Json<FeedSourceResponse>, StatusCode> {
+    let body = read_feed_body(request).await?;
+    let (ipc_bytes, key) = if body.binary {
+        (body.bytes, query.idempotency_key)
+    } else {
+        let parsed: FeedSourceRequest = json_body(&body.bytes)?;
+        (decode_b64(&parsed.delta_ipc_b64)?, parsed.idempotency_key)
+    };
+    feed_delta_bytes(
+        &registry,
+        &coordinator,
+        &job_id,
+        source_name,
+        ipc_bytes,
+        key,
+    )
+    .await
+    .map(Json)
+}
+
+/// `POST …/stream-delta` as the router serves it.
+pub async fn api_ivm_feed_stream_delta_wire(
+    State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
+    Path((job_id, source_name)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<FeedWireQuery>,
+    request: axum::extract::Request,
+) -> Result<Json<FeedStreamDeltaResponse>, StatusCode> {
+    let body = read_feed_body(request).await?;
+    let (ipc_bytes, key) = if body.binary {
+        (body.bytes, query.idempotency_key)
+    } else {
+        let parsed: FeedStreamDeltaRequest = json_body(&body.bytes)?;
+        (decode_b64(&parsed.delta_ipc_b64)?, parsed.idempotency_key)
+    };
+    feed_delta_bytes(
+        &registry,
+        &coordinator,
+        &job_id,
+        source_name,
+        ipc_bytes,
+        key,
+    )
+    .await
+    .map(Json)
+}
+
+/// `POST …/stream-bridge` as the router serves it.
+pub async fn api_ivm_stream_bridge_wire(
+    State(registry): State<SharedIvmJobRegistry>,
+    State(coordinator): State<SharedCoordinator>,
+    Path((job_id, source_name)): Path<(String, String)>,
+    axum::extract::Query(query): axum::extract::Query<FeedWireQuery>,
+    request: axum::extract::Request,
+) -> Result<Json<StreamBridgeResponse>, StatusCode> {
+    let body = read_feed_body(request).await?;
+    let (ipc_bytes, key) = if body.binary {
+        (body.bytes, query.idempotency_key)
+    } else {
+        let parsed: StreamBridgeRequest = json_body(&body.bytes)?;
+        (
+            decode_b64(&parsed.snapshot_ipc_b64)?,
+            parsed.idempotency_key,
+        )
+    };
+    feed_snapshot_bytes(
+        &registry,
+        &coordinator,
+        &job_id,
+        source_name,
+        ipc_bytes,
+        key,
+    )
     .await
     .map(Json)
 }
@@ -968,28 +1231,17 @@ pub async fn api_ivm_feed_stream_delta(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<FeedStreamDeltaRequest>,
 ) -> Result<Json<FeedStreamDeltaResponse>, StatusCode> {
-    ensure_ivm_leader(&coordinator).await?;
-    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
-    ensure_pending_headroom(&registry, &flow, &job_id)?;
-    let ipc_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &body.delta_ipc_b64,
+    // Pre-computed delta: the same thing as /feed; the distinct route is kept
+    // for coordinator API/wire compatibility with CDC-native producers.
+    let ipc_bytes = decode_b64(&body.delta_ipc_b64)?;
+    feed_delta_bytes(
+        &registry,
+        &coordinator,
+        &job_id,
+        source_name,
+        ipc_bytes,
+        body.idempotency_key,
     )
-    .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
-    let delta = deserialize_delta_batch(&ipc_bytes)
-        .map_err(ivm_err)?
-        .drop_zeros()
-        .map_err(ivm_err)?;
-    // Pre-computed delta: feed directly (same as /feed; the distinct route is
-    // kept for coordinator API/wire compatibility with CDC-native producers).
-    let entry = WalEntry::Feed {
-        source: source_name.clone(),
-        idempotency_key: body.idempotency_key.map(String::into_bytes),
-        delta_ipc: ipc_bytes,
-    };
-    accept_feed(&registry, &coordinator, &job_id, entry, |job| {
-        job.feed(&source_name, delta).map_err(|e| e.to_string())
-    })
     .await
     .map(Json)
 }
@@ -1232,7 +1484,7 @@ pub async fn api_ivm_step(
         let crate::ivm::IvmJob::Single(inner_flow) = &flow else {
             unreachable!("matched above")
         };
-        match submit_resident_ivm_step(&coordinator, &registry, inner_flow, &job_id).await {
+        match submit_resident_ivm_step(&coordinator, &registry, inner_flow, &job_id, 0).await {
             Ok((sum, tick_health)) => {
                 let health = health_for_resident(tick_health.as_ref());
                 (sum, health)
@@ -1263,6 +1515,9 @@ pub async fn api_ivm_step(
                 (sum, health)
             }
         }
+    } else if let (true, crate::ivm::IvmJob::Partitioned(partitioned)) = (executor_count > 0, &flow)
+    {
+        resident_partitioned_step(&coordinator, &registry, partitioned, &job_id).await?
     } else {
         let mode = if matches!(flow, crate::ivm::IvmJob::Partitioned(_)) {
             "central-partitioned"
@@ -1301,6 +1556,119 @@ pub async fn api_ivm_step(
         tick,
         view_health: health,
     }))
+}
+
+/// One tick of a key-partitioned job with its shards resident on executors.
+///
+/// IVM-AUD-DIST-A1: a job whose first view is a single-column `GROUP BY` is
+/// partitioned into shards, and a partitioned job used to be computed
+/// entirely on the coordinator — so the canonical incremental workload never
+/// used an executor at all. Each shard is a flow in its own right, so each is
+/// now attached to an executor exactly the way a single-flow job is, under its
+/// own id and fence, and the shards are spread across the executors that can
+/// take work. A shard whose dispatch fails is computed centrally for this
+/// tick and re-attaches on the next, as a single flow does.
+async fn resident_partitioned_step(
+    coordinator: &SharedCoordinator,
+    registry: &SharedIvmJobRegistry,
+    partitioned: &krishiv_ivm::PartitionedIncrementalFlow,
+    job_id: &str,
+) -> Result<(krishiv_ivm::StepSummary, ViewHealthJson), StatusCode> {
+    let timeout = std::time::Duration::from_secs(ivm_dispatch_timeout_secs());
+    let shards = partitioned.shard_flows();
+    let outcomes =
+        futures::future::join_all(shards.iter().enumerate().map(|(index, shard)| async move {
+            let shard_id = crate::ivm::shard_dispatch_id(job_id, index);
+            match submit_resident_ivm_step(coordinator, registry, shard, &shard_id, index).await {
+                Ok((summary, health)) => {
+                    let health = health.as_ref().map(ViewHealthJson::from_tick_health);
+                    (Ok(summary), health, None)
+                }
+                Err(dispatch_error) => {
+                    // The shard's pending input was re-fed before the error
+                    // came back, so a central step sees the same input.
+                    registry.update_dispatch(&shard_id, |d| d.attached = false);
+                    let stepped = match tokio::time::timeout(timeout, shard.step_datafusion()).await
+                    {
+                        Ok(result) => result,
+                        Err(_elapsed) => Err(krishiv_ivm::IvmError::execution(format!(
+                            "central step timed out after {}s",
+                            timeout.as_secs()
+                        ))),
+                    };
+                    let health = stepped.as_ref().ok().map(ViewHealthJson::reported);
+                    (
+                        stepped,
+                        health,
+                        Some(format!("shard {index}: {dispatch_error}")),
+                    )
+                }
+            }
+        }))
+        .await;
+
+    let mut summaries = Vec::with_capacity(outcomes.len());
+    let mut health = Some(ViewHealthJson {
+        reported: true,
+        unreported_reason: String::new(),
+        degraded_views: Vec::new(),
+        errored_views: Vec::new(),
+        degraded_omitted: 0,
+        errored_omitted: 0,
+    });
+    let mut fallbacks = Vec::new();
+    for (summary, shard_health, fallback) in outcomes {
+        summaries.push(summary);
+        fallbacks.extend(fallback);
+        health = match (health, shard_health) {
+            (Some(mut merged), Some(shard)) if shard.reported => {
+                for view in shard.degraded_views {
+                    if !merged.degraded_views.contains(&view) {
+                        merged.degraded_views.push(view);
+                    }
+                }
+                merged.errored_views.extend(shard.errored_views);
+                merged.degraded_omitted += shard.degraded_omitted;
+                merged.errored_omitted += shard.errored_omitted;
+                Some(merged)
+            }
+            // One shard with no report leaves the whole tick unreported: a
+            // partial list would read as "these are all the problems".
+            _ => None,
+        };
+    }
+    if !fallbacks.is_empty() {
+        tracing::warn!(
+            job_id,
+            fallbacks = %fallbacks.join("; "),
+            "resident dispatch failed for some shards; they were computed centrally \
+             this tick (recorded; they will re-attach)"
+        );
+    }
+    let summary =
+        krishiv_ivm::PartitionedIncrementalFlow::merge_shard_steps(summaries).map_err(|error| {
+            tracing::error!(job_id, %error, "partitioned IVM step failed");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
+    let tick = partitioned.tick().unwrap_or(0);
+    registry.update_dispatch(job_id, |d| {
+        d.last = Some(crate::ivm::IvmDispatchRecord {
+            tick,
+            mode: if fallbacks.is_empty() {
+                "resident-partitioned".to_owned()
+            } else {
+                "resident-partitioned-with-central-fallback".to_owned()
+            },
+            reason: fallbacks.join("; "),
+            at_unix_ms: krishiv_common::async_util::unix_now_ms(),
+        });
+    });
+    let health = health.unwrap_or_else(|| {
+        ViewHealthJson::unreported(
+            "a shard of this tick ran on a resident executor whose tick wire predates per-view health (pre-IVMD2)",
+        )
+    });
+    Ok((summary, health))
 }
 
 /// Default timeout for a dispatched IVM fragment before falling back to
@@ -1377,6 +1745,7 @@ async fn run_ivm_fragment_job(
     coordinator: &SharedCoordinator,
     fragment_body: String,
     label: &str,
+    executor: &krishiv_proto::ExecutorId,
 ) -> Result<Option<Vec<u8>>, String> {
     let fragment = krishiv_plan::task_fragment::TypedTaskFragment::new(
         krishiv_plan::ExecutionKind::DeltaBatch,
@@ -1385,9 +1754,13 @@ async fn run_ivm_fragment_job(
     .encode()
     .map_err(|e| format!("encode typed fragment: {e}"))?;
 
+    // The sequence keeps two fragments submitted in the same millisecond —
+    // the shards of one partitioned tick — from claiming the same id.
+    static FRAGMENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let sched_job_id = JobId::try_new(format!(
-        "{label}-{}",
-        krishiv_common::async_util::unix_now_ms()
+        "{label}-{}-{}",
+        krishiv_common::async_util::unix_now_ms(),
+        FRAGMENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ))
     .map_err(|e| e.to_string())?;
     let task = TaskSpec::new(
@@ -1399,7 +1772,9 @@ async fn run_ivm_fragment_job(
         label,
     )
     .with_task(task);
-    let spec = JobSpec::new(sched_job_id.clone(), label, JobKind::Batch).with_stage(stage);
+    let spec = JobSpec::new(sched_job_id.clone(), label, JobKind::Batch)
+        .with_stage(stage)
+        .with_pinned_executor(executor.clone());
 
     let notify = {
         let mut coord = coordinator.write().await;
@@ -1523,8 +1898,9 @@ fn drain_for_dispatch(flow: &IncrementalFlow) -> Result<DrainedForDispatch, Stri
 async fn submit_resident_ivm_step(
     coordinator: &SharedCoordinator,
     registry: &SharedIvmJobRegistry,
-    flow: &std::sync::Arc<IncrementalFlow>,
+    flow: &IncrementalFlow,
     ivm_job_id: &str,
+    spread: usize,
 ) -> Result<(krishiv_ivm::StepSummary, Option<krishiv_ivm::TickHealth>), String> {
     // 1. Drain pending locally — never lost: re-fed on any failure below.
     let (local_pending, dispatch_deltas) = drain_for_dispatch(flow)?;
@@ -1547,6 +1923,32 @@ async fn submit_resident_ivm_step(
 
     // 2. Attach if needed: ship the full state mirror once.
     let mut disp = registry.dispatch_state(ivm_job_id);
+    // Where this job's resident flow lives, or is about to (IVM-AUD-DIST-A2).
+    // An attachment to an executor that can no longer take work is over: its
+    // copy of the state is unreachable, and the coordinator's mirror is what
+    // the next attach ships.
+    let live = schedulable_executors(coordinator).await;
+    let executor = match disp.executor.clone().filter(|id| live.contains(id)) {
+        // Still there. If the job is detached (a failed tick), re-attaching
+        // to the same executor replaces the flow it holds instead of leaving
+        // that one behind and starting another somewhere else.
+        Some(executor) => executor,
+        None => {
+            if disp.attached {
+                tracing::warn!(
+                    job_id = %ivm_job_id,
+                    executor = ?disp.executor,
+                    "resident IVM executor is gone; re-attaching elsewhere"
+                );
+            }
+            disp.attached = false;
+            // `spread` fans a partitioned job's shards out across the
+            // executors instead of stacking them all on the first.
+            live.get(spread.checked_rem(live.len()).unwrap_or(0))
+                .cloned()
+                .ok_or_else(|| refeed(String::from("no executor can accept work")))?
+        }
+    };
     if !disp.attached {
         let state_bytes = flow
             .checkpoint_full()
@@ -1561,7 +1963,7 @@ async fn submit_resident_ivm_step(
                 .map_err(|e| refeed(e.to_string()))?,
         )
         .map_err(|e| refeed(e.to_string()))?;
-        let echo = run_ivm_fragment_job(coordinator, attach, "ivm-attach")
+        let echo = run_ivm_fragment_job(coordinator, attach, "ivm-attach", &executor)
             .await
             .map_err(refeed)?;
         // IVM-AUD-INT-F19: the attach reply is the wire negotiation. No blob
@@ -1579,6 +1981,7 @@ async fn submit_resident_ivm_step(
         registry.update_dispatch(ivm_job_id, |d| {
             d.attached = true;
             d.wire = negotiated;
+            d.executor = Some(executor.clone());
         });
         disp.attached = true;
         disp.wire = negotiated;
@@ -1604,7 +2007,7 @@ async fn submit_resident_ivm_step(
     let tick_fragment =
         krishiv_ivm::encode_ivm_tick_fragment(ivm_job_id, &dispatch_deltas, fence, binary_deltas)
             .map_err(|e| refeed(e.to_string()))?;
-    let blob = run_ivm_fragment_job(coordinator, tick_fragment, "ivm-tick")
+    let blob = run_ivm_fragment_job(coordinator, tick_fragment, "ivm-tick", &executor)
         .await
         .map_err(refeed)?
         .ok_or_else(|| refeed("ivm-tick produced no inline result blob".to_owned()))?;
@@ -1660,6 +2063,21 @@ async fn submit_resident_ivm_step(
 /// on the dialect every executor has always understood without a rollback.
 /// Costs the 25% wire saving and the per-view health (a JSON tick is answered
 /// in v1), which is the point — it is the old behaviour, exactly.
+/// Executors that can take work right now, in a stable order (by id), so the
+/// choice of where to attach a job does not depend on registration order.
+async fn schedulable_executors(coordinator: &SharedCoordinator) -> Vec<krishiv_proto::ExecutorId> {
+    let mut executors: Vec<krishiv_proto::ExecutorId> = coordinator
+        .read()
+        .await
+        .executor_snapshots()
+        .into_iter()
+        .filter(|e| e.state().can_accept_work())
+        .map(|e| e.executor_id().clone())
+        .collect();
+    executors.sort();
+    executors
+}
+
 fn legacy_tick_wire_forced() -> bool {
     krishiv_common::env_registry::truthy_env("KRISHIV_IVM_LEGACY_TICK_WIRE")
 }
@@ -2179,25 +2597,15 @@ pub async fn api_ivm_stream_bridge(
     Path((job_id, source_name)): Path<(String, String)>,
     Json(body): Json<StreamBridgeRequest>,
 ) -> Result<Json<StreamBridgeResponse>, StatusCode> {
-    ensure_ivm_leader(&coordinator).await?;
-    let flow = ensure_ivm_job(&registry, &coordinator, &job_id).await?;
-    ensure_pending_headroom(&registry, &flow, &job_id)?;
-    let ipc_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        &body.snapshot_ipc_b64,
+    let ipc_bytes = decode_b64(&body.snapshot_ipc_b64)?;
+    feed_snapshot_bytes(
+        &registry,
+        &coordinator,
+        &job_id,
+        source_name,
+        ipc_bytes,
+        body.idempotency_key,
     )
-    .map_err(|e| ivm_err(format!("base64 decode: {e}")))?;
-    // Decode Arrow IPC stream to RecordBatches.
-    let batches = decode_snapshot_batches(&ipc_bytes).map_err(ivm_err)?;
-    let entry = WalEntry::Snapshot {
-        source: source_name.clone(),
-        idempotency_key: body.idempotency_key.map(String::into_bytes),
-        snapshot_ipc: ipc_bytes,
-    };
-    accept_feed(&registry, &coordinator, &job_id, entry, |job| {
-        job.feed_snapshot(&source_name, &batches)
-            .map_err(|e| e.to_string())
-    })
     .await
     .map(Json)
 }
@@ -2395,15 +2803,15 @@ pub fn ivm_router(state: IvmRouterState) -> Router<()> {
         )
         .route(
             "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/feed",
-            post(api_ivm_feed_source),
+            post(api_ivm_feed_source_wire),
         )
         .route(
             "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-bridge",
-            post(api_ivm_stream_bridge),
+            post(api_ivm_stream_bridge_wire),
         )
         .route(
             "/api/v1/ivm/jobs/{job_id}/sources/{source_name}/stream-delta",
-            post(api_ivm_feed_stream_delta),
+            post(api_ivm_feed_stream_delta_wire),
         )
         .route("/api/v1/ivm/jobs/{job_id}/step", post(api_ivm_step))
         .route(
@@ -6058,5 +6466,501 @@ mod tests {
         create_revenue_job(&registry, &coordinator, "j").await;
         step_job(&registry, &coordinator, "j").await;
         assert!(revenue(&registry, &coordinator, "j").await.is_empty());
+    }
+    // ── the feed wire (IVM-AUD-DIST-G1) ──────────────────────────────────────
+
+    async fn post_feed(
+        registry: &SharedIvmJobRegistry,
+        coordinator: &SharedCoordinator,
+        uri: &str,
+        content_type: &str,
+        body: Vec<u8>,
+    ) -> (StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let router = ivm_router(IvmRouterState {
+            registry: registry.clone(),
+            coordinator: coordinator.clone(),
+        });
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header("content-type", content_type)
+                    .body(axum::body::Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    fn delta_ipc(rows: RecordBatch) -> Vec<u8> {
+        serialize_delta_batch(&DeltaBatch::from_inserts(rows).unwrap()).unwrap()
+    }
+
+    /// The body is the Arrow IPC bytes themselves: no JSON, no base64.
+    #[tokio::test]
+    async fn a_binary_arrow_body_feeds_the_same_as_the_json_one() {
+        let (registry, coordinator) = durable_deps(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        let (status, answer) = post_feed(
+            &registry,
+            &coordinator,
+            "/api/v1/ivm/jobs/j/sources/orders/feed",
+            ARROW_STREAM_CONTENT_TYPE,
+            delta_ipc(orders(&["EU"], &[10])),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(answer["success"], true);
+        assert_eq!(answer["durable"], true);
+
+        // The JSON body still works, through the same route.
+        let json = serde_json::json!({ "delta_ipc_b64": delta_b64(orders(&["EU"], &[5])) });
+        let (status, _) = post_feed(
+            &registry,
+            &coordinator,
+            "/api/v1/ivm/jobs/j/sources/orders/feed",
+            "application/json",
+            json.to_string().into_bytes(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        // So does the snapshot route.
+        let mut snapshot = Vec::new();
+        {
+            let rows = orders(&["EU", "US"], &[15, 7]);
+            let mut w =
+                arrow::ipc::writer::StreamWriter::try_new(&mut snapshot, &rows.schema()).unwrap();
+            w.write(&rows).unwrap();
+            w.finish().unwrap();
+        }
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 15.0)])
+        );
+        let (status, _) = post_feed(
+            &registry,
+            &coordinator,
+            "/api/v1/ivm/jobs/j/sources/orders/stream-delta",
+            "application/vnd.apache.arrow.stream; charset=binary",
+            delta_ipc(orders(&["US"], &[7])),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "parameters on the media type are fine"
+        );
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 15.0), ("US", 7.0)])
+        );
+        assert!(!snapshot.is_empty());
+    }
+
+    /// A binary body has no JSON field for its idempotency key, so the key
+    /// rides in the query string and works the same way.
+    #[tokio::test]
+    async fn a_binary_body_takes_its_idempotency_key_from_the_query() {
+        let (registry, coordinator) = durable_deps(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let uri = "/api/v1/ivm/jobs/j/sources/orders/feed?idempotency_key=offset-9";
+        let body = delta_ipc(orders(&["EU"], &[10]));
+        let (_, first) = post_feed(
+            &registry,
+            &coordinator,
+            uri,
+            ARROW_STREAM_CONTENT_TYPE,
+            body.clone(),
+        )
+        .await;
+        let (_, retry) = post_feed(
+            &registry,
+            &coordinator,
+            uri,
+            ARROW_STREAM_CONTENT_TYPE,
+            body,
+        )
+        .await;
+        assert_eq!(first["duplicate"], false);
+        assert_eq!(retry["duplicate"], true);
+        step_job(&registry, &coordinator, "j").await;
+        assert_eq!(
+            revenue(&registry, &coordinator, "j").await,
+            totals(&[("EU", 10.0)])
+        );
+    }
+
+    /// Garbage is a 400 on either wire, and never reaches the log.
+    #[tokio::test]
+    async fn a_body_that_is_not_a_delta_is_refused_on_both_wires() {
+        let (registry, coordinator) = durable_deps(1);
+        create_revenue_job(&registry, &coordinator, "j").await;
+        let uri = "/api/v1/ivm/jobs/j/sources/orders/feed";
+        for (content_type, body) in [
+            (ARROW_STREAM_CONTENT_TYPE, b"not arrow".to_vec()),
+            ("application/json", b"{not json".to_vec()),
+            ("application/json", br#"{"delta_ipc_b64":"!!!"}"#.to_vec()),
+        ] {
+            let (status, _) = post_feed(&registry, &coordinator, uri, content_type, body).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{content_type}");
+        }
+        assert!(coordinator.load_ivm_log("j", 0).await.is_empty());
+    }
+
+    #[test]
+    fn in_flight_budget_arithmetic() {
+        // A byte budget becomes at least one permit and never overflows.
+        assert_eq!(inflight_permits(1), 1);
+        assert_eq!(inflight_permits(1024 * 1024 * 1024), 1024 * 1024);
+        assert!(inflight_permits(u64::MAX) as usize <= tokio::sync::Semaphore::MAX_PERMITS);
+        // A body reserves its size, rounded up to a permit…
+        assert_eq!(permits_for_body(1, 1000), 1);
+        assert_eq!(permits_for_body(1025, 1000), 2);
+        // …an empty body still reserves one, and a body larger than the whole
+        // budget takes all of it, so it runs alone instead of never.
+        assert_eq!(permits_for_body(0, 1000), 1);
+        assert_eq!(permits_for_body(u64::MAX, 1000), 1000);
+    }
+    // ── executor pin (IVM-AUD-DIST-A2) ───────────────────────────────────────
+
+    /// Each fragment job the executors were given, and which one got it.
+    type PlacedFragments = Arc<std::sync::Mutex<Vec<(String, krishiv_proto::ExecutorId)>>>;
+
+    /// Play every executor in `leases`: run each `ivm-*` fragment as whichever
+    /// executor the coordinator assigned it to, and record that in `placed`.
+    fn spawn_recording_executors(
+        coordinator: SharedCoordinator,
+        leases: HashMap<krishiv_proto::ExecutorId, krishiv_proto::LeaseGeneration>,
+        placed: PlacedFragments,
+    ) -> tokio::task::JoinHandle<()> {
+        use krishiv_proto::{TaskOutputMetadata, TaskState, TaskStatusUpdate};
+        tokio::spawn(async move {
+            let mut handled: std::collections::HashSet<String> = Default::default();
+            loop {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                let fresh: Vec<JobId> = {
+                    let coord = coordinator.read().await;
+                    coord
+                        .job_snapshots()
+                        .into_iter()
+                        .filter(|j| j.job_id().as_str().starts_with("ivm-"))
+                        .filter(|j| !handled.contains(j.job_id().as_str()))
+                        .map(|j| j.job_id().clone())
+                        .collect()
+                };
+                for job_id in fresh {
+                    let mut coord = coordinator.write().await;
+                    let Ok(mut assignments) = coord.launch_assigned_task_assignments(&job_id)
+                    else {
+                        continue;
+                    };
+                    if assignments.is_empty() {
+                        continue;
+                    }
+                    handled.insert(job_id.as_str().to_owned());
+                    let assignment = assignments.remove(0);
+                    let executor = assignment.executor_id().clone();
+                    placed
+                        .lock()
+                        .unwrap()
+                        .push((job_id.as_str().to_owned(), executor.clone()));
+                    let blob = if job_id.as_str().starts_with("ivm-tick") {
+                        Some(revenue_output_blob("US", 5.0))
+                    } else {
+                        None
+                    };
+                    let meta = TaskOutputMetadata::new("ivm", 0, 0, 0)
+                        .with_inline_record_batch_ipc(blob.into_iter().collect());
+                    let update = TaskStatusUpdate::new(
+                        job_id,
+                        assignment.stage_id().clone(),
+                        assignment.task_id().clone(),
+                        executor.clone(),
+                        TaskState::Succeeded,
+                        assignment.attempt_id().as_u32(),
+                    )
+                    .with_lease_generation(leases[&executor])
+                    .with_output_metadata(meta);
+                    let _ = coord.apply_task_update(update);
+                    let _ = coord.take_pending_sink_finalize();
+                }
+            }
+        })
+    }
+
+    /// A job id may not contain the shard separator.
+    #[tokio::test]
+    async fn a_job_id_with_the_shard_separator_is_refused() {
+        let (registry, coordinator) = test_deps_with_shards(1);
+        let refused = api_ivm_create_job(
+            State(registry),
+            State(coordinator),
+            Json(CreateJobRequest {
+                job_id: Some("a#s1".into()),
+                partitioned: None,
+                force_diff_based: None,
+                delta_checkpoints: false,
+            }),
+        )
+        .await;
+        assert_eq!(refused.err(), Some(StatusCode::BAD_REQUEST));
+    }
+
+    /// IVM-AUD-DIST-A1: a partitioned job's shards run on executors — more
+    /// than one of them — and each shard stays on the executor it attached to.
+    /// A partitioned job used to be computed entirely on the coordinator.
+    #[tokio::test]
+    async fn a_partitioned_job_spreads_its_shards_across_executors() {
+        use krishiv_proto::ExecutorId;
+        let (registry, _) = test_deps_with_shards(3);
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("shard-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        let mut leases = HashMap::new();
+        for id in ["exec-a", "exec-b", "exec-c"] {
+            let executor_id = ExecutorId::try_new(id).unwrap();
+            let lease = coordinator
+                .write()
+                .await
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    format!("pod-{id}"),
+                    4,
+                ))
+                .expect("register executor");
+            leases.insert(executor_id, lease);
+        }
+        create_revenue_job(&registry, &coordinator, "j").await;
+        assert!(
+            registry.get("j").expect("job").is_partitioned(),
+            "precondition: the revenue view must partition at 3 shards"
+        );
+        let placed: PlacedFragments = Arc::default();
+        let driver = spawn_recording_executors(coordinator.clone(), leases, placed.clone());
+
+        // Enough distinct keys that every shard has input on every tick.
+        let regions: Vec<String> = (0..48).map(|i| format!("r{i}")).collect();
+        let regions: Vec<&str> = regions.iter().map(String::as_str).collect();
+        let amounts: Vec<i64> = (0..48).collect();
+        for _ in 0..2 {
+            let _ = api_ivm_feed_source(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path(("j".into(), "orders".into())),
+                Json(FeedSourceRequest {
+                    delta_ipc_b64: delta_b64(orders(&regions, &amounts)),
+                    idempotency_key: None,
+                }),
+            )
+            .await
+            .expect("feed");
+            let _ = tokio::time::timeout(
+                Duration::from_secs(30),
+                api_ivm_step(
+                    State(registry.clone()),
+                    State(coordinator.clone()),
+                    Path("j".into()),
+                ),
+            )
+            .await
+            .expect("step did not finish")
+            .expect("step");
+        }
+
+        assert_eq!(
+            registry
+                .dispatch_state("j")
+                .last
+                .map(|record| record.mode)
+                .as_deref(),
+            Some("resident-partitioned")
+        );
+        let mut shards = registry.resident_dispatches("j");
+        shards.retain(|(id, _)| id != "j");
+        shards.sort_by(|a, b| a.0.cmp(&b.0));
+        let ids: Vec<&str> = shards.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["j#s0", "j#s1", "j#s2"]);
+        let holders: Vec<&str> = shards
+            .iter()
+            .map(|(_, state)| {
+                assert!(state.attached);
+                assert_eq!(state.fence, 2, "two ticks, no re-attach");
+                state.executor.as_ref().expect("holder").as_str()
+            })
+            .collect();
+        assert_eq!(holders, ["exec-a", "exec-b", "exec-c"]);
+
+        // One attach per shard, then only ticks; each executor saw exactly
+        // one shard's worth of fragments.
+        let fragments = placed.lock().unwrap().clone();
+        let attaches = fragments
+            .iter()
+            .filter(|(job, _)| job.starts_with("ivm-attach"))
+            .count();
+        assert_eq!(attaches, 3, "{fragments:?}");
+        assert_eq!(fragments.len(), 9, "{fragments:?}");
+        for holder in holders {
+            let seen = fragments
+                .iter()
+                .filter(|(_, executor)| executor.as_str() == holder)
+                .count();
+            assert_eq!(seen, 3, "{holder}: {fragments:?}");
+        }
+
+        // Deleting the job detaches every shard from its own executor, and
+        // leaves no shard bookkeeping behind.
+        let _ = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("delete");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let detached: Vec<String> = placed
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(job, _)| job.starts_with("ivm-detach"))
+                .map(|(_, executor)| executor.as_str().to_owned())
+                .collect();
+            if detached.len() == 3 {
+                let mut detached = detached;
+                detached.sort();
+                assert_eq!(detached, ["exec-a", "exec-b", "exec-c"]);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "only {detached:?} were detached"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(registry.resident_dispatches("j").is_empty());
+        driver.abort();
+    }
+
+    /// With two executors, every fragment of a resident job must reach the
+    /// one that holds its flow. They used to be placed freely, so a tick
+    /// landed on the executor without the flow about half the time.
+    #[tokio::test]
+    async fn resident_fragments_all_go_to_the_executor_holding_the_flow() {
+        use krishiv_proto::ExecutorId;
+        let (registry, _) = test_deps_with_shards(1);
+        let coordinator = SharedCoordinator::new(
+            Coordinator::active(CoordinatorId::try_new("pin-coord").unwrap())
+                .with_store(crate::store::InMemoryMetadataStore::default()),
+        );
+        let mut leases = HashMap::new();
+        // Registered in the opposite order to their ids, so "first
+        // registered" and "first by id" are different executors.
+        for id in ["exec-b", "exec-a", "exec-c"] {
+            let executor_id = ExecutorId::try_new(id).unwrap();
+            let lease = coordinator
+                .write()
+                .await
+                .register_executor(krishiv_proto::ExecutorDescriptor::new(
+                    executor_id.clone(),
+                    format!("pod-{id}"),
+                    4,
+                ))
+                .expect("register executor");
+            leases.insert(executor_id, lease);
+        }
+        create_revenue_job(&registry, &coordinator, "j").await;
+
+        // Play all three executors, recording who was given each fragment.
+        let placed: PlacedFragments = Arc::default();
+        let driver = spawn_recording_executors(coordinator.clone(), leases, placed.clone());
+
+        for amount in [5, 6, 7] {
+            let _ = api_ivm_feed_source(
+                State(registry.clone()),
+                State(coordinator.clone()),
+                Path(("j".into(), "orders".into())),
+                Json(FeedSourceRequest {
+                    delta_ipc_b64: delta_b64(orders(&["US"], &[amount])),
+                    idempotency_key: None,
+                }),
+            )
+            .await
+            .expect("feed");
+            let _ = tokio::time::timeout(
+                Duration::from_secs(20),
+                api_ivm_step(
+                    State(registry.clone()),
+                    State(coordinator.clone()),
+                    Path("j".into()),
+                ),
+            )
+            .await
+            .expect("step did not finish")
+            .expect("step");
+        }
+
+        let holder = ExecutorId::try_new("exec-a").unwrap();
+        assert_eq!(registry.dispatch_state("j").executor, Some(holder.clone()));
+        let fragments = placed.lock().unwrap().clone();
+        let kinds: Vec<&str> = fragments
+            .iter()
+            .map(|(job, _)| {
+                if job.starts_with("ivm-attach") {
+                    "attach"
+                } else {
+                    "tick"
+                }
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["attach", "tick", "tick", "tick"],
+            "one attach, never a re-attach"
+        );
+        assert!(
+            fragments.iter().all(|(_, executor)| *executor == holder),
+            "every fragment must reach the executor holding the flow: {fragments:?}"
+        );
+
+        // Deleting the job detaches that same executor, not an arbitrary one.
+        let _ = api_ivm_delete_job(
+            State(registry.clone()),
+            State(coordinator.clone()),
+            Path("j".into()),
+        )
+        .await
+        .expect("delete");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let detach = loop {
+            if let Some(found) = placed
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(job, _)| job.starts_with("ivm-detach"))
+                .cloned()
+            {
+                break found;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no detach was dispatched"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        driver.abort();
+        assert_eq!(detach.1, holder);
     }
 }

@@ -376,6 +376,145 @@ fn changelog_from_delta(delta: &DeltaBatch) -> EngineResult<Option<ChangelogBatc
     Ok(Some(ChangelogBatch::new(expanded, kinds)?))
 }
 
+/// What identifies an incremental job's state: a checkpoint is only resumed by
+/// a job with the same query over the same sources.
+fn incremental_definition(job: &CompiledJob) -> String {
+    let mut definition = job.query.clone();
+    for source in &job.sources {
+        definition.push('\n');
+        definition.push_str(&source.name);
+        definition.push('\t');
+        definition.push_str(&source.connector);
+        definition.push('\t');
+        definition.push_str(&source.uri);
+    }
+    definition
+}
+
+/// The incremental engine's half of a [`CheckpointPayload`]: what, besides the
+/// source offsets, a run needs in order to continue the previous one.
+struct IncrementalResume {
+    definition: String,
+    /// Source schemas, since a resumed source may produce no batch to read
+    /// its schema from.
+    schemas: Vec<(String, SchemaRef)>,
+    /// `IncrementalFlow::checkpoint_full`.
+    flow_state: Vec<u8>,
+}
+
+const INCREMENTAL_RESUME_MAGIC: &[u8; 8] = b"KIVMRUN1";
+
+fn put_resume_field(out: &mut Vec<u8>, bytes: &[u8]) {
+    out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    out.extend_from_slice(bytes);
+}
+
+fn take_resume_field<'a>(rest: &mut &'a [u8]) -> EngineResult<&'a [u8]> {
+    let truncated = || EngineError::Runtime("incremental checkpoint is truncated".to_string());
+    let (len, tail) = rest.split_first_chunk::<8>().ok_or_else(truncated)?;
+    let len = usize::try_from(u64::from_le_bytes(*len)).map_err(|_| truncated())?;
+    if tail.len() < len {
+        return Err(truncated());
+    }
+    let (field, tail) = tail.split_at(len);
+    *rest = tail;
+    Ok(field)
+}
+
+impl IncrementalResume {
+    fn encode(
+        definition: &str,
+        schemas: &[(String, SchemaRef)],
+        flow_state: &[u8],
+    ) -> EngineResult<Vec<u8>> {
+        let mut out = INCREMENTAL_RESUME_MAGIC.to_vec();
+        put_resume_field(&mut out, definition.as_bytes());
+        out.extend_from_slice(&(schemas.len() as u64).to_le_bytes());
+        for (name, schema) in schemas {
+            put_resume_field(&mut out, name.as_bytes());
+            let empty = arrow::record_batch::RecordBatch::new_empty(schema.clone());
+            put_resume_field(&mut out, &krishiv_engine_core::encode_batch_ipc(&empty)?);
+        }
+        put_resume_field(&mut out, flow_state);
+        Ok(out)
+    }
+
+    /// `None` if `bytes` is some other engine's operator state.
+    fn decode(bytes: &[u8]) -> EngineResult<Option<Self>> {
+        let Some(mut rest) = bytes.strip_prefix(INCREMENTAL_RESUME_MAGIC.as_slice()) else {
+            return Ok(None);
+        };
+        let text = |field: &[u8]| {
+            String::from_utf8(field.to_vec())
+                .map_err(|e| EngineError::Runtime(format!("incremental checkpoint: {e}")))
+        };
+        let definition = text(take_resume_field(&mut rest)?)?;
+        let (count, tail) = rest.split_first_chunk::<8>().ok_or_else(|| {
+            EngineError::Runtime("incremental checkpoint is truncated".to_string())
+        })?;
+        rest = tail;
+        let mut schemas = Vec::new();
+        for _ in 0..u64::from_le_bytes(*count) {
+            let name = text(take_resume_field(&mut rest)?)?;
+            let empty = krishiv_engine_core::decode_batch_ipc(take_resume_field(&mut rest)?)?;
+            schemas.push((name, empty.schema()));
+        }
+        let flow_state = take_resume_field(&mut rest)?.to_vec();
+        Ok(Some(Self {
+            definition,
+            schemas,
+            flow_state,
+        }))
+    }
+}
+
+/// Record the flow's state and every source's offset as the job's latest
+/// checkpoint. The caller has flushed the sinks.
+///
+/// Taken once, when the run has drained its sources: a sink may close on
+/// flush (a Parquet file does), so there is no point mid-run at which the
+/// sinks are known to hold everything and can still be written to. A run that
+/// dies part-way is redone from the previous checkpoint.
+///
+/// Skipped if any source cannot report an offset: without one the job could
+/// restore its state but not its place in that source, and would absorb the
+/// source's rows a second time.
+async fn persist_incremental_checkpoint(
+    rt: &EngineRuntime,
+    job_id: &krishiv_engine_core::JobId,
+    flow: &IncrementalFlow,
+    definition: &str,
+    schemas: &[(String, SchemaRef)],
+    offsets: &[(String, Option<Vec<u8>>)],
+    epoch: u64,
+) -> EngineResult<()> {
+    let Some(source_offsets) = offsets
+        .iter()
+        .map(|(name, offset)| offset.clone().map(|offset| (name.clone(), offset)))
+        .collect::<Option<Vec<_>>>()
+    else {
+        tracing::debug!(
+            job = %job_id,
+            "a source reports no offset; the incremental job is not checkpointed"
+        );
+        return Ok(());
+    };
+    let flow_state = flow
+        .checkpoint_full()
+        .map_err(|e| EngineError::Runtime(format!("checkpoint: {e}")))?;
+    rt.checkpoint
+        .persist(
+            job_id,
+            &CheckpointPayload {
+                epoch,
+                operator_state: IncrementalResume::encode(definition, schemas, &flow_state)?,
+                source_offsets,
+                source_in_flight: Vec::new(),
+            },
+        )
+        .await
+}
+
 /// Feldera/DBSP-style incremental engine: maintains the query as a materialized
 /// view and emits a **changelog** (insertions and retractions) to the sinks as
 /// each input batch lands. The single output relation is registered under the
@@ -438,18 +577,93 @@ impl ComputeEngine for IncrementalEngine {
         // batch was consumed for its schema and then silently never processed:
         // a data loss with no error anywhere. The reader and its first batch are
         // now carried into the drain below instead.
+        // IVM-AUD-INT-F13: at a placement with durable state, the job resumes.
+        // It used to build a fresh flow on every run and never touch the
+        // checkpoint service, so a restarted job re-read every source from the
+        // start and rewrote its whole changelog. The checkpoint is the flow's
+        // state plus each source's offset, taken together once the run has
+        // drained its sources and flushed its sinks — so the state and the
+        // offsets always agree, and the sinks have everything the checkpoint
+        // accounts for. A run that dies part-way is redone from the previous
+        // checkpoint, so what it had already written is written again:
+        // delivery to the sinks is at-least-once.
+        let durable = rt.state_dir.is_some();
+        let job_id = JobHandle::from_name(&job.name, JobStatus::Running)?
+            .job_id()
+            .clone();
+        let definition = incremental_definition(&job);
+        let restored = if durable {
+            rt.checkpoint.restore_latest(&job_id).await?
+        } else {
+            None
+        };
+        let epoch = restored.as_ref().map_or(0, |payload| payload.epoch);
+        let resume = match &restored {
+            Some(payload) => match IncrementalResume::decode(&payload.operator_state)? {
+                Some(resume) if resume.definition == definition => Some((payload, resume)),
+                Some(_) => {
+                    tracing::warn!(
+                        job = %job.name,
+                        "the job's query or sources changed since its checkpoint; \
+                         starting from empty state and re-reading every source"
+                    );
+                    None
+                }
+                None => {
+                    tracing::warn!(
+                        job = %job.name,
+                        "the checkpoint under this job's name was not written by the \
+                         incremental engine; starting from empty state"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         let mut source_schemas: Vec<(String, SchemaRef)> = Vec::with_capacity(job.sources.len());
         let mut opened = Vec::with_capacity(job.sources.len());
+        // Each source's offset as of the last batch the flow has absorbed.
+        let mut offsets: Vec<(String, Option<Vec<u8>>)> = Vec::with_capacity(job.sources.len());
         for spec in &job.sources {
             let mut reader = rt.sources.open(spec).await?;
-            let first = reader.next_changelog().await?.ok_or_else(|| {
-                EngineError::Source(format!(
-                    "source '{}' (uri: '{}') produced no batches; the incremental \
-                     engine requires a non-empty source to infer the view schema",
-                    spec.name, spec.uri
-                ))
-            })?;
-            source_schemas.push((spec.name.clone(), first.batch().schema()));
+            let first = if let Some((payload, resume)) = &resume {
+                if let Some((_, offset)) = payload
+                    .source_offsets
+                    .iter()
+                    .find(|(name, _)| name == &spec.name)
+                {
+                    reader.restore_offset(offset)?;
+                }
+                // A resumed source may have nothing new, so its schema comes
+                // from the checkpoint rather than from a first batch.
+                let schema = resume
+                    .schemas
+                    .iter()
+                    .find(|(name, _)| name == &spec.name)
+                    .map(|(_, schema)| schema.clone())
+                    .ok_or_else(|| {
+                        EngineError::Runtime(format!(
+                            "checkpoint for job '{}' has no schema for source '{}'",
+                            job.name, spec.name
+                        ))
+                    })?;
+                offsets.push((spec.name.clone(), reader.checkpoint_offset()));
+                source_schemas.push((spec.name.clone(), schema));
+                None
+            } else {
+                // Taken before the probe: the probed batch is not absorbed yet.
+                offsets.push((spec.name.clone(), reader.checkpoint_offset()));
+                let first = reader.next_changelog().await?.ok_or_else(|| {
+                    EngineError::Source(format!(
+                        "source '{}' (uri: '{}') produced no batches; the incremental \
+                         engine requires a non-empty source to infer the view schema",
+                        spec.name, spec.uri
+                    ))
+                })?;
+                source_schemas.push((spec.name.clone(), first.batch().schema()));
+                Some(first)
+            };
             opened.push((spec, reader, first));
         }
         let output_schema = infer_output_schema(&source_schemas, &job.query).await?;
@@ -465,6 +679,11 @@ impl ComputeEngine for IncrementalEngine {
             lateness: vec![],
         })
         .map_err(|e| EngineError::Runtime(e.to_string()))?;
+        if let Some((_, resume)) = &resume {
+            flow.restore_full(&resume.flow_state)
+                .map_err(|e| EngineError::Runtime(format!("restore checkpoint: {e}")))?;
+        }
+        let checkpoint_schemas = source_schemas.clone();
 
         // Open every sink once; the changelog stream is written incrementally.
         let mut writers: Vec<Box<dyn SinkWriter>> = Vec::with_capacity(job.sinks.len());
@@ -507,9 +726,29 @@ impl ComputeEngine for IncrementalEngine {
         // Drive ALL sources to EOF with the same streaming path, continuing the
         // readers the schema probe already opened (see the audit note above) and
         // processing the batch it consumed for the schema before reading on.
-        for (spec, mut reader, first) in opened {
-            step_and_emit(&flow, &spec.name, &first, &mut writers).await?;
-            while let Some(changelog) = reader.next_changelog().await? {
+        //
+        // One batch from each source in turn (IVM-AUD-API-E5). Draining the
+        // first source before opening the second made an incremental join emit
+        // nothing for the whole of the first source and everything at once
+        // after it, in an order set by how the sources were listed.
+        let mut exhausted = vec![false; opened.len()];
+        while exhausted.iter().any(|done| !done) {
+            for (index, (spec, reader, probed)) in opened.iter_mut().enumerate() {
+                if exhausted.get(index).copied().unwrap_or(true) {
+                    continue;
+                }
+                let changelog = match probed.take() {
+                    Some(changelog) => changelog,
+                    None => match reader.next_changelog().await? {
+                        Some(changelog) => changelog,
+                        None => {
+                            if let Some(done) = exhausted.get_mut(index) {
+                                *done = true;
+                            }
+                            continue;
+                        }
+                    },
+                };
                 if let Some(first) = source_schemas.iter_mut().find(|(n, _)| n == &spec.name) {
                     if first.1.as_ref() != changelog.batch().schema().as_ref() {
                         // Schema drift across the same source — keep going but
@@ -524,14 +763,26 @@ impl ComputeEngine for IncrementalEngine {
                     source_schemas.push((spec.name.clone(), changelog.batch().schema()));
                 }
                 step_and_emit(&flow, &spec.name, &changelog, &mut writers).await?;
+                if let Some(slot) = offsets.get_mut(index) {
+                    slot.1 = reader.checkpoint_offset();
+                }
             }
         }
 
-        // The previous buffered path consumed the per-step deltas into the
-        // writers. This streaming path does the same; the final `Ok(())`
-        // flush is below.
         for writer in &mut writers {
             writer.flush().await?;
+        }
+        if durable {
+            persist_incremental_checkpoint(
+                &rt,
+                &job_id,
+                &flow,
+                &definition,
+                &checkpoint_schemas,
+                &offsets,
+                epoch + 1,
+            )
+            .await?;
         }
         // A bounded `run` drains its source once and returns; nothing continues
         // after it, so the invocation is Completed. Continuous maintenance is the
@@ -2188,6 +2439,111 @@ mod tests {
             .next_back()
             .expect("at least one count row");
         assert_eq!(last, 2, "the probed first batch must still be processed");
+    }
+
+    /// IVM-AUD-INT-F13: with durable state, a second run continues the first.
+    /// It used to start from empty state and re-read the source, rewriting the
+    /// whole changelog.
+    #[tokio::test]
+    async fn a_durable_incremental_job_resumes_instead_of_starting_over() {
+        let ckpt_dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        // Fresh service instances over the same directories, as after a restart.
+        let run = async |batches: Vec<RecordBatch>, query: &str| {
+            let sources = InMemorySourceProvider::new();
+            sources.insert("t", batches);
+            let sink = InMemorySinkProvider::new();
+            let mut rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+            rt.checkpoint = Arc::new(DurableCheckpointService::new(ckpt_dir.path()).unwrap());
+            rt.state_dir = Some(state_dir.path().to_path_buf());
+            let job = CompiledJob::new(
+                "resumable",
+                query,
+                vec![SourceSpec::cdc("t", "memory", "")],
+                vec![SinkSpec::new("out", "memory", "")],
+                false,
+            );
+            run_job(job, rt).await.unwrap();
+            sink.take("out")
+        };
+        let query = "SELECT k, SUM(v) AS total FROM t GROUP BY k";
+        let first = kv_batch(&["a", "b"], &[1, 2]);
+        let second = kv_batch(&["a"], &[10]);
+
+        let out = run(vec![first.clone()], query).await;
+        assert_eq!(out.iter().map(|cl| cl.num_rows()).sum::<usize>(), 2);
+
+        // The source has grown by one batch. Only that batch is read, and its
+        // effect is a change to the restored total: retract a=1, insert a=11.
+        let out = run(vec![first.clone(), second.clone()], query).await;
+        assert_eq!(out.len(), 1, "one changelog for the one new batch");
+        let cl = out.first().unwrap();
+        let mut kinds = cl.row_kinds().to_vec();
+        kinds.sort_by_key(|kind| *kind != RowKind::Delete);
+        assert_eq!(kinds, [RowKind::Delete, RowKind::Insert]);
+        let totals = cl
+            .batch()
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let mut totals: Vec<i64> = totals.iter().flatten().collect();
+        totals.sort_unstable();
+        assert_eq!(totals, [1, 11]);
+
+        // Nothing new: nothing is read and nothing is written.
+        let out = run(vec![first.clone(), second.clone()], query).await;
+        assert!(out.is_empty(), "{} changelogs", out.len());
+
+        // A different query is a different view: it starts over.
+        let out = run(
+            vec![first, second],
+            "SELECT k, COUNT(*) AS n FROM t GROUP BY k",
+        )
+        .await;
+        assert_eq!(out.len(), 2, "both batches are read again");
+    }
+
+    /// Without durable state a run stands alone, as it always has.
+    #[tokio::test]
+    async fn an_embedded_incremental_job_reads_its_source_from_the_start_every_run() {
+        let sources = InMemorySourceProvider::new();
+        sources.insert("t", vec![kv_batch(&["a"], &[1])]);
+        let sink = InMemorySinkProvider::new();
+        let rt = embedded_runtime(Arc::new(sources), Arc::new(sink.clone()));
+        for _ in 0..2 {
+            let job = CompiledJob::new(
+                "standalone",
+                "SELECT k, SUM(v) AS total FROM t GROUP BY k",
+                vec![SourceSpec::cdc("t", "memory", "")],
+                vec![SinkSpec::new("out", "memory", "")],
+                false,
+            );
+            run_job(job, rt.clone()).await.unwrap();
+            assert_eq!(sink.take("out").len(), 1);
+        }
+    }
+
+    /// A checkpoint that is cut short is an error, and another engine's
+    /// operator state is recognised as not ours.
+    #[test]
+    fn incremental_resume_round_trips_and_refuses_damage() {
+        let schema = kv_batch(&["a"], &[1]).schema();
+        let encoded =
+            IncrementalResume::encode("q", &[("t".to_string(), schema.clone())], &[7, 8, 9])
+                .unwrap();
+        let decoded = IncrementalResume::decode(&encoded).unwrap().unwrap();
+        assert_eq!(decoded.definition, "q");
+        assert_eq!(decoded.flow_state, [7, 8, 9]);
+        assert_eq!(decoded.schemas, [("t".to_string(), schema)]);
+        for len in INCREMENTAL_RESUME_MAGIC.len()..encoded.len() {
+            assert!(IncrementalResume::decode(&encoded[..len]).is_err(), "{len}");
+        }
+        assert!(
+            IncrementalResume::decode(b"window state")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

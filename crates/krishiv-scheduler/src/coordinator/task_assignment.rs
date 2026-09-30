@@ -236,8 +236,10 @@ impl Coordinator {
             pending: Vec<TaskId>,
             prefs: Vec<crate::LocalityPreference>,
         }
+        let pinned_executor;
         let stage_work: Vec<StageWork> = {
             let mut job = self.find_job_mut(job_id)?;
+            pinned_executor = job.spec.pinned_executor().cloned();
             let preferred_nodes = job.preferred_nodes_by_stage(&executor_hosts);
             // Only stages whose upstream shuffles have completed may be
             // assigned. The launch loop already refuses to LAUNCH a task whose
@@ -308,6 +310,14 @@ impl Coordinator {
                 .exec
                 .executors
                 .schedulable_executor_placements_excluding(&circuit_broken);
+            // A pinned job's state lives on one executor (IVM-AUD-DIST-A2):
+            // anywhere else its task would fail, so nowhere else is a
+            // candidate. With that executor unavailable the tasks stay
+            // Pending, which is the caller's signal to re-establish the state
+            // elsewhere rather than the scheduler's to guess.
+            if let Some(pin) = &pinned_executor {
+                executors.retain(|placement| placement.executor_id == *pin);
+            }
             if executors.is_empty() {
                 // Every executor went away between the fast-path check above
                 // and here; leave the tasks Pending for the next dispatch tick.

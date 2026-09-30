@@ -255,34 +255,53 @@ pub(super) async fn run_incremental(pipeline: Pipeline, policy: RunPolicy) -> Re
         .await?;
     }
 
-    // 3. Feed sources, advancing per policy.
-    let mut pacer = StepPacer::new();
+    // 3. Feed sources, advancing per policy — one item from each source per
+    //    round, not one source at a time.
+    //
+    //    IVM-AUD-API-E5: this used to drain source #1 completely before
+    //    touching #2. A join over two sources then saw the whole of one side
+    //    with nothing to match it, emitted a long run of empty or half-joined
+    //    deltas, and its changelog depended on the order the sources happened
+    //    to be declared in. Interleaving gives every tick a share of each
+    //    input, which is also what the connector-runtime path already does.
+    let mut queues: Vec<(String, std::collections::VecDeque<DeltaBatch>)> =
+        Vec::with_capacity(sources.len());
     for (sname, ingest) in sources {
-        match ingest {
-            Ingest::Memory(batches) => {
-                for b in batches {
-                    if b.num_rows() == 0 {
-                        continue;
-                    }
-                    let n = b.num_rows();
-                    let delta = DeltaBatch::from_inserts(b).map_err(rt)?;
-                    job.feed(&sname, &delta).await?;
-                    pacer.record_rows(n);
-                    maybe_step(&job, policy, &mut pacer).await?;
-                }
-            }
+        let deltas = match ingest {
+            Ingest::Memory(batches) => batches
+                .into_iter()
+                .filter(|b| b.num_rows() > 0)
+                .map(|b| DeltaBatch::from_inserts(b).map_err(rt))
+                .collect::<Result<std::collections::VecDeque<_>>>()?,
             Ingest::Cdc(changes) => {
+                let mut deltas = std::collections::VecDeque::with_capacity(changes.len());
                 for c in changes {
                     if let Some(delta) = DeltaBatch::from_cdc(c.before, c.after).map_err(rt)? {
-                        let n = delta.num_rows();
-                        job.feed(&sname, &delta).await?;
-                        pacer.record_rows(n);
-                        maybe_step(&job, policy, &mut pacer).await?;
+                        deltas.push_back(delta);
                     }
                 }
+                deltas
             }
             // Connectors were drained to Memory in step 0.
             Ingest::Connector(_) => unreachable!("connector sources are normalized to Memory"),
+        };
+        queues.push((sname, deltas));
+    }
+    let mut pacer = StepPacer::new();
+    loop {
+        let mut progressed = false;
+        for (sname, deltas) in &mut queues {
+            let Some(delta) = deltas.pop_front() else {
+                continue;
+            };
+            progressed = true;
+            let n = delta.num_rows();
+            job.feed(sname, &delta).await?;
+            pacer.record_rows(n);
+            maybe_step(&job, policy, &mut pacer).await?;
+        }
+        if !progressed {
+            break;
         }
     }
 

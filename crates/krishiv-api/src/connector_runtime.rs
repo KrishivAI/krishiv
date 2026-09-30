@@ -572,20 +572,14 @@ pub fn runtime_backed_engine_runtime(
 /// process, but — unlike the embedded runtime — the checkpoint service handed
 /// to them writes to disk, rooted at `checkpoint_dir`.
 ///
-/// # Only the streaming engine uses it
-///
-/// IVM-AUD-INT-F13. This used to say, flatly, that "their checkpoints persist
-/// to disk … so a job's operator state and source offsets survive a restart"
-/// and that the durability "is the single-node daemon's defining difference
-/// from embedded". That is true of [`StreamingEngine`], which restores the
-/// latest checkpoint in `streaming_setup`, rewinds its source to the
-/// checkpointed offset and persists operator state on an interval.
-/// [`IncrementalEngine::run`] never touches `rt.checkpoint` at all: it builds a
-/// fresh `IncrementalFlow` per run, drains its sources from the beginning and
-/// exits. For an incremental job this runtime therefore differs from embedded
-/// in the checkpoint *service* it carries and in nothing the engine does with
-/// it — a restart re-runs the job from zero and rewrites the whole changelog to
-/// the sink (see the delivery matrix in `krishiv_connectors::cert_matrix`).
+/// Both stateful engines use it. [`StreamingEngine`] restores the latest
+/// checkpoint, rewinds its source and persists operator state on an interval.
+/// [`IncrementalEngine::run`] checkpoints its view state together with every
+/// source's offset, and a later run of the same job resumes from there
+/// (IVM-AUD-INT-F13) — it used to build a fresh flow per run and re-read its
+/// sources from the beginning. The checkpoint is taken when a run completes;
+/// a run that dies part-way is redone, writing its output again (see the delivery matrix in
+/// `krishiv_connectors::cert_matrix`).
 ///
 /// A distributed placement swaps the checkpoint/source/sink services for
 /// cluster-backed ones.
