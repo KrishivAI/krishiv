@@ -163,12 +163,33 @@ print(session.sql('SELECT 42 as answer').collect().pretty())
 "
 ```
 
+## Working Constraints (Claude Code)
+
+- Fix findings in-session, sequentially. Delegate implementation only when
+  the task has a written spec and a mechanical done-check (`implementer`
+  agent, own worktree); debugging, root-causing and decisions about
+  dependencies, MSRV or semantics stay with the main agent. Research and
+  review agents (`researcher`, `reviewer`) are read-only.
+- Anything over a minute runs detached (`skills/gating/gate.sh`); gate on
+  exit codes read from the log, never on a tool's output.
+- Never compile while a measurement runs on this machine.
+- Commit only after the gate is green; never push unless asked.
+- Rocksdb-linking builds need `CXXFLAGS="-include cstdint"`.
+
 ## Skill Files
 
 Canonical location for all agent skills:
 
 - `skills/krishiv-engine/SKILL.md` — engine skill (references this file)
 - `skills/release/SKILL.md` — release orchestration skill
+- `skills/gating/SKILL.md` — verification before any "done" claim; detached runs
+- `skills/benchmarking/SKILL.md` — paired, interleaved, digested measurements
+- `skills/upgrading-deps/SKILL.md` — one arrow graph, MSRV sources, migrate deprecations
+- `skills/debugging-krishiv/SKILL.md` — isolate, find the mechanism, prove, then fix
+- `skills/logging-work/SKILL.md` — status log, register, CHANGELOG, commit shape
+
+Agents in `.claude/agents/`: `researcher`, `reviewer` (read-only, opus),
+`implementer` (spec'd tasks, own worktree, opus).
 
 If your tool requires a tool-specific path (e.g. Claude Code's
 `.claude/skills/`, Codex's `codex/skills/`), create a one-line forwarder:
