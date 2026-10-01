@@ -1,0 +1,109 @@
+# TPC-DS SF1 — Sail vs Krishiv vs DuckDB, 2026-10-02
+
+Data `target/tpcds-sf1` (24 Parquet tables), queries from DuckDB's `tpcds` extension (its dialect). Three interleaved passes, median per query, all engines on this box; Krishiv `ad76eca` + the reorder rule under test (`KRISHIV_JOIN_REORDER` default on), Sail 0.7.2 `local` mode with join reorder on, DuckDB defaults. Eight queries use double-quoted aliases (`AS "order count"`) that Spark SQL reads as string literals; Sail's numbers for q16, q32, q50, q62, q92, q94, q95, q99 come from a rerun with those aliases rewritten (`tpcds-sf1-sail-aliases-fixed-*.json`), which is a dialect fix, not a capability gap. Answers: Krishiv and Sail agree on 98 of 99 (q83 differs; DuckDB sides with Krishiv); Krishiv and Sail both differ from DuckDB on q58 and q59.
+
+| q | Krishiv ms | Sail ms | DuckDB ms | Sail/Krishiv | Krishiv=Sail |
+|---|---|---|---|---|---|
+| q1 | 60 | 50 | 40 | 0.83 | same |
+| q2 | 80 | 80 | 50 | 1.00 | same |
+| q3 | 70 | 30 | 20 | 0.43 | same |
+| q4 | 680 | 530 | 300 | 0.78 | same |
+| q5 | 110 | 90 | 50 | 0.82 | same |
+| q6 | 80 | 70 | 40 | 0.88 | same |
+| q7 | 120 | 120 | 40 | 1.00 | same |
+| q8 | 70 | 70 | 40 | 1.00 | same |
+| q9 | 240 | 170 | 140 | 0.71 | same |
+| q10 | 100 | 90 | 60 | 0.90 | same |
+| q11 | 450 | 300 | 150 | 0.67 | same |
+| q12 | 60 | 40 | 20 | 0.67 | same |
+| q13 | 160 | 130 | 90 | 0.81 | same |
+| q14 | 300 | 520 | 240 | 1.73 | same |
+| q15 | 40 | 30 | 30 | 0.75 | same |
+| q16 | 40 | 50 | 30 | 1.25 | same |
+| q17 | 170 | 80 | 50 | 0.47 | same |
+| q18 | 130 | 100 | 80 | 0.77 | same |
+| q19 | 80 | 60 | 40 | 0.75 | same |
+| q20 | 40 | 30 | 20 | 0.75 | same |
+| q21 | 40 | 30 | 20 | 0.75 | same |
+| q22 | 180 | 350 | 200 | 1.94 | same |
+| q23 | 360 | 520 | 270 | 1.44 | same |
+| q24 | 190 | 120 | 90 | 0.63 | same |
+| q25 | 180 | 80 | 40 | 0.44 | same |
+| q26 | 70 | 90 | 50 | 1.29 | same |
+| q27 | 130 | 310 | 90 | 2.38 | same |
+| q28 | 250 | 200 | 130 | 0.80 | same |
+| q29 | 190 | 80 | 60 | 0.42 | same |
+| q30 | 60 | 70 | 40 | 1.17 | same |
+| q31 | 150 | 140 | 50 | 0.93 | same |
+| q32 | 40 | 30 | 20 | 0.75 | same |
+| q33 | 80 | 70 | 40 | 0.88 | same |
+| q34 | 80 | 60 | 50 | 0.75 | same |
+| q35 | 120 | 80 | 90 | 0.67 | same |
+| q36 | 90 | 180 | 40 | 2.00 | same |
+| q37 | 50 | 40 | 20 | 0.80 | same |
+| q38 | 110 | 120 | 60 | 1.09 | same |
+| q39 | 110 | 120 | 50 | 1.09 | same |
+| q40 | 50 | 40 | 20 | 0.80 | same |
+| q41 | 30 | 30 | 10 | 1.00 | same |
+| q42 | 50 | 30 | 20 | 0.60 | same |
+| q43 | 70 | 50 | 40 | 0.71 | same |
+| q44 | 110 | 90 | 60 | 0.82 | same |
+| q45 | 50 | 40 | 30 | 0.80 | same |
+| q46 | 120 | 80 | 80 | 0.67 | same |
+| q47 | 180 | 350 | 140 | 1.94 | same |
+| q48 | 130 | 120 | 70 | 0.92 | same |
+| q49 | 110 | 120 | 50 | 1.09 | same |
+| q50 | 140 | 70 | 60 | 0.50 | same |
+| q51 | 310 | 270 | 230 | 0.87 | same |
+| q52 | 50 | 30 | 20 | 0.60 | same |
+| q53 | 70 | 50 | 30 | 0.71 | same |
+| q54 | 80 | 70 | 50 | 0.88 | same |
+| q55 | 50 | 40 | 20 | 0.80 | same |
+| q56 | 100 | 80 | 40 | 0.80 | same |
+| q57 | 90 | 210 | 70 | 2.33 | same |
+| q58 | 90 | 140 | 40 | 1.56 | same |
+| q59 | 120 | 110 | 100 | 0.92 | same |
+| q60 | 80 | 80 | 40 | 1.00 | same |
+| q61 | 150 | 100 | 70 | 0.67 | same |
+| q62 | 60 | 50 | 20 | 0.83 | same |
+| q63 | 70 | 50 | 30 | 0.71 | same |
+| q64 | 490 | 380 | 190 | 0.78 | same |
+| q65 | 130 | 100 | 50 | 0.77 | same |
+| q66 | 140 | 130 | 50 | 0.93 | same |
+| q67 | 500 | 550 | 440 | 1.10 | same |
+| q68 | 120 | 80 | 80 | 0.67 | same |
+| q69 | 80 | 100 | 60 | 1.25 | same |
+| q70 | 120 | 130 | 60 | 1.08 | same |
+| q71 | 80 | 50 | 50 | 0.62 | same |
+| q72 | 220 | 5060 | 340 | 23.00 | same |
+| q73 | 90 | 50 | 40 | 0.56 | same |
+| q74 | 220 | 170 | 170 | 0.77 | same |
+| q75 | 210 | 200 | 90 | 0.95 | same |
+| q76 | 80 | 70 | 40 | 0.88 | same |
+| q77 | 90 | 90 | 50 | 1.00 | same |
+| q78 | 310 | 310 | 160 | 1.00 | same |
+| q79 | 110 | 70 | 70 | 0.64 | same |
+| q80 | 220 | 220 | 80 | 1.00 | same |
+| q81 | 60 | 70 | 40 | 1.17 | same |
+| q82 | 60 | 40 | 20 | 0.67 | same |
+| q83 | 70 | 80 | 20 | 1.14 | DIFF |
+| q84 | 60 | 40 | 20 | 0.67 | same |
+| q85 | 110 | 90 | 50 | 0.82 | same |
+| q86 | 40 | 40 | 20 | 1.00 | same |
+| q87 | 100 | 120 | 80 | 1.20 | same |
+| q88 | 270 | 190 | 160 | 0.70 | same |
+| q89 | 70 | 60 | 40 | 0.86 | same |
+| q90 | 40 | 40 | 10 | 1.00 | same |
+| q91 | 70 | 60 | 30 | 0.86 | same |
+| q92 | 40 | 30 | 20 | 0.75 | same |
+| q93 | 130 | 90 | 60 | 0.69 | same |
+| q94 | 50 | 40 | 30 | 0.80 | same |
+| q95 | 190 | 100 | 220 | 0.53 | same |
+| q96 | 70 | 40 | 20 | 0.57 | same |
+| q97 | 90 | 70 | 70 | 0.78 | same |
+| q98 | 90 | 70 | 40 | 0.78 | same |
+| q99 | 60 | 50 | 40 | 0.83 | same |
+| **sum of medians** | **12800** | **16710** | **7290** | 1.31 | |
+
+Sail faster by >10% on 63 queries, slower by >10% on 16. Suite: Krishiv 12.8 s, Sail 16.7 s, DuckDB 7.3 s. Krishiv runs one process per query (startup and footer reads included); Sail and DuckDB serve every query from one warm process.
+

@@ -37,6 +37,7 @@ import hashlib
 import json
 import os
 import socket
+import threading
 import subprocess
 import sys
 import time
@@ -88,6 +89,51 @@ TABLES = [
     "customer", "lineitem", "nation", "orders",
     "part", "partsupp", "region", "supplier",
 ]
+
+
+class RssSampler:
+    """Peak resident size of a process while a query runs, in MiB.
+
+    Polled from `/proc/<pid>/status` every 50 ms on a thread, so it is the
+    peak *during the query*, not the process's lifetime high-water mark —
+    Sail and DuckDB serve every query from one process, so a lifetime figure
+    would only ever report the largest query so far.
+    """
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.peak_kb = 0
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _sample(self) -> int:
+        try:
+            with open(f"/proc/{self.pid}/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1])
+        except OSError:
+            pass
+        return 0
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.peak_kb = max(self.peak_kb, self._sample())
+            self._stop.wait(0.05)
+
+    def __enter__(self) -> "RssSampler":
+        self.peak_kb = self._sample()
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1)
+        self.peak_kb = max(self.peak_kb, self._sample())
+
+    @property
+    def peak_mb(self) -> int:
+        return self.peak_kb // 1024
 
 
 def table_path(data_root: str, table: str) -> str:
@@ -237,10 +283,12 @@ def run_duckdb(data_root: str, queries: list[dict], timeout_s: int) -> list[dict
             continue
         started = time.monotonic()
         try:
-            rows = con.execute(query["sql"]).fetchall()
+            with RssSampler(os.getpid()) as rss:
+                rows = con.execute(query["sql"]).fetchall()
             out.append({
                 "id": index, "name": query["name"], "status": "ok",
                 "elapsed_s": round(time.monotonic() - started, 2),
+                "peak_rss_mb": rss.peak_mb,
                 **fingerprint(rows),
             })
         except Exception as err:  # noqa: BLE001 - any engine error is a result
@@ -250,7 +298,8 @@ def run_duckdb(data_root: str, queries: list[dict], timeout_s: int) -> list[dict
                 "error": str(err)[-300:],
             })
         print(f"  duckdb q{index:<3} {out[-1]['status']:<7} "
-              f"{out[-1]['elapsed_s']:>8.2f} s", flush=True)
+              f"{out[-1]['elapsed_s']:>8.2f} s  rss={out[-1].get('peak_rss_mb', 0)} MiB",
+              flush=True)
     return out
 
 
@@ -380,10 +429,12 @@ def run_sail(binary: str, data_root: str, queries: list[dict],
                 continue
             started = time.monotonic()
             try:
-                rows = [tuple(r) for r in spark.sql(query["sql"]).collect()]
+                with RssSampler(server.pid) as rss:
+                    rows = [tuple(r) for r in spark.sql(query["sql"]).collect()]
                 out.append({
                     "id": index, "name": query["name"], "status": "ok",
                     "elapsed_s": round(time.monotonic() - started, 2),
+                    "peak_rss_mb": rss.peak_mb,
                     **fingerprint(rows),
                 })
             except Exception as err:  # noqa: BLE001
@@ -393,7 +444,8 @@ def run_sail(binary: str, data_root: str, queries: list[dict],
                     "error": str(err)[-300:],
                 })
             print(f"  sail   q{index:<3} {out[-1]['status']:<7} "
-                  f"{out[-1]['elapsed_s']:>8.2f} s", flush=True)
+                  f"{out[-1]['elapsed_s']:>8.2f} s  rss={out[-1].get('peak_rss_mb', 0)} MiB",
+                  flush=True)
     finally:
         if spark is not None:
             try:
@@ -428,23 +480,28 @@ def run_krishiv(binary: str, data_root: str, queries: list[dict],
             argv += ["--parquet", f"{table}={table_path(data_root, table)}"]
         argv += ["--query", query["sql"]]
         started = time.monotonic()
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True)
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True,
-                                  timeout=timeout_s, check=False)
+            with RssSampler(proc.pid) as rss:
+                stdout, stderr = proc.communicate(timeout=timeout_s)
         except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
             out.append({"id": index, "name": query["name"], "status": "timeout",
                         "elapsed_s": round(time.monotonic() - started, 2)})
+            print(f"  krishiv q{index:<2} timeout {timeout_s:>8} s", flush=True)
             continue
         elapsed = round(time.monotonic() - started, 2)
         if proc.returncode != 0:
-            detail = (proc.stderr or proc.stdout or "").strip()
+            detail = (stderr or stdout or "").strip()
             out.append({"id": index, "name": query["name"], "status": "failed",
                         "elapsed_s": elapsed, "error": detail[-300:]})
         else:
             try:
                 rows = [
                     tuple(json.loads(line).values())
-                    for line in proc.stdout.splitlines()
+                    for line in stdout.splitlines()
                     if line.strip()
                 ]
             except json.JSONDecodeError as err:
@@ -454,9 +511,11 @@ def run_krishiv(binary: str, data_root: str, queries: list[dict],
                 print(f"  krishiv q{index:<2} failed  {elapsed:>8.2f} s", flush=True)
                 continue
             out.append({"id": index, "name": query["name"], "status": "ok",
-                        "elapsed_s": elapsed, **fingerprint(rows)})
+                        "elapsed_s": elapsed, "peak_rss_mb": rss.peak_mb,
+                        **fingerprint(rows)})
         print(f"  krishiv q{index:<2} {out[-1]['status']:<7} "
-              f"{out[-1]['elapsed_s']:>8.2f} s", flush=True)
+              f"{out[-1]['elapsed_s']:>8.2f} s  rss={out[-1].get('peak_rss_mb', 0)} MiB",
+              flush=True)
     return out
 
 
@@ -496,6 +555,8 @@ def merge_passes(passes: list[list[dict]]) -> list[dict]:
             base["elapsed_s"] = round(median(times), 2)
             base["samples_s"] = times
             base["runs_ok"] = f"{len(ok)}/{len(samples)}"
+            if any("peak_rss_mb" in s for s in ok):
+                base["peak_rss_mb"] = max(s.get("peak_rss_mb", 0) for s in ok)
             # Judge determinism on content, not on the order of tied rows —
             # the same distinction the cross-engine check makes. An engine
             # that returns different *rows* run to run is a correctness bug;
@@ -572,13 +633,19 @@ def main() -> int:
                              "next, so drift in the machine's state lands on "
                              "every engine rather than on whichever ran last")
     parser.add_argument("--out")
+    parser.add_argument("--scale", type=int, default=100,
+                        help="scale factor recorded in the output (default 100)")
     parser.add_argument("--compare-to",
                         help="baseline JSON to diff digests against; "
                              "refuses across canonicalisation schemes")
     args = parser.parse_args()
 
     with open(args.corpus_json, encoding="utf-8") as handle:
-        queries = json.load(handle)["queries"]
+        corpus = json.load(handle)
+    queries = corpus["queries"]
+    # A corpus may name its own tables (TPC-DS has 24); the default is TPC-H's.
+    if corpus.get("tables"):
+        TABLES[:] = corpus["tables"]
 
     wanted = [e.strip() for e in args.engines.split(",") if e.strip()]
     results: dict[str, list[dict]] = {}
@@ -679,7 +746,7 @@ def main() -> int:
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as handle:
-            json.dump({"scale": 100, "data_root": args.data,
+            json.dump({"scale": args.scale, "data_root": args.data,
                        "cores": os.cpu_count(), "repeat": args.repeat,
                        # Stamped so a cross-scheme comparison is detectable
                        # instead of silently reporting false disagreements.

@@ -1,0 +1,63 @@
+{
+  "scale": 1,
+  "data_root": "target/tpcds-sf1",
+  "cores": 12,
+  "repeat": 3,
+  "digest_scheme": 2,
+  "interleaved": false,
+  "engine_env": {
+    "KRISHIV_BENCH_SPILL_DIR": "/home/gopal/krishiv-bench-data/spill"
+  },
+  "engines": {
+    "sail": [
+      {
+        "id": 1,
+        "name": "q50",
+        "status": "ok",
+        "elapsed_s": 0.07,
+        "peak_rss_mb": 388,
+        "rows": 6,
+        "digest": "5c05973e608a849b",
+        "digest_unordered": "5c05973e608a849b",
+        "samples_s": [
+          0.07,
+          0.07,
+          0.07
+        ],
+        "runs_ok": "3/3"
+      },
+      {
+        "id": 2,
+        "name": "q62",
+        "status": "ok",
+        "elapsed_s": 0.05,
+        "peak_rss_mb": 403,
+        "rows": 100,
+        "digest": "46a74ae4e7b001f3",
+        "digest_unordered": "46a74ae4e7b001f3",
+        "samples_s": [
+          0.05,
+          0.05,
+          0.04
+        ],
+        "runs_ok": "3/3"
+      },
+      {
+        "id": 3,
+        "name": "q99",
+        "status": "ok",
+        "elapsed_s": 0.05,
+        "peak_rss_mb": 422,
+        "rows": 90,
+        "digest": "fe3fed0678e37ca5",
+        "digest_unordered": "fe3fed0678e37ca5",
+        "samples_s": [
+          0.05,
+          0.06,
+          0.05
+        ],
+        "runs_ok": "3/3"
+      }
+    ]
+  }
+}
