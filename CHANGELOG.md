@@ -27,6 +27,13 @@ Semantic Versioning as described in `docs/RELEASE.md`.
   unbounded key, and keeps the written order unless the greedy order is
   estimated at least 2× cheaper. The size-only rule had regressed TPC-H SF100
   q5 from 21 s to a 38 GB process killed after 22 minutes.
+- Join reordering sees filter selectivity (`1/ndv` on a bounded key, Selinger
+  defaults otherwise), may start a chain from a filtered relation, and caps
+  every key's distinct count by the smaller side's base rows. TPC-H SF100
+  333 s → 297 s (q7 0.43×, q11 0.53×, q21 0.80×), TPC-DS SF1 12.9 s → 12.5 s,
+  every answer identical.
+- Benchmarks: Sail 0.7.2 compared on TPC-H SF100 and TPC-DS SF1 with
+  per-query peak RSS for every engine (`benchmarks/*2026-10-02*`).
 
 ### Fixed
 

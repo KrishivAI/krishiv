@@ -94,6 +94,18 @@ rewrote only q72's; the sweep against the size-only rule is neutral (13.11 s
 → 13.17 s, 99/99 identical) with q72 at 218 ms and q6/q26 — no longer
 reordered — at 79 ms and 71 ms, from 151 and 100.
 
+The 2026-10-02 Sail comparison then showed that every remaining Sail win on
+TPC-H was a join order: a filtered dimension joined into the fact before the
+big join (q7, q21), or a chain started from the filtered dimension (q11). The
+rule now scales a relation by its filters' selectivity, lets a filtered
+relation take the anchor, and has no inversion guard — the 2× estimated-gain
+rule is the guard. TPC-H SF100 333 s → 297 s (q7 0.43×, q11 0.53×, q21
+0.80×, 22/22 answers identical), level with Sail's 296 s on the same
+DataFusion; TPC-DS SF1 12.9 s → 12.5 s with 11 queries faster by >10% (q24,
+the inversion guard's reason to exist, is 0.67×) and q7/q72/q94 slower by
+10–50 ms. Two estimator corrections were needed on the way, both in the
+module docs of `join_reorder.rs`.
+
 Parquet filter pushdown, measured as a third arm, is **not** a suite-wide lever:
 enabling `datafusion.execution.parquet.pushdown_filters` globally is worth 1.4%
 (19823 ms → 19538 ms) because **51 of 99 queries lose more than 10% and only 10

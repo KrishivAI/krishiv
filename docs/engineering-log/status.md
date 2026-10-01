@@ -8858,3 +8858,42 @@ field nothing read.
   integration tests: 6855 passed, 0 failed; release build; TPC-H SF100
   single pass 22/22 ok, 335 s, **0 answer changes** against the DF54 run
   of the same morning (q11 same rows in a different tie order).
+
+
+## 2026-10-02 — Sail comparison on equal DataFusion; join reorder learns selectivity
+
+- **Completed** (overnight, unattended, all detached and checkpointed):
+  1. TPC-H SF100 Sail vs Krishiv vs DuckDB with both DataFusion engines on
+     55.1 (`benchmarks/tpch-sf100-sail-vs-krishiv-df55-2026-10-02.md`):
+     Krishiv 333 s (reorder off), Sail 296 s, DuckDB 193 s; peak RSS per
+     query for every engine (Krishiv 25 GB, Sail 31 GB, DuckDB 16 GB);
+     zero answer changes vs 10-01. Sail with its reorder **off**: 329 s —
+     its whole aggregate edge is join order.
+  2. Sail config and `EXPLAIN` for q6/q7/q11/q13 (`sail_explain.txt` in the
+     session scratchpad): q6's plans are identical; q7 and q11 differ only in
+     join order — the filtered `nation` joined into `supplier` before
+     `lineitem`, and q11 anchored on `nation`.
+  3. TPC-DS SF1, three engines, 3 passes
+     (`benchmarks/tpcds-sf1-sail-vs-krishiv-2026-10-02.md`): Krishiv 12.8 s
+     (99/99), Sail 16.7 s (99/99 after rewriting eight double-quoted aliases
+     Spark SQL reads as strings), DuckDB 7.3 s. Answers: q83 Sail ≠
+     Krishiv = DuckDB (open); q58/q59 Krishiv = Sail ≠ DuckDB is the q1 class
+     — DECIMAL scale 4 vs double at the 5th decimal, same values.
+  4. `JoinReorder`: filter selectivity in relation sizes, filtered relations
+     may anchor, no inversion guard, and the containment cap on every key
+     (base rows of the smaller side). TPC-H SF100 333 → 297 s, q7 0.43×,
+     q11 0.53×, q21 0.80×, 22/22 identical; TPC-DS 12.9 → 12.5 s, 99/99
+     identical. Two intermediate versions were measured and rejected: own-rows
+     cap (q9 2×), any-relation anchor (q72 18×); both are in the module docs.
+- **Validation**: `cargo test -p krishiv-sql` 902 lib + integration green on
+  the final rule; clippy clean; release A/Bs paired and interleaved with
+  digests (`skills/benchmarking/ab_krishiv.py`), 2 rounds TPC-H, 3 rounds
+  TPC-DS.
+- **Open**: TPC-DS q83 disagreement with Sail; the q6-class gap (Sail 5.7 s
+  vs 7.3 s with byte-identical plans) is *not* process startup — a Krishiv
+  process with the eight SF100 tables registered answers `SELECT 1` in
+  0.22 s — so it is scan execution configuration (Sail splits files into
+  finer byte ranges; partition and batch settings); TPC-DS q7/q72 40–50 ms
+  losses under the new rule.
+- **Next**: `python3 skills/benchmarking/ab_krishiv.py` on any further
+  estimator change; investigate q83 with Sail's rows.

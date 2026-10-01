@@ -98,6 +98,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{Column, DFSchemaRef, Result, ScalarValue, Statistics};
+use datafusion::logical_expr::Operator;
 use datafusion::logical_expr::{
     Expr, Join, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, TableScan,
 };
@@ -290,7 +291,7 @@ pub fn ndv_bounds_from_batches(batches: &[RecordBatch], rows: u64) -> HashMap<St
 /// now ranks by estimated join output, declines any chain with a key it has
 /// no distinct-value bound for, and keeps the written order unless the
 /// greedy one is estimated at least 2x cheaper (`REQUIRED_ESTIMATED_GAIN`);
-/// the inversion guard stays. With all three the rule changes **no** TPC-H plan at SF100
+/// the inversion guard stayed at first. With all three the rule changed **no** TPC-H plan at SF100
 /// and, of the 14 TPC-DS SF1 plans the old rule rewrote (6, 18, 19, 26, 37,
 /// 53, 63, 72, 77, 82, 84, 85, 89, 91), only q72's — the one that was ever a
 /// measured win.
@@ -310,6 +311,50 @@ pub fn ndv_bounds_from_batches(batches: &[RecordBatch], rows: u64) -> HashMap<St
 ///   12 "losses" and 9 "wins" over 10%, all on 50-500 ms queries whose
 ///   plans are identical under both rules — noise, not the rule.
 /// ```
+///
+/// # Selectivity and the anchor (2026-10-02)
+///
+/// With output estimates alone the rule still changed no TPC-H plan, and the
+/// Sail comparison showed where the remaining wins were: Sail runs the same
+/// DataFusion and beat Krishiv on q7 by 2.4x, q21 1.8x, q11 1.5x — every one a
+/// join order, never an operator. Its orders join a *filtered* dimension
+/// (`n_name IN two of 25`) into the fact before the big join, and start a
+/// chain from the dimension when that is cheapest. Three changes close that:
+///
+/// * a relation's size is its scan's rows times the selectivity of the
+///   filters above it (`1/ndv` for an equality on a bounded key, Selinger
+///   defaults otherwise);
+/// * the greedy tries every relation as the anchor and keeps the cheapest
+///   order (q11 is written `partsupp, supplier, nation` and runs
+///   `nation, supplier, partsupp`);
+/// * the inversion guard is gone — the 2x estimated-gain rule is the guard.
+///
+/// And one correction the first measurement forced: a composite key's
+/// distinct pairs are capped by the *smaller* side's rows on both sides. Capped
+/// by each side's own rows, `lineitem ⋈ partsupp` on `(partkey, suppkey)` was
+/// estimated at 80 M rows (it is 600 M), and q9 doubled to 65 s.
+///
+/// Measured against the output-estimate rule without selectivity (both on,
+/// release, paired and interleaved, digests identical throughout):
+///
+/// ```text
+///   TPC-H SF100, 2 rounds        333.0 s -> 296.9 s   (+12%)
+///   q7   31.2 s -> 13.6 s  0.43x    q11   4.2 s -> 2.2 s  0.53x
+///   q21  53.1 s -> 42.5 s  0.80x    q8, q9 and the other 18 unchanged
+///   Sail 0.7.2 on the same DataFusion, same box: 295.6 s
+///
+///   TPC-DS SF1, 99 queries, 3 rounds   12.9 s -> 12.5 s   (+3%)
+///   28 plans change; 11 faster by >10% (q29 0.58, q17 0.66, q61 0.66,
+///   q50 0.67, q11 0.77, q4 0.79, q85 0.79), 3 slower (q7 +50 ms,
+///   q72 +40 ms, q94 +10 ms); the q24 shape the inversion guard existed
+///   for is 0.67x faster without it.
+/// ```
+///
+/// Two estimator corrections those measurements forced, in order:
+/// capping every key's distinct count by the smaller side's *base* rows
+/// (q9 had doubled, see [`join_estimate`]), and allowing only a filtered
+/// relation to take the anchor (q72 had gone 18x slower, see
+/// [`greedy_order`]).
 ///
 /// # What is NOT measured
 ///
@@ -398,6 +443,116 @@ impl JoinReorder {
         entry.columns.get(&column.name).copied()
     }
 
+    /// Rows `relation` brings to the chain: its base table's count scaled by
+    /// the selectivity of every filter between the chain and the scan.
+    ///
+    /// The filters are what the written order ignores. TPC-H q7's two `nation`
+    /// copies carry `n_name = 'FRANCE' OR n_name = 'GERMANY'`, which leaves 2
+    /// of 25 rows; joined into `supplier` *before* `lineitem` that shrinks the
+    /// probe to 8% of 600 M rows, and joined last it shrinks nothing. Sail
+    /// orders it first and runs q7 2.4x faster on the same DataFusion.
+    ///
+    /// A predicate is read once: from the `Filter` nodes above the scan, or,
+    /// when there are none, from the scan's own pushed-down `filters` (an
+    /// inexact pushdown keeps both, and counting both would square it).
+    fn effective_size(&self, relation: &LogicalPlan) -> Option<u64> {
+        let rows = self.size_of(relation)? as f64;
+        let mut predicates: Vec<&Expr> = Vec::new();
+        let mut plan = relation;
+        loop {
+            plan = match plan {
+                LogicalPlan::TableScan(scan) => {
+                    if predicates.is_empty() {
+                        predicates.extend(scan.filters.iter());
+                    }
+                    break;
+                }
+                LogicalPlan::SubqueryAlias(alias) => alias.input.as_ref(),
+                LogicalPlan::Filter(filter) => {
+                    predicates.push(&filter.predicate);
+                    filter.input.as_ref()
+                }
+                LogicalPlan::Projection(projection) if is_column_pruning(projection) => {
+                    projection.input.as_ref()
+                }
+                _ => break,
+            };
+        }
+        let selectivity: f64 = predicates
+            .iter()
+            .map(|predicate| self.selectivity(relation, predicate))
+            .product();
+        Some((rows * selectivity).round().max(1.0) as u64)
+    }
+
+    /// Fraction of `relation`'s rows that `predicate` keeps.
+    ///
+    /// An equality on a column with a recorded distinct-value bound keeps
+    /// `1/ndv`; everything else takes the System R defaults
+    /// ([`EQUALITY_SELECTIVITY_DEFAULT`] and friends), which are coarse but
+    /// err toward *more* rows — the direction that keeps a large relation
+    /// from being mistaken for a small one. A predicate this cannot read
+    /// keeps every row.
+    fn selectivity(&self, relation: &LogicalPlan, predicate: &Expr) -> f64 {
+        match predicate {
+            Expr::BinaryExpr(binary) => match binary.op {
+                Operator::And => {
+                    self.selectivity(relation, &binary.left)
+                        * self.selectivity(relation, &binary.right)
+                }
+                Operator::Or => {
+                    let (left, right) = (
+                        self.selectivity(relation, &binary.left),
+                        self.selectivity(relation, &binary.right),
+                    );
+                    (left + right - left * right).min(1.0)
+                }
+                Operator::Eq => column_against_literal(&binary.left, &binary.right)
+                    .map_or(1.0, |column| self.equality_selectivity(relation, column)),
+                Operator::NotEq => column_against_literal(&binary.left, &binary.right)
+                    .map_or(1.0, |column| {
+                        1.0 - self.equality_selectivity(relation, column)
+                    }),
+                Operator::Lt | Operator::LtEq | Operator::Gt | Operator::GtEq => {
+                    column_against_literal(&binary.left, &binary.right)
+                        .map_or(1.0, |_| RANGE_SELECTIVITY_DEFAULT)
+                }
+                _ => 1.0,
+            },
+            Expr::InList(in_list) => {
+                let Expr::Column(column) = in_list.expr.as_ref() else {
+                    return 1.0;
+                };
+                let one = self.equality_selectivity(relation, column);
+                let kept = (one * in_list.list.len() as f64).min(1.0);
+                if in_list.negated { 1.0 - kept } else { kept }
+            }
+            Expr::Between(between) => {
+                let kept = if matches!(between.expr.as_ref(), Expr::Column(_)) {
+                    RANGE_SELECTIVITY_DEFAULT
+                } else {
+                    1.0
+                };
+                if between.negated { 1.0 - kept } else { kept }
+            }
+            Expr::Like(like) | Expr::SimilarTo(like) => {
+                if like.negated {
+                    1.0 - LIKE_SELECTIVITY_DEFAULT
+                } else {
+                    LIKE_SELECTIVITY_DEFAULT
+                }
+            }
+            Expr::Not(inner) => 1.0 - self.selectivity(relation, inner),
+            _ => 1.0,
+        }
+    }
+
+    fn equality_selectivity(&self, relation: &LogicalPlan, column: &Column) -> f64 {
+        self.ndv_of(relation, column)
+            .filter(|ndv| *ndv > 0)
+            .map_or(EQUALITY_SELECTIVITY_DEFAULT, |ndv| 1.0 / ndv as f64)
+    }
+
     /// Rows in `plan`, when it bottoms out in exactly one known base table.
     ///
     /// A subtree with no scan (a values list) or more than one (a join this rule
@@ -425,6 +580,32 @@ impl JoinReorder {
     }
 }
 
+/// Selectivity defaults where no statistic answers, from Selinger et al.
+/// (1979): an equality keeps a tenth, a range keeps a third, a pattern keeps
+/// half. Used only for columns without a distinct-value bound.
+const EQUALITY_SELECTIVITY_DEFAULT: f64 = 0.1;
+const RANGE_SELECTIVITY_DEFAULT: f64 = 0.3;
+const LIKE_SELECTIVITY_DEFAULT: f64 = 0.5;
+
+/// The column of a `column <op> literal` comparison, either way round; a
+/// literal under a cast still counts.
+fn column_against_literal<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a Column> {
+    fn is_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal(..) => true,
+            Expr::Cast(cast) => is_literal(&cast.expr),
+            Expr::TryCast(cast) => is_literal(&cast.expr),
+            _ => false,
+        }
+    }
+    match (left, right) {
+        (Expr::Column(column), other) | (other, Expr::Column(column)) if is_literal(other) => {
+            Some(column)
+        }
+        _ => None,
+    }
+}
+
 /// The table scan under `plan`, through nodes that keep a column's meaning:
 /// aliases, filters and column-pruning projections.
 fn base_scan(mut plan: &LogicalPlan) -> Option<&TableScan> {
@@ -449,6 +630,9 @@ struct Edge {
     b: usize,
     ndv_a: f64,
     ndv_b: f64,
+    /// Rows of each side's base table, before any filter: the containment cap.
+    base_a: f64,
+    base_b: f64,
 }
 
 /// One level's worth of a flattened inner-join chain.
@@ -574,6 +758,7 @@ fn join_estimate(
     let mut placed_ndv = 1.0_f64;
     let mut candidate_ndv = 1.0_f64;
     let mut connected = false;
+    let mut cap = f64::INFINITY;
     for edge in edges {
         let (theirs, ours) = if edge.a == candidate && placed.contains(&edge.b) {
             (edge.ndv_b, edge.ndv_a)
@@ -583,13 +768,29 @@ fn join_estimate(
             continue;
         };
         connected = true;
-        placed_ndv *= theirs;
-        candidate_ndv *= ours;
+        // Under containment both sides draw their key values from the
+        // smaller base table's domain, so neither distinct count can exceed
+        // its rows. The bounds here are upper bounds — a min/max range for a
+        // column, a product for a composite key — and both overshoot on the
+        // keys that matter: `l_orderkey` spans 600 M values for 150 M orders,
+        // the `(partkey, suppkey)` product is 2e13 for 80 M pairs. Uncapped,
+        // `orders ⋈ lineitem` was estimated at 150 M rows and
+        // `partsupp ⋈ lineitem` at 80 M (both are 600 M); TPC-H q9 doubled.
+        // The cap is the *base* rows, not the filtered size: a filtered
+        // dimension still has its whole domain on the fact side.
+        let edge_cap = edge.base_a.min(edge.base_b);
+        cap = cap.min(edge_cap);
+        placed_ndv *= theirs.min(edge_cap);
+        candidate_ndv *= ours.min(edge_cap);
     }
     if !connected {
         return None;
     }
-    let denominator = placed_ndv.min(rows).max(candidate_ndv.min(size)).max(1.0);
+    let denominator = placed_ndv
+        .min(rows)
+        .min(cap)
+        .max(candidate_ndv.min(size).min(cap))
+        .max(1.0);
     Some((rows * size / denominator).max(1.0))
 }
 
@@ -615,19 +816,60 @@ fn order_cost(order: &[usize], sizes: &[u64], edges: &[Edge]) -> Option<f64> {
     Some(cost)
 }
 
-/// Greedy order: keep the first relation, then repeatedly take the connected
-/// relation whose join is estimated to produce the fewest rows — the smaller
-/// relation on a tie, which is every candidate when each joins on a key.
+/// The cheapest greedy order over the written anchor and every *filtered*
+/// relation as anchor.
 ///
-/// The anchor is deliberately *not* chosen by size. It is the relation the query
-/// named first, which in a star-schema query is the fact table and is what every
-/// dimension reduces; re-anchoring on the smallest dimension would rebuild the
-/// same chain upside down for no measured gain, and would deviate from the
-/// author's written order in every query rather than only where sizes demand it.
-fn greedy_order(sizes: &[u64], edges: &[Edge], count: usize) -> Option<Vec<usize>> {
-    let mut placed = vec![0usize];
-    let mut rows = *sizes.first()? as f64;
-    let mut remaining: Vec<usize> = (1..count).collect();
+/// A left-deep chain's first relation is its build side all the way up, and
+/// the written anchor is wrong whenever a filtered dimension should lead:
+/// TPC-H q11 is written `partsupp, supplier, nation` with `n_name = 'GERMANY'`,
+/// and the order that runs is `nation, supplier, partsupp` — a 100 K row build
+/// probing 80 M rows once, instead of an 80 M row intermediate filtered last.
+///
+/// Only a relation the query has already made small may take the anchor.
+/// Anchoring on any relation let TPC-DS q72 start from the 5-row `warehouse`
+/// and build the 11.7 M row `inventory` side first: the estimate for joining
+/// the year-filtered `date_dim` to it on `d_week_seq` used the dimension's
+/// full-table 10 436 weeks where inventory's dates span 260, so it believed
+/// the filter cut inventory 25x, and q72 went from 210 ms to 3.8 s. The
+/// estimator does not propagate distinct counts through joins, and an
+/// unfiltered anchor is where that error is largest; a filtered anchor
+/// brings its own reduction with it. The written order still wins every tie,
+/// and the caller still requires it to be beaten by
+/// [`REQUIRED_ESTIMATED_GAIN`].
+fn greedy_order(
+    sizes: &[u64],
+    base_sizes: &[u64],
+    edges: &[Edge],
+    count: usize,
+) -> Option<Vec<usize>> {
+    let mut best: Option<(f64, Vec<usize>)> = None;
+    let filtered = |index: usize| sizes.get(index) < base_sizes.get(index);
+    for anchor in (0..count).filter(|index| *index == 0 || filtered(*index)) {
+        let Some(order) = greedy_order_from(anchor, sizes, edges, count) else {
+            continue;
+        };
+        let Some(cost) = order_cost(&order, sizes, edges) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(current, _)| cost < *current) {
+            best = Some((cost, order));
+        }
+    }
+    best.map(|(_, order)| order)
+}
+
+/// Greedy order from `anchor`: repeatedly take the connected relation whose
+/// join is estimated to produce the fewest rows — the smaller relation on a
+/// tie, which is every candidate when each joins on a key.
+fn greedy_order_from(
+    anchor: usize,
+    sizes: &[u64],
+    edges: &[Edge],
+    count: usize,
+) -> Option<Vec<usize>> {
+    let mut placed = vec![anchor];
+    let mut rows = *sizes.get(anchor)? as f64;
+    let mut remaining: Vec<usize> = (0..count).filter(|index| *index != anchor).collect();
     while !remaining.is_empty() {
         let mut best: Option<(f64, u64, usize)> = None;
         for candidate in remaining.iter().copied() {
@@ -686,7 +928,7 @@ impl OptimizerRule for JoinReorder {
         let Some(sizes) = chain
             .relations
             .iter()
-            .map(|relation| self.size_of(relation))
+            .map(|relation| self.effective_size(relation))
             .collect::<Option<Vec<u64>>>()
         else {
             return Ok(Transformed::no(plan));
@@ -723,32 +965,38 @@ impl OptimizerRule for JoinReorder {
             ) else {
                 return Ok(Transformed::no(plan));
             };
+            let (Some(base_a), Some(base_b)) =
+                (self.size_of(left_relation), self.size_of(right_relation))
+            else {
+                return Ok(Transformed::no(plan));
+            };
             edges.push(Edge {
                 a: l,
                 b: r,
                 ndv_a: ndv_a as f64,
                 ndv_b: ndv_b as f64,
+                base_a: base_a as f64,
+                base_b: base_b as f64,
             });
         }
 
-        // Only chains whose written order is actually inverted are reordered.
-        //
-        // A relation larger than the anchor is one the `FROM` clause asked to be
-        // joined before things that could have shrunk it — q72's `inventory`,
-        // 11.74 M rows against a 1.44 M row fact. Where every relation is
-        // smaller than the anchor, the written order is already fact-first and
-        // moving anything is a bet on selectivity this rule cannot estimate:
-        // reordering those chains regressed q24 4.0x (205 ms -> 805 ms), q50
-        // 2.0x and q36 1.4x on TPC-DS SF1, because `store_sales ⋈ store_returns`
-        // is a near-1:1 fact-to-fact join that *reduces*, and size alone cannot
-        // tell it from q72's fact-to-fact join that multiplies.
-        let Some(anchor) = sizes.first().copied() else {
+        // Whether to reorder at all is decided below by estimate alone: the
+        // greedy order must beat the written one by REQUIRED_ESTIMATED_GAIN.
+        // An earlier version also required a relation larger than the written
+        // anchor ("inverted" order) before looking; that was the size-only
+        // rule's protection against q24's reducing fact-to-fact join, and it
+        // also refused every fact-first chain whose dimension carries a
+        // selective filter — q7, q10, q11 — which is where the output estimate
+        // now does the work.
+        let Some(base_sizes) = chain
+            .relations
+            .iter()
+            .map(|relation| self.size_of(relation))
+            .collect::<Option<Vec<u64>>>()
+        else {
             return Ok(Transformed::no(plan));
         };
-        if !sizes.iter().skip(1).any(|size| *size > anchor) {
-            return Ok(Transformed::no(plan));
-        }
-        let Some(order) = greedy_order(&sizes, &edges, count) else {
+        let Some(order) = greedy_order(&sizes, &base_sizes, &edges, count) else {
             return Ok(Transformed::no(plan));
         };
         let written: Vec<usize> = (0..count).collect();
@@ -1036,16 +1284,16 @@ mod tests {
         );
     }
 
-    /// A chain already written fact-first must be left alone.
+    /// A fact-first chain is still reordered when a later join multiplies.
     ///
-    /// q24's `store_sales ⋈ store_returns` is a near-1:1 fact-to-fact join that
-    /// *reduces*; q72's `catalog_sales ⋈ inventory` is one that multiplies.
-    /// Base-table size cannot tell them apart, so the rule only reorders chains
-    /// where a relation is larger than the anchor — the case where the written
-    /// order is demonstrably inverted. Without this guard q24 ran 4.0x slower
-    /// (205 ms -> 805 ms on TPC-DS SF1).
+    /// Here every relation is smaller than the anchor, which the size-only
+    /// rule took as "already fact-first, leave it". The estimate sees that
+    /// `inventory` (16 rows per item) multiplies the fact to 46 M rows and
+    /// that the 1:1 `household_demographics` join costs nothing, so the
+    /// cheap join goes first and the multiplying one last — 2.9 M rows
+    /// through the demographics join instead of 46 M.
     #[tokio::test]
-    async fn a_chain_already_written_largest_first_is_left_alone() {
+    async fn a_fact_first_chain_is_reordered_when_a_later_join_multiplies() {
         let counts = registries(&[
             (
                 "catalog_sales",
@@ -1057,9 +1305,254 @@ mod tests {
         ]);
         let plan = plan_of(&context(Some(counts)), Q72_SHAPE).await;
         assert!(
-            join_line(&plan, "inv_item_sk") > join_line(&plan, "hd_demo_sk"),
-            "every relation is smaller than the anchor, so the written order \
-             stands and the rule must not reorder:\n{plan}"
+            join_line(&plan, "inv_item_sk") < join_line(&plan, "hd_demo_sk"),
+            "the multiplying inventory join must sit above the 1:1 \
+             demographics join:\n{plan}"
+        );
+    }
+
+    /// Tables for the TPC-H q7 and q11 shapes, one `Int64` column per key.
+    fn tpch_like_context(registries: (TableRowCounts, TableKeyNdv)) -> SessionContext {
+        fn columns(spec: &[(&str, DataType)], rows: &[Vec<ScalarValue>]) -> Arc<MemTable> {
+            let schema = Arc::new(Schema::new(
+                spec.iter()
+                    .map(|(name, data_type)| Field::new(*name, data_type.clone(), false))
+                    .collect::<Vec<_>>(),
+            ));
+            let arrays = (0..spec.len())
+                .map(|index| {
+                    ScalarValue::iter_to_array(rows.iter().map(|row| row[index].clone()))
+                        .expect("array")
+                })
+                .collect();
+            let batch = RecordBatch::try_new(Arc::clone(&schema), arrays).expect("batch");
+            Arc::new(MemTable::try_new(schema, vec![vec![batch]]).expect("mem table"))
+        }
+        let int = |value: i64| ScalarValue::Int64(Some(value));
+        let text = |value: &str| ScalarValue::Utf8(Some(value.to_owned()));
+        let (counts, ndv) = registries;
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_optimizer_rule(Arc::new(JoinReorder::forced(counts, ndv)))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_table(
+            "nation",
+            columns(
+                &[("n_nationkey", DataType::Int64), ("n_name", DataType::Utf8)],
+                &[vec![int(1), text("FRANCE")], vec![int(2), text("GERMANY")]],
+            ),
+        )
+        .expect("nation");
+        ctx.register_table(
+            "supplier",
+            columns(
+                &[
+                    ("s_suppkey", DataType::Int64),
+                    ("s_nationkey", DataType::Int64),
+                ],
+                &[vec![int(1), int(1)], vec![int(2), int(2)]],
+            ),
+        )
+        .expect("supplier");
+        ctx.register_table(
+            "lineitem",
+            columns(
+                &[
+                    ("l_suppkey", DataType::Int64),
+                    ("l_orderkey", DataType::Int64),
+                ],
+                &[vec![int(1), int(10)], vec![int(2), int(20)]],
+            ),
+        )
+        .expect("lineitem");
+        ctx.register_table(
+            "orders",
+            columns(
+                &[
+                    ("o_orderkey", DataType::Int64),
+                    ("o_custkey", DataType::Int64),
+                ],
+                &[vec![int(10), int(100)], vec![int(20), int(200)]],
+            ),
+        )
+        .expect("orders");
+        ctx.register_table(
+            "customer",
+            columns(
+                &[
+                    ("c_custkey", DataType::Int64),
+                    ("c_nationkey", DataType::Int64),
+                ],
+                &[vec![int(100), int(1)], vec![int(200), int(2)]],
+            ),
+        )
+        .expect("customer");
+        ctx.register_table(
+            "partsupp",
+            columns(
+                &[
+                    ("ps_suppkey", DataType::Int64),
+                    ("ps_partkey", DataType::Int64),
+                ],
+                &[vec![int(1), int(7)], vec![int(2), int(8)]],
+            ),
+        )
+        .expect("partsupp");
+        ctx
+    }
+
+    /// TPC-H SF100 sizes and distinct-value bounds for the q7/q11 tables.
+    fn tpch_sf100_registries() -> (TableRowCounts, TableKeyNdv) {
+        registries(&[
+            ("nation", 25, &[("n_nationkey", 25)]),
+            (
+                "supplier",
+                1_000_000,
+                &[("s_suppkey", 1_000_000), ("s_nationkey", 25)],
+            ),
+            (
+                "lineitem",
+                600_037_902,
+                &[("l_suppkey", 1_000_000), ("l_orderkey", 150_000_000)],
+            ),
+            (
+                "orders",
+                150_000_000,
+                &[("o_orderkey", 150_000_000), ("o_custkey", 10_000_000)],
+            ),
+            (
+                "customer",
+                15_000_000,
+                &[("c_custkey", 15_000_000), ("c_nationkey", 25)],
+            ),
+            (
+                "partsupp",
+                80_000_000,
+                &[("ps_suppkey", 1_000_000), ("ps_partkey", 20_000_000)],
+            ),
+        ])
+    }
+
+    /// TPC-H q7: a filtered dimension must be joined into `supplier` *before*
+    /// `lineitem`.
+    ///
+    /// Written `supplier, lineitem, orders, customer, n1, n2`, the nation
+    /// filters (`n_name IN two of 25`) apply last, after a 600 M row join.
+    /// Without selectivity the estimate found the greedy order only 1.3x
+    /// cheaper and declined; Sail joins `n1` first and runs q7 2.4x faster.
+    #[tokio::test]
+    async fn a_filtered_dimension_is_joined_before_the_fact_it_reduces() {
+        let ctx = tpch_like_context(tpch_sf100_registries());
+        let plan = plan_of(
+            &ctx,
+            "SELECT count(*) FROM supplier \
+             JOIN lineitem ON (s_suppkey = l_suppkey) \
+             JOIN orders ON (l_orderkey = o_orderkey) \
+             JOIN customer ON (o_custkey = c_custkey) \
+             JOIN nation n1 ON (s_nationkey = n1.n_nationkey) \
+             JOIN nation n2 ON (c_nationkey = n2.n_nationkey) \
+             WHERE (n1.n_name = 'FRANCE' AND n2.n_name = 'GERMANY') \
+                OR (n1.n_name = 'GERMANY' AND n2.n_name = 'FRANCE')",
+        )
+        .await;
+        assert!(
+            join_line(&plan, "s_nationkey") > join_line(&plan, "l_suppkey"),
+            "the filtered nation must join supplier below the lineitem join:\n{plan}"
+        );
+    }
+
+    /// TPC-H q11: the anchor may change when a filtered dimension should lead.
+    ///
+    /// Written `partsupp, supplier, nation` with `n_name = 'GERMANY'`; the
+    /// cheapest order starts from `nation` — a 40 K row build probing 80 M
+    /// rows once. Anchored on the written first relation the greedy could
+    /// never find it.
+    #[tokio::test]
+    async fn a_chain_may_be_re_anchored_on_a_filtered_dimension() {
+        let ctx = tpch_like_context(tpch_sf100_registries());
+        let plan = plan_of(
+            &ctx,
+            "SELECT count(*) FROM partsupp \
+             JOIN supplier ON (ps_suppkey = s_suppkey) \
+             JOIN nation ON (s_nationkey = n_nationkey) \
+             WHERE n_name = 'GERMANY'",
+        )
+        .await;
+        assert!(
+            join_line(&plan, "ps_suppkey") < join_line(&plan, "s_nationkey"),
+            "the nation-supplier join must be the build side under the partsupp join:\n{plan}"
+        );
+    }
+
+    /// Selectivity: `1/ndv` on a bounded column, the System R defaults
+    /// elsewhere, and the AND/OR/NOT algebra over them.
+    #[tokio::test]
+    async fn filter_selectivity_scales_a_relation_by_its_predicates() {
+        use datafusion::logical_expr::{col, lit};
+        let (counts, ndv) = registries(&[("supplier", 1_000_000, &[("s_nationkey", 25)])]);
+        let rule = JoinReorder::forced(counts, ndv);
+        let ctx = tpch_like_context(tpch_sf100_registries());
+        let scan = ctx
+            .table("supplier")
+            .await
+            .expect("table")
+            .into_unoptimized_plan();
+        let size = |predicate: Expr| {
+            let plan = datafusion::logical_expr::LogicalPlanBuilder::from(scan.clone())
+                .filter(predicate)
+                .expect("filter")
+                .build()
+                .expect("plan");
+            rule.effective_size(&plan).expect("size")
+        };
+        assert_eq!(
+            size(col("s_nationkey").eq(lit(7_i64))),
+            40_000,
+            "1/25 of a million"
+        );
+        assert_eq!(
+            size(col("s_nationkey").in_list(vec![lit(1_i64), lit(2_i64)], false)),
+            80_000,
+            "two of 25"
+        );
+        assert_eq!(
+            size(col("s_suppkey").eq(lit(7_i64))),
+            100_000,
+            "no bound: a tenth"
+        );
+        assert_eq!(
+            size(col("s_suppkey").gt(lit(7_i64))),
+            300_000,
+            "range default"
+        );
+        assert_eq!(
+            size(
+                col("s_nationkey")
+                    .eq(lit(7_i64))
+                    .and(col("s_suppkey").gt(lit(7_i64)))
+            ),
+            12_000,
+            "AND multiplies"
+        );
+        assert_eq!(
+            size(
+                col("s_nationkey")
+                    .eq(lit(1_i64))
+                    .or(col("s_nationkey").eq(lit(2_i64)))
+            ),
+            78_400,
+            "OR is inclusion-exclusion"
+        );
+        assert_eq!(
+            size(col("s_nationkey").not_eq(lit(7_i64))),
+            960_000,
+            "NOT complements"
+        );
+        assert_eq!(
+            size(col("s_suppkey").eq(col("s_nationkey"))),
+            1_000_000,
+            "unreadable keeps all"
         );
     }
 
@@ -1174,27 +1667,39 @@ mod tests {
                 b: 1,
                 ndv_a: 15_000_000.0,
                 ndv_b: 10_000_000.0,
+                base_a: 15e6,
+                base_b: 150e6,
             },
             Edge {
                 a: 0,
                 b: 2,
                 ndv_a: 25.0,
                 ndv_b: 25.0,
+                base_a: 15e6,
+                base_b: 1e6,
             },
         ];
         let orders = join_estimate(15e6, 1, &[0], &sizes, &edges).unwrap();
         let supplier = join_estimate(15e6, 2, &[0], &sizes, &edges).unwrap();
         assert_eq!(orders, 150e6, "a key join keeps the many side's rows");
         assert_eq!(supplier, 15e6 * 1e6 / 25.0, "a 25-value key multiplies");
-        assert_eq!(greedy_order(&sizes, &edges, 3), Some(vec![0, 1, 2]));
+        assert_eq!(greedy_order(&sizes, &sizes, &edges, 3), Some(vec![0, 1, 2]));
         // Not connected: no estimate.
         assert_eq!(join_estimate(15e6, 2, &[1], &sizes, &edges), None);
     }
 
-    /// A composite key cannot have more distinct values than either side has
-    /// rows, so multiplying per-column bounds is capped.
+    /// A composite key's distinct pairs are capped by the *smaller* side's rows
+    /// on both sides, not each side by its own.
+    ///
+    /// TPC-H q9: `lineitem ⋈ partsupp` on `(partkey, suppkey)`. The pair is
+    /// partsupp's key (80 M rows, 80 M pairs); lineitem's 600 M rows draw
+    /// their pairs from that same domain, so it holds at most 80 M distinct
+    /// pairs too. Capping lineitem's product by its own 600 M rows made the
+    /// join look like it produced 80 M rows; it produces 600 M, and that
+    /// estimate put an 80 M row build side under the whole query — q9 went
+    /// from 33 s to 65 s at SF100.
     #[test]
-    fn a_composite_key_distinct_count_is_capped_by_rows() {
+    fn a_composite_key_distinct_count_is_capped_by_the_smaller_side() {
         let sizes = [600_000_000, 80_000_000];
         let edges = [
             Edge {
@@ -1202,16 +1707,58 @@ mod tests {
                 b: 1,
                 ndv_a: 20_000_000.0,
                 ndv_b: 20_000_000.0,
+                base_a: 600e6,
+                base_b: 80e6,
             },
             Edge {
                 a: 0,
                 b: 1,
                 ndv_a: 1_000_000.0,
                 ndv_b: 1_000_000.0,
+                base_a: 600e6,
+                base_b: 80e6,
             },
         ];
         let estimate = join_estimate(600e6, 1, &[0], &sizes, &edges).unwrap();
-        assert_eq!(estimate, 80e6, "600M x 80M / min(2e13, 600M) = 80M");
+        assert_eq!(estimate, 600e6, "600M x 80M / min(2e13, 80M) = 600M");
+        let estimate = join_estimate(80e6, 0, &[1], &sizes, &edges).unwrap();
+        assert_eq!(estimate, 600e6, "the same join from the other side");
+    }
+
+    /// The cap is the base table's rows, not the filtered size: 4.75 of 25
+    /// nations still see every supplier's nationkey, so the join keeps
+    /// 4.75/25 of supplier, not all of it.
+    #[test]
+    fn a_filtered_dimension_keeps_its_whole_domain_for_the_cap() {
+        let sizes = [1_000_000, 5];
+        let edges = [Edge {
+            a: 0,
+            b: 1,
+            ndv_a: 25.0,
+            ndv_b: 25.0,
+            base_a: 1e6,
+            base_b: 25.0,
+        }];
+        let estimate = join_estimate(1e6, 1, &[0], &sizes, &edges).unwrap();
+        assert_eq!(estimate, 1e6 * 5.0 / 25.0, "a fifth of the suppliers");
+    }
+
+    /// A single key's range bound is capped the same way: `l_orderkey` spans
+    /// 600 M values for 150 M orders, and uncapped that made `orders ⋈ lineitem`
+    /// look like it halved `lineitem`.
+    #[test]
+    fn a_sparse_key_range_bound_is_capped_by_the_smaller_side() {
+        let sizes = [600_000_000, 150_000_000];
+        let edges = [Edge {
+            a: 0,
+            b: 1,
+            ndv_a: 600_000_000.0,
+            ndv_b: 150_000_000.0,
+            base_a: 600e6,
+            base_b: 150e6,
+        }];
+        let estimate = join_estimate(600e6, 1, &[0], &sizes, &edges).unwrap();
+        assert_eq!(estimate, 600e6, "600M x 150M / min(600M, 150M) = 600M");
     }
 
     #[test]
