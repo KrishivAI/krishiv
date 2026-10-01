@@ -78,10 +78,15 @@
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{Result, Statistics};
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::execution::disk_manager::RefCountedTempFile;
+// DF55 replaced direct `RefCountedTempFile` use with the `SpillFile` trait:
+// `InProgressSpillFile::finish` now yields `Option<Arc<dyn SpillFile>>` and
+// `read_spill_as_stream` takes `Arc<dyn SpillFile>`. Same lifetime semantics —
+// the file is deleted when the last handle drops — behind a trait object.
+use datafusion::execution::SpillFile;
 use datafusion::execution::memory_pool::MemoryConsumer;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
@@ -90,8 +95,8 @@ use datafusion::physical_plan::repartition::BatchPartitioner;
 use datafusion::physical_plan::spill::{SpillManager, get_record_batch_memory_size};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PlanProperties,
-    SendableRecordBatchStream,
+    ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, InputDistributionRequirements,
+    PlanProperties, SendableRecordBatchStream, StatisticsArgs,
 };
 use futures::{StreamExt, TryStreamExt};
 use std::fmt;
@@ -251,6 +256,20 @@ impl DisplayAs for GraceHashJoinExec {
 }
 
 impl ExecutionPlan for GraceHashJoinExec {
+    /// DF55 made this required. `GraceHashJoinExec` owns no expressions of its
+    /// own — the join keys and the optional filter live on `template`, which
+    /// this node delegates every other plan-level question to. Returning
+    /// `Continue` here would compile and would hide the join's expressions from
+    /// every optimizer pass that walks them.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        self.template.apply_expressions(f)
+    }
+
     fn name(&self) -> &str {
         "GraceHashJoinExec"
     }
@@ -266,8 +285,8 @@ impl ExecutionPlan for GraceHashJoinExec {
         vec![self.template.left(), self.template.right()]
     }
 
-    fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.template.required_input_distribution()
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        self.template.input_distribution_requirements()
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -320,10 +339,26 @@ impl ExecutionPlan for GraceHashJoinExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.template.partition_statistics(partition)
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.template.child_stats_requests(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        self.template.statistics_from_inputs(input_stats, args)
     }
 }
+
+/// One bucket's spill files: (bucket, build side, probe side); `None` is an
+/// empty side.
+type BucketPair = (
+    usize,
+    Option<Arc<dyn SpillFile>>,
+    Option<Arc<dyn SpillFile>>,
+);
 
 /// Run the join for one output partition.
 async fn join(
@@ -442,11 +477,7 @@ async fn join(
 
     // Pass 3: one in-memory join per bucket, streamed in turn so that only one
     // bucket's build side is resident at a time.
-    let pairs: Vec<(
-        usize,
-        Option<RefCountedTempFile>,
-        Option<RefCountedTempFile>,
-    )> = build_files
+    let pairs: Vec<BucketPair> = build_files
         .into_iter()
         .zip(probe_files)
         .enumerate()
@@ -495,8 +526,8 @@ async fn join(
 async fn join_bucket(
     template: &Arc<HashJoinExec>,
     bucket: usize,
-    build_file: Option<RefCountedTempFile>,
-    probe_file: Option<RefCountedTempFile>,
+    build_file: Option<Arc<dyn SpillFile>>,
+    probe_file: Option<Arc<dyn SpillFile>>,
     build_spills: &SpillManager,
     probe_spills: &SpillManager,
     build_schema: SchemaRef,
@@ -638,7 +669,7 @@ async fn spill_by_bucket(
     buckets: usize,
     spills: &SpillManager,
     request: &str,
-) -> Result<Vec<Option<RefCountedTempFile>>> {
+) -> Result<Vec<Option<Arc<dyn SpillFile>>>> {
     let mut partitioner = BatchPartitioner::new_hash_partitioner(keys, buckets, Time::new())?;
     // The type of an in-progress spill file is not nameable outside DataFusion,
     // so it is only ever inferred here.
@@ -725,6 +756,16 @@ impl DisplayAs for OnceStreamExec {
 }
 
 impl ExecutionPlan for OnceStreamExec {
+    /// DF55 made this required. A consumed-once stream holds no `PhysicalExpr`.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "OnceStreamExec"
     }

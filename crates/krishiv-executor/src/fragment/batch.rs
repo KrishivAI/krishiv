@@ -1932,35 +1932,31 @@ fn parse_memory_kafka_partition(
             });
         }
         let parts: Vec<&str> = payload.splitn(4, ':').collect();
-        if parts.len() != 4 {
+        let [topic, kafka_partition, start_offset, records] = parts.as_slice() else {
             return Err(ExecutorError::InvalidAssignment {
                 message: format!(
                     "input partition {} must use memory-kafka:<topic>:<partition>:<start_offset>:<id=value,...>",
                     partition.partition_id()
                 ),
             });
-        }
-        let topic = parts[0].trim();
+        };
+        let topic = topic.trim();
         if topic.is_empty() {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from("memory-kafka topic cannot be empty"),
             });
         }
-        let kafka_partition =
-            parts[1]
-                .trim()
-                .parse::<i32>()
-                .map_err(|error| ExecutorError::InvalidAssignment {
-                    message: format!("invalid memory-kafka partition id: {error}"),
-                })?;
-        let start_offset =
-            parts[2]
-                .trim()
-                .parse::<i64>()
-                .map_err(|error| ExecutorError::InvalidAssignment {
-                    message: format!("invalid memory-kafka start offset: {error}"),
-                })?;
-        let records = parts[3].trim();
+        let kafka_partition = kafka_partition.trim().parse::<i32>().map_err(|error| {
+            ExecutorError::InvalidAssignment {
+                message: format!("invalid memory-kafka partition id: {error}"),
+            }
+        })?;
+        let start_offset = start_offset.trim().parse::<i64>().map_err(|error| {
+            ExecutorError::InvalidAssignment {
+                message: format!("invalid memory-kafka start offset: {error}"),
+            }
+        })?;
+        let records = records.trim();
         if records.is_empty() {
             return Err(ExecutorError::InvalidAssignment {
                 message: String::from("memory-kafka records cannot be empty"),

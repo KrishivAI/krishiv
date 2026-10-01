@@ -1107,9 +1107,11 @@ mod tests {
             cell(r#"SELECT from_json('[1, 2, 3]', 'ARRAY<INT>') AS xs"#).await,
             "[1, 2, 3]"
         );
+        // Entries keep the document's order, as in Spark (serde_json
+        // `preserve_order`, declared in the workspace Cargo.toml).
         assert_eq!(
             cell(r#"SELECT from_json('{"k":1,"j":2}', 'MAP<STRING, INT>') AS m"#).await,
-            "{j: 2, k: 1}"
+            "{k: 1, j: 2}"
         );
         assert_eq!(
             cell(r#"SELECT from_json('{"o":{"x":7}}', 'o STRUCT<x: INT, y: STRING>') AS s"#).await,

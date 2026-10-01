@@ -888,7 +888,9 @@ fn update_mutation_rows(
             batch.num_rows(),
         );
         for (row, matched) in matches.iter().enumerate() {
-            mutable.extend(usize::from(*matched), row, row + 1);
+            mutable
+                .try_extend(usize::from(*matched), row, row + 1)
+                .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
         }
         if let Some(slot) = columns.get_mut(index) {
             *slot = arrow::array::make_array(mutable.freeze());

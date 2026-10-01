@@ -43,7 +43,22 @@
 
 use datafusion::common::stats::Precision;
 use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::sync::Arc;
+
+/// Statistics of `plan` at `partition` (`None` = all partitions).
+///
+/// DataFusion 55 computes statistics through a [`StatisticsContext`] that
+/// resolves children first and caches by node; `partition_statistics` is
+/// deprecated. The context is per call: every caller here asks once, from
+/// an optimizer rule or a test, and a cache keyed by node pointers must not
+/// outlive the plan tree it was built on.
+pub(crate) fn plan_statistics(
+    plan: &dyn ExecutionPlan,
+    partition: Option<usize>,
+) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {
+    StatisticsContext::new().compute(plan, &StatisticsArgs::new().with_partition(partition))
+}
 
 /// A join build side's estimated size, with `Precision::Absent` flattened to
 /// `None` so an unknown is never laundered into a confident zero.
@@ -70,7 +85,7 @@ impl BuildSideEstimate {
     /// An error computing statistics is not evidence of anything, and both
     /// callers are optimisations — declining to act is always valid.
     pub(crate) fn of(build: &Arc<dyn ExecutionPlan>) -> Self {
-        match build.partition_statistics(None) {
+        match plan_statistics(build.as_ref(), None) {
             Ok(stats) => Self {
                 rows: value(&stats.num_rows),
                 bytes: value(&stats.total_byte_size),

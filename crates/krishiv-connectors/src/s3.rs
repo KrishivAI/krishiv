@@ -1,5 +1,8 @@
 //! S3-compatible object store source (Parquet streaming) and sink (buffered + atomic upload).
 
+// `ParquetObjectReader` is deprecated in parquet 59 in favour of a hand-written
+// `AsyncFileReader`; it still works and the replacement is a separate change.
+#![allow(deprecated)]
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;

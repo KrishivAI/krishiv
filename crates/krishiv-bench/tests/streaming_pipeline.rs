@@ -177,7 +177,7 @@ fn q4_pipeline_averages_winning_bids_per_category() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    avgs.sort_by(|a, b| a.0.cmp(&b.0));
+    avgs.sort_by_key(|a| a.0);
     assert_eq!(
         avgs,
         vec![(10, 650.0), (11, 50.0)],

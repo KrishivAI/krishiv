@@ -57,7 +57,7 @@ async fn file_paths_for_snapshot(
     // unreferenced would resurrect the rows they delete.
     let mut paths = HashSet::new();
     for task in tasks {
-        for delete in &task.deletes {
+        for delete in task.deletes() {
             paths.insert(delete.file_path.clone());
         }
         paths.insert(task.data_file_path().to_string());
@@ -464,7 +464,7 @@ pub async fn compact_data_files(
     // bin. So deletes force the whole table through the delete-applying
     // arrow reader (new in iceberg 0.10) and a full rewrite — the result is
     // a delete-free table, which is exactly what compacting deletes means.
-    let has_deletes = tasks.iter().any(|t| !t.deletes.is_empty());
+    let has_deletes = tasks.iter().any(|t| !t.deletes().is_empty());
 
     // Group files by partition value, then bin-pack the small ones within
     // each partition. A file without a manifest row count cannot be carried
@@ -477,21 +477,22 @@ pub async fn compact_data_files(
         let mut groups: std::collections::BTreeMap<String, Vec<&iceberg::scan::FileScanTask>> =
             std::collections::BTreeMap::new();
         for task in &tasks {
-            let key = format!("{:?}", task.partition);
+            let key = format!("{:?}", task.partition());
             groups.entry(key).or_default().push(task);
         }
 
         for (_, mut files) in groups {
-            files.sort_by_key(|t| t.file_size_in_bytes);
+            files.sort_by_key(|t| t.file_size_in_bytes());
             let mut bin: Vec<&iceberg::scan::FileScanTask> = Vec::new();
             let mut bin_bytes = 0u64;
             for task in files {
-                if task.file_size_in_bytes >= target_file_size_bytes && task.record_count.is_some()
+                if task.file_size_in_bytes() >= target_file_size_bytes
+                    && task.record_count().is_some()
                 {
                     kept.push(task);
                     continue;
                 }
-                bin_bytes += task.file_size_in_bytes.max(1);
+                bin_bytes += task.file_size_in_bytes().max(1);
                 bin.push(task);
                 if bin_bytes >= target_file_size_bytes {
                     bins.push(std::mem::take(&mut bin));
@@ -504,7 +505,7 @@ pub async fn compact_data_files(
         }
         // A one-file bin with a known row count gains nothing from a rewrite.
         bins.retain(|bin| match bin.as_slice() {
-            [only] if only.record_count.is_some() => {
+            [only] if only.record_count().is_some() => {
                 kept.push(only);
                 false
             }
@@ -602,7 +603,7 @@ pub async fn compact_data_files(
         }
         for task in &tasks {
             replaced.push(task.data_file_path().to_string());
-            for delete in &task.deletes {
+            for delete in task.deletes() {
                 let path = delete.file_path.clone();
                 if !replaced.contains(&path) {
                     replaced.push(path);
@@ -707,7 +708,7 @@ pub async fn compact_data_files(
     let spec_id = new_table.metadata().default_partition_spec_id();
     let mut data_files = Vec::with_capacity(kept.len() + pending.len());
     for task in &kept {
-        let record_count = task.record_count.ok_or_else(|| {
+        let record_count = task.record_count().ok_or_else(|| {
             LakehouseError::Iceberg(format!(
                 "compact_data_files: kept file {} lost its record count",
                 task.data_file_path()
@@ -718,9 +719,9 @@ pub async fn compact_data_files(
                 .content(DataContentType::Data)
                 .file_path(task.data_file_path().to_string())
                 .file_format(DataFileFormat::Parquet)
-                .file_size_in_bytes(task.file_size_in_bytes)
+                .file_size_in_bytes(task.file_size_in_bytes())
                 .record_count(record_count)
-                .partition(task.partition.clone().unwrap_or_else(Struct::empty))
+                .partition(task.partition().cloned().unwrap_or_else(Struct::empty))
                 .partition_spec_id(spec_id)
                 .build()
                 .map_err(|e| LakehouseError::Iceberg(e.to_string()))?,
@@ -1380,7 +1381,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            tasks.iter().any(|t| !t.deletes.is_empty()),
+            tasks.iter().any(|t| !t.deletes().is_empty()),
             "fixture must plan tasks with delete files"
         );
         let mut raw_rows = 0usize;
@@ -1676,7 +1677,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(
-            tasks.iter().all(|t| t.deletes.is_empty()),
+            tasks.iter().all(|t| t.deletes().is_empty()),
             "the compacted table must carry no delete files"
         );
         let mut ids = Vec::new();

@@ -65,6 +65,7 @@
 //! the SF100 sweeps have actually been measured against, and a newer operator
 //! earns the default by beating it on the cluster.
 
+use crate::join_estimates::plan_statistics;
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -207,7 +208,7 @@ fn build_bytes_estimate(hash_join: &HashJoinExec) -> Option<u64> {
     }
     // An error computing statistics is not evidence of a large build side, and
     // this rule is an optimisation: declining is always a valid answer.
-    let stats = hash_join.left().partition_statistics(None).ok()?;
+    let stats = plan_statistics(hash_join.left().as_ref(), None).ok()?;
     match stats.total_byte_size {
         Precision::Exact(bytes) | Precision::Inexact(bytes) => u64::try_from(bytes).ok(),
         Precision::Absent => estimated_build_bytes_from_rows(&stats, &hash_join.left().schema()),
@@ -3026,7 +3027,7 @@ mod grace_tests {
             let any = plan.as_ref() as &dyn std::any::Any;
             if let Some(grace) = any.downcast_ref::<GraceHashJoinExec>() {
                 let build = &grace.children()[0];
-                let stats = build.partition_statistics(None).ok()?;
+                let stats = plan_statistics(build.as_ref(), None).ok()?;
                 return match stats.total_byte_size {
                     Precision::Exact(b) | Precision::Inexact(b) => u64::try_from(b).ok(),
                     Precision::Absent => estimated_build_bytes_from_rows(&stats, &build.schema()),

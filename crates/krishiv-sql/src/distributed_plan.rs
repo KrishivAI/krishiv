@@ -35,6 +35,7 @@
 //! the builder cannot prove correct returns `None` — the caller falls back
 //! to today's single-task `sql:` path (capability honesty).
 
+use crate::join_estimates::plan_statistics;
 use std::fmt;
 use std::sync::Arc;
 
@@ -42,7 +43,7 @@ use arrow::datatypes::SchemaRef;
 use base64::Engine as _;
 use datafusion::error::DataFusionError;
 use datafusion::execution::TaskContext;
-use datafusion::logical_expr::execution_props::ScalarSubqueryResults;
+use datafusion::logical_expr::physical_planning_context::ScalarSubqueryResults;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -51,6 +52,7 @@ use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqu
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties as _, Partitioning,
     PlanProperties, SendableRecordBatchStream,
@@ -724,10 +726,13 @@ fn pin_file_scans_to_partitions(plan: Arc<dyn ExecutionPlan>) -> SqlResult<Arc<d
     if !changed {
         return Ok(plan);
     }
-    plan.with_new_children(new_children)
-        .map_err(|e| SqlError::DataFusion {
-            message: format!("scan pinning rewrite: {e}"),
-        })
+    plan.replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+    .map_err(|e| SqlError::DataFusion {
+        message: format!("scan pinning rewrite: {e}"),
+    })
 }
 
 /// True when a task-fragment body carries a proto-encoded physical plan.
@@ -810,7 +815,24 @@ pub fn execute_dfplan_body(
         Some(reader) => KrishivPhysicalCodec::executor(reader),
         None => KrishivPhysicalCodec::coordinator(),
     };
-    let task_ctx = session.task_ctx();
+    // A fragment is one partition of a plan whose other partitions run in
+    // other tasks, so no cross-partition runtime state can ever complete
+    // here. DataFusion's join dynamic filter is exactly that: for a
+    // CollectLeft (broadcast) join the build side reports its bounds into a
+    // `SharedBuildAccumulator` whose barrier waits for *every* probe
+    // partition before releasing the probe scan — and this task is one of
+    // them. Through DataFusion 54 the filter stayed inert after a proto
+    // round trip (`is_used` counted live consumer references, which decoding
+    // never created); 55 finds the consumer by expression id, which the round
+    // trip preserves, and the first broadcast-join fragment waited forever.
+    // Runtime filtering across tasks is `RuntimeFilterExec`'s job.
+    let mut config = session.copied_config();
+    config
+        .options_mut()
+        .optimizer
+        .enable_join_dynamic_filter_pushdown = false;
+    let task_ctx =
+        Arc::new(datafusion::execution::TaskContext::from(session).with_session_config(config));
     let (spec, plan) = decode_dfplan_task(body, &task_ctx, &codec)?;
     // Choose the spill strategy here, on the executor, not upstream: see
     // `apply_local_spill_strategy`.
@@ -1291,7 +1313,7 @@ async fn subquery_is_cheap_to_fold(df: &datafusion::dataframe::DataFrame) -> boo
     let Ok(plan) = df.clone().create_physical_plan().await else {
         return false;
     };
-    let Ok(stats) = plan.partition_statistics(None) else {
+    let Ok(stats) = plan_statistics(plan.as_ref(), None) else {
         return false;
     };
     match stats.total_byte_size {
@@ -1773,7 +1795,7 @@ impl ShuffleReadExec {
 
     /// Capture a cut subtree's estimate at the point the exchange is replaced.
     pub fn estimate_of(plan: &Arc<dyn ExecutionPlan>) -> (Option<usize>, Option<usize>) {
-        plan.partition_statistics(None).map_or((None, None), |s| {
+        plan_statistics(plan.as_ref(), None).map_or((None, None), |s| {
             (
                 Self::precision_value(&s.num_rows),
                 Self::precision_value(&s.total_byte_size),
@@ -1826,6 +1848,18 @@ impl DisplayAs for ShuffleReadExec {
 }
 
 impl ExecutionPlan for ShuffleReadExec {
+    /// DF55 made this required. A shuffle read is a leaf that holds no `PhysicalExpr`.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "ShuffleReadExec"
     }
@@ -1851,11 +1885,13 @@ impl ExecutionPlan for ShuffleReadExec {
     /// a stage that has not run. Absent stays absent: a rule that keys on
     /// known-size (as `SpillableJoinSelection` deliberately does) must still
     /// be able to tell "no idea" from "small".
-    fn partition_statistics(
+    fn statistics_from_inputs(
         &self,
-        partition: Option<usize>,
+        _input_stats: &[Arc<datafusion::common::Statistics>],
+        args: &datafusion::physical_plan::StatisticsArgs,
     ) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {
         use datafusion::common::stats::Precision;
+        let partition = args.partition();
         let partitions = self.properties.partitioning.partition_count().max(1);
         // A per-partition question gets the even-split share. Shuffle output is
         // hash-partitioned, so even split is the right null hypothesis; skew is
@@ -2083,6 +2119,9 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
         buf: &[u8],
         inputs: &[Arc<dyn ExecutionPlan>],
         _ctx: &TaskContext,
+        // DF55 threads a converter through so a codec can round-trip nested
+        // plans. Our payloads are self-contained JSON tags, so it is unused.
+        _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         use crate::runtime_filter_exec::{RuntimeFilterBuildExec, RuntimeFilterProbeExec};
         // The runtime-filter nodes carry a `node` tag; a shuffle-read payload
@@ -2152,6 +2191,7 @@ impl PhysicalExtensionCodec for KrishivPhysicalCodec {
         &self,
         node: Arc<dyn ExecutionPlan>,
         buf: &mut Vec<u8>,
+        _proto_converter: &dyn datafusion_proto::physical_plan::PhysicalProtoConverterExtension,
     ) -> datafusion::error::Result<()> {
         use crate::runtime_filter_exec::{RuntimeFilterBuildExec, RuntimeFilterProbeExec};
         let filter_payload = if let Some(build) = node.downcast_ref::<RuntimeFilterBuildExec>() {
@@ -2626,7 +2666,10 @@ fn cut_exchanges(
             // a stage boundary here would add a shuffle round trip for no
             // parallelism. Keep the node as-is.
             return plan
-                .with_new_children(vec![input])
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
                 .map_err(|e| Unsupported(format!("gather rewrite: {e}")));
         }
         let schema = input.schema();
@@ -2702,7 +2745,10 @@ fn cut_exchanges(
         };
         if !worth_cutting {
             return plan
-                .with_new_children(vec![input])
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
                 .map_err(|e| Unsupported(format!("sort-merge passthrough: {e}")));
         }
         let map_task_count = input.output_partitioning().partition_count();
@@ -2710,7 +2756,10 @@ fn cut_exchanges(
             // Already a single stream: a stage boundary here would add a
             // shuffle round trip and buy no parallelism.
             return plan
-                .with_new_children(vec![input])
+                .replace_children(
+                    vec![input],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
                 .map_err(|e| Unsupported(format!("sort-merge gather rewrite: {e}")));
         }
         let schema = input.schema();
@@ -2774,7 +2823,10 @@ fn cut_exchanges(
                 .map(|link| Arc::clone(&link.plan)),
         );
         return plan
-            .with_new_children(children)
+            .replace_children(
+                children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .map_err(|e| Unsupported(format!("scalar-subquery rewrite: {e}")));
     }
 
@@ -2792,8 +2844,11 @@ fn cut_exchanges(
     if !changed {
         return Ok(plan);
     }
-    plan.with_new_children(new_children)
-        .map_err(|e| Unsupported(format!("plan rewrite: {e}")))
+    plan.replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+    .map_err(|e| Unsupported(format!("plan rewrite: {e}")))
 }
 
 /// Join types whose unmatched BUILD-side rows are emitted only after every
@@ -3102,10 +3157,13 @@ fn reduce_by_broadcast_dimension_inner(
             rebuilt.push(new_child);
         }
         if changed {
-            plan.with_new_children(rebuilt)
-                .map_err(|e| SqlError::DataFusion {
-                    message: format!("dimension-reduction rewrite: {e}"),
-                })?
+            plan.replace_children(
+                rebuilt,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("dimension-reduction rewrite: {e}"),
+            })?
         } else {
             plan
         }
@@ -3177,7 +3235,7 @@ fn is_broadcastable_dimension(plan: &Arc<dyn ExecutionPlan>) -> bool {
     if estimate.is_wholly_degenerate() {
         return false;
     }
-    let Ok(stats) = plan.partition_statistics(None) else {
+    let Ok(stats) = plan_statistics(plan.as_ref(), None) else {
         return false;
     };
     let bytes = match stats.total_byte_size {
@@ -3241,7 +3299,10 @@ fn attach_reducer(
             };
             *slot = new_child;
             return Arc::clone(plan)
-                .with_new_children(children)
+                .replace_children(
+                    children,
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
                 .map(Some)
                 .map_err(|e| SqlError::DataFusion {
                     message: format!("dimension-reduction splice: {e}"),
@@ -3310,10 +3371,13 @@ pub fn redistribute_unsplittable_broadcast_joins(
             new_children.push(rewritten);
         }
         if changed {
-            plan.with_new_children(new_children)
-                .map_err(|e| SqlError::DataFusion {
-                    message: format!("broadcast-join redistribution rewrite: {e}"),
-                })?
+            plan.replace_children(
+                new_children,
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
+            .map_err(|e| SqlError::DataFusion {
+                message: format!("broadcast-join redistribution rewrite: {e}"),
+            })?
         } else {
             plan
         }
@@ -3820,7 +3884,10 @@ fn remap_shuffle_reads(
         return Arc::clone(plan);
     }
     Arc::clone(plan)
-        .with_new_children(new_children)
+        .replace_children(
+            new_children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .unwrap_or_else(|_| Arc::clone(plan))
 }
 
@@ -4363,7 +4430,7 @@ mod tests {
 
         let unknown = ShuffleReadExec::new(0, 4, 4, Arc::clone(&schema), None);
         assert_eq!(
-            unknown.partition_statistics(None).unwrap().total_byte_size,
+            plan_statistics(&unknown, None).unwrap().total_byte_size,
             Precision::Absent,
             "a read with no estimate must stay Absent — inventing a size is how \
              a spill decision gets made on a guess"
@@ -4371,7 +4438,7 @@ mod tests {
 
         let known = ShuffleReadExec::new(0, 4, 4, Arc::clone(&schema), None)
             .with_upstream_estimate(Some(1_000), Some(800_000));
-        let whole = known.partition_statistics(None).unwrap();
+        let whole = plan_statistics(&known, None).unwrap();
         assert_eq!(whole.num_rows, Precision::Inexact(1_000));
         assert_eq!(
             whole.total_byte_size,
@@ -4379,7 +4446,7 @@ mod tests {
             "the whole-plan question gets the whole stage's size"
         );
 
-        let one = known.partition_statistics(Some(0)).unwrap();
+        let one = plan_statistics(&known, Some(0)).unwrap();
         assert_eq!(
             one.total_byte_size,
             Precision::Inexact(200_000),
@@ -4400,17 +4467,22 @@ mod tests {
         );
         let codec = KrishivPhysicalCodec::coordinator();
         let mut buf = Vec::new();
-        codec.try_encode(Arc::clone(&node), &mut buf).unwrap();
+        let converter = datafusion_proto::physical_plan::DefaultPhysicalProtoConverter {};
+        codec
+            .try_encode(Arc::clone(&node), &mut buf, &converter)
+            .unwrap();
 
         let ctx = crate::SqlEngine::new_with_engine_memory(crate::EngineMemory::Unbounded);
         let task_ctx = ctx.session_context().task_ctx();
-        let decoded = codec.try_decode(&buf, &[], &task_ctx).unwrap();
+        let decoded = codec.try_decode(&buf, &[], &task_ctx, &converter).unwrap();
 
         // Re-encode and compare bytes rather than downcasting: it asserts the
         // same property (the estimate made the trip intact) and it also catches
         // a field that decodes but is dropped on the way back out.
         let mut round_tripped = Vec::new();
-        codec.try_encode(decoded, &mut round_tripped).unwrap();
+        codec
+            .try_encode(decoded, &mut round_tripped, &converter)
+            .unwrap();
         assert_eq!(
             String::from_utf8(round_tripped).unwrap(),
             String::from_utf8(buf).unwrap(),
@@ -6987,10 +7059,7 @@ mod staged_tpch_tests {
         .await;
         let join_ref = join.downcast_ref::<HashJoinExec>().expect("hash join");
 
-        let stats = join_ref
-            .left()
-            .partition_statistics(None)
-            .expect("statistics");
+        let stats = plan_statistics(join_ref.left().as_ref(), None).expect("statistics");
         assert!(
             matches!(
                 stats.num_rows,
@@ -7245,9 +7314,14 @@ mod staged_tpch_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let ctx = tpch_context_with_broadcast(tmp.path(), join_threshold, broadcast_bytes).await;
         let expected = render(&direct(&ctx, sql).await);
-        let actual = run_staged(&ctx, sql)
-            .await
-            .unwrap_or_else(|e| panic!("{label}: staged execution failed: {e}"));
+        // Bounded: the 2026-10-01 DataFusion 55 upgrade made every
+        // broadcast-join fragment wait on a cross-partition barrier it could
+        // never satisfy, and the only symptom was a test that never finished.
+        let actual =
+            tokio::time::timeout(std::time::Duration::from_secs(120), run_staged(&ctx, sql))
+                .await
+                .unwrap_or_else(|_| panic!("{label}: staged execution did not finish in 120 s"))
+                .unwrap_or_else(|e| panic!("{label}: staged execution failed: {e}"));
         assert_eq!(
             render(&actual),
             expected,
@@ -8434,12 +8508,6 @@ mod registration_parity_tests {
             format!("{keyed_options:?}"),
             "a declared key must not change how the table is read"
         );
-        assert!(
-            keyed_options.collect_stat,
-            "statistics collection must stay on: every size-based rule goes \
-             blind without it"
-        );
-
         // The one difference that is supposed to exist.
         assert!(plain.constraints().is_none_or(|c| c.is_empty()));
         assert!(
@@ -8462,15 +8530,14 @@ mod registration_parity_tests {
 
         let ctx = planning_session_context(4);
         ctx.register_table("keyed", Arc::clone(&keyed)).unwrap();
-        let stats = ctx
+        let plan = ctx
             .sql("SELECT k, v FROM keyed")
             .await
             .unwrap()
             .create_physical_plan()
             .await
-            .unwrap()
-            .partition_statistics(None)
             .unwrap();
+        let stats = plan_statistics(plan.as_ref(), None).unwrap();
         assert!(
             matches!(stats.num_rows, Precision::Exact(3) | Precision::Inexact(3)),
             "expected a row count for a keyed table, got {:?} — this is the \

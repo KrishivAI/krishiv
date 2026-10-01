@@ -53,7 +53,12 @@ fn report_join_modes(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>, d
     }
 
     if let Some(join) = (plan.as_ref() as &dyn std::any::Any).downcast_ref::<HashJoinExec>() {
-        let stats = join.left().partition_statistics(None).ok();
+        let stats = datafusion::physical_plan::StatisticsContext::new()
+            .compute(
+                join.left().as_ref(),
+                &datafusion::physical_plan::StatisticsArgs::new(),
+            )
+            .ok();
         let (rows, bytes) = stats.map_or_else(
             || (String::from("error"), String::from("error")),
             |s| (show(s.num_rows), show(s.total_byte_size)),

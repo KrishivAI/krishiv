@@ -316,7 +316,7 @@ impl std::fmt::Debug for TableVectorIndex {
 
 impl TableVectorIndex {
     pub(crate) fn new(index: IvfIndex, embeddings: Vec<f32>, dim: usize) -> Self {
-        let n_rows = if dim == 0 { 0 } else { embeddings.len() / dim };
+        let n_rows = embeddings.len().checked_div(dim).unwrap_or(0);
         let mut radii_euclid = vec![0.0f64; index.nlist()];
         for ((members, centroid), radius) in index
             .cells()

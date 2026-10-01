@@ -364,8 +364,9 @@ impl Catalog for PostgresCatalog {
         // Serialise and write metadata.json to the warehouse.
         let metadata_json = serde_json::to_string_pretty(&metadata)
             .map_err(|e| iceberg_err(format!("serialize metadata: {e}")))?;
-        let metadata_location =
-            MetadataLocation::new_with_metadata(&location, &metadata).to_string();
+        let metadata_location = MetadataLocation::try_new_with_metadata(&metadata)
+            .map_err(|e| iceberg_err(e.to_string()))?
+            .to_string();
 
         self.file_io
             .new_output(&metadata_location)

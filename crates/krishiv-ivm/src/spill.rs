@@ -118,12 +118,25 @@ pub fn spill_session_context_with_limit(limit: Option<usize>) -> SessionContext 
     }
     // Never larger than a quarter of the pool it lives in, and never below the
     // minimum DataFusion needs to merge at all.
-    let scaled = (effective / 4).min(DEFAULT_SORT_SPILL_RESERVATION_BYTES);
-    debug_assert!(
-        scaled >= MIN_SORT_SPILL_RESERVATION_BYTES && scaled <= effective / 4,
-        "sort reservation {scaled} does not fit pool {effective}"
+    //
+    // The quarter is shared by every sort partition: each `ExternalSorter`
+    // holds its own merge reservation, unspillable, for the whole sort, and a
+    // query sorts on `target_partitions` partitions at once. Reserved per
+    // partition at the full 10 MiB, twelve partitions claim 120 MiB of a
+    // 64 MiB pool and the sort fails outright — the outcome this module
+    // exists to prevent (seen on DataFusion 55, whose planner sorts a
+    // repartitioned input per partition where 54 sorted it once).
+    let config = SessionConfig::new();
+    let partitions = config.target_partitions().max(1);
+    let scaled = (effective / 4 / partitions).clamp(
+        MIN_SORT_SPILL_RESERVATION_BYTES,
+        DEFAULT_SORT_SPILL_RESERVATION_BYTES,
     );
-    let config = SessionConfig::new().with_sort_spill_reservation_bytes(scaled);
+    debug_assert!(
+        scaled * partitions <= effective / 4 || scaled == MIN_SORT_SPILL_RESERVATION_BYTES,
+        "sort reservation {scaled} x {partitions} does not fit pool {effective}"
+    );
+    let config = config.with_sort_spill_reservation_bytes(scaled);
     let mut builder = RuntimeEnvBuilder::new()
         .with_memory_pool(std::sync::Arc::new(FairSpillPool::new(effective)))
         .with_max_temp_directory_size(spill_disk_limit_bytes());

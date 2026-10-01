@@ -210,6 +210,18 @@ impl DisplayAs for RuntimeFilterBuildExec {
 }
 
 impl ExecutionPlan for RuntimeFilterBuildExec {
+    /// DF55 made this required. It keys off a column *index*, not an expression, so it holds no `PhysicalExpr`.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "RuntimeFilterBuildExec"
     }
@@ -400,6 +412,18 @@ async fn collect_filter(
 }
 
 impl ExecutionPlan for RuntimeFilterProbeExec {
+    /// DF55 made this required. It keys off a column *index*, not an expression, so it holds no `PhysicalExpr`.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::common::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::common::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn name(&self) -> &str {
         "RuntimeFilterProbeExec"
     }
@@ -438,11 +462,26 @@ impl ExecutionPlan for RuntimeFilterProbeExec {
     /// known size into an unknown one downstream of this node is how q18 ran out
     /// of memory. An over-estimate is the safe direction — the filter only ever
     /// removes rows.
-    fn partition_statistics(
+    fn child_stats_requests(
         &self,
         partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        use datafusion::physical_plan::ChildStats;
+        // The data input at the asked partition; the build side's statistics
+        // say nothing about this node's output.
+        vec![ChildStats::At(partition), ChildStats::Skip]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<datafusion::common::Statistics>],
+        _args: &datafusion::physical_plan::StatisticsArgs,
     ) -> datafusion::error::Result<Arc<datafusion::common::Statistics>> {
-        let stats = self.input.partition_statistics(partition)?;
+        let Some(stats) = input_stats.first() else {
+            return Ok(Arc::new(datafusion::common::Statistics::new_unknown(
+                self.schema().as_ref(),
+            )));
+        };
         let mut stats = stats.as_ref().clone();
         stats.num_rows = stats.num_rows.to_inexact();
         stats.total_byte_size = stats.total_byte_size.to_inexact();
@@ -767,7 +806,14 @@ mod tests {
             RuntimeFilterProbeExec::try_new(Arc::clone(&data), Arc::clone(&filter), 0)
                 .expect("probe"),
         );
-        let rebuilt = ExecutionPlan::with_new_children(node, vec![data, filter]).expect("rebuild");
+        let rebuilt = node
+            .replace_children(
+                vec![data, filter],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
+            .expect("rebuild");
         let rebuilt = rebuilt
             .downcast_ref::<RuntimeFilterProbeExec>()
             .expect("still a probe node");
@@ -776,8 +822,14 @@ mod tests {
 
         let build =
             Arc::new(RuntimeFilterBuildExec::try_new(source(keys(&[1])), 0, 8192).expect("build"));
-        let rebuilt =
-            ExecutionPlan::with_new_children(build, vec![source(keys(&[1]))]).expect("rebuild");
+        let rebuilt = build
+            .replace_children(
+                vec![source(keys(&[1]))],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )
+            .expect("rebuild");
         let rebuilt = rebuilt
             .downcast_ref::<RuntimeFilterBuildExec>()
             .expect("still a build node");
@@ -795,6 +847,14 @@ mod tests {
             RuntimeFilterProbeExec::try_new(source(keys(&[1])), source(keys(&[1])), 0)
                 .expect("probe"),
         );
-        assert!(ExecutionPlan::with_new_children(node, vec![source(keys(&[1]))]).is_err());
+        assert!(
+            node.replace_children(
+                vec![source(keys(&[1]))],
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                )
+            )
+            .is_err()
+        );
     }
 }

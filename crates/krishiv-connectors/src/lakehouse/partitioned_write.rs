@@ -152,8 +152,14 @@ pub fn build_unbound_partition_spec(
                 field.column
             ))
         })?;
+        let partition_field = iceberg::spec::UnboundPartitionField::builder()
+            .source_ids(vec![source.id])
+            .name(field.field_name())
+            .transform(field.transform)
+            .build()
+            .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
         builder = builder
-            .add_partition_field(source.id, field.field_name(), field.transform)
+            .add_partition_field(partition_field)
             .map_err(|e| LakehouseError::Iceberg(e.to_string()))?;
     }
     Ok(builder.build())
@@ -519,10 +525,10 @@ mod tests {
         .unwrap();
         let fields = spec.fields();
         assert_eq!(fields.len(), 2);
-        assert_eq!(fields[0].source_id, 2);
-        assert_eq!(fields[0].name, "region");
-        assert_eq!(fields[1].source_id, 1);
-        assert_eq!(fields[1].name, "id_bucket");
+        assert_eq!(fields[0].source_id().unwrap(), 2);
+        assert_eq!(fields[0].name(), "region");
+        assert_eq!(fields[1].source_id().unwrap(), 1);
+        assert_eq!(fields[1].name(), "id_bucket");
         assert!(
             build_unbound_partition_spec(&[parse_partition_transform("missing").unwrap()], &schema)
                 .is_err()

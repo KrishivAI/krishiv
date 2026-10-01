@@ -8,7 +8,25 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Added
 
+- **Sail in the engine comparison**: `scripts/bench/tpch_compare_engines.py`
+  runs Sail (Spark Connect, local mode) beside Krishiv and DuckDB with
+  interleaved passes, cross-engine digests and per-pass checkpoints;
+  `benchmarks/tpch-sf100-sail-vs-krishiv-2026-10-01.md` has the result.
+
 ### Changed
+
+- **DataFusion 55.1 / Arrow 59.2 / Parquet 59.2** (from 54.1 / 58.4), the
+  dependency set Sail 0.7.2 pins. `iceberg` has no release on Arrow 59, so
+  both iceberg crates come from a pinned git revision of iceberg-rust `main`
+  until 0.11 is published.
+- **MSRV 1.95** (from 1.94.1): required by that iceberg revision.
+  `rust-toolchain.toml` and the Docker base images follow. `sysinfo` moves to
+  0.39, which the old MSRV had blocked.
+- Join reordering ranks candidates by estimated join output
+  (`|L|·|R| / max(ndv)`) instead of base-table size, declines chains with an
+  unbounded key, and keeps the written order unless the greedy order is
+  estimated at least 2× cheaper. The size-only rule had regressed TPC-H SF100
+  q5 from 21 s to a 38 GB process killed after 22 minutes.
 
 ### Fixed
 

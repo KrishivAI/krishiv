@@ -555,7 +555,7 @@ pub(crate) struct ObjectParquetSinkStream {
     /// relative path. `BTreeMap` keeps deterministic staged-path ordering.
     writers: std::collections::BTreeMap<
         String,
-        parquet::arrow::AsyncArrowWriter<parquet::arrow::async_writer::ParquetObjectWriter>,
+        parquet::arrow::AsyncArrowWriter<object_store::buffered::BufWriter>,
     >,
     /// `Some` when the staged commit protocol applies: `(job_id, task_id, attempt)`
     /// name the staged part files. `None` = legacy direct write to `dest_path`.
@@ -652,7 +652,9 @@ impl ObjectParquetSinkStream {
                 let writer = match self.writers.entry(rel.clone()) {
                     std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
                     std::collections::btree_map::Entry::Vacant(entry) => {
-                        let object_writer = parquet::arrow::async_writer::ParquetObjectWriter::new(
+                        // `BufWriter` buffers to a multipart upload and completes
+                        // it on shutdown, which `AsyncArrowWriter::close` calls.
+                        let object_writer = object_store::buffered::BufWriter::new(
                             Arc::clone(&self.store),
                             object_store::path::Path::from(rel.as_str()),
                         );

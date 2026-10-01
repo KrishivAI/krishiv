@@ -512,7 +512,7 @@ pub mod native {
             // (foreign merge-on-read writers) through iceberg's
             // delete-applying arrow reader instead — and since read_all
             // feeds a rewrite, the rewrite lands delete-free.
-            if tasks.iter().any(|t| !t.deletes.is_empty()) {
+            if tasks.iter().any(|t| !t.deletes().is_empty()) {
                 let stream = scan
                     .to_arrow()
                     .await

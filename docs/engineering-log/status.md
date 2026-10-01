@@ -8818,3 +8818,43 @@ field nothing read.
 - **Next**: q7 is the one TPC-H query where a reorder is worth 2× and the
   new rule declines it — its chain is written fact-first and the estimate
   gain is under 2×; revisit once the estimate has filter selectivity.
+
+
+## 2026-10-01 — DataFusion 55.1 / Arrow 59.2 / MSRV 1.95
+
+- **Completed**: the workspace moves from DataFusion 54.1 + arrow 58.4 to
+  55.1 + 59.2 (parquet, arrow-flight alike), the set Sail 0.7.2 pins. The
+  DF55 migration patch kept since §85 applied cleanly and was deleted; 55.1
+  had moved further (register §85 addendum lists every API). `iceberg` still
+  has no release on arrow 59, so both iceberg crates are a pinned git
+  revision of iceberg-rust `main` (`19603861`); its `rust-version = 1.95`
+  moved the MSRV, `rust-toolchain.toml` and the Docker base images.
+  `sysinfo` 0.39 and pyo3 0.29.3 came along.
+- **Found by the gate, each root-caused before the fix**:
+  1. *Broadcast-join fragments hung forever* (staged q17/q19, >30 min).
+     DF 54 armed the join's dynamic-filter barrier only when a live consumer
+     reference existed (`is_used`), which a proto-decoded fragment never
+     has; DF 55 finds the consumer by expression id, which the round trip
+     preserves, so the one-partition fragment waited for every other
+     partition's build bounds. `execute_dfplan_body` now runs fragments with
+     `enable_join_dynamic_filter_pushdown = false` — cross-task runtime
+     filtering is `RuntimeFilterExec`'s job — and the staged tests carry a
+     120 s timeout so a regression fails instead of hanging CI.
+  2. *IVM spill sort failed outright in a 64 MiB pool*. DF 55 sorts a
+     repartitioned input per partition (`SortExec preserve_partitioning=true`
+     over `RoundRobinBatch(12)`), each `ExternalSorter` holding its own
+     unspillable 10 MiB merge reservation: 120 MiB claimed from 64. The
+     reservation is now `pool/4/target_partitions`, floored at 64 KiB.
+  3. *`from_json` MAP order flipped from sorted to written*: DF 55 enables
+     serde_json `preserve_order` by feature unification. Written order is
+     Spark's behaviour, so the feature is now declared in the workspace and
+     the test expects it.
+  Plus Rust 1.95 clippy: `manual_checked_ops`, `collapsible_match`,
+  `needless_option_as_deref`, `unnecessary_sort_by`, and a pre-existing
+  `indexing_slicing` behind the `kafka` feature.
+- **Validation**: `cargo fmt --check`; `cargo clippy --workspace
+  --all-targets --all-features -- -D warnings` clean on 1.95; `cargo test
+  --workspace --lib --no-fail-fast` plus krishiv-sql/krishiv-connectors
+  integration tests: 6855 passed, 0 failed; release build; TPC-H SF100
+  single pass 22/22 ok, 335 s, **0 answer changes** against the DF54 run
+  of the same morning (q11 same rows in a different tie order).

@@ -31,10 +31,11 @@ coordinators. State formats ship a migration or are documented as a break
 
 ## Dependency baseline
 
-The workspace pins DataFusion 54.1 / Arrow 54 and the Rust toolchain in
-`rust-toolchain.toml`; the DataFusion 55 / Arrow 59 migration is prepared as
-a patch (`../implementation/patches/datafusion-55-arrow-59-migration.patch`)
-and, like the MSRV bump, is a deliberate release decision recorded in
+The workspace pins DataFusion 55.1 / Arrow 59.2 (the set Sail 0.7.2 pins) and
+the Rust toolchain in `rust-toolchain.toml` (1.95, the MSRV). Taken 2026-10-01;
+the one dependency without a release on Arrow 59 — `iceberg` — is a pinned git
+revision of iceberg-rust `main` until 0.11 is published. An Arrow or DataFusion
+major, like an MSRV bump, is a deliberate release decision recorded in
 `COMPATIBILITY.md` when taken.
 
 ## Deprecation

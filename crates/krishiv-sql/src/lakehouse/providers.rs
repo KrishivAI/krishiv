@@ -154,13 +154,17 @@ impl TableProvider for DeltaScanProvider {
 /// table, or every file removed by a delete) that must scan to zero rows
 /// instead of failing the query.
 ///
-/// # Why the listing options are not left at their defaults
+/// # Why the listing options were not left at their defaults (DF <= 54)
 ///
-/// `ListingOptions::new` is not "defaults" in the usual sense — it sets
-/// `collect_stat: false` and `target_partitions: 1`, and DataFusion expects a
-/// caller to follow it with `.with_session_config_options(..)` (which is what
-/// `register_parquet` does). Left as constructed it undoes the two things this
-/// function exists to provide:
+/// Through DataFusion 54 `ListingOptions::new` set `collect_stat: false` and
+/// `target_partitions: 1`, and this function overrode both. DF55 **removed
+/// those two fields** — they are read from `SessionConfig` instead — so the
+/// overrides are gone and the session's values apply directly. That is the
+/// same behaviour, not a relaxation: `collect_stat(true)` matched the session
+/// default, and `target_partitions` was already taken from
+/// `state.config().target_partitions()`. The hazards below are what the
+/// overrides existed to prevent, kept because they explain why the session
+/// values must stay right:
 ///
 /// * **`collect_stat: false`** — no row counts and no byte sizes, so
 ///   `SpillableJoinSelection` and broadcast selection cannot size a build side
@@ -178,7 +182,10 @@ impl TableProvider for DeltaScanProvider {
 fn parquet_files_table(
     files: Vec<std::path::PathBuf>,
     schema: SchemaRef,
-    target_partitions: usize,
+    // Retained so callers keep passing the session's value explicitly and the
+    // doc above stays honest about where partitioning comes from; DF55 reads it
+    // from SessionConfig, so it is no longer plumbed into ListingOptions.
+    _target_partitions: usize,
 ) -> DfResult<Arc<dyn TableProvider>> {
     use datafusion::datasource::file_format::parquet::ParquetFormat;
     use datafusion::datasource::listing::{
@@ -196,10 +203,8 @@ fn parquet_files_table(
         return Ok(Arc::new(MemTable::try_new(schema, vec![vec![]])?));
     }
 
-    let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".parquet")
-        .with_collect_stat(true)
-        .with_target_partitions(target_partitions.max(1));
+    let options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
     let config = ListingTableConfig::new_with_multi_paths(urls)
         .with_listing_options(options)
         // The table's declared schema, not one inferred per file: the Delta log

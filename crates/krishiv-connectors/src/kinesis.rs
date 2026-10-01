@@ -379,7 +379,7 @@ pub fn records_to_batch(schema: &SchemaRef, records: &[Record]) -> ConnectorResu
 
     for r in records {
         seq_col.append_value(r.sequence_number());
-        key_col.append_value(r.partition_key());
+        key_col.append_value(r.partition_key().unwrap_or_default());
         data_col.append_value(r.data().as_ref());
         match r.approximate_arrival_timestamp() {
             Some(dt) => match dt.to_millis() {

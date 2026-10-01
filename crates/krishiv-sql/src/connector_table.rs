@@ -124,22 +124,41 @@ pub fn register_connector_table_factories(
     );
 }
 
+/// DF55 changed `CreateExternalTable.location: String` into
+/// `locations: Vec<String>`, so one DDL can name several files that are read
+/// together as a single table. Every connector kind below addresses exactly
+/// one path, topic or URL, so silently taking the first of several would drop
+/// the rest and answer from part of the data — the shape of defect this
+/// codebase's register exists to catch. Take the one; refuse the many.
+fn single_location(cmd: &CreateExternalTable) -> DataFusionResult<String> {
+    match cmd.locations.as_slice() {
+        [] => Ok(String::new()),
+        [only] => Ok(only.clone()),
+        many => Err(datafusion::error::DataFusionError::NotImplemented(format!(
+            "CREATE EXTERNAL TABLE named {} LOCATIONs, but a connector table addresses \
+             exactly one; use a directory or a glob, or declare one table per location",
+            many.len()
+        ))),
+    }
+}
+
 /// Build a [`ConnectorConfig`] from a `CREATE EXTERNAL TABLE` command.
 pub fn connector_config_from_ddl(
     kind: &str,
     cmd: &CreateExternalTable,
 ) -> DataFusionResult<ConnectorConfig> {
     let name = cmd.name.table().to_string();
+    let location = single_location(cmd)?;
     Ok(match kind {
         "parquet" => {
-            if !cmd.location.is_empty() {
-                validate_path_under_warehouse(&cmd.location)?;
+            if !location.is_empty() {
+                validate_path_under_warehouse(&location)?;
             }
-            ConnectorConfig::new(name, kind).with_property("path", cmd.location.clone())
+            ConnectorConfig::new(name, kind).with_property("path", location.clone())
         }
         "s3" => {
             let mut cfg = ConnectorConfig::new(cmd.name.table(), kind)
-                .with_property("object_path", cmd.location.clone());
+                .with_property("object_path", location.clone());
             for (key, value) in &cmd.options {
                 if key == "base_path" {
                     cfg = cfg.with_property("base_path", value.clone());
@@ -149,7 +168,7 @@ pub fn connector_config_from_ddl(
         }
         "kafka" => {
             let mut cfg = ConnectorConfig::new(cmd.name.table(), kind)
-                .with_property("topic", cmd.location.clone())
+                .with_property("topic", location.clone())
                 .with_property("bootstrap.servers", "127.0.0.1:9092".to_string())
                 .with_property("group.id", "krishiv-sql".to_string());
             for (key, value) in &cmd.options {
@@ -177,8 +196,7 @@ pub fn connector_config_from_ddl(
         // refused by the registry (no Elasticsearch SOURCE driver), which is
         // the honest answer rather than a guessed scan.
         "elasticsearch" => {
-            let mut cfg =
-                ConnectorConfig::new(name, kind).with_property("url", cmd.location.clone());
+            let mut cfg = ConnectorConfig::new(name, kind).with_property("url", location.clone());
             for (key, value) in &cmd.options {
                 let key = key.strip_prefix("format.").unwrap_or(key);
                 cfg = cfg.with_property(key, value.clone());
@@ -191,8 +209,7 @@ pub fn connector_config_from_ddl(
         // registry driver), `cursor.column`/`cursor.after` for incremental
         // keyset pull, `batch_size` for page sizing.
         "jdbc" => {
-            let mut cfg =
-                ConnectorConfig::new(name, kind).with_property("url", cmd.location.clone());
+            let mut cfg = ConnectorConfig::new(name, kind).with_property("url", location.clone());
             for (key, value) in &cmd.options {
                 // DataFusion namespaces un-dotted OPTIONS keys under
                 // `format.` — accept both spellings of the same option.
@@ -226,7 +243,7 @@ pub fn connector_config_from_ddl(
             }
             cfg
         }
-        _ => ConnectorConfig::new(name, kind).with_property("path", cmd.location.clone()),
+        _ => ConnectorConfig::new(name, kind).with_property("path", location.clone()),
     })
 }
 
@@ -301,7 +318,14 @@ impl TableProviderFactory for ConnectorTableFactory {
         // cannot resolve an s3:// URL and previously failed the DDL with
         // "path 's3://…' not accessible: No such file or directory"
         // (engine-s3-ddl-gap).
-        if self.connector_kind == "parquet" && is_object_store_url(&cmd.location) {
+        // Any object-store location routes to ListingTableFactory, which handles
+        // multi-location DDL natively — so this checks *all* of them rather
+        // than one, and a mixed local/remote list falls through to the
+        // connector path where `single_location` refuses it by name.
+        if self.connector_kind == "parquet"
+            && !cmd.locations.is_empty()
+            && cmd.locations.iter().all(|l| is_object_store_url(l))
+        {
             return datafusion::datasource::listing_table_factory::ListingTableFactory::new()
                 .create(state, cmd)
                 .await;
@@ -976,7 +1000,7 @@ mod insert_into_tests {
         let source = ConnectorConfig::new("t", "jdbc").with_property("table", "x");
         let sink = sink_config_for(&source).unwrap();
         assert_eq!(sink.kind, "jdbc_sink");
-        assert_eq!(sink.get("table").as_deref(), Some("x"));
+        assert_eq!(sink.get("table"), Some("x"));
 
         // kafka gained a sink counterpart with the Phase 67 batch door, so
         // the honest-refusal case moved to a kind that truly has none.

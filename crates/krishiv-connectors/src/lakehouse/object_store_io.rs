@@ -372,14 +372,15 @@ impl FileWrite for ObjectStoreFileWrite {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&mut self) -> Result<FileMetadata> {
         if self.closed {
             return Err(Error::new(ErrorKind::DataInvalid, "file already closed"));
         }
         self.closed = true;
+        let size = self.buffer.len() as u64;
         let payload = PutPayload::from(std::mem::take(&mut self.buffer));
         self.store.put(&self.key, payload).await.map_err(os_err)?;
-        Ok(())
+        Ok(FileMetadata { size })
     }
 }
 

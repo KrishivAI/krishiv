@@ -74,12 +74,13 @@ pub fn task_index_for_key_group(key_group: u16, parallelism: u32) -> u32 {
     let fat_span = rem * (base + 1); // groups owned by the first `rem` tasks
     if kg < fat_span {
         kg / (base + 1)
-    } else if base == 0 {
-        // parallelism > NUM_KEY_GROUPS: every group sits in the fat span;
-        // out-of-range kg (impossible for u16 < groups) clamps to last task.
-        p - 1
     } else {
-        rem + (kg - fat_span) / base
+        // `base == 0` means parallelism > NUM_KEY_GROUPS: every group sits in
+        // the fat span, and an out-of-range kg (impossible for u16 < groups)
+        // clamps to the last task.
+        (kg - fat_span)
+            .checked_div(base)
+            .map_or(p - 1, |offset| rem + offset)
     }
 }
 

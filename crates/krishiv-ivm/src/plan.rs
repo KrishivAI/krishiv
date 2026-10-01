@@ -27,6 +27,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::DFSchema;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::execution::context::ExecutionProps;
+use datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion::logical_expr::{Aggregate, Expr, Join, JoinType, LogicalPlan, Projection, Window};
 use datafusion::optimizer::analyzer::type_coercion::TypeCoercionRewriter;
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
@@ -1999,7 +2000,13 @@ fn build_map_plan(
         // arithmetic expression would fail the Arrow kernel at evaluation.
         let mut coercion = TypeCoercionRewriter::new(&df_schema);
         let coerced = expr.clone().rewrite(&mut coercion).ok()?.data;
-        let physical = create_physical_expr(&coerced, &df_schema, &props).ok()?;
+        let physical = create_physical_expr(
+            &coerced,
+            &df_schema,
+            &props,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()?;
         compiled.push((name.clone(), physical));
         // MAP-TYPE-1: the type comes from the plan node's schema, NOT from
         // re-deriving it here. The first cut derived it independently and the
@@ -2286,7 +2293,13 @@ fn build_keyed_topn_plan(
     for (expr, planned) in proj_exprs.iter().zip(proj_schema.fields().iter()) {
         let mut coercion = TypeCoercionRewriter::new(&df_schema);
         let coerced = expr.clone().rewrite(&mut coercion).ok()?.data;
-        let physical = create_physical_expr(&coerced, &df_schema, &props).ok()?;
+        let physical = create_physical_expr(
+            &coerced,
+            &df_schema,
+            &props,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()?;
         compiled.push((planned.name().clone(), physical));
         fields.push(Field::new(
             planned.name(),
@@ -2846,7 +2859,13 @@ fn build_join_plan(
         let mut coercion = TypeCoercionRewriter::new(&pair_schema);
         let coerced = combined.rewrite(&mut coercion).ok()?.data;
         let props2 = ExecutionProps::new();
-        let predicate = create_physical_expr(&coerced, &pair_schema, &props2).ok()?;
+        let predicate = create_physical_expr(
+            &coerced,
+            &pair_schema,
+            &props2,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()?;
         op.set_membership_residual(Arc::new(move |pair: &RecordBatch| {
             let v = predicate.evaluate(pair).map_err(|e| {
                 krishiv_delta::DeltaError::Operator(format!("membership residual failed: {e}"))
@@ -2935,7 +2954,13 @@ fn build_join_plan(
         let combined = rewrite_right_keys(combined)?;
         let mut coercion = TypeCoercionRewriter::new(&joined_schema);
         let coerced = combined.rewrite(&mut coercion).ok()?.data;
-        let predicate = create_physical_expr(&coerced, &joined_schema, &props).ok()?;
+        let predicate = create_physical_expr(
+            &coerced,
+            &joined_schema,
+            &props,
+            &PhysicalPlanningContext::default(),
+        )
+        .ok()?;
         Some(SourceFilter { predicate })
     };
     let post = match projection {
@@ -2951,7 +2976,13 @@ fn build_join_plan(
                 let expr = rewrite_right_keys(expr.clone())?;
                 let mut coercion = TypeCoercionRewriter::new(&joined_schema);
                 let coerced = expr.rewrite(&mut coercion).ok()?.data;
-                let physical = create_physical_expr(&coerced, &joined_schema, &props).ok()?;
+                let physical = create_physical_expr(
+                    &coerced,
+                    &joined_schema,
+                    &props,
+                    &PhysicalPlanningContext::default(),
+                )
+                .ok()?;
                 compiled.push((planned.name().clone(), physical));
                 // Names and types from the planner's own projection schema —
                 // never re-derived (CORE-23 / MAP-TYPE-1).
@@ -3346,7 +3377,13 @@ fn compile_source_filter(
     let mut coercion = TypeCoercionRewriter::new(&df_schema);
     let coerced = combined.rewrite(&mut coercion).map_err(|_| ())?.data;
     let props = ExecutionProps::new();
-    let predicate = create_physical_expr(&coerced, &df_schema, &props).map_err(|_| ())?;
+    let predicate = create_physical_expr(
+        &coerced,
+        &df_schema,
+        &props,
+        &PhysicalPlanningContext::default(),
+    )
+    .map_err(|_| ())?;
     Ok(Some(SourceFilter { predicate }))
 }
 

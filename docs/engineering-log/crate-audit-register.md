@@ -7742,6 +7742,25 @@ Taken instead: arrow/arrow-flight/parquet **58.4.0** and datafusion(+proto,
 +functions-nested) **54.1.0** — the ceiling the constraint allows, and 58.4 is
 precisely what iceberg-rust main pins, so the workspace now tracks them exactly.
 
+### 2026-10-01 addendum — taken
+
+DataFusion 55.1 / arrow 59.2 landed on 2026-10-01 (status entry of that date).
+The saved patch applied cleanly to HEAD outside `Cargo.toml` and has been
+deleted; 55.1 then moved further than the patch knew: `ListingOptions` lost
+`collect_stat` and `target_partitions` (both read from `SessionConfig`),
+`PhysicalExtensionCodec::{try_encode,try_decode}` take a
+`PhysicalProtoConverterExtension`, and `partition_statistics` /
+`with_new_children` / `required_input_distribution` are deprecated in favour
+of `StatisticsContext::compute` + `statistics_from_inputs`,
+`replace_children(…, ReplaceChildrenOptions)` and
+`input_distribution_requirements`. iceberg still has no arrow-59 release;
+both iceberg crates are a pinned git revision of iceberg-rust `main`
+(`19603861`, 2026-10-01), whose `rust-version = "1.95"` is why the MSRV moved.
+Its API moved too: `FileScanTask` and `UnboundPartitionField` fields are
+private behind accessors, `UnboundPartitionField` is built with a builder,
+`FileWrite::close` returns `FileMetadata`, `MetadataLocation::new_with_metadata`
+became `try_new_with_metadata(&metadata)` and `PrimitiveType` gained `Unknown`.
+
 ### "Latest" is wrong for a crate on DataFusion's public surface
 
 `object_store` 0.14.1 is newer than 0.13.2, and taking it was a mistake I made

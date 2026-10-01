@@ -67,6 +67,7 @@ pub mod iceberg_scan {
             PrimitiveType::Uuid => DataType::FixedSizeBinary(16),
             PrimitiveType::Fixed(n) => DataType::FixedSizeBinary(i32::try_from(*n).ok()?),
             PrimitiveType::Binary => DataType::Binary,
+            PrimitiveType::Unknown => return None,
             PrimitiveType::Decimal { precision, scale } => {
                 DataType::Decimal128(u8::try_from(*precision).ok()?, i8::try_from(*scale).ok()?)
             }
@@ -179,18 +180,12 @@ pub mod iceberg_scan {
         // before the query's own (S3-registered) context ever scans the table.
         let state = SessionStateBuilder::new().with_default_features().build();
 
-        // `target_partitions` is set for the same reason `collect_stat` is:
-        // `ListingOptions::new` leaves it at **1**, which hands the snapshot's
-        // whole file list to the scan as a single group and reads a many-file
-        // Iceberg table serially.
-        //
-        // This provider is built at *registration* time, so there is no query
-        // session to ask; the default state's value (the machine's parallelism)
-        // is the best available answer and is strictly better than one.
-        let listing_options = ListingOptions::new(format)
-            .with_file_extension(".parquet")
-            .with_collect_stat(true)
-            .with_target_partitions(state.config().target_partitions().max(1));
+        // Through DataFusion 54 `ListingOptions::new` set `collect_stat: false`
+        // and `target_partitions: 1` and both were overridden here; DF 55
+        // removed the fields and reads both from the querying session's
+        // config, so a many-file Iceberg table is split across the session's
+        // partitions and its statistics are collected without any override.
+        let listing_options = ListingOptions::new(format).with_file_extension(".parquet");
         if (first_path.starts_with("s3://") || first_path.starts_with("s3a://"))
             && let Ok(url) = url::Url::parse(first_path)
         {

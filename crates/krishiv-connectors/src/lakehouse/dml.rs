@@ -83,7 +83,7 @@ async fn scan_iceberg_table(
     // through iceberg's delete-applying arrow reader (new in 0.10) instead.
     // Every caller rewrites what it reads, so the rewrite also compacts the
     // deletes away — the output table is delete-free.
-    if tasks.iter().any(|t| !t.deletes.is_empty()) {
+    if tasks.iter().any(|t| !t.deletes().is_empty()) {
         use futures::TryStreamExt as _;
         let stream = scan
             .to_arrow()
@@ -2261,7 +2261,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            tasks.iter().all(|t| t.deletes.is_empty()),
+            tasks.iter().all(|t| t.deletes().is_empty()),
             "the rewrite must land delete-free"
         );
         let batches = scan_iceberg_table(&table, &ctx).await.unwrap();

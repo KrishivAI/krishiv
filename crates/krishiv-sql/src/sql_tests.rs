@@ -6,15 +6,31 @@ mod tests {
     /// pass through unchanged (and the registration step no-ops on them).
     #[test]
     fn extract_create_external_table_location_reads_the_uri() {
-        use crate::extract_create_external_table_location as loc;
+        use crate::extract_create_external_table_locations as loc;
         assert_eq!(
-            loc("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 's3://bkt/p/'").as_deref(),
-            Some("s3://bkt/p/")
+            loc("CREATE EXTERNAL TABLE t STORED AS PARQUET LOCATION 's3://bkt/p/'"),
+            vec!["s3://bkt/p/".to_string()]
         );
-        assert_eq!(loc("SELECT 1"), None);
+        assert!(loc("SELECT 1").is_empty());
         assert_eq!(
-            loc("CREATE EXTERNAL TABLE f STORED AS PARQUET LOCATION '/tmp/d.parquet'").as_deref(),
-            Some("/tmp/d.parquet")
+            loc("CREATE EXTERNAL TABLE f STORED AS PARQUET LOCATION '/tmp/d.parquet'"),
+            vec!["/tmp/d.parquet".to_string()]
+        );
+    }
+
+    /// DF55 lets one DDL name several locations. Every one must come back: the
+    /// caller registers an object store per location, and returning only the
+    /// first would leave a second bucket unresolvable at plan time.
+    #[test]
+    fn every_location_of_a_multi_location_ddl_is_returned() {
+        use crate::extract_create_external_table_locations as loc;
+        assert_eq!(
+            loc("CREATE EXTERNAL TABLE t STORED AS PARQUET \
+                 LOCATION ('s3://one/a.parquet', 's3://two/b.parquet')"),
+            vec![
+                "s3://one/a.parquet".to_string(),
+                "s3://two/b.parquet".to_string()
+            ]
         );
     }
 

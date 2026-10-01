@@ -5,6 +5,7 @@
 //! This crate owns the DataFusion integration for R1 while keeping DataFusion
 //! out of the long-term public API exposed by `krishiv-api`.
 
+use crate::join_estimates::plan_statistics;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::num::NonZeroUsize;
@@ -1000,7 +1001,7 @@ async fn provider_join_statistics(
     }
     let state = context.state();
     let scan = provider.scan(&state, None, &[], None).await.ok()?;
-    let stats = scan.partition_statistics(None).ok()?;
+    let stats = plan_statistics(scan.as_ref(), None).ok()?;
     let rows = stats.num_rows.get_value().copied()? as u64;
     let ndv = crate::join_reorder::column_ndv_bounds(&schema, &stats, rows);
     Some((rows, ndv))
@@ -3599,7 +3600,7 @@ impl SqlEngine {
         // (engine-s3-ddl-gap), so an `s3://` external table previously failed at
         // plan time with "no suitable object store found for s3://…". No-op for
         // file/connector locations, so it is safe for every external-table DDL.
-        if let Some(location) = extract_create_external_table_location(&rewritten) {
+        for location in extract_create_external_table_locations(&rewritten) {
             self.register_s3_object_store_for_warehouse(&location)
                 .map_err(|message| SqlError::DataFusion { message })?;
         }
@@ -3689,13 +3690,14 @@ impl SqlEngine {
     ) -> SqlResult<()> {
         use incremental_view::{IncrementalViewResult, IncrementalViewStatement};
         match (statement, outcome) {
-            (_, IncrementalViewResult::Dropped(name)) => {
-                // Whatever was readable under the view's name — the view
-                // itself or a pipeline's output — goes with the declaration.
-                if self.context.table_exist(name.as_str())? {
-                    self.context.deregister_table(name.as_str())?;
-                }
+            // Whatever was readable under the view's name — the view itself
+            // or a pipeline's output — goes with the declaration.
+            (_, IncrementalViewResult::Dropped(name))
+                if self.context.table_exist(name.as_str())? =>
+            {
+                self.context.deregister_table(name.as_str())?;
             }
+            (_, IncrementalViewResult::Dropped(_)) => {}
             (
                 Some(IncrementalViewStatement::Create {
                     name,
@@ -4651,19 +4653,27 @@ pub(crate) fn extract_create_external_table_name(query: &str) -> Option<String> 
     }
 }
 
-/// Extract the `LOCATION` URI of a `CREATE EXTERNAL TABLE … LOCATION '<uri>'`
-/// statement, or `None` for any other SQL.
+/// Extract the `LOCATION` URIs of a `CREATE EXTERNAL TABLE … LOCATION (…)`
+/// statement — empty for any other SQL.
 ///
 /// Used to register the backing S3 object store before the DDL executes, so an
 /// `s3://`/`s3a://` location can be schema-inferred and scanned. Mirrors
 /// [`extract_create_external_table_name`] (same single-parse, first-statement
 /// contract).
-pub(crate) fn extract_create_external_table_location(query: &str) -> Option<String> {
+///
+/// Returns **every** location, not the first. DF55 changed the parser's
+/// `location: String` to `locations: Vec<String>`, and a DDL may now name two
+/// buckets; registering only the first would leave the second unresolvable at
+/// plan time with the same "no suitable object store found" this function
+/// exists to prevent.
+pub(crate) fn extract_create_external_table_locations(query: &str) -> Vec<String> {
     use datafusion::sql::parser::{DFParser, Statement as DFStatement};
-    let mut stmts = DFParser::parse_sql(query).ok()?;
-    match stmts.pop_front()? {
-        DFStatement::CreateExternalTable(create) => Some(create.location),
-        _ => None,
+    let Ok(mut stmts) = DFParser::parse_sql(query) else {
+        return Vec::new();
+    };
+    match stmts.pop_front() {
+        Some(DFStatement::CreateExternalTable(create)) => create.locations,
+        _ => Vec::new(),
     }
 }
 
