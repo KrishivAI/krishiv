@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the TPC-H corpus through Krishiv, DuckDB and Spark on one machine.
+"""Run the TPC-H corpus through Krishiv, DuckDB, Spark and Sail on one machine.
 
 The only comparison that means anything is one where the hardware, the data
 and the SQL are identical and the runs do not overlap. Everything else in this
@@ -22,6 +22,10 @@ Usage:
   scripts/bench/tpch_compare_engines.py --data /data/tpch-sf100 \
       --corpus-json corpus.json --krishiv target/release/krishiv \
       --out benchmarks/tpch-sf100-engine-comparison.json
+
+Sail (https://github.com/lakehq/sail) is driven over Spark Connect: pass the
+`sail` CLI from a `pip install pysail` environment as `--sail`, and run this
+script with a Python that has `pyspark-client` installed.
 """
 
 from __future__ import annotations
@@ -32,6 +36,7 @@ import decimal
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -86,11 +91,17 @@ TABLES = [
 
 
 def table_path(data_root: str, table: str) -> str:
-    if table in SINGLE_FILE_TABLES:
-        single = os.path.join(data_root, f"{table}.parquet")
-        if os.path.exists(single):
-            return single
-    return os.path.join(data_root, table)
+    """The table's parquet: `<table>.parquet` or a `<table>/` directory of parts.
+
+    Small scale factors are generated one file per table, so any table can be
+    a single file, not only the two that always are.
+    """
+    single = os.path.join(data_root, f"{table}.parquet")
+    directory = os.path.join(data_root, table)
+    if (table in SINGLE_FILE_TABLES or not os.path.isdir(directory)) \
+            and os.path.exists(single):
+        return single
+    return directory
 
 
 def parquet_glob(data_root: str, table: str) -> str:
@@ -312,6 +323,92 @@ def run_spark(data_root: str, queries: list[dict], timeout_s: int) -> list[dict]
     return out
 
 
+SAIL_PORT = int(os.environ.get("KRISHIV_BENCH_SAIL_PORT", "50061"))
+
+
+def wait_for_port(port: int, timeout_s: float) -> bool:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                return True
+        except OSError:
+            time.sleep(0.2)
+    return False
+
+
+def run_sail(binary: str, data_root: str, queries: list[dict],
+             timeout_s: int) -> list[dict]:
+    """One Sail server per pass, queried over Spark Connect like a PySpark job.
+
+    Sail runs in its default `local` mode: one process, every core. The only
+    setting changed from its defaults is the one Sail's own published TPC-H
+    benchmark turns on — cost-based join reorder — so this measures Sail as
+    its authors measure it. Temporary files go to real disk for the same
+    reason the other engines' spill does (see SPILL_DIR).
+
+    Like DuckDB and Spark, the tables are registered once per pass and every
+    query runs in the same session. Krishiv starts a process per query, which
+    costs it its startup and parquet-footer reads on every query.
+    """
+    from pyspark.sql import SparkSession
+
+    env = dict(os.environ)
+    env.setdefault("SAIL_OPTIMIZER__ENABLE_JOIN_REORDER", "true")
+    env["SAIL_RUNTIME__TEMPORARY_FILES__PATHS"] = json.dumps([SPILL_DIR])
+    env["TMPDIR"] = SPILL_DIR
+    os.makedirs(SPILL_DIR, exist_ok=True)
+    log_path = os.path.join(SPILL_DIR, "sail-server.log")
+    with open(log_path, "ab") as log:
+        server = subprocess.Popen(
+            [binary, "spark", "server", "--ip", "127.0.0.1", "--port", str(SAIL_PORT)],
+            stdout=log, stderr=subprocess.STDOUT, env=env)
+    out: list[dict] = []
+    spark = None
+    try:
+        if not wait_for_port(SAIL_PORT, 60):
+            raise RuntimeError(f"sail server did not listen on {SAIL_PORT}; see {log_path}")
+        spark = SparkSession.builder.remote(f"sc://127.0.0.1:{SAIL_PORT}").getOrCreate()
+        for table in TABLES:
+            spark.read.parquet(table_path(data_root, table)).createOrReplaceTempView(table)
+        for index, query in enumerate(queries, start=1):
+            if not disk_headroom_ok(data_root):
+                out.append({"id": index, "name": query["name"], "status": "skipped",
+                            "elapsed_s": 0.0,
+                            "error": f"disk below {MIN_FREE_BYTES // 1024**3} GiB free"})
+                print(f"  sail   q{index:<3} skipped (low disk)", flush=True)
+                continue
+            started = time.monotonic()
+            try:
+                rows = [tuple(r) for r in spark.sql(query["sql"]).collect()]
+                out.append({
+                    "id": index, "name": query["name"], "status": "ok",
+                    "elapsed_s": round(time.monotonic() - started, 2),
+                    **fingerprint(rows),
+                })
+            except Exception as err:  # noqa: BLE001
+                out.append({
+                    "id": index, "name": query["name"], "status": "failed",
+                    "elapsed_s": round(time.monotonic() - started, 2),
+                    "error": str(err)[-300:],
+                })
+            print(f"  sail   q{index:<3} {out[-1]['status']:<7} "
+                  f"{out[-1]['elapsed_s']:>8.2f} s", flush=True)
+    finally:
+        if spark is not None:
+            try:
+                spark.stop()
+            except Exception:  # noqa: BLE001 - the server is going away anyway
+                pass
+        server.terminate()
+        try:
+            server.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            server.kill()
+            server.wait()
+    return out
+
+
 def run_krishiv(binary: str, data_root: str, queries: list[dict],
                 timeout_s: int) -> list[dict]:
     out = []
@@ -463,11 +560,17 @@ def main() -> int:
     parser.add_argument("--data", required=True)
     parser.add_argument("--corpus-json", required=True)
     parser.add_argument("--krishiv", help="path to the krishiv binary")
+    parser.add_argument("--sail", help="path to the `sail` CLI (pip install pysail)")
     parser.add_argument("--engines", default="krishiv,duckdb,spark")
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--repeat", type=int, default=1,
                         help="passes over the whole corpus per engine; "
                              "reported time is the median (default 1)")
+    parser.add_argument("--interleave", action="store_true",
+                        help="alternate engines pass by pass (A B A B …) instead "
+                             "of running every pass of one engine before the "
+                             "next, so drift in the machine's state lands on "
+                             "every engine rather than on whichever ran last")
     parser.add_argument("--out")
     parser.add_argument("--compare-to",
                         help="baseline JSON to diff digests against; "
@@ -488,26 +591,44 @@ def main() -> int:
     # know about the others. Every engine also gets the same number of passes;
     # giving one a median and the others a single sample would bias the
     # comparison toward whichever got to discard its worst run.
+    runners = {
+        "duckdb": lambda: run_duckdb(args.data, queries, args.timeout),
+        "spark": lambda: run_spark(args.data, queries, args.timeout),
+        "krishiv": lambda: run_krishiv(args.krishiv, args.data, queries, args.timeout),
+        "sail": lambda: run_sail(args.sail, args.data, queries, args.timeout),
+    }
+    runnable = []
+    for engine in wanted:
+        if engine not in runners:
+            print(f"unknown engine {engine}", flush=True)
+        elif engine in ("krishiv", "sail") and not getattr(args, engine):
+            print(f"skipping {engine}: --{engine} not given", flush=True)
+        else:
+            runnable.append(engine)
+    # Either every pass of one engine, then the next (the default), or one pass
+    # of each engine in turn (--interleave). The order of work is the only
+    # difference; every engine gets the same number of passes either way.
+    if args.interleave:
+        schedule = [(attempt, engine) for attempt in range(1, args.repeat + 1)
+                    for engine in runnable]
+    else:
+        schedule = [(attempt, engine) for engine in runnable
+                    for attempt in range(1, args.repeat + 1)]
+    passes: dict[str, list[list[dict]]] = {engine: [] for engine in runnable}
     with machine_lock(f"tpch_compare_engines {args.engines} repeat={args.repeat}"):
-        for engine in wanted:
-            if engine == "krishiv" and not args.krishiv:
-                print("skipping krishiv: --krishiv not given", flush=True)
-                continue
-            if engine not in ("duckdb", "spark", "krishiv"):
-                print(f"unknown engine {engine}", flush=True)
-                continue
-            passes = []
-            for attempt in range(1, args.repeat + 1):
-                print(f"\n=== {engine} ({len(queries)} queries) "
-                      f"pass {attempt}/{args.repeat} ===", flush=True)
-                if engine == "duckdb":
-                    passes.append(run_duckdb(args.data, queries, args.timeout))
-                elif engine == "spark":
-                    passes.append(run_spark(args.data, queries, args.timeout))
-                else:
-                    passes.append(
-                        run_krishiv(args.krishiv, args.data, queries, args.timeout))
-            results[engine] = merge_passes(passes)
+        for attempt, engine in schedule:
+            print(f"\n=== {engine} ({len(queries)} queries) "
+                  f"pass {attempt}/{args.repeat} ===", flush=True)
+            passes[engine].append(runners[engine]())
+            if args.out:
+                # Checkpoint the raw passes. A run that dies in pass 3 — the
+                # 2026-10-01 Sail q21 OOM kill took the whole session with
+                # it — otherwise leaves nothing but the log, and the log has
+                # no digests.
+                with open(args.out + ".passes.json", "w", encoding="utf-8") as handle:
+                    json.dump(passes, handle, indent=1)
+    for engine in runnable:
+        results[engine] = merge_passes(passes[engine])
 
     print("\n=== summary ===", flush=True)
     for engine, rows in results.items():
@@ -563,6 +684,12 @@ def main() -> int:
                        # Stamped so a cross-scheme comparison is detectable
                        # instead of silently reporting false disagreements.
                        "digest_scheme": DIGEST_SCHEME,
+                       "interleaved": args.interleave,
+                       # Engine settings in force for this run. A number with
+                       # a switch flipped is a different measurement, and the
+                       # file is the only place a later reader can find out.
+                       "engine_env": {key: value for key, value in sorted(os.environ.items())
+                                      if key.startswith(("KRISHIV_", "SAIL_"))},
                        "engines": results},
                       handle, indent=2)
         print(f"\nwrote {args.out}", flush=True)

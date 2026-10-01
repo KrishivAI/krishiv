@@ -1,0 +1,614 @@
+{
+  "scale": 100,
+  "data_root": "/home/gopal/krishiv-bench-data/tpch/sf100",
+  "cores": 12,
+  "repeat": 1,
+  "digest_scheme": 2,
+  "interleaved": true,
+  "engine_env": {
+    "KRISHIV_BENCH_SPILL_DIR": "/home/gopal/krishiv-bench-data/spill",
+    "KRISHIV_JOIN_REORDER": "off"
+  },
+  "engines": {
+    "krishiv": [
+      {
+        "id": 1,
+        "name": "pricing_summary",
+        "status": "ok",
+        "elapsed_s": 21.7,
+        "rows": 4,
+        "digest": "beffb06c0c51d99a",
+        "digest_unordered": "beffb06c0c51d99a"
+      },
+      {
+        "id": 2,
+        "name": "minimum_cost_supplier",
+        "status": "ok",
+        "elapsed_s": 3.47,
+        "rows": 100,
+        "digest": "cafd41b242c467a6",
+        "digest_unordered": "0323f166d6f9fcac"
+      },
+      {
+        "id": 3,
+        "name": "shipping_priority",
+        "status": "ok",
+        "elapsed_s": 12.42,
+        "rows": 10,
+        "digest": "5ba1a12f7ea503ff",
+        "digest_unordered": "01c7004bc3268c48"
+      },
+      {
+        "id": 4,
+        "name": "order_priority_checking",
+        "status": "ok",
+        "elapsed_s": 6.78,
+        "rows": 5,
+        "digest": "ca9e07d277046f7d",
+        "digest_unordered": "ca9e07d277046f7d"
+      },
+      {
+        "id": 5,
+        "name": "local_supplier_volume",
+        "status": "ok",
+        "elapsed_s": 17.91,
+        "rows": 5,
+        "digest": "bc2d53f428eb4be1",
+        "digest_unordered": "b73d2911f5a6ed01"
+      },
+      {
+        "id": 6,
+        "name": "forecasting_revenue_change",
+        "status": "ok",
+        "elapsed_s": 7.27,
+        "rows": 1,
+        "digest": "bffe0fc39786433b",
+        "digest_unordered": "bffe0fc39786433b"
+      },
+      {
+        "id": 7,
+        "name": "volume_shipping",
+        "status": "ok",
+        "elapsed_s": 31.16,
+        "rows": 4,
+        "digest": "b8f12d6601c224b7",
+        "digest_unordered": "b8f12d6601c224b7"
+      },
+      {
+        "id": 8,
+        "name": "national_market_share",
+        "status": "ok",
+        "elapsed_s": 18.88,
+        "rows": 2,
+        "digest": "d2c933c88bbd0844",
+        "digest_unordered": "d2c933c88bbd0844"
+      },
+      {
+        "id": 9,
+        "name": "product_type_profit_measure",
+        "status": "ok",
+        "elapsed_s": 34.68,
+        "rows": 175,
+        "digest": "7a5580a7ff491742",
+        "digest_unordered": "5564f9866865ef99"
+      },
+      {
+        "id": 10,
+        "name": "returned_item_reporting",
+        "status": "ok",
+        "elapsed_s": 14.92,
+        "rows": 20,
+        "digest": "075ae962b4e84c1f",
+        "digest_unordered": "dbe0803fb606a683"
+      },
+      {
+        "id": 11,
+        "name": "important_stock_identification",
+        "status": "ok",
+        "elapsed_s": 4.3,
+        "rows": 92698,
+        "digest": "49bbabbfef89ee52",
+        "digest_unordered": "f7b061e609273cb1"
+      },
+      {
+        "id": 12,
+        "name": "shipping_modes_and_order_priority",
+        "status": "ok",
+        "elapsed_s": 10.94,
+        "rows": 2,
+        "digest": "e13ebd10c3b10cce",
+        "digest_unordered": "e13ebd10c3b10cce"
+      },
+      {
+        "id": 13,
+        "name": "customer_distribution",
+        "status": "ok",
+        "elapsed_s": 16.11,
+        "rows": 45,
+        "digest": "d43f7c762f44667e",
+        "digest_unordered": "897bcc78b03a1cba"
+      },
+      {
+        "id": 14,
+        "name": "promotion_effect",
+        "status": "ok",
+        "elapsed_s": 7.48,
+        "rows": 1,
+        "digest": "834c5af639004e5e",
+        "digest_unordered": "834c5af639004e5e"
+      },
+      {
+        "id": 15,
+        "name": "top_supplier",
+        "status": "ok",
+        "elapsed_s": 7.35,
+        "rows": 1,
+        "digest": "dea30e15eaf9c243",
+        "digest_unordered": "dea30e15eaf9c243"
+      },
+      {
+        "id": 16,
+        "name": "parts_supplier_relationship",
+        "status": "ok",
+        "elapsed_s": 3.03,
+        "rows": 27840,
+        "digest": "18bf85dfd47a0e99",
+        "digest_unordered": "037e2693557a552a"
+      },
+      {
+        "id": 17,
+        "name": "small_quantity_order_revenue",
+        "status": "ok",
+        "elapsed_s": 16.99,
+        "rows": 1,
+        "digest": "5f5b0c414e4bf9b3",
+        "digest_unordered": "5f5b0c414e4bf9b3"
+      },
+      {
+        "id": 18,
+        "name": "large_volume_customer",
+        "status": "ok",
+        "elapsed_s": 26.72,
+        "rows": 100,
+        "digest": "c63f1672cb9c5fc6",
+        "digest_unordered": "2bfc9e8dcf4ecc30"
+      },
+      {
+        "id": 19,
+        "name": "discounted_revenue",
+        "status": "ok",
+        "elapsed_s": 12.71,
+        "rows": 1,
+        "digest": "ae672a75faa0cdab",
+        "digest_unordered": "ae672a75faa0cdab"
+      },
+      {
+        "id": 20,
+        "name": "potential_part_promotion",
+        "status": "ok",
+        "elapsed_s": 13.28,
+        "rows": 17971,
+        "digest": "9805143996dec7ea",
+        "digest_unordered": "9805143996dec7ea"
+      },
+      {
+        "id": 21,
+        "name": "suppliers_who_kept_orders_waiting",
+        "status": "ok",
+        "elapsed_s": 44.35,
+        "rows": 100,
+        "digest": "ede3163c7f63da88",
+        "digest_unordered": "eb2964289a0e140f"
+      },
+      {
+        "id": 22,
+        "name": "global_sales_opportunity",
+        "status": "ok",
+        "elapsed_s": 2.73,
+        "rows": 7,
+        "digest": "0336ef31cc384b2b",
+        "digest_unordered": "0336ef31cc384b2b"
+      }
+    ],
+    "sail": [
+      {
+        "id": 1,
+        "name": "pricing_summary",
+        "status": "ok",
+        "elapsed_s": 21.02,
+        "rows": 4,
+        "digest": "beffb06c0c51d99a",
+        "digest_unordered": "beffb06c0c51d99a"
+      },
+      {
+        "id": 2,
+        "name": "minimum_cost_supplier",
+        "status": "ok",
+        "elapsed_s": 3.56,
+        "rows": 100,
+        "digest": "cafd41b242c467a6",
+        "digest_unordered": "0323f166d6f9fcac"
+      },
+      {
+        "id": 3,
+        "name": "shipping_priority",
+        "status": "ok",
+        "elapsed_s": 10.08,
+        "rows": 10,
+        "digest": "5ba1a12f7ea503ff",
+        "digest_unordered": "01c7004bc3268c48"
+      },
+      {
+        "id": 4,
+        "name": "order_priority_checking",
+        "status": "ok",
+        "elapsed_s": 4.78,
+        "rows": 5,
+        "digest": "ca9e07d277046f7d",
+        "digest_unordered": "ca9e07d277046f7d"
+      },
+      {
+        "id": 5,
+        "name": "local_supplier_volume",
+        "status": "ok",
+        "elapsed_s": 16.73,
+        "rows": 5,
+        "digest": "bc2d53f428eb4be1",
+        "digest_unordered": "b73d2911f5a6ed01"
+      },
+      {
+        "id": 6,
+        "name": "forecasting_revenue_change",
+        "status": "ok",
+        "elapsed_s": 5.85,
+        "rows": 1,
+        "digest": "bffe0fc39786433b",
+        "digest_unordered": "bffe0fc39786433b"
+      },
+      {
+        "id": 7,
+        "name": "volume_shipping",
+        "status": "ok",
+        "elapsed_s": 12.79,
+        "rows": 4,
+        "digest": "b8f12d6601c224b7",
+        "digest_unordered": "b8f12d6601c224b7"
+      },
+      {
+        "id": 8,
+        "name": "national_market_share",
+        "status": "ok",
+        "elapsed_s": 18.93,
+        "rows": 2,
+        "digest": "d2c933c88bbd0844",
+        "digest_unordered": "d2c933c88bbd0844"
+      },
+      {
+        "id": 9,
+        "name": "product_type_profit_measure",
+        "status": "ok",
+        "elapsed_s": 38.58,
+        "rows": 175,
+        "digest": "7a5580a7ff491742",
+        "digest_unordered": "5564f9866865ef99"
+      },
+      {
+        "id": 10,
+        "name": "returned_item_reporting",
+        "status": "ok",
+        "elapsed_s": 14.52,
+        "rows": 20,
+        "digest": "075ae962b4e84c1f",
+        "digest_unordered": "dbe0803fb606a683"
+      },
+      {
+        "id": 11,
+        "name": "important_stock_identification",
+        "status": "ok",
+        "elapsed_s": 4.84,
+        "rows": 92698,
+        "digest": "bb9180680c9da822",
+        "digest_unordered": "f7b061e609273cb1"
+      },
+      {
+        "id": 12,
+        "name": "shipping_modes_and_order_priority",
+        "status": "ok",
+        "elapsed_s": 19.62,
+        "rows": 2,
+        "digest": "e13ebd10c3b10cce",
+        "digest_unordered": "e13ebd10c3b10cce"
+      },
+      {
+        "id": 13,
+        "name": "customer_distribution",
+        "status": "ok",
+        "elapsed_s": 14.99,
+        "rows": 45,
+        "digest": "d43f7c762f44667e",
+        "digest_unordered": "897bcc78b03a1cba"
+      },
+      {
+        "id": 14,
+        "name": "promotion_effect",
+        "status": "ok",
+        "elapsed_s": 12.13,
+        "rows": 1,
+        "digest": "834c5af639004e5e",
+        "digest_unordered": "834c5af639004e5e"
+      },
+      {
+        "id": 15,
+        "name": "top_supplier",
+        "status": "ok",
+        "elapsed_s": 17.92,
+        "rows": 1,
+        "digest": "dea30e15eaf9c243",
+        "digest_unordered": "dea30e15eaf9c243"
+      },
+      {
+        "id": 16,
+        "name": "parts_supplier_relationship",
+        "status": "ok",
+        "elapsed_s": 2.8,
+        "rows": 27840,
+        "digest": "18bf85dfd47a0e99",
+        "digest_unordered": "037e2693557a552a"
+      },
+      {
+        "id": 17,
+        "name": "small_quantity_order_revenue",
+        "status": "ok",
+        "elapsed_s": 35.67,
+        "rows": 1,
+        "digest": "5f5b0c414e4bf9b3",
+        "digest_unordered": "5f5b0c414e4bf9b3"
+      },
+      {
+        "id": 18,
+        "name": "large_volume_customer",
+        "status": "ok",
+        "elapsed_s": 52.18,
+        "rows": 100,
+        "digest": "c63f1672cb9c5fc6",
+        "digest_unordered": "2bfc9e8dcf4ecc30"
+      },
+      {
+        "id": 19,
+        "name": "discounted_revenue",
+        "status": "ok",
+        "elapsed_s": 14.46,
+        "rows": 1,
+        "digest": "ae672a75faa0cdab",
+        "digest_unordered": "ae672a75faa0cdab"
+      },
+      {
+        "id": 20,
+        "name": "potential_part_promotion",
+        "status": "ok",
+        "elapsed_s": 10.89,
+        "rows": 17971,
+        "digest": "9805143996dec7ea",
+        "digest_unordered": "9805143996dec7ea"
+      },
+      {
+        "id": 21,
+        "name": "suppliers_who_kept_orders_waiting",
+        "status": "ok",
+        "elapsed_s": 49.4,
+        "rows": 100,
+        "digest": "ede3163c7f63da88",
+        "digest_unordered": "eb2964289a0e140f"
+      },
+      {
+        "id": 22,
+        "name": "global_sales_opportunity",
+        "status": "ok",
+        "elapsed_s": 4.23,
+        "rows": 7,
+        "digest": "0336ef31cc384b2b",
+        "digest_unordered": "0336ef31cc384b2b"
+      }
+    ],
+    "duckdb": [
+      {
+        "id": 1,
+        "name": "pricing_summary",
+        "status": "ok",
+        "elapsed_s": 12.22,
+        "rows": 4,
+        "digest": "ff81b8fa2ea2baff",
+        "digest_unordered": "ff81b8fa2ea2baff"
+      },
+      {
+        "id": 2,
+        "name": "minimum_cost_supplier",
+        "status": "ok",
+        "elapsed_s": 2.27,
+        "rows": 100,
+        "digest": "cafd41b242c467a6",
+        "digest_unordered": "0323f166d6f9fcac"
+      },
+      {
+        "id": 3,
+        "name": "shipping_priority",
+        "status": "ok",
+        "elapsed_s": 8.68,
+        "rows": 10,
+        "digest": "5ba1a12f7ea503ff",
+        "digest_unordered": "01c7004bc3268c48"
+      },
+      {
+        "id": 4,
+        "name": "order_priority_checking",
+        "status": "ok",
+        "elapsed_s": 5.79,
+        "rows": 5,
+        "digest": "ca9e07d277046f7d",
+        "digest_unordered": "ca9e07d277046f7d"
+      },
+      {
+        "id": 5,
+        "name": "local_supplier_volume",
+        "status": "ok",
+        "elapsed_s": 10.02,
+        "rows": 5,
+        "digest": "bc2d53f428eb4be1",
+        "digest_unordered": "b73d2911f5a6ed01"
+      },
+      {
+        "id": 6,
+        "name": "forecasting_revenue_change",
+        "status": "ok",
+        "elapsed_s": 3.74,
+        "rows": 1,
+        "digest": "bffe0fc39786433b",
+        "digest_unordered": "bffe0fc39786433b"
+      },
+      {
+        "id": 7,
+        "name": "volume_shipping",
+        "status": "ok",
+        "elapsed_s": 9.12,
+        "rows": 4,
+        "digest": "b8f12d6601c224b7",
+        "digest_unordered": "b8f12d6601c224b7"
+      },
+      {
+        "id": 8,
+        "name": "national_market_share",
+        "status": "ok",
+        "elapsed_s": 11.57,
+        "rows": 2,
+        "digest": "d2c933c88bbd0844",
+        "digest_unordered": "d2c933c88bbd0844"
+      },
+      {
+        "id": 9,
+        "name": "product_type_profit_measure",
+        "status": "ok",
+        "elapsed_s": 23.55,
+        "rows": 175,
+        "digest": "7a5580a7ff491742",
+        "digest_unordered": "5564f9866865ef99"
+      },
+      {
+        "id": 10,
+        "name": "returned_item_reporting",
+        "status": "ok",
+        "elapsed_s": 9.97,
+        "rows": 20,
+        "digest": "075ae962b4e84c1f",
+        "digest_unordered": "dbe0803fb606a683"
+      },
+      {
+        "id": 11,
+        "name": "important_stock_identification",
+        "status": "ok",
+        "elapsed_s": 2.35,
+        "rows": 92698,
+        "digest": "ba5201b510bb431e",
+        "digest_unordered": "f7b061e609273cb1"
+      },
+      {
+        "id": 12,
+        "name": "shipping_modes_and_order_priority",
+        "status": "ok",
+        "elapsed_s": 6.45,
+        "rows": 2,
+        "digest": "e13ebd10c3b10cce",
+        "digest_unordered": "e13ebd10c3b10cce"
+      },
+      {
+        "id": 13,
+        "name": "customer_distribution",
+        "status": "ok",
+        "elapsed_s": 15.67,
+        "rows": 45,
+        "digest": "d43f7c762f44667e",
+        "digest_unordered": "897bcc78b03a1cba"
+      },
+      {
+        "id": 14,
+        "name": "promotion_effect",
+        "status": "ok",
+        "elapsed_s": 7.61,
+        "rows": 1,
+        "digest": "834c5af639004e5e",
+        "digest_unordered": "834c5af639004e5e"
+      },
+      {
+        "id": 15,
+        "name": "top_supplier",
+        "status": "ok",
+        "elapsed_s": 6.89,
+        "rows": 1,
+        "digest": "dea30e15eaf9c243",
+        "digest_unordered": "dea30e15eaf9c243"
+      },
+      {
+        "id": 16,
+        "name": "parts_supplier_relationship",
+        "status": "ok",
+        "elapsed_s": 2.86,
+        "rows": 27840,
+        "digest": "18bf85dfd47a0e99",
+        "digest_unordered": "037e2693557a552a"
+      },
+      {
+        "id": 17,
+        "name": "small_quantity_order_revenue",
+        "status": "ok",
+        "elapsed_s": 11.12,
+        "rows": 1,
+        "digest": "5f5b0c414e4bf9b3",
+        "digest_unordered": "5f5b0c414e4bf9b3"
+      },
+      {
+        "id": 18,
+        "name": "large_volume_customer",
+        "status": "ok",
+        "elapsed_s": 18.57,
+        "rows": 100,
+        "digest": "c63f1672cb9c5fc6",
+        "digest_unordered": "2bfc9e8dcf4ecc30"
+      },
+      {
+        "id": 19,
+        "name": "discounted_revenue",
+        "status": "ok",
+        "elapsed_s": 14.0,
+        "rows": 1,
+        "digest": "ae672a75faa0cdab",
+        "digest_unordered": "ae672a75faa0cdab"
+      },
+      {
+        "id": 20,
+        "name": "potential_part_promotion",
+        "status": "ok",
+        "elapsed_s": 19.12,
+        "rows": 17971,
+        "digest": "9805143996dec7ea",
+        "digest_unordered": "9805143996dec7ea"
+      },
+      {
+        "id": 21,
+        "name": "suppliers_who_kept_orders_waiting",
+        "status": "ok",
+        "elapsed_s": 53.1,
+        "rows": 100,
+        "digest": "ede3163c7f63da88",
+        "digest_unordered": "eb2964289a0e140f"
+      },
+      {
+        "id": 22,
+        "name": "global_sales_opportunity",
+        "status": "ok",
+        "elapsed_s": 3.86,
+        "rows": 7,
+        "digest": "0336ef31cc384b2b",
+        "digest_unordered": "0336ef31cc384b2b"
+      }
+    ]
+  }
+}
