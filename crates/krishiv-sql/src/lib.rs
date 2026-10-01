@@ -838,8 +838,9 @@ fn with_krishiv_optimizer_rules_with_vector_cache(
     builder: datafusion::execution::session_state::SessionStateBuilder,
     vector_indexes: crate::vector_search::VectorIndexCache,
     row_counts: crate::join_reorder::TableRowCounts,
+    key_ndv: crate::join_reorder::TableKeyNdv,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
-    with_krishiv_optimizer_rules_inner(builder, None, vector_indexes, row_counts)
+    with_krishiv_optimizer_rules_inner(builder, None, vector_indexes, row_counts, key_ndv)
 }
 
 /// As [`with_krishiv_optimizer_rules`], with the spillable-join build-side
@@ -854,6 +855,7 @@ pub fn with_krishiv_optimizer_rules_with_join_threshold(
         spill_join_build_bytes,
         std::sync::Arc::default(),
         std::sync::Arc::default(),
+        std::sync::Arc::default(),
     )
 }
 
@@ -863,6 +865,7 @@ fn with_krishiv_optimizer_rules_inner(
     spill_join_build_bytes: Option<u64>,
     vector_indexes: crate::vector_search::VectorIndexCache,
     row_counts: crate::join_reorder::TableRowCounts,
+    key_ndv: crate::join_reorder::TableKeyNdv,
 ) -> datafusion::execution::session_state::SessionStateBuilder {
     let spillable_join = match spill_join_build_bytes {
         // Deliberately NOT grace-aware: this builder plans the stages the
@@ -950,17 +953,17 @@ fn with_krishiv_optimizer_rules_inner(
         ))
         // DataFusion 54 has no join-reordering rule, so a multi-way inner join
         // executes in FROM-clause order however the relations are sized. This
-        // reorders the chain smallest-connected-first from the engine's own
-        // row-count registry; over an empty registry (the staged planner) it
-        // declines. On unless `KRISHIV_JOIN_REORDER` says otherwise — see
-        // `join_reorder` for the 99-query sweep behind that default, and for
-        // what the sweep does not cover.
+        // reorders the chain by estimated join output, from the engine's own
+        // row-count and key-cardinality registries; over empty registries (the
+        // staged planner) it declines. On unless `KRISHIV_JOIN_REORDER` says
+        // otherwise — see `join_reorder` for the sweeps behind that default.
         .with_optimizer_rule(std::sync::Arc::new(crate::join_reorder::JoinReorder::new(
-            row_counts,
+            row_counts, key_ndv,
         )))
 }
 
-/// Row count for a table that has just been registered.
+/// Row count for a table that has just been registered, and bounds on its
+/// columns' distinct values.
 ///
 /// `TableProvider::statistics()` is the cheap path, and it is the only path the
 /// registration sites used to take. But it is a trait method whose default is
@@ -979,20 +982,28 @@ fn with_krishiv_optimizer_rules_inner(
 /// Returns `None` when neither source has a count, so a provider that genuinely
 /// cannot estimate leaves the registry untouched rather than recording a zero
 /// that reads as "empty table".
-async fn provider_row_count(
+///
+/// The same statistics also bound each column's distinct values, which the
+/// join-reorder rule needs to tell a join that narrows from one that multiplies
+/// — see [`crate::join_reorder::column_ndv_bounds`].
+async fn provider_join_statistics(
     context: &SessionContext,
     provider: &std::sync::Arc<dyn datafusion::datasource::TableProvider>,
-) -> Option<u64> {
-    if let Some(rows) = provider
-        .statistics()
-        .and_then(|stats| stats.num_rows.get_value().copied())
+) -> Option<(u64, HashMap<String, u64>)> {
+    let schema = provider.schema();
+    if let Some(stats) = provider.statistics()
+        && let Some(rows) = stats.num_rows.get_value().copied()
     {
-        return Some(rows as u64);
+        let rows = rows as u64;
+        let ndv = crate::join_reorder::column_ndv_bounds(&schema, &stats, rows);
+        return Some((rows, ndv));
     }
     let state = context.state();
     let scan = provider.scan(&state, None, &[], None).await.ok()?;
     let stats = scan.partition_statistics(None).ok()?;
-    stats.num_rows.get_value().copied().map(|rows| rows as u64)
+    let rows = stats.num_rows.get_value().copied()? as u64;
+    let ndv = crate::join_reorder::column_ndv_bounds(&schema, &stats, rows);
+    Some((rows, ndv))
 }
 
 /// Build the DataFusion session config with a configurable parallelism level.
@@ -1229,6 +1240,10 @@ pub struct SqlEngine {
     /// Used by `krishiv_logical_plan` to annotate scan nodes for the
     /// `BroadcastAutoRule` optimizer.
     table_row_counts: Arc<std::sync::RwLock<HashMap<String, u64>>>,
+    /// Upper bounds on the distinct values of each table's columns, shared
+    /// with the join-reorder rule. Populated beside `table_row_counts` from the
+    /// same statistics; see [`crate::join_reorder::TableKeyNdv`].
+    table_key_ndv: crate::join_reorder::TableKeyNdv,
     /// Per-table vector indexes (Phase 36 G19), shared with the
     /// `ann_rewrite::AnnTopKPrefilter` optimizer rule so an index built
     /// through any entry point accelerates plain-SQL kNN immediately.
@@ -1530,12 +1545,14 @@ impl SqlEngine {
         // the engine must read one registry, so a table registered after the
         // session was built is sized on the next query rather than never.
         let table_row_counts: crate::join_reorder::TableRowCounts = Arc::default();
+        let table_key_ndv: crate::join_reorder::TableKeyNdv = Arc::default();
 
         let mut state_builder = with_krishiv_optimizer_rules_with_vector_cache(
             datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_default_features(),
             vector_indexes.clone(),
             Arc::clone(&table_row_counts),
+            Arc::clone(&table_key_ndv),
         )
         .with_config(build_single_node_session_config(
             target_partitions,
@@ -1650,6 +1667,7 @@ impl SqlEngine {
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
             table_row_counts,
+            table_key_ndv,
             vector_indexes,
             memory_limit_bytes,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -1668,11 +1686,13 @@ impl SqlEngine {
             Arc::new(RwLock::new(std::collections::HashSet::new()));
         let vector_indexes: crate::vector_search::VectorIndexCache = Arc::default();
         let table_row_counts: crate::join_reorder::TableRowCounts = Arc::default();
+        let table_key_ndv: crate::join_reorder::TableKeyNdv = Arc::default();
         let mut state = with_krishiv_optimizer_rules_with_vector_cache(
             datafusion::execution::session_state::SessionStateBuilder::new()
                 .with_default_features(),
             vector_indexes.clone(),
             Arc::clone(&table_row_counts),
+            Arc::clone(&table_key_ndv),
         )
         .with_config(build_single_node_session_config(target_partitions, None))
         .build();
@@ -1696,6 +1716,7 @@ impl SqlEngine {
             shuffle_partitions: Arc::new(std::sync::RwLock::new(None)),
             cached_table_originals: Arc::new(std::sync::RwLock::new(HashMap::new())),
             table_row_counts,
+            table_key_ndv,
             vector_indexes,
             memory_limit_bytes: None,
             #[cfg(all(feature = "iceberg-datafusion", feature = "local-catalog"))]
@@ -2706,13 +2727,15 @@ impl SqlEngine {
         // (Re-)registration replaces the rows a vector index described.
         self.invalidate_vector_indexes(table_name);
         // Extract estimated row count from table provider statistics, falling
-        // back to the planned scan — see `provider_row_count` for why the
+        // back to the planned scan — see `provider_join_statistics` for why the
         // direct call alone recorded nothing for Parquet.
         if let Ok(provider) = self.context.table_provider(table_name).await
-            && let Some(rows) = provider_row_count(&self.context, &provider).await
-            && let Ok(mut counts) = self.table_row_counts.write()
+            && let Some((rows, ndv)) = provider_join_statistics(&self.context, &provider).await
         {
-            counts.insert(table_name.to_string(), rows);
+            if let Ok(mut counts) = self.table_row_counts.write() {
+                counts.insert(table_name.to_string(), rows);
+            }
+            crate::join_reorder::record_key_ndv(&self.table_key_ndv, table_name, rows, ndv);
         }
         self.invalidate_plan_cache();
         Ok(())
@@ -2747,6 +2770,7 @@ impl SqlEngine {
             return Ok(());
         }
         let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let key_ndv = crate::join_reorder::ndv_bounds_from_batches(&batches, total_rows as u64);
         let schema = batches
             .first()
             .ok_or_else(|| SqlError::DataFusion {
@@ -2780,6 +2804,12 @@ impl SqlEngine {
             && let Ok(mut counts) = self.table_row_counts.write()
         {
             counts.insert(table_name.to_string(), total_rows as u64);
+            crate::join_reorder::record_key_ndv(
+                &self.table_key_ndv,
+                table_name,
+                total_rows as u64,
+                key_ndv,
+            );
         }
         self.invalidate_plan_cache();
         Ok(())
@@ -3607,13 +3637,12 @@ impl SqlEngine {
         if let Some(table_name) = extract_create_external_table_name(&rewritten)
             && !table_name.is_empty()
             && let Ok(provider) = self.context.table_provider(&table_name).await
+            && let Some((rows, ndv)) = provider_join_statistics(&self.context, &provider).await
+            && let Ok(mut counts) = self.table_row_counts.write()
+            && !counts.contains_key(&table_name)
         {
-            let maybe_rows = provider_row_count(&self.context, &provider).await;
-            if let Some(rows) = maybe_rows
-                && let Ok(mut counts) = self.table_row_counts.write()
-            {
-                counts.entry(table_name).or_insert(rows);
-            }
+            counts.insert(table_name.clone(), rows);
+            crate::join_reorder::record_key_ndv(&self.table_key_ndv, &table_name, rows, ndv);
         }
 
         // Cache the logical plan for future repeated calls. The plan cached is

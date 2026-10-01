@@ -83,6 +83,17 @@ the chain smallest-connected-first takes q72 from 2699 ms to 252 ms, past
 DuckDB's 305 ms. Measured across all 99 the rule is +15.0% with 7 wins >10%,
 4 losses >10% (worst 24 ms) and 88 neutral; outside q72 it is neutral.
 
+That first version ranked candidates by base-table size alone, and at TPC-H
+SF100 that put `supplier` before `customer` on a 25-value `nationkey` join:
+q5 went from 21 s to a 38 GB process killed after 22 minutes, q8 and q10
+doubled, q9 lost 37%. The rule now ranks by estimated join output
+(`|L|·|R| / max(ndv)`, distinct counts from Parquet statistics) and keeps the
+written order unless the greedy one is estimated at least 2× cheaper. It
+changes no TPC-H plan, and of the fourteen TPC-DS plans the size-only version
+rewrote only q72's; the sweep against the size-only rule is neutral (13.11 s
+→ 13.17 s, 99/99 identical) with q72 at 218 ms and q6/q26 — no longer
+reordered — at 79 ms and 71 ms, from 151 and 100.
+
 Parquet filter pushdown, measured as a third arm, is **not** a suite-wide lever:
 enabling `datafusion.execution.parquet.pushdown_filters` globally is worth 1.4%
 (19823 ms → 19538 ms) because **51 of 99 queries lose more than 10% and only 10

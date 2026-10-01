@@ -8789,3 +8789,32 @@ field nothing read.
 - **Next**: `gh release create v0.1.1 --prerelease -F <notes>`; after the
   workflow runs, smoke-test the binary archive and images (`RELEASE.md`
   step 9).
+
+
+## 2026-10-01 — Sail vs Krishiv at TPC-H SF100; join reorder re-ranked by output estimate
+
+- **Completed**: `scripts/bench/tpch_compare_engines.py` runs Sail (Spark
+  Connect, local mode, its join reorder on) beside Krishiv and DuckDB,
+  `--interleave`, digests across engines, and now checkpoints raw passes to
+  `<out>.passes.json` after every pass. Result at SF100, 12 cores, Krishiv
+  reorder off, median of 3–4 interleaved passes: Krishiv 332 s, Sail 320 s,
+  DuckDB 203 s (`benchmarks/tpch-sf100-sail-vs-krishiv-2026-10-01.json`).
+  Krishiv and Sail agree on 22/22 answers; both differ from DuckDB on q1 only
+  (6th-decimal rounding of `avg_disc`). Sail wins 15 queries, mostly 10–30%,
+  q7 by 2.4× (a join-order win); Krishiv wins q15/q17/q18 by 1.7–1.9×. Sail
+  peaks at 30 GB on q21 and was OOM-killed once; Sail's published 52.8 s is
+  not reproducible here.
+- **Fixed**: the size-only `JoinReorder` (`ea8720e`) regressed TPC-H SF100 —
+  q5 21 s → killed at 22 min / 38 GB, q10 2.1×, q8 1.9×, q9 1.4×. It now
+  ranks by estimated join output using distinct-value bounds recorded at
+  registration (Parquet min/max or in-memory batches), declines chains with
+  an unbounded key, and keeps the written order unless the greedy order is
+  estimated ≥2× cheaper. Changes no TPC-H plan; TPC-DS SF1 vs the old rule
+  −0.5% suite, 99/99 identical, q72 218 ms, q6/q26 faster.
+- **Validation**: `cargo test -p krishiv-sql` (898 lib + integration, all
+  green), clippy clean, release build measured as above (one process per
+  query, paired/interleaved for TPC-DS).
+- **Not measured**: the distributed path; Sail with its reorder off.
+- **Next**: q7 is the one TPC-H query where a reorder is worth 2× and the
+  new rule declines it — its chain is written fact-first and the estimate
+  gain is under 2×; revisit once the estimate has filter selectivity.
