@@ -37,6 +37,11 @@ Semantic Versioning as described in `docs/RELEASE.md`.
 
 ### Fixed
 
+- Executors with `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` set no longer let one
+  task reserve the whole process budget: each task requests its slot's share,
+  so concurrent fragments no longer fall to the 32 MiB floor and fail joins
+  with `Resources exhausted`.
+
 ## [0.1.1] - 2026-09-07
 
 Highlights since 0.1.0: the TPC-DS SF1 suite runs 21.4 s → 13.5 s (2.03× DuckDB,

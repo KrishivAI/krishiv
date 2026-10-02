@@ -8897,3 +8897,32 @@ field nothing read.
   losses under the new rule.
 - **Next**: `python3 skills/benchmarking/ab_krishiv.py` on any further
   estimator change; investigate q83 with Sail's rows.
+
+
+## 2026-10-02 — distributed TPC-H SF100 on kind: 22/22, answers identical
+
+- **Completed**: the distributed path measured for the first time since the
+  DataFusion 55 upgrade, the fragment dynamic-filter fix and the selectivity
+  reorder — on the existing 3-node kind cluster (not recreated: it also hosts
+  the platform release and a 52-day soak), data in a host MinIO
+  (`~/krishiv-bench-data/minio`, 41.5 GB, 134 s to upload), image
+  `localhost/krishiv:fast-bd19cc6`. 22/22 queries, 21 byte-identical to the
+  embedded run and q11 the same rows in tie order, every query multi-stage
+  (`benchmarks/tpch-sf100-distributed-kind-3x-2026-10-02.md`). Timings are
+  contention-bound on one box and are not a performance result.
+- **Found and fixed**: with `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` set and no
+  per-task limit, `reserve_task_engine_memory` asked for the whole process
+  budget per task; the first fragment took all 12 GB as a private pool and
+  the other slots got the 32 MiB floor, failing q3/q5 on `HashJoinInput`.
+  `task_engine_want` now requests `budget / slots` (unit-tested). The
+  Flight SQL (`KRISHIV_API_KEYS`) and shuffle (`KRISHIV_SHUFFLE_TOKEN`)
+  listeners refuse `0.0.0.0` without credentials in this image; the
+  manifest sets both.
+- **Harness**: `tpch_cluster_run.py` records scheme-2 digests from the
+  inline Arrow IPC results; `tpch_cluster_compare.py` diffs a cluster JSON
+  against an embedded one by digest and reports single-task fallbacks.
+- **Validation**: see the commit's gate line; the cluster run itself is the
+  validation of the distributed path.
+- **Next**: the same run on the k3s rig when it is reachable (real
+  3-box numbers); delete `target/debug` was the price of the disk — the
+  next debug build is from scratch.

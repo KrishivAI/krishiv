@@ -1,0 +1,174 @@
+apiVersion: v1
+kind: Namespace
+metadata: { name: krishiv-bench }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: krishiv-bench-tokens, namespace: krishiv-bench }
+stringData: { shuffle: "REPLACE_WITH_openssl_rand_hex_24", flight: "REPLACE_WITH_openssl_rand_hex_24", token: "REPLACE_WITH_openssl_rand_hex_24", task: "REPLACE_WITH_openssl_rand_hex_24" }
+---
+apiVersion: v1
+kind: Secret
+metadata: { name: bench-s3, namespace: krishiv-bench }
+stringData:
+  AWS_ACCESS_KEY_ID: benchminio
+  AWS_SECRET_ACCESS_KEY: REPLACE_WITH_MINIO_PASSWORD
+  AWS_ENDPOINT_URL: http://172.18.0.1:9000
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-coordinator, namespace: krishiv-bench }
+spec:
+  selector: { app: bench-coordinator }
+  ports:
+    - { name: grpc, port: 2001 }
+    - { name: http, port: 2002 }
+    - { name: flight, port: 2003 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-coordinator, namespace: krishiv-bench }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: bench-coordinator } }
+  template:
+    metadata: { labels: { app: bench-coordinator } }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: krishiv-control-plane }
+      tolerations: [{ key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }]
+      containers:
+        - name: coordinator
+          image: IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          args: [clusterd, --grpc-addr, 0.0.0.0:2001, --http-addr, 0.0.0.0:2002, --flight-addr, 0.0.0.0:2003, --durability-profile, dev-local, --leader-backend, single]
+          envFrom: [{ secretRef: { name: bench-s3 } }]
+          env:
+            - { name: KRISHIV_SHUFFLE_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: shuffle } } }
+            - { name: KRISHIV_API_KEYS, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: flight } } }
+            - { name: KRISHIV_JOIN_REORDER, value: "on" }
+            - { name: KRISHIV_COORDINATOR_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: token } } }
+            - { name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: task } } }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: KRISHIV_COORDINATOR_ID, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_NAMESPACE, valueFrom: { fieldRef: { fieldPath: metadata.namespace } } }
+          ports: [{ containerPort: 2001 }, { containerPort: 2002 }, { containerPort: 2003 }]
+          resources: { requests: { cpu: "1", memory: 1Gi }, limits: { cpu: "4", memory: 6Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-exec-control-plane, namespace: krishiv-bench, labels: { app: bench-exec } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: bench-exec, node: control-plane } }
+  template:
+    metadata: { labels: { app: bench-exec, node: control-plane } }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: krishiv-control-plane }
+      tolerations: [{ key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }]
+      containers:
+        - name: executor
+          image: IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          args: [executor, --coordinator, http://bench-coordinator:2001, --connect, --executor-id, bench-control-plane, --task-grpc-addr, 0.0.0.0:7071, --barrier-grpc-addr, 0.0.0.0:7072, --http-addr, 0.0.0.0:8080, --shuffle-flight-addr, 0.0.0.0:7074, --durability-profile, dev-local, --shuffle-dir, /tmp/krishiv-shuffle]
+          envFrom: [{ secretRef: { name: bench-s3 } }]
+          env:
+            - { name: KRISHIV_SHUFFLE_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: shuffle } } }
+            - { name: KRISHIV_API_KEYS, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: flight } } }
+            - { name: KRISHIV_JOIN_REORDER, value: "on" }
+            - { name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH, value: "true" }
+            - { name: KRISHIV_COORDINATOR_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: token } } }
+            - { name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: task } } }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ containerPort: 7071 }, { containerPort: 7072 }, { containerPort: 7074 }, { containerPort: 8080 }]
+          resources: { requests: { cpu: "2", memory: 8Gi }, limits: { cpu: "4", memory: 16Gi } }
+          volumeMounts: [{ name: shuffle, mountPath: /tmp/krishiv-shuffle }]
+      volumes: [{ name: shuffle, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-exec, namespace: krishiv-bench }
+spec:
+  clusterIP: None
+  selector: { app: bench-exec }
+  ports: [{ name: task, port: 7071 }, { name: barrier, port: 7072 }, { name: shuffle, port: 7074 }, { name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-exec-worker, namespace: krishiv-bench, labels: { app: bench-exec } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: bench-exec, node: worker } }
+  template:
+    metadata: { labels: { app: bench-exec, node: worker } }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: krishiv-worker }
+      tolerations: [{ key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }]
+      containers:
+        - name: executor
+          image: IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          args: [executor, --coordinator, http://bench-coordinator:2001, --connect, --executor-id, bench-worker, --task-grpc-addr, 0.0.0.0:7071, --barrier-grpc-addr, 0.0.0.0:7072, --http-addr, 0.0.0.0:8080, --shuffle-flight-addr, 0.0.0.0:7074, --durability-profile, dev-local, --shuffle-dir, /tmp/krishiv-shuffle]
+          envFrom: [{ secretRef: { name: bench-s3 } }]
+          env:
+            - { name: KRISHIV_SHUFFLE_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: shuffle } } }
+            - { name: KRISHIV_API_KEYS, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: flight } } }
+            - { name: KRISHIV_JOIN_REORDER, value: "on" }
+            - { name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH, value: "true" }
+            - { name: KRISHIV_COORDINATOR_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: token } } }
+            - { name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: task } } }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ containerPort: 7071 }, { containerPort: 7072 }, { containerPort: 7074 }, { containerPort: 8080 }]
+          resources: { requests: { cpu: "2", memory: 8Gi }, limits: { cpu: "4", memory: 16Gi } }
+          volumeMounts: [{ name: shuffle, mountPath: /tmp/krishiv-shuffle }]
+      volumes: [{ name: shuffle, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-exec, namespace: krishiv-bench }
+spec:
+  clusterIP: None
+  selector: { app: bench-exec }
+  ports: [{ name: task, port: 7071 }, { name: barrier, port: 7072 }, { name: shuffle, port: 7074 }, { name: http, port: 8080 }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: bench-exec-worker2, namespace: krishiv-bench, labels: { app: bench-exec } }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: bench-exec, node: worker2 } }
+  template:
+    metadata: { labels: { app: bench-exec, node: worker2 } }
+    spec:
+      nodeSelector: { kubernetes.io/hostname: krishiv-worker2 }
+      tolerations: [{ key: node-role.kubernetes.io/control-plane, operator: Exists, effect: NoSchedule }]
+      containers:
+        - name: executor
+          image: IMAGE_TAG
+          imagePullPolicy: IfNotPresent
+          args: [executor, --coordinator, http://bench-coordinator:2001, --connect, --executor-id, bench-worker2, --task-grpc-addr, 0.0.0.0:7071, --barrier-grpc-addr, 0.0.0.0:7072, --http-addr, 0.0.0.0:8080, --shuffle-flight-addr, 0.0.0.0:7074, --durability-profile, dev-local, --shuffle-dir, /tmp/krishiv-shuffle]
+          envFrom: [{ secretRef: { name: bench-s3 } }]
+          env:
+            - { name: KRISHIV_SHUFFLE_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: shuffle } } }
+            - { name: KRISHIV_API_KEYS, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: flight } } }
+            - { name: KRISHIV_JOIN_REORDER, value: "on" }
+            - { name: KRISHIV_REQUIRE_EXECUTOR_TASK_AUTH, value: "true" }
+            - { name: KRISHIV_COORDINATOR_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: token } } }
+            - { name: KRISHIV_EXECUTOR_TASK_BEARER_TOKEN, valueFrom: { secretKeyRef: { name: krishiv-bench-tokens, key: task } } }
+            - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: POD_IP, valueFrom: { fieldRef: { fieldPath: status.podIP } } }
+          ports: [{ containerPort: 7071 }, { containerPort: 7072 }, { containerPort: 7074 }, { containerPort: 8080 }]
+          resources: { requests: { cpu: "2", memory: 8Gi }, limits: { cpu: "4", memory: 16Gi } }
+          volumeMounts: [{ name: shuffle, mountPath: /tmp/krishiv-shuffle }]
+      volumes: [{ name: shuffle, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: bench-exec, namespace: krishiv-bench }
+spec:
+  clusterIP: None
+  selector: { app: bench-exec }
+  ports: [{ name: task, port: 7071 }, { name: barrier, port: 7072 }, { name: shuffle, port: 7074 }, { name: http, port: 8080 }]

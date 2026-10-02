@@ -1051,6 +1051,26 @@ impl Drop for ProcessMemoryReservation {
     }
 }
 
+/// How much of an explicit process budget one task asks the arbiter for.
+///
+/// A job's own per-task limit is honoured exactly (capped at the budget).
+/// Without one the task asks for its *slot's share*, not the whole budget:
+/// `KRISHIV_EXECUTOR_MEMORY_LIMIT_BYTES` promises "hard per-task partitioning
+/// of a fixed process budget", and partitioning a budget means dividing it.
+/// Asking for all of it let the first fragment of every stage reserve the
+/// entire 12 GB as a private pool and left the other three slots the 32 MiB
+/// floor — on the 3-node kind cluster at TPC-H SF100 that failed q3, q5 and
+/// every other join-heavy query with `Resources exhausted` on a
+/// `HashJoinInput` of a few hundred megabytes, while 11.9 GB sat reserved and
+/// idle in the same process.
+fn task_engine_want(desired: Option<u64>, process_limit: u64, slots: usize) -> u64 {
+    let share = process_limit / u64::try_from(slots.max(1)).unwrap_or(1);
+    desired
+        .unwrap_or(share)
+        .min(process_limit)
+        .max(MIN_TASK_ENGINE_MEMORY_BYTES.min(process_limit))
+}
+
 /// Decide where a task's DataFusion execution memory comes from, reserving
 /// against the explicit process budget when one is configured.
 ///
@@ -1084,10 +1104,11 @@ pub(crate) fn reserve_task_engine_memory(
         );
     };
 
-    let want = desired
-        .map(|d| u64::try_from(d).unwrap_or(u64::MAX))
-        .unwrap_or(process_limit)
-        .min(process_limit);
+    let want = task_engine_want(
+        desired.map(|d| u64::try_from(d).unwrap_or(u64::MAX)),
+        process_limit,
+        executor_capacity().slots.get(),
+    );
 
     // Phase 56 (SH7): task engine pools draw from the unified arbiter's
     // Execution region — shuffle buffers created inside task execution ride
@@ -1596,6 +1617,38 @@ mod tests {
         assert_eq!(super::elastic_parallelism(nz(2), nz(4), 1), nz(4));
         assert_eq!(super::elastic_parallelism(nz(2), nz(4), 2), nz(2));
         assert_eq!(super::elastic_parallelism(nz(2), nz(4), 4), nz(2));
+    }
+
+    /// An explicit process budget is divided among the slots; one task never
+    /// asks for all of it.
+    #[test]
+    fn a_process_budget_is_partitioned_per_slot_not_taken_whole() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(
+            super::task_engine_want(None, 12 * gib, 4),
+            3 * gib,
+            "a quarter each"
+        );
+        assert_eq!(
+            super::task_engine_want(None, 12 * gib, 1),
+            12 * gib,
+            "one slot: all"
+        );
+        assert_eq!(
+            super::task_engine_want(Some(2 * gib), 12 * gib, 4),
+            2 * gib,
+            "a job's own limit is honoured exactly"
+        );
+        assert_eq!(
+            super::task_engine_want(Some(40 * gib), 12 * gib, 4),
+            12 * gib,
+            "but never beyond the budget"
+        );
+        assert_eq!(
+            super::task_engine_want(None, 64 * 1024 * 1024, 4),
+            32 * 1024 * 1024,
+            "a tiny budget still grants the floor"
+        );
     }
 
     #[test]

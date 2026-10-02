@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import json
+from pathlib import Path
 import os
 import signal
 import subprocess
@@ -368,6 +369,40 @@ def table_path(data_root: str, table: str, single_file: set[str]) -> str:
     return f"{root}/{table}/"
 
 
+
+def fingerprint_ipc(batches_b64: list[str]) -> dict:
+    """Rows of base64 Arrow IPC batches, hashed as `tpch_compare_engines` does.
+
+    Imported lazily: the engine harness pulls in optional engines at import
+    time only inside its runners, so this import is cheap, and keeping one
+    `fingerprint` means the digests are comparable by construction.
+    """
+    import base64
+    import io
+    import sys
+
+    try:
+        import pyarrow as pa
+        import pyarrow.ipc as ipc
+    except ImportError:
+        return {}
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from tpch_compare_engines import DIGEST_SCHEME, fingerprint  # noqa: E402
+
+    rows: list[tuple] = []
+    for encoded in batches_b64:
+        # serde writes `Vec<u8>` as a JSON array of numbers; a base64 string
+        # is accepted too in case the API ever switches.
+        raw = bytes(encoded) if isinstance(encoded, list) else base64.b64decode(encoded)
+        try:
+            reader = ipc.open_stream(io.BytesIO(raw))
+            table = reader.read_all()
+        except pa.ArrowInvalid:
+            table = ipc.open_file(io.BytesIO(raw)).read_all()
+        rows.extend(tuple(r.values()) for r in table.to_pylist())
+    return {**fingerprint(rows), "digest_scheme": DIGEST_SCHEME}
+
+
 def run_query(
     coordinator: str,
     query: dict,
@@ -456,12 +491,17 @@ def run_query(
             # sweep exists to catch exactly this.
             distributed = bool(task_count and task_count > 1)
             _forget_inflight()
+            # The answer, hashed with the engine harness's scheme so a
+            # distributed run can be diffed against an embedded one. A
+            # timing without a digest cannot tell "fast" from "wrong".
+            fingerprint = fingerprint_ipc(poll.get("inline_record_batch_ipc", []))
             return {
                 "id": query["id"],
                 "name": query["name"],
                 "job_id": job_id,
                 "status": "ok",
                 "elapsed_s": elapsed,
+                **fingerprint,
                 "result_batches": len(poll.get("inline_record_batch_ipc", [])),
                 "stage_count": stage_count,
                 "task_count": task_count,
